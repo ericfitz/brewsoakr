@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod eligibility;
 pub mod error;
+pub mod git;
 pub mod hours;
 pub mod identity;
 pub mod paths;
