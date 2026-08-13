@@ -57,12 +57,89 @@ pub fn parse_cask(rb: &str) -> Result<CaskIdentity, Error> {
     })
 }
 
-/// True if any line matches `^\s*(deprecate!|disable!)\b`.
-pub fn is_deprecated_or_disabled(rb: &str) -> bool {
-    rb.lines().any(|line| {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleKind {
+    Deprecated,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleFlag {
+    pub kind: LifecycleKind,
+    /// ISO `YYYY-MM-DD` from the Homebrew `date:` keyword, if parseable.
+    pub date: Option<String>,
+}
+
+/// Homebrew `deprecate!` / `disable!` calls. `date:` is a required keyword.
+pub fn lifecycle_flags(rb: &str) -> Vec<LifecycleFlag> {
+    let mut out = Vec::new();
+    for line in rb.lines() {
         let t = line.trim_start();
-        starts_with_bang_call(t, "deprecate!") || starts_with_bang_call(t, "disable!")
-    })
+        let kind = if starts_with_bang_call(t, "deprecate!") {
+            LifecycleKind::Deprecated
+        } else if starts_with_bang_call(t, "disable!") {
+            LifecycleKind::Disabled
+        } else {
+            continue;
+        };
+        out.push(LifecycleFlag {
+            kind,
+            date: date_keyword(t),
+        });
+    }
+    out
+}
+
+/// True when a `deprecate!`/`disable!` date is today or earlier, or the date
+/// is missing/unparseable. Future dates are not yet in effect (Homebrew
+/// `Date.parse(date) <= Date.today`).
+pub fn is_deprecated_or_disabled(rb: &str, today: &str) -> bool {
+    lifecycle_flags(rb)
+        .iter()
+        .any(|flag| flag_in_effect(flag, today))
+}
+
+pub fn upcoming_lifecycle_messages(rb: &str, today: &str) -> Vec<String> {
+    lifecycle_flags(rb)
+        .into_iter()
+        .filter(|flag| !flag_in_effect(flag, today))
+        .filter_map(|flag| {
+            let date = flag.date?;
+            let word = match flag.kind {
+                LifecycleKind::Deprecated => "deprecated",
+                LifecycleKind::Disabled => "disabled",
+            };
+            Some(format!("scheduled to be {word} on {date}"))
+        })
+        .collect()
+}
+
+fn flag_in_effect(flag: &LifecycleFlag, today: &str) -> bool {
+    match flag.date.as_deref() {
+        Some(d) if is_iso_date(d) => d <= today,
+        _ => true,
+    }
+}
+
+fn date_keyword(line: &str) -> Option<String> {
+    let key = "date:";
+    let pos = line.find(key)?;
+    let rest = line[pos + key.len()..].trim_start();
+    first_double_quoted(rest).filter(|d| is_iso_date(d))
+}
+
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 {
+                true
+            } else {
+                c.is_ascii_digit()
+            }
+        })
 }
 
 fn starts_with_bang_call(line: &str, keyword: &str) -> bool {
@@ -317,12 +394,41 @@ end
 
     #[test]
     fn detects_deprecate_bang() {
-        assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA));
+        assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA, "2024-01-01"));
+        assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA, "2026-08-13"));
+    }
+
+    #[test]
+    fn future_deprecate_date_is_not_yet_in_effect() {
+        let rb = r#"
+class New < Formula
+  url "https://example.com/new-1.0.tar.gz"
+  sha256 "ddd444"
+  deprecate! date: "2030-11-01", because: :deprecated_upstream
+  disable! date: "2031-11-01", because: :deprecated_upstream
+end
+"#;
+        assert!(!is_deprecated_or_disabled(rb, "2026-08-13"));
+        let msgs = upcoming_lifecycle_messages(rb, "2026-08-13");
+        assert_eq!(
+            msgs,
+            [
+                "scheduled to be deprecated on 2030-11-01",
+                "scheduled to be disabled on 2031-11-01",
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_date_is_treated_as_in_effect() {
+        let rb = "  deprecate! because: :unmaintained\n";
+        assert!(is_deprecated_or_disabled(rb, "2026-08-13"));
+        assert!(upcoming_lifecycle_messages(rb, "2026-08-13").is_empty());
     }
 
     #[test]
     fn comment_disable_does_not_match() {
         let rb = "# disable! maybe\nclass X < Formula\nend\n";
-        assert!(!is_deprecated_or_disabled(rb));
+        assert!(!is_deprecated_or_disabled(rb, "2026-08-13"));
     }
 }

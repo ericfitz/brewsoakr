@@ -18,12 +18,18 @@ pub enum DesiredAction {
     RefuseDeprecated,
 }
 
-/// `cutoff_blob` / `head_blob` are raw git bytes. `installed` is parsed receipt identity.
-pub fn upstream_status(cutoff_blob: Option<&[u8]>, head_blob: Option<&[u8]>) -> UpstreamStatus {
+/// `cutoff_blob` / `head_blob` are raw git bytes. `today` is `YYYY-MM-DD`.
+/// `installed` is parsed receipt identity.
+pub fn upstream_status(
+    cutoff_blob: Option<&[u8]>,
+    head_blob: Option<&[u8]>,
+    today: &str,
+) -> UpstreamStatus {
     let Some(head) = head_blob else {
         return UpstreamStatus::Yanked;
     };
-    let deprecated = std::str::from_utf8(head).is_ok_and(identity::is_deprecated_or_disabled);
+    let deprecated =
+        std::str::from_utf8(head).is_ok_and(|rb| identity::is_deprecated_or_disabled(rb, today));
     if deprecated {
         UpstreamStatus::Deprecated
     } else if cutoff_blob.is_none() {
@@ -106,6 +112,8 @@ class Wget < Formula
 end
 "#;
 
+    const TODAY: &str = "2026-08-13";
+
     fn formula_id(rb: &str) -> PkgIdentity {
         PkgIdentity::Formula(parse_formula(rb).unwrap())
     }
@@ -113,7 +121,7 @@ end
     #[test]
     fn too_new() {
         let head = formula_id(HEAD_RB);
-        let status = upstream_status(None, Some(HEAD_RB.as_bytes()));
+        let status = upstream_status(None, Some(HEAD_RB.as_bytes()), TODAY);
         assert_eq!(status, UpstreamStatus::TooNew);
         assert_eq!(
             desired_action(status, None, None, Some(&head)),
@@ -124,7 +132,7 @@ end
     #[test]
     fn yanked() {
         let cutoff = formula_id(CUTOFF_RB);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), None);
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), None, TODAY);
         assert_eq!(status, UpstreamStatus::Yanked);
         assert_eq!(
             desired_action(status, None, Some(&cutoff), None),
@@ -139,6 +147,7 @@ end
         let status = upstream_status(
             Some(CUTOFF_RB.as_bytes()),
             Some(DEPRECATED_HEAD_RB.as_bytes()),
+            TODAY,
         );
         assert_eq!(status, UpstreamStatus::Deprecated);
         assert_eq!(
@@ -151,7 +160,7 @@ end
     fn already_soaked() {
         let cutoff = formula_id(CUTOFF_RB);
         let head = formula_id(HEAD_RB);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()));
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&cutoff), Some(&cutoff), Some(&head)),
@@ -172,7 +181,7 @@ end
             ("1.21.4", "1.21.4")
         );
         assert_ne!(cutoff, head);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()));
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&head), Some(&cutoff), Some(&head)),
@@ -195,7 +204,7 @@ end
         );
         assert_ne!(installed, cutoff);
         assert_ne!(installed, head);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()));
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&installed), Some(&cutoff), Some(&head)),
@@ -204,10 +213,29 @@ end
     }
 
     #[test]
+    fn future_deprecate_date_is_eligible() {
+        let rb = r#"
+class Wget < Formula
+  url "https://example.com/wget-1.21.4.tar.gz"
+  sha256 "zzz999"
+  deprecate! date: "2030-11-01", because: :deprecated_upstream
+end
+"#;
+        let cutoff = formula_id(CUTOFF_RB);
+        let head = formula_id(rb);
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(rb.as_bytes()), TODAY);
+        assert_eq!(status, UpstreamStatus::Eligible);
+        assert_eq!(
+            desired_action(status, None, Some(&cutoff), Some(&head)),
+            DesiredAction::InstallCutoff
+        );
+    }
+
+    #[test]
     fn not_installed_eligible() {
         let cutoff = formula_id(CUTOFF_RB);
         let head = formula_id(HEAD_RB);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()));
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, None, Some(&cutoff), Some(&head)),

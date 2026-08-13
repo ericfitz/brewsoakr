@@ -123,6 +123,9 @@ pub fn outdated(
             held.push(format!("{}: unparseable identity", pkg.name));
             continue;
         };
+        for warn in &view.warnings {
+            writeln!(out, "warning: {warn}")?;
+        }
         match view.action {
             DesiredAction::InstallCutoff => {
                 let installed_ver = view
@@ -196,6 +199,9 @@ pub fn info(
             view.head.as_ref().map(identity_version).unwrap_or("none")
         )?;
         writeln!(out, "action: {}", action_label(view.action))?;
+        for warn in &view.warnings {
+            writeln!(out, "warning: {warn}")?;
+        }
     }
     Ok(RunResult {
         refused: false,
@@ -402,6 +408,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             writeln!(self.out, "{name}: unparseable identity; skipping")?;
             return Ok(());
         };
+        for warn in &view.warnings {
+            writeln!(self.out, "warning: {warn}")?;
+        }
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
@@ -494,7 +503,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         dep: &str,
     ) -> Result<bool, Error> {
         let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, dep, kind)?;
-        let status = eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref());
+        let status = eligibility::upstream_status(
+            blobs.cutoff.as_deref(),
+            blobs.head.as_deref(),
+            &calendar_today(),
+        );
         if status != UpstreamStatus::Eligible {
             self.refuse_ineligible_dep(target, dep, status)?;
             return Ok(false);
@@ -652,6 +665,7 @@ struct ResolvedView {
     head: Option<PkgIdentity>,
     action: DesiredAction,
     cutoff_blob: Option<Vec<u8>>,
+    warnings: Vec<String>,
 }
 
 fn resolve_named(
@@ -701,16 +715,35 @@ fn resolve_view(
         },
         None => None,
     };
-    let status = eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref());
+    let today = calendar_today();
+    let status =
+        eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref(), &today);
     let action =
         eligibility::desired_action(status, installed.as_ref(), cutoff.as_ref(), head.as_ref());
+    let warnings = match blobs
+        .head
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+    {
+        Some(rb) => identity::upcoming_lifecycle_messages(rb, &today)
+            .into_iter()
+            .map(|msg| format!("{name} {msg}"))
+            .collect(),
+        None => Vec::new(),
+    };
     Ok(Some(ResolvedView {
         installed,
         cutoff,
         head,
         action,
         cutoff_blob: blobs.cutoff,
+        warnings,
     }))
+}
+
+fn calendar_today() -> String {
+    let d = time::OffsetDateTime::now_utc().date();
+    format!("{:04}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day())
 }
 
 fn resolve_pkg_blobs(
@@ -1026,6 +1059,36 @@ mod tests {
         assert!(text.contains("beta"), "missing beta: {text}");
         assert!(text.contains("gamma"), "missing gamma: {text}");
         assert!(!result.refused, "listing holds is not a refusal");
+    }
+
+    #[test]
+    fn outdated_warns_future_deprecate_and_does_not_hold() {
+        let old = formula_rb("py", "3.13.0", "oldsha");
+        let mid = formula_rb("py", "3.14.0", "midsha");
+        let new = format!(
+            "{}\n  deprecate! date: \"2099-11-01\", because: :deprecated_upstream\n",
+            formula_rb("py", "3.14.1", "newsha").trim_end()
+        );
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/p/py.rb", mid);
+        git.insert_blob("headsha", "Formula/p/py.rb", new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("py", old)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let mut out = Vec::new();
+        outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("warning: py scheduled to be deprecated on 2099-11-01"),
+            "{text}"
+        );
+        assert!(text.contains("==> Outdated"), "{text}");
+        assert!(
+            !text.contains("py:") || !text.contains("Held"),
+            "future deprecate must not hold: {text}"
+        );
     }
 
     #[test]
