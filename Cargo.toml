@@ -3,7 +3,7 @@ name = "brewsoakr"
 version = "0.1.0"
 edition = "2024"
 description = "Homebrew wrapper that soaks formula and cask updates"
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
