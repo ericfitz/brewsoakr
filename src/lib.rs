@@ -7,6 +7,7 @@ pub mod github;
 pub mod hours;
 pub mod identity;
 pub mod paths;
+pub mod resolve;
 pub mod snapshot;
 
 pub use error::Error;
