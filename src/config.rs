@@ -107,7 +107,10 @@ mod tests {
 
     #[test]
     fn cli_zero_is_usage() {
-        assert!(matches!(resolve_hours(Some(0), None, None), Err(Error::Usage(_))));
+        assert!(matches!(
+            resolve_hours(Some(0), None, None),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]
@@ -125,7 +128,13 @@ mod tests {
 
     #[test]
     fn invalid_file_is_default() {
-        for contents in ["", "hours = 48\n", "SOAK_HOURS = 0\n", "SOAK_HOURS = \"x\"\n", "[[["] {
+        for contents in [
+            "",
+            "hours = 48\n",
+            "SOAK_HOURS = 0\n",
+            "SOAK_HOURS = \"x\"\n",
+            "[[[",
+        ] {
             let r = resolve_hours(None, None, Some(contents)).unwrap();
             assert_eq!(r.hours.get(), 24, "contents={contents:?}");
         }

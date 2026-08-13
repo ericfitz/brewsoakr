@@ -54,11 +54,25 @@ mod tests {
 
     #[test]
     fn brew_gt_1_is_brew() {
-        assert_eq!(Error::Brew { status: 3, message: "x".into() }.exit_code(), 3);
+        assert_eq!(
+            Error::Brew {
+                status: 3,
+                message: "x".into()
+            }
+            .exit_code(),
+            3
+        );
     }
 
     #[test]
     fn brew_1_is_1() {
-        assert_eq!(Error::Brew { status: 1, message: "x".into() }.exit_code(), 1);
+        assert_eq!(
+            Error::Brew {
+                status: 1,
+                message: "x".into()
+            }
+            .exit_code(),
+            1
+        );
     }
 }
