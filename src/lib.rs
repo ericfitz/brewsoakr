@@ -3,6 +3,7 @@ pub mod config;
 pub mod eligibility;
 pub mod error;
 pub mod git;
+pub mod github;
 pub mod hours;
 pub mod identity;
 pub mod paths;
