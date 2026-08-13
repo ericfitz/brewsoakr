@@ -78,13 +78,13 @@ impl Brew for ProcessBrew {
         let json = String::from_utf8_lossy(&output.stdout);
         let cellar = self.brew_dir("--cellar");
         let caskroom = self.brew_dir("--caskroom");
-        parse_installed_json(&json, |name, kind| match kind {
+        parse_installed_json(&json, |name, kind, version| match kind {
             PkgKind::Formula => cellar
                 .as_deref()
-                .and_then(|dir| read_formula_receipt(dir, name)),
+                .and_then(|dir| read_formula_receipt(dir, name, version)),
             PkgKind::Cask => caskroom
                 .as_deref()
-                .and_then(|dir| find_named_rb(&dir.join(name), name)),
+                .and_then(|dir| read_cask_receipt(dir, name, version)),
         })
     }
 
@@ -201,32 +201,45 @@ fn parse_deps_stdout(stdout: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn read_formula_receipt(cellar: &Path, name: &str) -> Option<String> {
-    let pkg_dir = cellar.join(name);
-    let entries = std::fs::read_dir(pkg_dir).ok()?;
-    for entry in entries.flatten() {
-        let rb = entry.path().join(".brew").join(format!("{name}.rb"));
-        if let Ok(text) = std::fs::read_to_string(rb) {
+fn read_formula_receipt(cellar: &Path, name: &str, version: Option<&str>) -> Option<String> {
+    let version = version?;
+    let rb = cellar
+        .join(name)
+        .join(version)
+        .join(".brew")
+        .join(format!("{name}.rb"));
+    std::fs::read_to_string(rb).ok()
+}
+
+fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Option<String> {
+    let metadata = caskroom.join(name).join(".metadata");
+    let target = format!("{name}.rb");
+    if let Some(version) = version {
+        let versioned = metadata.join(version);
+        if let Some(text) = walk_metadata_for_file(&versioned, &target) {
             return Some(text);
         }
     }
-    None
+    walk_metadata_for_file(&metadata, &target)
 }
 
-fn find_named_rb(dir: &Path, name: &str) -> Option<String> {
-    let target = format!("{name}.rb");
-    walk_for_file(dir, &target)
-}
-
-fn walk_for_file(dir: &Path, target: &str) -> Option<String> {
-    let entries = std::fs::read_dir(dir).ok()?;
+/// Walk only `dir` (a `.metadata` tree). Unreadable subdirs are skipped.
+fn walk_metadata_for_file(dir: &Path, target: &str) -> Option<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return None;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            if let Some(text) = walk_for_file(&path, target) {
+        let is_dir = std::fs::metadata(&path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            if let Some(text) = walk_metadata_for_file(&path, target) {
                 return Some(text);
             }
-        } else if path.file_name().and_then(|s| s.to_str()) == Some(target)
+            continue;
+        }
+        if path.file_name().and_then(|s| s.to_str()) == Some(target)
             && let Ok(text) = std::fs::read_to_string(&path)
         {
             return Some(text);
@@ -237,7 +250,7 @@ fn walk_for_file(dir: &Path, target: &str) -> Option<String> {
 
 fn parse_installed_json(
     v: &str,
-    read_receipt: impl Fn(&str, PkgKind) -> Option<String>,
+    mut read_receipt: impl FnMut(&str, PkgKind, Option<&str>) -> Option<String>,
 ) -> Result<Vec<InstalledPkg>, Error> {
     let mut out = Vec::new();
     for obj in json_objects_in_array(v, "formulae")? {
@@ -247,7 +260,8 @@ fn parse_installed_json(
         if !keep_tap(json_string_value(obj, "tap").as_deref()) {
             continue;
         }
-        if let Some(receipt_rb) = read_receipt(&name, PkgKind::Formula) {
+        let version = installed_version(obj);
+        if let Some(receipt_rb) = read_receipt(&name, PkgKind::Formula, version.as_deref()) {
             out.push(InstalledPkg {
                 name,
                 kind: PkgKind::Formula,
@@ -262,7 +276,8 @@ fn parse_installed_json(
         if !keep_tap(json_string_value(obj, "tap").as_deref()) {
             continue;
         }
-        if let Some(receipt_rb) = read_receipt(&name, PkgKind::Cask) {
+        let version = installed_version(obj);
+        if let Some(receipt_rb) = read_receipt(&name, PkgKind::Cask, version.as_deref()) {
             out.push(InstalledPkg {
                 name,
                 kind: PkgKind::Cask,
@@ -271,6 +286,21 @@ fn parse_installed_json(
         }
     }
     Ok(out)
+}
+
+/// Formula: `installed[0].version`. Cask: string `installed`.
+fn installed_version(obj: &str) -> Option<String> {
+    let after = find_json_key(obj, "installed")?;
+    let after = after.trim_start();
+    if after.starts_with("null") {
+        return None;
+    }
+    if after.starts_with('"') {
+        return parse_json_string(after).filter(|s| !s.is_empty());
+    }
+    let rest = after.strip_prefix('[')?;
+    let first = scan_array_objects(rest)?.into_iter().next()?;
+    json_string_value(first, "version").filter(|s| !s.is_empty())
 }
 
 fn keep_tap(tap: Option<&str>) -> bool {
@@ -493,7 +523,7 @@ mod tests {
             }
           ]
         }"#;
-        let got = parse_installed_json(json, |name, kind| match (name, kind) {
+        let got = parse_installed_json(json, |name, kind, _version| match (name, kind) {
             ("wget", PkgKind::Formula) => Some("class Wget; end".into()),
             ("firefox", PkgKind::Cask) => Some("cask \"firefox\"".into()),
             ("foo", _) => panic!("third-party tap should be dropped before receipt read"),
@@ -523,7 +553,7 @@ mod tests {
           "formulae": [{"name": "ca-certificates", "tap": ""}],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |name, kind| {
+        let got = parse_installed_json(json, |name, kind, _version| {
             assert_eq!(name, "ca-certificates");
             assert_eq!(kind, PkgKind::Formula);
             Some("class CaCertificates; end".into())
@@ -532,5 +562,142 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "ca-certificates");
         assert_eq!(got[0].kind, PkgKind::Formula);
+    }
+
+    #[test]
+    fn parse_installed_json_passes_installed_version() {
+        let json = r#"{
+          "formulae": [
+            {
+              "name": "wget",
+              "tap": "homebrew/core",
+              "installed": [{"version": "1.21.4"}]
+            }
+          ],
+          "casks": [
+            {
+              "token": "firefox",
+              "tap": "homebrew/cask",
+              "installed": "128.0"
+            }
+          ]
+        }"#;
+        let mut versions = Vec::new();
+        parse_installed_json(json, |name, kind, version| {
+            versions.push((name.to_string(), kind, version.map(str::to_string)));
+            Some("rb".into())
+        })
+        .expect("parse");
+        assert_eq!(
+            versions,
+            vec![
+                ("wget".into(), PkgKind::Formula, Some("1.21.4".into())),
+                ("firefox".into(), PkgKind::Cask, Some("128.0".into())),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_formula_receipt_uses_installed_version_keg() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        let old = cellar.join("wget").join("1.20.0").join(".brew");
+        let new = cellar.join("wget").join("1.21.4").join(".brew");
+        std::fs::create_dir_all(&old).expect("old keg");
+        std::fs::create_dir_all(&new).expect("new keg");
+        std::fs::write(old.join("wget.rb"), "old-receipt").expect("old rb");
+        std::fs::write(new.join("wget.rb"), "new-receipt").expect("new rb");
+        assert_eq!(
+            read_formula_receipt(cellar, "wget", Some("1.21.4")).as_deref(),
+            Some("new-receipt")
+        );
+        assert_eq!(
+            read_formula_receipt(cellar, "wget", Some("9.9.9")).as_deref(),
+            None
+        );
+        assert_eq!(read_formula_receipt(cellar, "wget", None).as_deref(), None);
+    }
+
+    #[test]
+    fn parse_installed_json_reads_versioned_formula_keg() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path().to_path_buf();
+        let old = cellar.join("wget").join("1.20.0").join(".brew");
+        let new = cellar.join("wget").join("1.21.4").join(".brew");
+        std::fs::create_dir_all(&old).expect("old keg");
+        std::fs::create_dir_all(&new).expect("new keg");
+        std::fs::write(old.join("wget.rb"), "old-receipt").expect("old rb");
+        std::fs::write(new.join("wget.rb"), "new-receipt").expect("new rb");
+        let json = r#"{
+          "formulae": [
+            {
+              "name": "wget",
+              "tap": "homebrew/core",
+              "installed": [{"version": "1.21.4"}]
+            }
+          ],
+          "casks": []
+        }"#;
+        let got = parse_installed_json(json, |name, kind, version| {
+            assert_eq!(kind, PkgKind::Formula);
+            read_formula_receipt(&cellar, name, version)
+        })
+        .expect("parse");
+        assert_eq!(
+            got,
+            vec![InstalledPkg {
+                name: "wget".into(),
+                kind: PkgKind::Formula,
+                receipt_rb: "new-receipt".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn read_cask_receipt_uses_metadata_not_app_bundle() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let caskroom = tmp.path();
+        let app = caskroom
+            .join("firefox")
+            .join("128.0")
+            .join("Firefox.app")
+            .join("Contents");
+        std::fs::create_dir_all(&app).expect("app bundle");
+        std::fs::write(app.join("firefox.rb"), "decoy-from-app").expect("decoy");
+        assert_eq!(
+            read_cask_receipt(caskroom, "firefox", Some("128.0")).as_deref(),
+            None
+        );
+        let meta = caskroom
+            .join("firefox")
+            .join(".metadata")
+            .join("128.0")
+            .join("20240101000000.000")
+            .join("Casks");
+        std::fs::create_dir_all(&meta).expect("metadata");
+        std::fs::write(meta.join("firefox.rb"), "cask \"firefox\"").expect("receipt");
+        assert_eq!(
+            read_cask_receipt(caskroom, "firefox", Some("128.0")).as_deref(),
+            Some("cask \"firefox\"")
+        );
+    }
+
+    #[test]
+    fn read_cask_receipt_skips_unreadable_metadata_subdir() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let caskroom = tmp.path();
+        let metadata = caskroom.join("firefox").join(".metadata");
+        let blocked = metadata.join("blocked");
+        let good = metadata.join("128.0").join("ts").join("Casks");
+        std::fs::create_dir_all(&blocked).expect("blocked");
+        std::fs::create_dir_all(&good).expect("good");
+        std::fs::write(good.join("firefox.rb"), "from-metadata").expect("receipt");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod 0");
+        let got = read_cask_receipt(caskroom, "firefox", None);
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod restore");
+        assert_eq!(got.as_deref(), Some("from-metadata"));
     }
 }
