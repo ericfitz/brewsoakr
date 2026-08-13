@@ -106,7 +106,7 @@ impl Brew for ProcessBrew {
             PkgKind::Formula => "--formula",
             PkgKind::Cask => "--cask",
         };
-        let output = self.run(&["deps".into(), flag.into(), token.into()])?;
+        let output = self.run(&["deps".into(), "--1".into(), flag.into(), token.into()])?;
         if !output.status.success() {
             return Err(brew_fail(&output));
         }

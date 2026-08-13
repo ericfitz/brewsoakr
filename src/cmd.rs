@@ -7,6 +7,7 @@ use crate::resolve::{self, PkgKind, PkgRef};
 use crate::snapshot::{self, Snapshots};
 use crate::tap;
 use crate::{Error, SoakHours};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -313,6 +314,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         kind: PkgKind,
         view: &ResolvedView,
     ) -> Result<(), Error> {
+        self.ensure_tap()?;
         let pkg = PkgRef {
             name: name.to_string(),
             kind,
@@ -322,21 +324,38 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         })?;
         tap::write_blob(self.tap_root, &pkg, blob)?;
 
-        let deps = tap::dep_closure(self.brew, kind, name, |dep| {
-            cutoff_blob_exists(self.git, self.snaps, self.cache, dep, kind).unwrap_or(false)
-        })?;
-        for dep in deps {
+        let deps = self.collect_cutoff_deps(name, kind)?;
+        for (dep, dep_kind) in deps {
             if self.installed.iter().any(|p| p.name == dep) {
                 continue;
             }
-            if !self.install_missing_dep(name, kind, &dep)? {
+            if !self.install_missing_dep(name, dep_kind, &dep)? {
                 return Ok(());
             }
         }
 
-        self.ensure_tap()?;
         let args = tap::brew_install_args(&pkg, self.user_flags, true);
         self.record_run(&args)
+    }
+
+    fn collect_cutoff_deps(
+        &self,
+        root: &str,
+        root_kind: PkgKind,
+    ) -> Result<Vec<(String, PkgKind)>, Error> {
+        let mut walk = CutoffDepWalk {
+            brew: self.brew,
+            git: self.git,
+            snaps: self.snaps,
+            cache: self.cache,
+            tap_root: self.tap_root,
+            installed: self.installed,
+            visiting: HashSet::new(),
+            visited: HashSet::new(),
+            out: Vec::new(),
+        };
+        walk.visit(root, root_kind, false)?;
+        Ok(walk.out)
     }
 
     /// Install a missing cutoff dep. Returns false when the target was refused.
@@ -398,22 +417,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if self.force_formula {
             return Ok(PkgKind::Formula);
         }
-        if let Some(pkg) = self.installed.iter().find(|p| p.name == name) {
-            return Ok(pkg.kind);
-        }
-        let formula = resolve_view(
-            self.git,
-            self.snaps,
-            self.cache,
-            name,
-            PkgKind::Formula,
-            None,
-        )?;
-        if formula.cutoff.is_some() || formula.head.is_some() {
-            Ok(PkgKind::Formula)
-        } else {
-            Ok(PkgKind::Cask)
-        }
+        natural_kind(self.git, self.snaps, self.cache, self.installed, name)
     }
 
     fn ensure_tap(&mut self) -> Result<(), Error> {
@@ -431,6 +435,47 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Some(prev) => prev.max(code),
             None => code,
         });
+        Ok(())
+    }
+}
+
+struct CutoffDepWalk<'a, B, G> {
+    brew: &'a B,
+    git: &'a G,
+    snaps: &'a Snapshots,
+    cache: &'a Path,
+    tap_root: &'a Path,
+    installed: &'a [InstalledPkg],
+    visiting: HashSet<String>,
+    visited: HashSet<String>,
+    out: Vec<(String, PkgKind)>,
+}
+
+impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
+    fn visit(&mut self, name: &str, kind: PkgKind, include_self: bool) -> Result<(), Error> {
+        if self.visiting.contains(name) || self.visited.contains(name) {
+            return Ok(());
+        }
+        self.visiting.insert(name.to_string());
+        if include_self {
+            write_cutoff_blob(self.git, self.snaps, self.cache, self.tap_root, name, kind)?;
+        }
+        let token = tap::install_token(&PkgRef {
+            name: name.to_string(),
+            kind,
+        });
+        for dep in self.brew.deps(kind, &token)? {
+            if !cutoff_in_either_tree(self.git, self.snaps, self.cache, &dep)? {
+                continue;
+            }
+            let dep_kind = natural_kind(self.git, self.snaps, self.cache, self.installed, &dep)?;
+            self.visit(&dep, dep_kind, true)?;
+        }
+        self.visiting.remove(name);
+        self.visited.insert(name.to_string());
+        if include_self {
+            self.out.push((name.to_string(), kind));
+        }
         Ok(())
     }
 }
@@ -522,6 +567,56 @@ fn cutoff_blob_exists(
     Ok(resolve_pkg_blobs(git, snaps, cache, name, kind)?
         .cutoff
         .is_some())
+}
+
+fn cutoff_in_either_tree(
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    name: &str,
+) -> Result<bool, Error> {
+    Ok(
+        cutoff_blob_exists(git, snaps, cache, name, PkgKind::Formula)?
+            || cutoff_blob_exists(git, snaps, cache, name, PkgKind::Cask)?,
+    )
+}
+
+fn natural_kind(
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    installed: &[InstalledPkg],
+    name: &str,
+) -> Result<PkgKind, Error> {
+    if let Some(pkg) = installed.iter().find(|p| p.name == name) {
+        return Ok(pkg.kind);
+    }
+    let formula = resolve_view(git, snaps, cache, name, PkgKind::Formula, None)?;
+    if formula.cutoff.is_some() || formula.head.is_some() {
+        Ok(PkgKind::Formula)
+    } else {
+        Ok(PkgKind::Cask)
+    }
+}
+
+fn write_cutoff_blob(
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    tap_root: &Path,
+    name: &str,
+    kind: PkgKind,
+) -> Result<(), Error> {
+    let blobs = resolve_pkg_blobs(git, snaps, cache, name, kind)?;
+    let blob = blobs.cutoff.as_deref().ok_or_else(|| {
+        Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
+    })?;
+    let pkg = PkgRef {
+        name: name.to_string(),
+        kind,
+    };
+    tap::write_blob(tap_root, &pkg, blob)?;
+    Ok(())
 }
 
 fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
@@ -995,7 +1090,7 @@ mod tests {
         git.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
 
         let mut deps = std::collections::BTreeMap::new();
-        deps.insert("fresh".into(), vec!["lib".into()]);
+        deps.insert(soaked("fresh"), vec!["lib".into()]);
         let brew = MockBrew {
             deps,
             ..MockBrew::new()
@@ -1056,5 +1151,218 @@ mod tests {
             "third-party must not use soaked tap: {runs:?}"
         );
         let _ = result;
+    }
+
+    fn cask_rb(name: &str, version: &str) -> String {
+        format!(
+            "cask \"{name}\"\n  version \"{version}\"\n  sha256 \"cafebabe\"\n  url \"https://example.com/{name}-{version}.zip\"\n"
+        )
+    }
+
+    fn soaked(name: &str) -> String {
+        format!("brewsoakr/soaked/{name}")
+    }
+
+    fn run_is_soaked_dep_install(runs: &[Vec<String>], name: &str, kind_flag: &str) -> bool {
+        let token = soaked(name);
+        runs.iter().any(|args| {
+            args.first().map(String::as_str) == Some("install")
+                && args.iter().any(|a| a == &token)
+                && args.iter().any(|a| a == kind_flag)
+                && !args.iter().any(|a| a == "--ignore-dependencies")
+        })
+    }
+
+    struct FailShowGit {
+        inner: InMemoryGit,
+        fail_substr: &'static str,
+    }
+
+    impl GitStore for FailShowGit {
+        fn init_bare(&self, dir: &Path) -> Result<(), Error> {
+            self.inner.init_bare(dir)
+        }
+
+        fn fetch_depth1(
+            &self,
+            dir: &Path,
+            remote: &str,
+            sha: &str,
+            ref_name: &str,
+        ) -> Result<(), Error> {
+            self.inner.fetch_depth1(dir, remote, sha, ref_name)
+        }
+
+        fn show(&self, dir: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Error> {
+            if path.contains(self.fail_substr) {
+                return Err(Error::Other(format!("git show failed: {path}")));
+            }
+            self.inner.show(dir, sha, path)
+        }
+
+        fn rev_parse(&self, dir: &Path, rev: &str) -> Result<Option<String>, Error> {
+            self.inner.rev_parse(dir, rev)
+        }
+
+        fn gc_prune(&self, dir: &Path) -> Result<(), Error> {
+            self.inner.gc_prune(dir)
+        }
+    }
+
+    #[test]
+    fn install_uses_cutoff_tap_deps_not_head_graph() {
+        let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
+        let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
+        let lib_mid = formula_rb("lib", "1.0.0", "libmid");
+        let lib_new = formula_rb("lib", "1.1.0", "libnew");
+        let head_mid = formula_rb("headonly", "1.0.0", "hmid");
+        let head_new = formula_rb("headonly", "1.1.0", "hnew");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
+        git.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
+        git.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
+        git.insert_blob("headsha", "Formula/l/lib.rb", lib_new);
+        git.insert_blob("cutoffsha", "Formula/h/headonly.rb", head_mid);
+        git.insert_blob("headsha", "Formula/h/headonly.rb", head_new);
+
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert("fresh".into(), vec!["headonly".into()]);
+        deps.insert(soaked("fresh"), vec!["lib".into()]);
+        let brew = MockBrew {
+            deps,
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["fresh".to_string()];
+        let result = install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &names,
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .expect("install");
+        let runs = lock_runs(&brew);
+        assert!(
+            run_is_soaked_dep_install(&runs, "lib", "--formula"),
+            "cutoff dep lib must be installed from tap: {runs:?}"
+        );
+        assert!(
+            run_is_soaked_install(&runs, "fresh"),
+            "target must still install: {runs:?}"
+        );
+        assert!(
+            !run_has_token(&runs, &soaked("headonly")),
+            "HEAD-only dep must not enter soak path: {runs:?}"
+        );
+        assert!(!result.refused);
+    }
+
+    #[test]
+    fn install_cask_installs_formula_dep() {
+        let app_mid = cask_rb("app", "1.0.0");
+        let app_new = cask_rb("app", "1.1.0");
+        let lib_mid = formula_rb("lib", "1.0.0", "libmid");
+        let lib_new = formula_rb("lib", "1.1.0", "libnew");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/a/app.rb", app_mid);
+        git.insert_blob("caskhead", "Casks/a/app.rb", app_new);
+        git.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
+        git.insert_blob("headsha", "Formula/l/lib.rb", lib_new);
+
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert(soaked("app"), vec!["lib".into()]);
+        let brew = MockBrew {
+            deps,
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["app".to_string()];
+        let result = install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &names,
+            true,
+            false,
+            &[],
+            &mut out,
+        )
+        .expect("install");
+        let runs = lock_runs(&brew);
+        assert!(
+            run_is_soaked_dep_install(&runs, "lib", "--formula"),
+            "cask must soak-install formula dep: {runs:?}"
+        );
+        assert!(
+            run_is_soaked_install(&runs, "app"),
+            "cask target must install with --ignore-dependencies: {runs:?}"
+        );
+        assert!(!result.refused);
+    }
+
+    #[test]
+    fn install_git_show_error_aborts_before_target() {
+        let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
+        let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
+        let lib_mid = formula_rb("lib", "1.0.0", "libmid");
+        let lib_new = formula_rb("lib", "1.1.0", "libnew");
+
+        let inner = InMemoryGit::new();
+        inner.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
+        inner.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
+        inner.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
+        inner.insert_blob("headsha", "Formula/l/lib.rb", lib_new);
+        let git = FailShowGit {
+            inner,
+            fail_substr: "Formula/l/lib.rb",
+        };
+
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert(soaked("fresh"), vec!["lib".into()]);
+        deps.insert("fresh".into(), vec!["lib".into()]);
+        let brew = MockBrew {
+            deps,
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["fresh".to_string()];
+        let err = install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &names,
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .expect_err("git show failure must abort the command");
+        assert!(
+            matches!(err, Error::Other(ref msg) if msg.contains("git show failed")),
+            "{err}"
+        );
+        let runs = lock_runs(&brew);
+        assert!(
+            !run_has_token(&runs, &soaked("fresh")),
+            "must not --ignore-dependencies the target after git failure: {runs:?}"
+        );
     }
 }
