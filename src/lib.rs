@@ -1,5 +1,6 @@
 pub mod brew;
 pub mod cli;
+pub mod cmd;
 pub mod config;
 pub mod eligibility;
 pub mod error;
