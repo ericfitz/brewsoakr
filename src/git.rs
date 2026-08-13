@@ -62,7 +62,10 @@ impl GitStore for ProcessGit {
         sha: &str,
         ref_name: &str,
     ) -> Result<(), Error> {
-        let spec = format!("{sha}:{ref_name}");
+        // Cutoff/HEAD pins are not ancestry-ordered: a later update may move
+        // the ref to an older commit, or to a depth-1 object with no local
+        // history connecting it to the previous pin. Force the update.
+        let spec = format!("+{sha}:{ref_name}");
         let output = Self::git()
             .arg("--git-dir")
             .arg(dir)
@@ -264,6 +267,50 @@ mod tests {
         assert_eq!(
             git.rev_parse(unused_dir(), REF_CUTOFF).expect("rev-parse"),
             Some("newcutoff".into())
+        );
+    }
+
+    fn git_ok(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn process_git_fetch_replaces_non_fast_forward_cutoff() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let bare = tmp.path().join("bare.git");
+        std::fs::create_dir(&src).unwrap();
+        git_ok(&src, &["init", "-b", "main"]);
+        git_ok(&src, &["config", "user.email", "test@example.com"]);
+        git_ok(&src, &["config", "user.name", "Test"]);
+        std::fs::write(src.join("f"), "one\n").unwrap();
+        git_ok(&src, &["add", "f"]);
+        git_ok(&src, &["commit", "-m", "one"]);
+        let older = git_ok(&src, &["rev-parse", "HEAD"]);
+        std::fs::write(src.join("f"), "two\n").unwrap();
+        git_ok(&src, &["add", "f"]);
+        git_ok(&src, &["commit", "-m", "two"]);
+        let newer = git_ok(&src, &["rev-parse", "HEAD"]);
+
+        let git = ProcessGit;
+        git.init_bare(&bare).expect("init bare");
+        git.fetch_depth1(&bare, src.to_str().unwrap(), &newer, REF_CUTOFF)
+            .expect("fetch newer");
+        git.fetch_depth1(&bare, src.to_str().unwrap(), &older, REF_CUTOFF)
+            .expect("fetch older (non-fast-forward)");
+        assert_eq!(
+            git.rev_parse(&bare, REF_CUTOFF).expect("rev-parse"),
+            Some(older)
         );
     }
 }
