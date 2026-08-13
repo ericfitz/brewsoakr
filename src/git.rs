@@ -4,6 +4,7 @@ use std::process::{Command, Output, Stdio};
 
 pub const REF_CUTOFF: &str = "refs/brewsoak/cutoff";
 pub const REF_HEAD: &str = "refs/brewsoak/head";
+pub const REF_WINDOW: &str = "refs/brewsoak/window";
 
 pub trait GitStore {
     fn init_bare(&self, dir: &Path) -> Result<(), Error>;
@@ -18,6 +19,22 @@ pub trait GitStore {
     fn show(&self, dir: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Error>;
     fn rev_parse(&self, dir: &Path, rev: &str) -> Result<Option<String>, Error>;
     fn gc_prune(&self, dir: &Path) -> Result<(), Error>;
+    /// Fetch recent history into `refs/brewsoak/window`. Default: unsupported.
+    fn fetch_shallow_since(
+        &self,
+        _dir: &Path,
+        _remote: &str,
+        _until_unix: i64,
+    ) -> Result<(), Error> {
+        Err(Error::Git {
+            action: "fetching history to find the soak cutoff".into(),
+            detail: "this git backend cannot shallow-fetch".into(),
+        })
+    }
+    /// SHA of the latest commit on `refs/brewsoak/window` at or before `until_unix`.
+    fn log_sha_before(&self, _dir: &Path, _until_unix: i64) -> Result<Option<String>, Error> {
+        Ok(None)
+    }
 }
 
 pub struct ProcessGit;
@@ -30,14 +47,35 @@ impl ProcessGit {
     }
 }
 
-fn git_fail(context: &str, output: &Output) -> Error {
+fn git_detail(output: &Output) -> String {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stderr = stderr.trim();
-    if stderr.is_empty() {
-        Error::Other(format!("{context}: git exited {}", output.status))
-    } else {
-        Error::Other(format!("{context}: {stderr}"))
+    if !stderr.is_empty() {
+        return stderr.to_string();
     }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = stdout.trim();
+    if !stdout.is_empty() {
+        return stdout.to_string();
+    }
+    format!("git exited {}", output.status)
+}
+
+fn git_fail(action: &str, output: &Output) -> Error {
+    Error::Git {
+        action: action.to_string(),
+        detail: git_detail(output),
+    }
+}
+
+fn run_git(action: &str, args: &[&str]) -> Result<Output, Error> {
+    ProcessGit::git()
+        .args(args)
+        .output()
+        .map_err(|e| Error::Git {
+            action: action.to_string(),
+            detail: format!("could not start git: {e}"),
+        })
 }
 
 fn missing_object(output: &Output) -> bool {
@@ -47,11 +85,13 @@ fn missing_object(output: &Output) -> bool {
 
 impl GitStore for ProcessGit {
     fn init_bare(&self, dir: &Path) -> Result<(), Error> {
-        let output = Self::git().arg("init").arg("--bare").arg(dir).output()?;
+        let action = "creating the local soak git store";
+        let dir = dir.to_string_lossy();
+        let output = run_git(action, &["init", "--bare", dir.as_ref()])?;
         if output.status.success() {
             Ok(())
         } else {
-            Err(git_fail("git init --bare", &output))
+            Err(git_fail(action, &output))
         }
     }
 
@@ -62,70 +102,120 @@ impl GitStore for ProcessGit {
         sha: &str,
         ref_name: &str,
     ) -> Result<(), Error> {
-        // Cutoff/HEAD pins are not ancestry-ordered: a later update may move
-        // the ref to an older commit, or to a depth-1 object with no local
-        // history connecting it to the previous pin. Force the update.
+        // Pins are not ancestry-ordered. Force so a later cutoff/HEAD SHA
+        // that is older or disconnected (depth-1) still replaces the pin.
         let spec = format!("+{sha}:{ref_name}");
-        let output = Self::git()
-            .arg("--git-dir")
-            .arg(dir)
-            .arg("fetch")
-            .arg("--depth=1")
-            .arg(remote)
-            .arg(&spec)
-            .output()?;
+        let action = format!("updating soak pin {ref_name} to {sha} from {remote}");
+        let dir = dir.to_string_lossy();
+        let output = run_git(
+            &action,
+            &[
+                "--git-dir",
+                dir.as_ref(),
+                "fetch",
+                "--force",
+                "--depth=1",
+                remote,
+                &spec,
+            ],
+        )?;
         if output.status.success() {
             Ok(())
         } else {
-            Err(git_fail("git fetch --depth=1", &output))
+            Err(git_fail(&action, &output))
         }
     }
 
     fn show(&self, dir: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Error> {
         let spec = format!("{sha}:{path}");
-        let output = Self::git()
-            .arg("--git-dir")
-            .arg(dir)
-            .arg("show")
-            .arg(&spec)
-            .output()?;
+        let action = format!("reading {path} from git commit {sha}");
+        let dir = dir.to_string_lossy();
+        let output = run_git(&action, &["--git-dir", dir.as_ref(), "show", &spec])?;
         if output.status.success() {
             Ok(Some(output.stdout))
         } else if missing_object(&output) {
             Ok(None)
         } else {
-            Err(git_fail("git show", &output))
+            Err(git_fail(&action, &output))
         }
     }
 
     fn rev_parse(&self, dir: &Path, rev: &str) -> Result<Option<String>, Error> {
-        let output = Self::git()
-            .arg("--git-dir")
-            .arg(dir)
-            .arg("rev-parse")
-            .arg(rev)
-            .output()?;
+        let action = format!("resolving git ref {rev}");
+        let dir = dir.to_string_lossy();
+        let output = run_git(&action, &["--git-dir", dir.as_ref(), "rev-parse", rev])?;
         if output.status.success() {
             let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
             Ok(Some(sha))
         } else if missing_object(&output) {
             Ok(None)
         } else {
-            Err(git_fail("git rev-parse", &output))
+            Err(git_fail(&action, &output))
         }
     }
 
     fn gc_prune(&self, dir: &Path) -> Result<(), Error> {
-        let output = Self::git()
-            .arg("-C")
-            .arg(dir)
-            .arg("gc")
-            .arg("--prune=now")
-            .output()?;
+        let action = "pruning unused objects from the soak git cache";
+        let dir = dir.to_string_lossy();
+        let output = run_git(action, &["-C", dir.as_ref(), "gc", "--prune=now"])?;
         if output.status.success() {
             Ok(())
         } else {
-            Err(git_fail("git gc --prune=now", &output))
+            Err(git_fail(action, &output))
+        }
+    }
+
+    fn fetch_shallow_since(&self, dir: &Path, remote: &str, until_unix: i64) -> Result<(), Error> {
+        let action = format!("fetching history from {remote} to find the soak cutoff");
+        let dir = dir.to_string_lossy();
+        let since = format!("--shallow-since={until_unix}");
+        let spec = format!("+HEAD:{REF_WINDOW}");
+        let output = run_git(
+            &action,
+            &[
+                "--git-dir",
+                dir.as_ref(),
+                "fetch",
+                "--force",
+                &since,
+                remote,
+                &spec,
+            ],
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(git_fail(&action, &output))
+        }
+    }
+
+    fn log_sha_before(&self, dir: &Path, until_unix: i64) -> Result<Option<String>, Error> {
+        let action = "looking up the last commit at or before the soak cutoff";
+        let dir = dir.to_string_lossy();
+        let before = format!("--before={until_unix}");
+        let output = run_git(
+            action,
+            &[
+                "--git-dir",
+                dir.as_ref(),
+                "log",
+                "-1",
+                &before,
+                "--format=%H",
+                REF_WINDOW,
+            ],
+        )?;
+        if output.status.success() {
+            let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if sha.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(sha))
+            }
+        } else if missing_object(&output) {
+            Ok(None)
+        } else {
+            Err(git_fail(action, &output))
         }
     }
 }
@@ -311,6 +401,65 @@ mod tests {
         assert_eq!(
             git.rev_parse(&bare, REF_CUTOFF).expect("rev-parse"),
             Some(older)
+        );
+    }
+
+    #[test]
+    fn process_git_shallow_window_replaces_non_fast_forward() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let bare = tmp.path().join("bare.git");
+        std::fs::create_dir(&src).unwrap();
+        git_ok(&src, &["init", "-b", "main"]);
+        git_ok(&src, &["config", "user.email", "test@example.com"]);
+        git_ok(&src, &["config", "user.name", "Test"]);
+        std::fs::write(src.join("f"), "one\n").unwrap();
+        git_ok(&src, &["add", "f"]);
+        git_ok(&src, &["commit", "-m", "one"]);
+        let older = git_ok(&src, &["rev-parse", "HEAD"]);
+        std::fs::write(src.join("f"), "two\n").unwrap();
+        git_ok(&src, &["add", "f"]);
+        git_ok(&src, &["commit", "-m", "two"]);
+        let newer = git_ok(&src, &["rev-parse", "HEAD"]);
+
+        let git = ProcessGit;
+        git.init_bare(&bare).expect("init bare");
+        git.fetch_depth1(&bare, src.to_str().unwrap(), &newer, REF_WINDOW)
+            .expect("pin window to newer");
+        git_ok(&src, &["reset", "--hard", &older]);
+        git.fetch_shallow_since(&bare, src.to_str().unwrap(), 0)
+            .expect("shallow fetch older HEAD onto window");
+        assert_eq!(
+            git.rev_parse(&bare, REF_WINDOW).expect("rev-parse"),
+            Some(older)
+        );
+    }
+
+    #[test]
+    fn process_git_fetch_error_explains_action_and_includes_git_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("bare.git");
+        let git = ProcessGit;
+        git.init_bare(&bare).expect("init bare");
+        let err = git
+            .fetch_depth1(
+                &bare,
+                "/no/such/brewsoak-remote",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                REF_CUTOFF,
+            )
+            .expect_err("fetch must fail");
+        let text = err.to_string();
+        assert!(text.contains("updating soak pin"), "missing action: {text}");
+        assert!(
+            text.contains("git failed"),
+            "missing brewsoakr framing: {text}"
+        );
+        assert!(
+            text.to_lowercase()
+                .contains("does not appear to be a git repository")
+                || text.contains("fatal:"),
+            "missing git output: {text}"
         );
     }
 }

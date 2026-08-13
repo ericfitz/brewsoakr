@@ -2,7 +2,6 @@ use crate::git::{GitStore, REF_CUTOFF, REF_HEAD};
 use crate::github::{GithubApi, cutoff_instant};
 use crate::{Error, SoakHours};
 use std::path::Path;
-use std::process::{Command, Stdio};
 use time::OffsetDateTime;
 
 pub const CORE_REMOTE: &str = "https://github.com/Homebrew/homebrew-core";
@@ -122,50 +121,20 @@ fn write_state(cache: &Path, snaps: &Snapshots) -> Result<(), Error> {
     Ok(())
 }
 
-/// Resolve cutoff via `git fetch --shallow-since` when GitHub lookup fails.
-/// Only ProcessGit creates a bare `HEAD`; InMemoryGit cannot shallow-fetch.
+/// Resolve cutoff via a forced shallow fetch when GitHub lookup fails.
+/// Only ProcessGit can shallow-fetch; InMemoryGit returns `Error::Git`.
 fn cutoff_via_shallow(
-    _git: &impl GitStore,
+    git: &impl GitStore,
     dir: &Path,
     remote: &str,
     until: OffsetDateTime,
 ) -> Result<String, Error> {
-    if !dir.join("HEAD").exists() {
-        return Err(Error::Other("github and git fallback failed".into()));
-    }
     let unix = until.unix_timestamp();
-    let fetch = Command::new("git")
-        .stdin(Stdio::null())
-        .arg("--git-dir")
-        .arg(dir)
-        .arg("fetch")
-        .arg(format!("--shallow-since={unix}"))
-        .arg(remote)
-        .arg("HEAD")
-        .output();
-    if !matches!(fetch, Ok(ref o) if o.status.success()) {
-        return Err(Error::Other("github and git fallback failed".into()));
-    }
-    let log = Command::new("git")
-        .stdin(Stdio::null())
-        .arg("--git-dir")
-        .arg(dir)
-        .arg("log")
-        .arg("-1")
-        .arg(format!("--before={unix}"))
-        .arg("--format=%H")
-        .output();
-    match log {
-        Ok(o) if o.status.success() => {
-            let sha = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if sha.is_empty() {
-                Err(Error::Other("github and git fallback failed".into()))
-            } else {
-                Ok(sha)
-            }
-        }
-        _ => Err(Error::Other("github and git fallback failed".into())),
-    }
+    git.fetch_shallow_since(dir, remote, unix)?;
+    git.log_sha_before(dir, unix)?.ok_or_else(|| Error::Git {
+        action: "looking up the last commit at or before the soak cutoff".into(),
+        detail: "git returned no commit in the fetched window".into(),
+    })
 }
 
 #[cfg(test)]

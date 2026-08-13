@@ -4,8 +4,17 @@ use std::fmt;
 pub enum Error {
     Usage(String),
     Refusal(String),
-    Brew { status: i32, message: String },
+    Brew {
+        status: i32,
+        message: String,
+    },
     Io(std::io::Error),
+    /// A git invocation failed. `action` is what brewsoakr was doing;
+    /// `detail` is git's stderr (or why git could not be started).
+    Git {
+        action: String,
+        detail: String,
+    },
     Other(String),
 }
 
@@ -15,7 +24,7 @@ impl Error {
             Error::Usage(_) => 2,
             Error::Refusal(_) => 1,
             Error::Brew { status, .. } => *status,
-            Error::Io(_) | Error::Other(_) => 1,
+            Error::Io(_) | Error::Git { .. } | Error::Other(_) => 1,
         }
     }
 }
@@ -26,6 +35,9 @@ impl fmt::Display for Error {
             Error::Usage(s) | Error::Refusal(s) | Error::Other(s) => write!(f, "{s}"),
             Error::Brew { message, .. } => write!(f, "{message}"),
             Error::Io(e) => write!(f, "{e}"),
+            Error::Git { action, detail } => {
+                write!(f, "while {action}, git failed:\n{detail}")
+            }
         }
     }
 }
@@ -74,5 +86,20 @@ mod tests {
             .exit_code(),
             1
         );
+    }
+
+    #[test]
+    fn git_explains_action_and_includes_git_output() {
+        let err = Error::Git {
+            action: "updating the homebrew-core soak pin".into(),
+            detail: "! [rejected] abc -> refs/brewsoak/cutoff  (non-fast-forward)".into(),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("updating the homebrew-core soak pin"),
+            "{text}"
+        );
+        assert!(text.contains("non-fast-forward"), "{text}");
+        assert_eq!(err.exit_code(), 1);
     }
 }
