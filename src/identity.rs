@@ -22,26 +22,46 @@ pub enum PkgIdentity {
 }
 
 pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
+    let git_tag = keyword_quoted(rb, "tag:");
+    let git_rev = keyword_quoted(rb, "revision:");
     let version = match first_quoted(rb, "version ") {
         Some(v) => v,
         None => {
-            let url = first_quoted(rb, "url ")
-                .ok_or_else(|| Error::Other("formula missing version and url".into()))?;
-            version_from_url(&url)
-                .ok_or_else(|| Error::Other("could not derive formula version from url".into()))?
+            if let Some(tag) = git_tag.as_deref() {
+                tag.strip_prefix('v').unwrap_or(tag).to_string()
+            } else {
+                let url = first_quoted(rb, "url ").ok_or_else(|| {
+                    Error::Other("formula missing version, git tag, and url".into())
+                })?;
+                version_from_url(&url).ok_or_else(|| {
+                    Error::Other("could not derive formula version from url".into())
+                })?
+            }
         }
     };
     let revision = first_u32(rb, "revision ").unwrap_or(0);
     let rebuild = first_u32(rb, "rebuild ").unwrap_or(0);
     let sha256 = first_sha256_before_bottle(rb)
-        .or_else(|| first_quoted(rb, "sha256 "))
-        .ok_or_else(|| Error::Other("formula missing sha256".into()))?;
+        .or(git_rev)
+        .or(git_tag)
+        .ok_or_else(|| Error::Other("formula missing sha256 and git revision".into()))?;
     Ok(FormulaIdentity {
         version,
         revision,
         rebuild,
         sha256,
     })
+}
+
+/// `tag: "v1.2.3"` / `revision: "abc…"` (Homebrew git-url kwargs).
+fn keyword_quoted(rb: &str, key: &str) -> Option<String> {
+    for line in rb.lines() {
+        let t = line.trim_start();
+        if let Some(rest) = t.strip_prefix(key) {
+            return first_double_quoted(rest.trim_start());
+        }
+    }
+    None
 }
 
 pub fn parse_cask(rb: &str) -> Result<CaskIdentity, Error> {
@@ -375,6 +395,40 @@ end
         assert_eq!(id.version, "3.0");
         assert_eq!(id.sha256, "ccc333");
         assert_eq!(id.url, "https://example.com/foo-3.0.dmg");
+    }
+
+    #[test]
+    fn parse_formula_git_tag_and_revision() {
+        let rb = r#"
+class Helm < Formula
+  url "https://github.com/helm/helm.git",
+      tag:      "v4.2.3",
+      revision: "43e8b7feece8beb0fcba47059ec9b522fd929a64"
+  bottle do
+    sha256 cellar: :any_skip_relocation, arm64_sonoma: "bbb222"
+  end
+end
+"#;
+        let id = parse_formula(rb).unwrap();
+        assert_eq!(id.version, "4.2.3");
+        assert_eq!(id.sha256, "43e8b7feece8beb0fcba47059ec9b522fd929a64");
+    }
+
+    #[test]
+    fn parse_formula_git_revision_with_explicit_version() {
+        let rb = r#"
+class X264 < Formula
+  url "https://code.videolan.org/videolan/x264.git",
+      revision: "b35605ace3ddf7c1a5d67a2eb553f034aef41d55"
+  version "r3222"
+  bottle do
+    sha256 cellar: :any, arm64_sonoma: "bbb222"
+  end
+end
+"#;
+        let id = parse_formula(rb).unwrap();
+        assert_eq!(id.version, "r3222");
+        assert_eq!(id.sha256, "b35605ace3ddf7c1a5d67a2eb553f034aef41d55");
     }
 
     #[test]

@@ -19,15 +19,30 @@ pub fn git_path(pkg: &PkgRef) -> String {
         PkgKind::Formula => "Formula",
         PkgKind::Cask => "Casks",
     };
-    format!("{root}/{}/{}.rb", first_dir_char(&pkg.name), pkg.name)
+    format!(
+        "{root}/{}/{}.rb",
+        subdirectory(pkg.kind, &pkg.name),
+        pkg.name
+    )
 }
 
-/// First path component: lowercase if the first character is ASCII, else as-is.
-fn first_dir_char(name: &str) -> String {
-    match name.chars().next() {
-        Some(c) if c.is_ascii() => c.to_ascii_lowercase().to_string(),
-        Some(c) => c.to_string(),
-        None => String::new(),
+/// Homebrew core/cask tap subdirectory.
+/// Formulae whose names start with `lib` live in `Formula/lib/`.
+/// Casks whose tokens start with `font-` live in `Casks/font/font-<next-char>/`.
+fn subdirectory(kind: PkgKind, name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    match kind {
+        PkgKind::Formula if lower.starts_with("lib") => "lib".into(),
+        PkgKind::Cask if lower.starts_with("font-") => {
+            let rest = &lower["font-".len()..];
+            let ch = rest.chars().next().unwrap_or('f');
+            format!("font/font-{ch}")
+        }
+        _ => match name.chars().next() {
+            Some(c) if c.is_ascii() => c.to_ascii_lowercase().to_string(),
+            Some(c) => c.to_string(),
+            None => String::new(),
+        },
     }
 }
 
@@ -130,6 +145,24 @@ mod tests {
     #[test]
     fn git_path_openssl_at_3() {
         assert_eq!(git_path(&formula("openssl@3")), "Formula/o/openssl@3.rb");
+    }
+
+    #[test]
+    fn git_path_libpng_uses_lib_subdir() {
+        assert_eq!(git_path(&formula("libpng")), "Formula/lib/libpng.rb");
+    }
+
+    #[test]
+    fn git_path_lib_prefix_even_for_name_lib() {
+        assert_eq!(git_path(&formula("lib")), "Formula/lib/lib.rb");
+    }
+
+    #[test]
+    fn git_path_font_cask_uses_font_subdir() {
+        assert_eq!(
+            git_path(&cask("font-fira-code")),
+            "Casks/font/font-f/font-fira-code.rb"
+        );
     }
 
     #[test]

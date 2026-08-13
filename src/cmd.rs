@@ -1323,7 +1323,7 @@ mod tests {
         let git = InMemoryGit::new();
         git.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
         git.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
-        git.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
+        git.insert_blob("cutoffsha", "Formula/lib/lib.rb", lib_mid);
 
         let mut deps = std::collections::BTreeMap::new();
         deps.insert(soaked("fresh"), vec!["lib".into()]);
@@ -1457,8 +1457,8 @@ mod tests {
         let git = InMemoryGit::new();
         git.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
         git.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
-        git.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
-        git.insert_blob("headsha", "Formula/l/lib.rb", lib_new);
+        git.insert_blob("cutoffsha", "Formula/lib/lib.rb", lib_mid);
+        git.insert_blob("headsha", "Formula/lib/lib.rb", lib_new);
         git.insert_blob("cutoffsha", "Formula/h/headonly.rb", head_mid);
         git.insert_blob("headsha", "Formula/h/headonly.rb", head_new);
 
@@ -1512,8 +1512,8 @@ mod tests {
         let git = InMemoryGit::new();
         git.insert_blob("caskcut", "Casks/a/app.rb", app_mid);
         git.insert_blob("caskhead", "Casks/a/app.rb", app_new);
-        git.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
-        git.insert_blob("headsha", "Formula/l/lib.rb", lib_new);
+        git.insert_blob("cutoffsha", "Formula/lib/lib.rb", lib_mid);
+        git.insert_blob("headsha", "Formula/lib/lib.rb", lib_new);
 
         let mut deps = std::collections::BTreeMap::new();
         deps.insert(soaked("app"), vec!["lib".into()]);
@@ -1560,11 +1560,11 @@ mod tests {
         let inner = InMemoryGit::new();
         inner.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
         inner.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
-        inner.insert_blob("cutoffsha", "Formula/l/lib.rb", lib_mid);
-        inner.insert_blob("headsha", "Formula/l/lib.rb", lib_new);
+        inner.insert_blob("cutoffsha", "Formula/lib/lib.rb", lib_mid);
+        inner.insert_blob("headsha", "Formula/lib/lib.rb", lib_new);
         let git = FailShowGit {
             inner,
-            fail_substr: "Formula/l/lib.rb",
+            fail_substr: "Formula/lib/lib.rb",
         };
 
         let mut deps = std::collections::BTreeMap::new();
