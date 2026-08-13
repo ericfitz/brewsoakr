@@ -167,6 +167,7 @@ impl ProcessBrew {
     fn spawn_brew(&self, args: &[String], visible: bool) -> Result<Output, Error> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args);
+        cmd.env("HOMEBREW_NO_AUTO_UPDATE", "1");
         if self.skip_tap_trust.get() {
             cmd.env("HOMEBREW_NO_REQUIRE_TAP_TRUST", "1");
         }
@@ -283,7 +284,16 @@ impl Brew for MockBrew {
     }
 
     fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
-        Ok(self.deps.get(token).cloned().unwrap_or_default())
+        let stem = Path::new(token)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(token);
+        Ok(self
+            .deps
+            .get(token)
+            .or_else(|| self.deps.get(stem))
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

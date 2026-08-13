@@ -86,7 +86,9 @@ impl World for RealWorld {
     }
 
     fn tap_root(&self) -> PathBuf {
-        real_tap_root(self.brew())
+        // Must live outside Homebrew's Taps/ so `brew install /path/foo.rb`
+        // is not treated as brewsoakr/soaked (same-name tap conflict).
+        self.cache_path().join("staging")
     }
 
     fn git(&self) -> &git::ProcessGit {
@@ -99,22 +101,6 @@ impl World for RealWorld {
 
     fn brew(&self) -> &brew::ProcessBrew {
         &self.brew
-    }
-}
-
-fn real_tap_root(brew: &impl brew::Brew) -> PathBuf {
-    const TAP_REL: &str = "Library/Taps/brewsoakr/homebrew-soaked";
-    match brew.run(&["--repository".into()]) {
-        Ok(output) if output.status.success() => {
-            let repo = String::from_utf8_lossy(&output.stdout);
-            let repo = repo.trim();
-            if repo.is_empty() {
-                PathBuf::from("/opt/homebrew").join(TAP_REL)
-            } else {
-                PathBuf::from(repo).join(TAP_REL)
-            }
-        }
-        _ => PathBuf::from("/opt/homebrew").join(TAP_REL),
     }
 }
 

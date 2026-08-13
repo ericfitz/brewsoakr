@@ -295,7 +295,6 @@ pub fn reinstall(
         brew_verb: "reinstall",
         force_cask: false,
         force_formula: false,
-        tapped: false,
         refused: false,
         brew_status: None,
         out,
@@ -356,7 +355,6 @@ fn apply_many(
         brew_verb,
         force_cask,
         force_formula,
-        tapped: false,
         refused: false,
         brew_status: None,
         out,
@@ -381,7 +379,6 @@ struct ApplySession<'a, B, G, W> {
     brew_verb: &'a str,
     force_cask: bool,
     force_formula: bool,
-    tapped: bool,
     refused: bool,
     brew_status: Option<i32>,
     out: &'a mut W,
@@ -451,7 +448,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         kind: PkgKind,
         view: &ResolvedView,
     ) -> Result<(), Error> {
-        self.ensure_tap()?;
         let pkg = PkgRef {
             name: name.to_string(),
             kind,
@@ -459,7 +455,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let blob = view.cutoff_blob.as_deref().ok_or_else(|| {
             Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
         })?;
-        tap::write_blob(self.tap_root, &pkg, blob)?;
+        let path = tap::write_blob(self.tap_root, &pkg, blob)?;
 
         let deps = self.collect_cutoff_deps(name, kind)?;
         for (dep, dep_kind) in deps {
@@ -471,7 +467,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
 
-        let args = tap::brew_install_args(&pkg, self.user_flags, true);
+        let args = tap::brew_install_args(&pkg, &path, self.user_flags, true);
         self.record_run(&args)
     }
 
@@ -519,9 +515,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             name: dep.to_string(),
             kind,
         };
-        tap::write_blob(self.tap_root, &pkg, blob)?;
-        self.ensure_tap()?;
-        let args = tap::brew_install_args(&pkg, &[], false);
+        let path = tap::write_blob(self.tap_root, &pkg, blob)?;
+        let args = tap::brew_install_args(&pkg, &path, &[], false);
         self.record_run(&args)?;
         Ok(true)
     }
@@ -559,14 +554,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             return Ok(PkgKind::Formula);
         }
         natural_kind(self.git, self.snaps, self.cache, self.installed, name)
-    }
-
-    fn ensure_tap(&mut self) -> Result<(), Error> {
-        if !self.tapped {
-            self.brew.tap_new_soaked()?;
-            self.tapped = true;
-        }
-        Ok(())
     }
 
     fn record_run(&mut self, args: &[String]) -> Result<(), Error> {
@@ -639,10 +626,11 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         if include_self {
             write_cutoff_blob(self.git, self.snaps, self.cache, self.tap_root, name, kind)?;
         }
-        let token = tap::install_token(&PkgRef {
-            name: name.to_string(),
-            kind,
-        });
+        let staged = match kind {
+            PkgKind::Formula => tap::tap_formula_path(self.tap_root, name),
+            PkgKind::Cask => tap::tap_cask_path(self.tap_root, name),
+        };
+        let token = staged.to_string_lossy().into_owned();
         for dep in self.brew.deps(kind, &token)? {
             if !cutoff_in_either_tree(self.git, self.snaps, self.cache, &dep)? {
                 continue;
@@ -1146,10 +1134,10 @@ mod tests {
     }
 
     fn run_is_soaked_install(runs: &[Vec<String>], name: &str) -> bool {
-        let token = format!("brewsoakr/soaked/{name}");
+        let suffix = format!("/{name}.rb");
         runs.iter().any(|args| {
             args.first().map(String::as_str) == Some("install")
-                && args.iter().any(|a| a == &token)
+                && args.iter().any(|a| a.ends_with(&suffix))
                 && args.iter().any(|a| a == "--ignore-dependencies")
         })
     }
@@ -1326,7 +1314,7 @@ mod tests {
         git.insert_blob("cutoffsha", "Formula/lib/lib.rb", lib_mid);
 
         let mut deps = std::collections::BTreeMap::new();
-        deps.insert(soaked("fresh"), vec!["lib".into()]);
+        deps.insert("fresh".into(), vec!["lib".into()]);
         let brew = MockBrew {
             deps,
             ..MockBrew::new()
@@ -1395,15 +1383,11 @@ mod tests {
         )
     }
 
-    fn soaked(name: &str) -> String {
-        format!("brewsoakr/soaked/{name}")
-    }
-
     fn run_is_soaked_dep_install(runs: &[Vec<String>], name: &str, kind_flag: &str) -> bool {
-        let token = soaked(name);
+        let suffix = format!("/{name}.rb");
         runs.iter().any(|args| {
             args.first().map(String::as_str) == Some("install")
-                && args.iter().any(|a| a == &token)
+                && args.iter().any(|a| a.ends_with(&suffix))
                 && args.iter().any(|a| a == kind_flag)
                 && !args.iter().any(|a| a == "--ignore-dependencies")
         })
@@ -1464,7 +1448,7 @@ mod tests {
 
         let mut deps = std::collections::BTreeMap::new();
         deps.insert("fresh".into(), vec!["headonly".into()]);
-        deps.insert(soaked("fresh"), vec!["lib".into()]);
+        deps.insert("fresh".into(), vec!["lib".into()]);
         let brew = MockBrew {
             deps,
             ..MockBrew::new()
@@ -1496,7 +1480,7 @@ mod tests {
             "target must still install: {runs:?}"
         );
         assert!(
-            !run_has_token(&runs, &soaked("headonly")),
+            !run_has_token(&runs, "brewsoakr/soaked/headonly"),
             "HEAD-only dep must not enter soak path: {runs:?}"
         );
         assert!(!result.refused);
@@ -1516,7 +1500,7 @@ mod tests {
         git.insert_blob("headsha", "Formula/lib/lib.rb", lib_new);
 
         let mut deps = std::collections::BTreeMap::new();
-        deps.insert(soaked("app"), vec!["lib".into()]);
+        deps.insert("app".into(), vec!["lib".into()]);
         let brew = MockBrew {
             deps,
             ..MockBrew::new()
@@ -1568,7 +1552,7 @@ mod tests {
         };
 
         let mut deps = std::collections::BTreeMap::new();
-        deps.insert(soaked("fresh"), vec!["lib".into()]);
+        deps.insert("fresh".into(), vec!["lib".into()]);
         deps.insert("fresh".into(), vec!["lib".into()]);
         let brew = MockBrew {
             deps,
@@ -1597,7 +1581,7 @@ mod tests {
         );
         let runs = lock_runs(&brew);
         assert!(
-            !run_has_token(&runs, &soaked("fresh")),
+            !run_has_token(&runs, "brewsoakr/soaked/fresh"),
             "must not --ignore-dependencies the target after git failure: {runs:?}"
         );
     }
@@ -1949,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn install_trusts_soaked_tap() {
+    fn install_uses_file_path_not_tap_token() {
         let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
         let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
         let git = InMemoryGit::new();
@@ -1975,9 +1959,12 @@ mod tests {
         .expect("install");
         let runs = lock_runs(&brew);
         assert!(
-            runs.iter()
-                .any(|args| args == &["trust".to_string(), "brewsoakr/soaked".into()]),
-            "expected brew trust brewsoakr/soaked: {runs:?}"
+            runs.iter().any(|args| {
+                args.first().map(String::as_str) == Some("install")
+                    && args.iter().any(|a| a.ends_with("/fresh.rb"))
+                    && !args.iter().any(|a| a.contains("brewsoakr/soaked"))
+            }),
+            "install must use a file path, not a tap token: {runs:?}"
         );
     }
 
@@ -2011,7 +1998,7 @@ mod tests {
             visible
                 .iter()
                 .any(|args| args.first().map(String::as_str) == Some("install")
-                    && args.iter().any(|a| a == "brewsoakr/soaked/fresh")),
+                    && args.iter().any(|a| a.ends_with("/fresh.rb"))),
             "soaked install must use run_visible: {visible:?}"
         );
     }

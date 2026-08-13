@@ -4,9 +4,6 @@ use crate::resolve::{PkgKind, PkgRef};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-pub const TAP_USER: &str = "brewsoakr";
-pub const TAP_NAME: &str = "soaked";
-
 pub fn tap_formula_path(tap_root: &Path, name: &str) -> PathBuf {
     tap_root.join("Formula").join(format!("{name}.rb"))
 }
@@ -23,8 +20,22 @@ pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf,
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, blob)?;
+    let text = String::from_utf8_lossy(blob);
+    std::fs::write(&path, sanitize_unofficial(&text))?;
     Ok(path)
+}
+
+/// Drop stanzas that Homebrew only allows in official taps (load-time errors).
+pub fn sanitize_unofficial(rb: &str) -> String {
+    let mut out = String::with_capacity(rb.len());
+    for line in rb.lines() {
+        if line.trim_start().starts_with("no_autobump!") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Core dependency names in toposort order (deps first). The target `name` is not included.
@@ -76,11 +87,12 @@ impl<B: Brew, F: Fn(&str) -> bool> ClosureWalk<'_, B, F> {
     }
 }
 
-pub fn install_token(pkg: &PkgRef) -> String {
-    format!("{TAP_USER}/{TAP_NAME}/{}", pkg.name)
-}
-
-pub fn brew_install_args(pkg: &PkgRef, user_flags: &[String], ignore_deps: bool) -> Vec<String> {
+pub fn brew_install_args(
+    pkg: &PkgRef,
+    path: &Path,
+    user_flags: &[String],
+    ignore_deps: bool,
+) -> Vec<String> {
     let mut args = vec!["install".to_string()];
     args.push(match pkg.kind {
         PkgKind::Formula => "--formula".into(),
@@ -95,7 +107,7 @@ pub fn brew_install_args(pkg: &PkgRef, user_flags: &[String], ignore_deps: bool)
         }
         args.push(flag.clone());
     }
-    args.push(install_token(pkg));
+    args.push(path.to_string_lossy().into_owned());
     args
 }
 
@@ -194,31 +206,42 @@ mod tests {
 
     #[test]
     fn brew_install_args_formula_ignore_deps() {
-        let args = brew_install_args(&formula("wget"), &[], true);
+        let path = Path::new("/tmp/staging/Formula/wget.rb");
+        let args = brew_install_args(&formula("wget"), path, &[], true);
         assert!(
             args.iter().any(|a| a == "--ignore-dependencies"),
             "{args:?}"
         );
-        assert!(
-            args.iter().any(|a| a == "brewsoakr/soaked/wget"),
-            "{args:?}"
-        );
+        assert!(args.iter().any(|a| a == path.to_str().unwrap()), "{args:?}");
         assert_eq!(args[0], "install");
         assert!(args.iter().any(|a| a == "--formula"), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.contains("brewsoakr/soaked")),
+            "path install must not use a tap token: {args:?}"
+        );
     }
 
     #[test]
     fn brew_install_args_cask_forwards_user_flags_without_subcommand() {
+        let path = Path::new("/tmp/staging/Casks/firefox.rb");
         let flags = ["install".to_string(), "--appdir=/Apps".to_string()];
-        let args = brew_install_args(&cask("firefox"), &flags, false);
+        let args = brew_install_args(&cask("firefox"), path, &flags, false);
         assert_eq!(
             args,
             vec![
                 "install",
                 "--cask",
                 "--appdir=/Apps",
-                "brewsoakr/soaked/firefox",
+                "/tmp/staging/Casks/firefox.rb",
             ]
         );
+    }
+
+    #[test]
+    fn sanitize_unofficial_strips_no_autobump() {
+        let rb = "class Sqlite < Formula\n  url \"https://example.com/s.tgz\"\n  sha256 \"abc\"\n  no_autobump! because: :bumped_by_upstream\nend\n";
+        let got = sanitize_unofficial(rb);
+        assert!(!got.contains("no_autobump!"), "{got}");
+        assert!(got.contains("class Sqlite"), "{got}");
     }
 }
