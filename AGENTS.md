@@ -1,5 +1,11 @@
 # brewsoakr
 
+## Installing soaked formulae
+
+- Install from a staged `.rb` path under the brewsoakr cache, not `brewsoakr/soaked/<name>`.
+- Homebrew rejects path installs unless `HOMEBREW_DEVELOPER=1` is set and `HOMEBREW_FORBID_PACKAGES_FROM_PATHS` is unset. Set those on every brewsoakr `brew` child. Also set `HOMEBREW_NO_AUTO_UPDATE=1`.
+- Do not uninstall a `homebrew/core` keg to switch taps.
+
 ## Git
 
 - Every git invocation goes through `ProcessGit` / `GitStore` in `src/git.rs`. Do not spawn `git` from other modules.

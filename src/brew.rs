@@ -149,6 +149,34 @@ impl Brew for ProcessBrew {
     }
 }
 
+/// Env for brewsoakr-driven `brew` children.
+/// `HOMEBREW_DEVELOPER` allows path installs (`brew install ./foo.rb`) and
+/// `--ignore-dependencies`. Unset FORBID so a user-level forbid cannot block us.
+fn apply_brewsoakr_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
+    for (key, value) in brewsoakr_brew_env_pairs(skip_tap_trust) {
+        match value {
+            Some(v) => {
+                cmd.env(key, v);
+            }
+            None => {
+                cmd.env_remove(key);
+            }
+        }
+    }
+}
+
+fn brewsoakr_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut pairs = vec![
+        ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
+        ("HOMEBREW_DEVELOPER", Some("1")),
+        ("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", None),
+    ];
+    if skip_tap_trust {
+        pairs.push(("HOMEBREW_NO_REQUIRE_TAP_TRUST", Some("1")));
+    }
+    pairs
+}
+
 impl ProcessBrew {
     fn brew_dir(&self, flag: &str) -> Option<PathBuf> {
         let output = self.run(&[flag.into()]).ok()?;
@@ -167,10 +195,7 @@ impl ProcessBrew {
     fn spawn_brew(&self, args: &[String], visible: bool) -> Result<Output, Error> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args);
-        cmd.env("HOMEBREW_NO_AUTO_UPDATE", "1");
-        if self.skip_tap_trust.get() {
-            cmd.env("HOMEBREW_NO_REQUIRE_TAP_TRUST", "1");
-        }
+        apply_brewsoakr_brew_env(&mut cmd, self.skip_tap_trust.get());
         if !visible {
             return match cmd.output() {
                 Ok(output) => Ok(output),
@@ -817,6 +842,26 @@ mod tests {
             .expect("parse");
         assert!(got.iter().find(|p| p.name == "wget").expect("wget").pinned);
         assert!(!got.iter().find(|p| p.name == "curl").expect("curl").pinned);
+    }
+
+    #[test]
+    fn brewsoakr_brew_env_enables_path_installs() {
+        let pairs = brewsoakr_brew_env_pairs(false);
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "HOMEBREW_DEVELOPER" && *v == Some("1"))
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "HOMEBREW_FORBID_PACKAGES_FROM_PATHS" && v.is_none())
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "HOMEBREW_NO_AUTO_UPDATE" && *v == Some("1"))
+        );
     }
 
     #[test]
