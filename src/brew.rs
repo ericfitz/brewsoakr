@@ -172,6 +172,13 @@ pub fn passthrough_exec(bin: &Path, args: &[String]) -> Error {
     }
 }
 
+/// `exec` brew; returns an exit code only if replacement fails.
+pub fn exec(bin: &Path, args: &[String]) -> i32 {
+    let err = passthrough_exec(bin, args);
+    eprintln!("brewsoakr: {err}");
+    err.exit_code()
+}
+
 fn exit_status_raw(code: i32) -> i32 {
     if code == 0 { 0 } else { code << 8 }
 }

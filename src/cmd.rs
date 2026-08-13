@@ -46,6 +46,36 @@ pub fn combine_exit(refused: bool, brew_status: Option<i32>) -> i32 {
     }
 }
 
+pub fn ensure_snapshots(
+    git: &impl GitStore,
+    gh: &impl GithubApi,
+    brew: &impl Brew,
+    cache: &Path,
+    hours: SoakHours,
+    now: time::OffsetDateTime,
+    force: bool,
+) -> Result<Snapshots, Error> {
+    let snaps = if force {
+        snapshot::refresh(git, gh, cache, hours, now)?
+    } else {
+        match snapshot::load_state(cache)? {
+            Some(s) => return Ok(s),
+            None => snapshot::refresh(git, gh, cache, hours, now)?,
+        }
+    };
+    prefetch_installed(brew, git, cache, &snaps);
+    Ok(snaps)
+}
+
+pub fn prefetch_installed(brew: &impl Brew, git: &impl GitStore, cache: &Path, snaps: &Snapshots) {
+    let Ok(installed) = brew.installed_core() else {
+        return;
+    };
+    for pkg in installed {
+        let _ = resolve_pkg_blobs(git, snaps, cache, &pkg.name, pkg.kind);
+    }
+}
+
 pub fn update(
     git: &impl GitStore,
     gh: &impl GithubApi,
