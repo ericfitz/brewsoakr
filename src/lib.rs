@@ -10,6 +10,7 @@ pub mod identity;
 pub mod paths;
 pub mod resolve;
 pub mod snapshot;
+pub mod tap;
 
 pub use error::Error;
 pub use hours::SoakHours;
