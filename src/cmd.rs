@@ -209,6 +209,63 @@ pub fn install(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn reinstall(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    tap_root: &Path,
+    names: &[String],
+    user_flags: &[String],
+    out: &mut impl Write,
+) -> Result<RunResult, Error> {
+    if names.is_empty() {
+        return Err(Error::Usage("reinstall: no packages specified".into()));
+    }
+    let installed = brew.installed_core()?;
+    let mut session = ApplySession {
+        brew,
+        git,
+        snaps,
+        cache,
+        tap_root,
+        user_flags,
+        installed: &installed,
+        brew_verb: "reinstall",
+        force_cask: false,
+        force_formula: false,
+        tapped: false,
+        refused: false,
+        brew_status: None,
+        out,
+    };
+    for name in names {
+        if resolve::is_third_party(name) {
+            session.apply_one(name)?;
+            continue;
+        }
+        let Some(pkg) = installed.iter().find(|p| p.name == *name) else {
+            return Err(Error::Refusal(format!(
+                "reinstall: no installed keg: {name}"
+            )));
+        };
+        let view = resolve_view(git, snaps, cache, name, pkg.kind, Some(&pkg.receipt_rb))?;
+        if view.installed.as_ref() == view.head.as_ref() {
+            let mut args = vec!["reinstall".to_string()];
+            args.extend(user_flags.iter().cloned());
+            args.push(name.to_string());
+            session.record_run(&args)?;
+            continue;
+        }
+        session.apply_one(name)?;
+    }
+    Ok(RunResult {
+        refused: session.refused,
+        brew_status: session.brew_status,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn apply_many(
     brew: &impl Brew,
     git: &impl GitStore,
@@ -291,7 +348,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 }
             }
             DesiredAction::LeaveAheadOfSoak => {
-                writeln!(self.out, "{}", ahead_message(name))?;
+                if self.brew_verb == "reinstall" {
+                    writeln!(
+                        self.out,
+                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {name}` to bypass brewsoakr."
+                    )?;
+                    self.refused = true;
+                } else {
+                    writeln!(self.out, "{}", ahead_message(name))?;
+                }
             }
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
@@ -1364,5 +1429,143 @@ mod tests {
             !run_has_token(&runs, &soaked("fresh")),
             "must not --ignore-dependencies the target after git failure: {runs:?}"
         );
+    }
+
+    fn call_reinstall(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        snaps: &Snapshots,
+        tap: &Path,
+        names: &[String],
+        out: &mut Vec<u8>,
+    ) -> Result<RunResult, Error> {
+        reinstall(brew, git, snaps, unused_cache(), tap, names, &[], out)
+    }
+
+    #[test]
+    fn reinstall_true_repair() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid);
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new.clone());
+
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_new)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["wget".to_string()];
+        let result =
+            call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out).expect("reinstall");
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.iter()
+                .any(|args| args == &["reinstall".to_string(), "wget".to_string()]),
+            "true repair must brew reinstall wget: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|args| args.iter().any(|a| a.contains("brewsoakr/soaked"))),
+            "true repair must not use soaked tap: {runs:?}"
+        );
+        assert!(!result.refused, "true repair is not a refusal");
+    }
+
+    #[test]
+    fn reinstall_already_soaked() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["wget".to_string()];
+        let result =
+            call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out).expect("reinstall");
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.is_empty(),
+            "already soaked must not brew reinstall or install: {runs:?}"
+        );
+        assert!(!result.refused, "already soaked is not a refusal");
+    }
+
+    #[test]
+    fn reinstall_behind() {
+        let wget_old = formula_rb("wget", "1.0.0", "oldsha");
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid);
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_old)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["wget".to_string()];
+        let result =
+            call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out).expect("reinstall");
+        let runs = lock_runs(&brew);
+        assert!(
+            run_is_soaked_install(&runs, "wget"),
+            "behind reinstall must tap-install cutoff with --ignore-dependencies: {runs:?}"
+        );
+        assert!(
+            !runs
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("reinstall")),
+            "behind reinstall must not brew reinstall HEAD: {runs:?}"
+        );
+        assert!(!result.refused, "eligible behind reinstall must not refuse");
+    }
+
+    #[test]
+    fn reinstall_missing() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid);
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+
+        let brew = MockBrew::new();
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["wget".to_string()];
+        let err = call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out)
+            .expect_err("missing reinstall must refuse");
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.is_empty(),
+            "missing reinstall must not run brew: {runs:?}"
+        );
+        match err {
+            Error::Refusal(msg) => {
+                assert!(
+                    msg.contains("no installed keg"),
+                    "missing reinstall refusal: {msg}"
+                );
+            }
+            other => panic!("expected Error::Refusal, got {other:?}"),
+        }
     }
 }
