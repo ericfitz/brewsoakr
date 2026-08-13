@@ -45,10 +45,10 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
 }
 
 pub fn parse_cask(rb: &str) -> Result<CaskIdentity, Error> {
-    let version =
-        first_quoted(rb, "version ").ok_or_else(|| Error::Other("cask missing version".into()))?;
-    let sha256 =
-        first_quoted(rb, "sha256 ").ok_or_else(|| Error::Other("cask missing sha256".into()))?;
+    let version = first_quoted_or_symbol(rb, "version ")
+        .ok_or_else(|| Error::Other("cask missing version".into()))?;
+    let sha256 = first_quoted_or_symbol(rb, "sha256 ")
+        .ok_or_else(|| Error::Other("cask missing sha256".into()))?;
     let url = first_quoted(rb, "url ").ok_or_else(|| Error::Other("cask missing url".into()))?;
     Ok(CaskIdentity {
         version,
@@ -85,6 +85,36 @@ fn first_quoted(rb: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Quoted string, or a Ruby symbol such as `:latest` / `:no_check`.
+fn first_quoted_or_symbol(rb: &str, key: &str) -> Option<String> {
+    for line in rb.lines() {
+        let t = line.trim_start();
+        let Some(rest) = t.strip_prefix(key) else {
+            continue;
+        };
+        if let Some(q) = first_double_quoted(rest) {
+            return Some(q);
+        }
+        if let Some(sym) = first_ruby_symbol(rest) {
+            return Some(sym);
+        }
+    }
+    None
+}
+
+fn first_ruby_symbol(s: &str) -> Option<String> {
+    let rest = s.trim_start().strip_prefix(':')?;
+    let token: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if token.is_empty() {
+        None
+    } else {
+        Some(format!(":{token}"))
+    }
 }
 
 fn first_double_quoted(s: &str) -> Option<String> {
@@ -268,6 +298,21 @@ end
         assert_eq!(id.version, "3.0");
         assert_eq!(id.sha256, "ccc333");
         assert_eq!(id.url, "https://example.com/foo-3.0.dmg");
+    }
+
+    #[test]
+    fn parse_cask_latest_and_no_check_as_identity_tokens() {
+        let rb = r#"
+cask "nightly" do
+  version :latest
+  sha256 :no_check
+  url "https://example.com/nightly.dmg"
+end
+"#;
+        let id = parse_cask(rb).unwrap();
+        assert_eq!(id.version, ":latest");
+        assert_eq!(id.sha256, ":no_check");
+        assert_eq!(id.url, "https://example.com/nightly.dmg");
     }
 
     #[test]

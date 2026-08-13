@@ -99,21 +99,30 @@ pub fn outdated(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    extra_args: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
+    let brew_status = passthrough_third_party(brew, "outdated", extra_args, extra_args)?;
     let installed = brew.installed_core()?;
     let mut upgrades = Vec::new();
     let mut held = Vec::new();
     let mut ahead = Vec::new();
     for pkg in &installed {
-        let view = resolve_view(
+        if pkg.pinned {
+            continue;
+        }
+        let Some(view) = resolve_view(
             git,
             snaps,
             cache,
             &pkg.name,
             pkg.kind,
             Some(&pkg.receipt_rb),
-        )?;
+        )?
+        else {
+            held.push(format!("{}: unparseable identity", pkg.name));
+            continue;
+        };
         match view.action {
             DesiredAction::InstallCutoff => {
                 let installed_ver = view
@@ -140,7 +149,7 @@ pub fn outdated(
     write_section(out, "==> Ahead of soak", &ahead)?;
     Ok(RunResult {
         refused: false,
-        brew_status: None,
+        brew_status,
     })
 }
 
@@ -150,12 +159,24 @@ pub fn info(
     snaps: &Snapshots,
     cache: &Path,
     names: &[String],
+    user_flags: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
+    let mut brew_status = None;
     let installed = brew.installed_core()?;
     for name in names {
-        let view = resolve_named(git, snaps, cache, name, &installed)?;
+        if resolve::is_third_party(name) {
+            let mut args = vec!["info".to_string()];
+            args.extend(user_flags.iter().cloned());
+            args.push(name.clone());
+            merge_status(&mut brew_status, brew.run_visible(&args)?);
+            continue;
+        }
         writeln!(out, "{name}")?;
+        let Some(view) = resolve_named(git, snaps, cache, name, &installed)? else {
+            writeln!(out, "unparseable identity")?;
+            continue;
+        };
         writeln!(
             out,
             "installed: {}",
@@ -178,7 +199,7 @@ pub fn info(
     }
     Ok(RunResult {
         refused: false,
-        brew_status: None,
+        brew_status,
     })
 }
 
@@ -195,7 +216,11 @@ pub fn upgrade(
 ) -> Result<RunResult, Error> {
     let installed = brew.installed_core()?;
     let targets: Vec<String> = if names.is_empty() {
-        installed.iter().map(|p| p.name.clone()).collect()
+        installed
+            .iter()
+            .filter(|p| !p.pinned)
+            .map(|p| p.name.clone())
+            .collect()
     } else {
         names.to_vec()
     };
@@ -279,7 +304,11 @@ pub fn reinstall(
                 "reinstall: no installed keg: {name}"
             )));
         };
-        let view = resolve_view(git, snaps, cache, name, pkg.kind, Some(&pkg.receipt_rb))?;
+        let Some(view) = resolve_view(git, snaps, cache, name, pkg.kind, Some(&pkg.receipt_rb))?
+        else {
+            writeln!(session.out, "{name}: unparseable identity; skipping")?;
+            continue;
+        };
         if view.installed.as_ref() == view.head.as_ref() {
             let mut args = vec!["reinstall".to_string()];
             args.extend(user_flags.iter().cloned());
@@ -368,7 +397,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             .iter()
             .find(|p| p.name == name)
             .map(|p| p.receipt_rb.as_str());
-        let view = resolve_view(self.git, self.snaps, self.cache, name, kind, receipt)?;
+        let Some(view) = resolve_view(self.git, self.snaps, self.cache, name, kind, receipt)?
+        else {
+            writeln!(self.out, "{name}: unparseable identity; skipping")?;
+            return Ok(());
+        };
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
@@ -524,14 +557,52 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     }
 
     fn record_run(&mut self, args: &[String]) -> Result<(), Error> {
-        let output = self.brew.run(args)?;
-        let code = output.status.code().unwrap_or(1);
-        self.brew_status = Some(match self.brew_status {
-            Some(prev) => prev.max(code),
-            None => code,
-        });
+        let output = self.brew.run_visible(args)?;
+        merge_status(&mut self.brew_status, output);
         Ok(())
     }
+}
+
+fn merge_status(slot: &mut Option<i32>, output: std::process::Output) {
+    let mut code = output.status.code().unwrap_or(1);
+    if code != 0 && already_installed_message(&output) {
+        code = 0;
+    }
+    *slot = Some(match *slot {
+        Some(prev) => prev.max(code),
+        None => code,
+    });
+}
+
+fn already_installed_message(output: &std::process::Output) -> bool {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    format!("{stdout}\n{stderr}")
+        .to_ascii_lowercase()
+        .contains("already installed")
+}
+
+fn passthrough_third_party(
+    brew: &impl Brew,
+    verb: &str,
+    extra_args: &[String],
+    name_args: &[String],
+) -> Result<Option<i32>, Error> {
+    let third: Vec<String> = name_args
+        .iter()
+        .filter(|a| !a.starts_with('-') && resolve::is_third_party(a))
+        .cloned()
+        .collect();
+    if third.is_empty() {
+        return Ok(None);
+    }
+    let mut args = vec![verb.to_string()];
+    args.extend(extra_args.iter().filter(|a| a.starts_with('-')).cloned());
+    args.extend(third);
+    let output = brew.run_visible(&args)?;
+    let mut status = None;
+    merge_status(&mut status, output);
+    Ok(status)
 }
 
 struct CutoffDepWalk<'a, B, G> {
@@ -589,13 +660,13 @@ fn resolve_named(
     cache: &Path,
     name: &str,
     installed: &[InstalledPkg],
-) -> Result<ResolvedView, Error> {
+) -> Result<Option<ResolvedView>, Error> {
     if let Some(pkg) = installed.iter().find(|p| p.name == name) {
         return resolve_view(git, snaps, cache, name, pkg.kind, Some(&pkg.receipt_rb));
     }
-    let formula = resolve_view(git, snaps, cache, name, PkgKind::Formula, None)?;
-    if formula.cutoff.is_some() || formula.head.is_some() {
-        return Ok(formula);
+    let formula_blobs = resolve_pkg_blobs(git, snaps, cache, name, PkgKind::Formula)?;
+    if formula_blobs.cutoff.is_some() || formula_blobs.head.is_some() {
+        return resolve_view(git, snaps, cache, name, PkgKind::Formula, None);
     }
     resolve_view(git, snaps, cache, name, PkgKind::Cask, None)
 }
@@ -607,30 +678,39 @@ fn resolve_view(
     name: &str,
     kind: PkgKind,
     receipt_rb: Option<&str>,
-) -> Result<ResolvedView, Error> {
+) -> Result<Option<ResolvedView>, Error> {
     let blobs = resolve_pkg_blobs(git, snaps, cache, name, kind)?;
     let installed = match receipt_rb {
-        Some(rb) => Some(parse_pkg(kind, rb)?),
+        Some(rb) => match parse_pkg(kind, rb) {
+            Ok(id) => Some(id),
+            Err(_) => return Ok(None),
+        },
         None => None,
     };
     let cutoff = match blobs.cutoff.as_deref() {
-        Some(bytes) => Some(parse_pkg_bytes(kind, bytes)?),
+        Some(bytes) => match parse_pkg_bytes(kind, bytes) {
+            Ok(id) => Some(id),
+            Err(_) => return Ok(None),
+        },
         None => None,
     };
     let head = match blobs.head.as_deref() {
-        Some(bytes) => Some(parse_pkg_bytes(kind, bytes)?),
+        Some(bytes) => match parse_pkg_bytes(kind, bytes) {
+            Ok(id) => Some(id),
+            Err(_) => return Ok(None),
+        },
         None => None,
     };
     let status = eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref());
     let action =
         eligibility::desired_action(status, installed.as_ref(), cutoff.as_ref(), head.as_ref());
-    Ok(ResolvedView {
+    Ok(Some(ResolvedView {
         installed,
         cutoff,
         head,
         action,
         cutoff_blob: blobs.cutoff,
-    })
+    }))
 }
 
 fn resolve_pkg_blobs(
@@ -686,7 +766,7 @@ fn natural_kind(
     if let Some(pkg) = installed.iter().find(|p| p.name == name) {
         return Ok(pkg.kind);
     }
-    let formula = resolve_view(git, snaps, cache, name, PkgKind::Formula, None)?;
+    let formula = resolve_pkg_blobs(git, snaps, cache, name, PkgKind::Formula)?;
     if formula.cutoff.is_some() || formula.head.is_some() {
         Ok(PkgKind::Formula)
     } else {
@@ -906,21 +986,9 @@ mod tests {
 
         let brew = MockBrew {
             installed: vec![
-                InstalledPkg {
-                    name: "alpha".into(),
-                    kind: PkgKind::Formula,
-                    receipt_rb: alpha_old,
-                },
-                InstalledPkg {
-                    name: "beta".into(),
-                    kind: PkgKind::Formula,
-                    receipt_rb: beta_old,
-                },
-                InstalledPkg {
-                    name: "gamma".into(),
-                    kind: PkgKind::Formula,
-                    receipt_rb: gamma_new,
-                },
+                formula_pkg("alpha", alpha_old),
+                formula_pkg("beta", beta_old),
+                formula_pkg("gamma", gamma_new),
             ],
             ..MockBrew::new()
         };
@@ -942,7 +1010,8 @@ mod tests {
     fn outdated_lists_upgrade_held_and_ahead_sections() {
         let (brew, git, snaps) = view_world();
         let mut out = Vec::new();
-        let result = outdated(&brew, &git, &snaps, unused_cache(), &mut out).expect("outdated");
+        let result =
+            outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains("==> Outdated (will upgrade)"),
@@ -964,7 +1033,8 @@ mod tests {
         let (brew, git, snaps) = view_world();
         let mut out = Vec::new();
         let names = ["alpha".to_string()];
-        let result = info(&brew, &git, &snaps, unused_cache(), &names, &mut out).expect("info");
+        let result =
+            info(&brew, &git, &snaps, unused_cache(), &names, &[], &mut out).expect("info");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("1.1.0"), "missing cutoff version: {text}");
         assert!(
@@ -993,6 +1063,14 @@ mod tests {
             name: name.into(),
             kind: PkgKind::Formula,
             receipt_rb,
+            pinned: false,
+        }
+    }
+
+    fn formula_pkg_pinned(name: &str, receipt_rb: String) -> InstalledPkg {
+        InstalledPkg {
+            pinned: true,
+            ..formula_pkg(name, receipt_rb)
         }
     }
 
@@ -1597,5 +1675,321 @@ mod tests {
             }
             other => panic!("expected Error::Refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn outdated_skips_unparseable_identity_and_continues() {
+        let alpha_old = formula_rb("alpha", "1.0.0", "oldsha");
+        let alpha_mid = formula_rb("alpha", "1.1.0", "midsha");
+        let alpha_new = formula_rb("alpha", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/a/alpha.rb", alpha_mid);
+        git.insert_blob("headsha", "Formula/a/alpha.rb", alpha_new);
+        git.insert_blob("cutoffsha", "Formula/b/bad.rb", "class Bad; end\n");
+        git.insert_blob("headsha", "Formula/b/bad.rb", "class Bad; end\n");
+
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("bad", "class Bad; end\n".into()),
+                formula_pkg("alpha", alpha_old),
+            ],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let mut out = Vec::new();
+        let result =
+            outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("alpha"), "good pkg must still list: {text}");
+        assert!(
+            text.contains("bad") && text.contains("unparseable"),
+            "unparseable pkg must be held, not abort: {text}"
+        );
+        assert!(!result.refused);
+    }
+
+    #[test]
+    fn upgrade_nameless_skips_unparseable_and_continues() {
+        let ok_old = formula_rb("ok", "1.0.0", "oldsha");
+        let ok_mid = formula_rb("ok", "1.1.0", "midsha");
+        let ok_new = formula_rb("ok", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/o/ok.rb", ok_mid);
+        git.insert_blob("headsha", "Formula/o/ok.rb", ok_new);
+        git.insert_blob("cutoffsha", "Formula/b/bad.rb", "class Bad; end\n");
+        git.insert_blob("headsha", "Formula/b/bad.rb", "class Bad; end\n");
+
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("bad", "class Bad; end\n".into()),
+                formula_pkg("ok", ok_old),
+            ],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let result = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        let runs = lock_runs(&brew);
+        assert!(
+            run_is_soaked_install(&runs, "ok"),
+            "parse failure must not abort remaining upgrades: {runs:?}"
+        );
+        assert!(
+            !run_has_token(&runs, "brewsoakr/soaked/bad"),
+            "unparseable must not install: {runs:?}"
+        );
+        assert!(!result.refused, "unparseable skip is not a soak refusal");
+    }
+
+    #[test]
+    fn upgrade_nameless_skips_pinned_formula() {
+        let pin_old = formula_rb("pin", "1.0.0", "oldsha");
+        let pin_mid = formula_rb("pin", "1.1.0", "midsha");
+        let pin_new = formula_rb("pin", "1.2.0", "newsha");
+        let ok_old = formula_rb("ok", "1.0.0", "oldsha");
+        let ok_mid = formula_rb("ok", "1.1.0", "midsha");
+        let ok_new = formula_rb("ok", "1.2.0", "newsha");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/p/pin.rb", pin_mid);
+        git.insert_blob("headsha", "Formula/p/pin.rb", pin_new);
+        git.insert_blob("cutoffsha", "Formula/o/ok.rb", ok_mid);
+        git.insert_blob("headsha", "Formula/o/ok.rb", ok_new);
+
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg_pinned("pin", pin_old),
+                formula_pkg("ok", ok_old),
+            ],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let result = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        let runs = lock_runs(&brew);
+        assert!(
+            run_is_soaked_install(&runs, "ok"),
+            "unpinned must still upgrade: {runs:?}"
+        );
+        assert!(
+            !run_has_token(&runs, "brewsoakr/soaked/pin"),
+            "pinned must be skipped: {runs:?}"
+        );
+        assert!(!result.refused);
+    }
+
+    #[test]
+    fn outdated_skips_pinned_formula() {
+        let pin_old = formula_rb("pin", "1.0.0", "oldsha");
+        let pin_mid = formula_rb("pin", "1.1.0", "midsha");
+        let pin_new = formula_rb("pin", "1.2.0", "newsha");
+        let ok_old = formula_rb("ok", "1.0.0", "oldsha");
+        let ok_mid = formula_rb("ok", "1.1.0", "midsha");
+        let ok_new = formula_rb("ok", "1.2.0", "newsha");
+
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/p/pin.rb", pin_mid);
+        git.insert_blob("headsha", "Formula/p/pin.rb", pin_new);
+        git.insert_blob("cutoffsha", "Formula/o/ok.rb", ok_mid);
+        git.insert_blob("headsha", "Formula/o/ok.rb", ok_new);
+
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg_pinned("pin", pin_old),
+                formula_pkg("ok", ok_old),
+            ],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let mut out = Vec::new();
+        outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("ok"), "unpinned must list: {text}");
+        assert!(
+            !text.contains("pin"),
+            "pinned must not list as outdated: {text}"
+        );
+    }
+
+    #[test]
+    fn info_mixed_third_party_passthrough() {
+        let alpha_old = formula_rb("alpha", "1.0.0", "oldsha");
+        let alpha_mid = formula_rb("alpha", "1.1.0", "midsha");
+        let alpha_new = formula_rb("alpha", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/a/alpha.rb", alpha_mid);
+        git.insert_blob("headsha", "Formula/a/alpha.rb", alpha_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("alpha", alpha_old)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let mut out = Vec::new();
+        let names = ["alpha".to_string(), "acme/tools/foo".to_string()];
+        info(&brew, &git, &snaps, unused_cache(), &names, &[], &mut out).expect("info");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("alpha"), "core name still soaked: {text}");
+        let visible = brew.visible_runs.lock().expect("visible");
+        assert!(
+            visible
+                .iter()
+                .any(|args| args == &["info".to_string(), "acme/tools/foo".into()]),
+            "third-party must brew.run_visible info: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn outdated_mixed_third_party_passthrough() {
+        let (brew, git, snaps) = view_world();
+        let mut out = Vec::new();
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &["acme/tools/foo".to_string()],
+            &mut out,
+        )
+        .expect("outdated");
+        let visible = brew.visible_runs.lock().expect("visible");
+        assert!(
+            visible
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("outdated")
+                    && args.iter().any(|a| a == "acme/tools/foo")),
+            "third-party must brew.run_visible outdated: {visible:?}"
+        );
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("alpha"), "soaked listing still runs: {text}");
+    }
+
+    #[test]
+    fn install_trusts_soaked_tap() {
+        let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
+        let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
+        git.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
+        let brew = MockBrew::new();
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["fresh".to_string()];
+        install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &names,
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .expect("install");
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.iter()
+                .any(|args| args == &["trust".to_string(), "brewsoakr/soaked".into()]),
+            "expected brew trust brewsoakr/soaked: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn install_uses_run_visible_for_soaked_install() {
+        let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
+        let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
+        git.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
+        let brew = MockBrew::new();
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["fresh".to_string()];
+        install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &names,
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .expect("install");
+        let visible = brew.visible_runs.lock().expect("visible");
+        assert!(
+            visible
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("install")
+                    && args.iter().any(|a| a == "brewsoakr/soaked/fresh")),
+            "soaked install must use run_visible: {visible:?}"
+        );
+    }
+
+    #[test]
+    fn install_already_installed_nonzero_is_success() {
+        let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
+        let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/f/fresh.rb", fresh_mid);
+        git.insert_blob("headsha", "Formula/f/fresh.rb", fresh_new);
+        let brew = MockBrew {
+            next_status: 1,
+            next_stderr: b"Error: fresh 1.1.0 is already installed\n".to_vec(),
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let names = ["fresh".to_string()];
+        let result = install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &names,
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .expect("install");
+        assert!(
+            !result.refused,
+            "already-installed must not be a soak refusal"
+        );
+        assert_eq!(
+            result.brew_status,
+            Some(0),
+            "non-zero already-installed must be treated as success"
+        );
     }
 }

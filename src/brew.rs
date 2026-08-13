@@ -1,10 +1,11 @@
 use crate::Error;
 use crate::resolve::PkgKind;
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,11 +13,15 @@ pub struct InstalledPkg {
     pub name: String,
     pub kind: PkgKind,
     pub receipt_rb: String,
+    pub pinned: bool,
 }
 
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
+    /// Capturing run for JSON, deps, `--repository`, tap-new, and trust.
     fn run(&self, args: &[String]) -> Result<Output, Error>;
+    /// Live stdout/stderr for install/upgrade/reinstall and brew passthrough.
+    fn run_visible(&self, args: &[String]) -> Result<Output, Error>;
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn tap_new_soaked(&self) -> Result<(), Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
@@ -24,13 +29,26 @@ pub trait Brew {
 
 pub struct ProcessBrew {
     pub bin: PathBuf,
+    skip_tap_trust: Cell<bool>,
+}
+
+impl ProcessBrew {
+    pub fn new(bin: PathBuf) -> Self {
+        Self {
+            bin,
+            skip_tap_trust: Cell::new(false),
+        }
+    }
 }
 
 pub struct MockBrew {
     pub installed: Vec<InstalledPkg>,
     pub deps: BTreeMap<String, Vec<String>>,
     pub runs: Mutex<Vec<Vec<String>>>,
+    pub visible_runs: Mutex<Vec<Vec<String>>>,
     pub next_status: i32,
+    pub next_stdout: Vec<u8>,
+    pub next_stderr: Vec<u8>,
 }
 
 impl Default for MockBrew {
@@ -39,7 +57,10 @@ impl Default for MockBrew {
             installed: Vec::new(),
             deps: BTreeMap::new(),
             runs: Mutex::new(Vec::new()),
+            visible_runs: Mutex::new(Vec::new()),
             next_status: 0,
+            next_stdout: Vec::new(),
+            next_stderr: Vec::new(),
         }
     }
 }
@@ -55,6 +76,21 @@ impl MockBrew {
             .unwrap_or_else(|e| e.into_inner())
             .push(args.to_vec());
     }
+
+    fn record_visible(&self, args: &[String]) {
+        self.visible_runs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(args.to_vec());
+    }
+
+    fn mock_output(&self) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(exit_status_raw(self.next_status)),
+            stdout: self.next_stdout.clone(),
+            stderr: self.next_stderr.clone(),
+        }
+    }
 }
 
 impl Brew for ProcessBrew {
@@ -63,11 +99,11 @@ impl Brew for ProcessBrew {
     }
 
     fn run(&self, args: &[String]) -> Result<Output, Error> {
-        match Command::new(&self.bin).args(args).output() {
-            Ok(output) => Ok(output),
-            Err(e) if e.kind() == ErrorKind::NotFound => Err(Error::Usage("brew not found".into())),
-            Err(e) => Err(Error::from(e)),
-        }
+        self.spawn_brew(args, false)
+    }
+
+    fn run_visible(&self, args: &[String]) -> Result<Output, Error> {
+        self.spawn_brew(args, true)
     }
 
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -94,11 +130,10 @@ impl Brew for ProcessBrew {
             "brewsoakr/soaked".into(),
             "--no-git".into(),
         ])?;
-        if output.status.success() || tap_already_exists(&output) {
-            Ok(())
-        } else {
-            Err(brew_fail(&output))
+        if !(output.status.success() || tap_already_exists(&output)) {
+            return Err(brew_fail(&output));
         }
+        self.trust_soaked_tap()
     }
 
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
@@ -128,6 +163,93 @@ impl ProcessBrew {
             Some(PathBuf::from(dir))
         }
     }
+
+    fn spawn_brew(&self, args: &[String], visible: bool) -> Result<Output, Error> {
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(args);
+        if self.skip_tap_trust.get() {
+            cmd.env("HOMEBREW_NO_REQUIRE_TAP_TRUST", "1");
+        }
+        if !visible {
+            return match cmd.output() {
+                Ok(output) => Ok(output),
+                Err(e) if e.kind() == ErrorKind::NotFound => {
+                    Err(Error::Usage("brew not found".into()))
+                }
+                Err(e) => Err(Error::from(e)),
+            };
+        }
+        cmd.stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                return Err(Error::Usage("brew not found".into()));
+            }
+            Err(e) => return Err(Error::from(e)),
+        };
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+        let out_thread = std::thread::spawn(move || match stdout_pipe.as_mut() {
+            Some(pipe) => copy_and_forward(pipe, &mut std::io::stdout()),
+            None => Vec::new(),
+        });
+        let err_thread = std::thread::spawn(move || match stderr_pipe.as_mut() {
+            Some(pipe) => copy_and_forward(pipe, &mut std::io::stderr()),
+            None => Vec::new(),
+        });
+        let status = child.wait()?;
+        let stdout = out_thread.join().unwrap_or_default();
+        let stderr = err_thread.join().unwrap_or_default();
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    fn trust_soaked_tap(&self) -> Result<(), Error> {
+        let output = self.run(&["trust".into(), "brewsoakr/soaked".into()])?;
+        if output.status.success() {
+            return Ok(());
+        }
+        if trust_command_unavailable(&output) {
+            // Homebrew < 6 has no `brew trust`. Disable the Homebrew 6 check
+            // for later brew deps/install of brewsoakr/soaked/*.
+            self.skip_tap_trust.set(true);
+            return Ok(());
+        }
+        Err(brew_fail(&output))
+    }
+}
+
+fn copy_and_forward(src: &mut impl Read, dst: &mut impl Write) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        match src.read(&mut tmp) {
+            Ok(0) => break,
+            Ok(n) => {
+                let chunk = &tmp[..n];
+                buf.extend_from_slice(chunk);
+                let _ = dst.write_all(chunk);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let _ = dst.flush();
+    buf
+}
+
+fn trust_command_unavailable(output: &Output) -> bool {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    text.contains("unknown command")
+        || text.contains("unknown subcommand")
+        || text.contains("invalid command")
 }
 
 impl Brew for MockBrew {
@@ -137,11 +259,13 @@ impl Brew for MockBrew {
 
     fn run(&self, args: &[String]) -> Result<Output, Error> {
         self.record(args);
-        Ok(Output {
-            status: std::process::ExitStatus::from_raw(exit_status_raw(self.next_status)),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        })
+        Ok(self.mock_output())
+    }
+
+    fn run_visible(&self, args: &[String]) -> Result<Output, Error> {
+        self.record(args);
+        self.record_visible(args);
+        Ok(self.mock_output())
     }
 
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -154,6 +278,7 @@ impl Brew for MockBrew {
             "brewsoakr/soaked".into(),
             "--no-git".into(),
         ])?;
+        let _ = self.run(&["trust".into(), "brewsoakr/soaked".into()])?;
         Ok(())
     }
 
@@ -273,6 +398,7 @@ fn parse_installed_json(
                 name,
                 kind: PkgKind::Formula,
                 receipt_rb,
+                pinned: json_bool_value(obj, "pinned").unwrap_or(false),
             });
         }
     }
@@ -289,6 +415,7 @@ fn parse_installed_json(
                 name,
                 kind: PkgKind::Cask,
                 receipt_rb,
+                pinned: json_bool_value(obj, "pinned").unwrap_or(false),
             });
         }
     }
@@ -419,6 +546,18 @@ fn json_string_value(obj: &str, key: &str) -> Option<String> {
     parse_json_string(after)
 }
 
+fn json_bool_value(obj: &str, key: &str) -> Option<bool> {
+    let after = find_json_key(obj, key)?;
+    let after = after.trim_start();
+    if after.starts_with("true") {
+        Some(true)
+    } else if after.starts_with("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 fn parse_json_string(s: &str) -> Option<String> {
     let s = s.strip_prefix('"')?;
     let mut out = String::new();
@@ -456,8 +595,16 @@ mod tests {
         MockBrew {
             installed,
             deps,
-            runs: Mutex::new(Vec::new()),
-            next_status: 0,
+            ..MockBrew::new()
+        }
+    }
+
+    fn pkg(name: &str, kind: PkgKind, receipt_rb: &str) -> InstalledPkg {
+        InstalledPkg {
+            name: name.into(),
+            kind,
+            receipt_rb: receipt_rb.into(),
+            pinned: false,
         }
     }
 
@@ -473,16 +620,8 @@ mod tests {
     #[test]
     fn mock_installed_core_returns_the_vec() {
         let installed = vec![
-            InstalledPkg {
-                name: "wget".into(),
-                kind: PkgKind::Formula,
-                receipt_rb: "class Wget; end".into(),
-            },
-            InstalledPkg {
-                name: "firefox".into(),
-                kind: PkgKind::Cask,
-                receipt_rb: "cask \"firefox\"".into(),
-            },
+            pkg("wget", PkgKind::Formula, "class Wget; end"),
+            pkg("firefox", PkgKind::Cask, "cask \"firefox\""),
         ];
         let brew = mock_with(installed.clone(), BTreeMap::new());
         let got = brew.installed_core().expect("mock installed");
@@ -540,16 +679,8 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                InstalledPkg {
-                    name: "wget".into(),
-                    kind: PkgKind::Formula,
-                    receipt_rb: "class Wget; end".into(),
-                },
-                InstalledPkg {
-                    name: "firefox".into(),
-                    kind: PkgKind::Cask,
-                    receipt_rb: "cask \"firefox\"".into(),
-                },
+                pkg("wget", PkgKind::Formula, "class Wget; end"),
+                pkg("firefox", PkgKind::Cask, "cask \"firefox\""),
             ]
         );
     }
@@ -650,13 +781,84 @@ mod tests {
             read_formula_receipt(&cellar, name, version)
         })
         .expect("parse");
+        assert_eq!(got, vec![pkg("wget", PkgKind::Formula, "new-receipt")]);
+    }
+
+    #[test]
+    fn parse_installed_json_reads_pinned() {
+        let json = r#"{
+          "formulae": [
+            {
+              "name": "wget",
+              "tap": "homebrew/core",
+              "pinned": true,
+              "installed": [{"version": "1.21.4"}]
+            },
+            {
+              "name": "curl",
+              "tap": "homebrew/core",
+              "pinned": false,
+              "installed": [{"version": "8.0.0"}]
+            }
+          ],
+          "casks": []
+        }"#;
+        let got = parse_installed_json(json, |name, _kind, _version| Some(name.to_string()))
+            .expect("parse");
+        assert!(got.iter().find(|p| p.name == "wget").expect("wget").pinned);
+        assert!(!got.iter().find(|p| p.name == "curl").expect("curl").pinned);
+    }
+
+    #[test]
+    fn mock_run_visible_records_separately() {
+        let brew = MockBrew::new();
+        brew.run_visible(&["install".into(), "wget".into()])
+            .expect("visible");
+        brew.run(&["deps".into(), "wget".into()]).expect("capture");
+        let visible = brew.visible_runs.lock().expect("visible_runs");
         assert_eq!(
-            got,
-            vec![InstalledPkg {
-                name: "wget".into(),
-                kind: PkgKind::Formula,
-                receipt_rb: "new-receipt".into(),
-            }]
+            visible.as_slice(),
+            [vec!["install".to_string(), "wget".into()]]
+        );
+        let runs = brew.runs.lock().expect("runs");
+        assert_eq!(runs.len(), 2);
+    }
+
+    #[test]
+    fn process_brew_run_captures_stdout() {
+        let brew = ProcessBrew::new(PathBuf::from("/bin/echo"));
+        let output = brew.run(&["hello-capture".into()]).expect("run");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("hello-capture"),
+            "{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn process_brew_run_visible_forwards_and_returns_status() {
+        let brew = ProcessBrew::new(PathBuf::from("/bin/echo"));
+        let output = brew
+            .run_visible(&["hello-visible".into()])
+            .expect("run_visible");
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("hello-visible"),
+            "{:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn mock_tap_new_soaked_records_trust() {
+        let brew = MockBrew::new();
+        brew.tap_new_soaked().expect("tap");
+        let runs = brew.runs.lock().expect("runs");
+        assert!(
+            runs.iter()
+                .any(|args| args == &["trust".to_string(), "brewsoakr/soaked".into()]),
+            "expected brew trust brewsoakr/soaked: {runs:?}"
         );
     }
 

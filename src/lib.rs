@@ -53,9 +53,7 @@ impl RealWorld {
             github: github::UreqGithub {
                 base: "https://api.github.com".into(),
             },
-            brew: brew::ProcessBrew {
-                bin: paths::brew_bin(),
-            },
+            brew: brew::ProcessBrew::new(paths::brew_bin()),
         }
     }
 }
@@ -159,6 +157,11 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             Ok(Dispatch::Exit(0))
         }
         cli::Command::Outdated => {
+            if third_party_only_names(&inv.brew_args) {
+                let mut argv = vec!["outdated".to_string()];
+                argv.extend(inv.brew_args);
+                return Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), argv));
+            }
             let cache = world.cache_path();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
@@ -175,10 +178,17 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.git(),
                 &snaps,
                 &cache,
+                &inv.brew_args,
                 &mut out,
             ))
         }
         cli::Command::Info { names } => {
+            if !names.is_empty() && names.iter().all(|n| crate::resolve::is_third_party(n)) {
+                let mut argv = vec!["info".to_string()];
+                argv.extend(inv.brew_args.iter().cloned());
+                argv.extend(names);
+                return Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), argv));
+            }
             let cache = world.cache_path();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
@@ -196,6 +206,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &snaps,
                 &cache,
                 &names,
+                &inv.brew_args,
                 &mut out,
             ))
         }
@@ -278,6 +289,11 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             ))
         }
     }
+}
+
+fn third_party_only_names(args: &[String]) -> bool {
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    !names.is_empty() && names.iter().all(|n| crate::resolve::is_third_party(n))
 }
 
 fn soaked_exit(result: Result<cmd::RunResult, Error>) -> Result<Dispatch, Error> {
@@ -463,6 +479,36 @@ mod tests {
         assert!(
             world.github.refreshed.get(),
             "refresh should have queried github"
+        );
+    }
+
+    #[test]
+    fn info_third_party_is_exec_without_refresh() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["info", "acme/tools/foo"]), &world).expect("dispatch") {
+            Dispatch::Exec(_bin, argv) => {
+                assert_eq!(argv, s(&["info", "acme/tools/foo"]));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !world.github.refreshed.get(),
+            "third-party info must not refresh snapshots"
+        );
+    }
+
+    #[test]
+    fn outdated_third_party_is_exec_without_refresh() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["outdated", "acme/tools/foo"]), &world).expect("dispatch") {
+            Dispatch::Exec(_bin, argv) => {
+                assert_eq!(argv, s(&["outdated", "acme/tools/foo"]));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !world.github.refreshed.get(),
+            "third-party outdated must not refresh snapshots"
         );
     }
 }
