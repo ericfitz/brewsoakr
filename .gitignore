@@ -1,2 +1,5 @@
 .worktrees
 /target
+/brewsoakr
+**/*.rs.bk
+*.pdb
