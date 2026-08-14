@@ -52,14 +52,21 @@ pub fn desired_action(
         UpstreamStatus::Eligible => {
             if installed.is_none() {
                 DesiredAction::InstallCutoff
-            } else if installed == cutoff_id {
+            } else if identities_match(installed, cutoff_id) {
                 DesiredAction::NoOpAlreadySoaked
-            } else if installed == head_id && cutoff_id != head_id {
+            } else if identities_match(installed, head_id) && cutoff_id != head_id {
                 DesiredAction::LeaveAheadOfSoak
             } else {
                 DesiredAction::InstallCutoff
             }
         }
+    }
+}
+
+fn identities_match(a: Option<&PkgIdentity>, b: Option<&PkgIdentity>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.same_artifact(b),
+        _ => false,
     }
 }
 
@@ -164,6 +171,31 @@ end
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&cutoff), Some(&cutoff), Some(&head)),
+            DesiredAction::NoOpAlreadySoaked
+        );
+    }
+
+    #[test]
+    fn receipt_without_bottle_matches_cutoff_rebuild() {
+        // Homebrew Cellar receipts omit the bottle block. Missing rebuild is
+        // not rebuild 0; version/revision/sha256 still identify the artifact.
+        const RECEIPT_RB: &str = r#"
+class Wget < Formula
+  url "https://example.com/wget-1.21.4.tar.gz"
+  sha256 "aaa111"
+  revision 1
+end
+"#;
+        let installed = formula_id(RECEIPT_RB);
+        let cutoff = formula_id(CUTOFF_RB);
+        let head = formula_id(HEAD_RB);
+        assert_ne!(
+            installed, cutoff,
+            "exact identity still sees missing rebuild"
+        );
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
+        assert_eq!(
+            desired_action(status, Some(&installed), Some(&cutoff), Some(&head)),
             DesiredAction::NoOpAlreadySoaked
         );
     }

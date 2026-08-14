@@ -112,6 +112,10 @@ Installed vs cutoff/HEAD cannot use raw bytes: Homebrew rewrites the Cellar/Cask
 
 Sources: installed receipt (Cellar `*/.brew/<name>.rb` or Caskroom `.metadata`), cutoff blob, HEAD blob.
 
+Homebrew rewrites Cellar receipts and **drops the `bottle` block**, so a missing `rebuild` is unknown, not `0`. Compare rebuild only when both sides have it. Cutoff vs HEAD still sees rebuild (both are unmodified upstream files), so a same-version bottle rebuild still starts the soak clock.
+
+A no-op “already soaked” line is printed only with `-v` / `--verbose`.
+
 ### Desired-state table
 
 | Installed identity | Meaning | Mutating command |
@@ -174,7 +178,7 @@ Otherwise treat as a soaked install of the cutoff artifact. If that would not re
    - already installed (any identity, including ahead of soak) → leave it
    - eligible and missing → `brew install brewsoakr/soaked/<dep>`
    - missing and not eligible → refuse the **target**
-5. Install the target with `--ignore-dependencies` so `brew` cannot pull a HEAD core/cask dep. Include build deps only when `brew deps` says they are needed.
+5. Install the target from the staged cutoff `.rb` without `--ignore-dependencies` (Homebrew treats that flag as an unsupported developer option). The cutoff dep closure is already installed, so `brew` should treat those deps as satisfied. Set `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` so `brew` does not then upgrade dependents to HEAD. Include build deps only when `brew deps` says they are needed.
 
 User flags are forwarded. `brew` keeps stdout/stderr. brewsoakr prints refusals and ahead-of-soak notes around that. If `brew` fails for an eligible package (missing bottle, compile error), that package takes `brew`’s exit code; remaining eligible packages still run.
 

@@ -4,7 +4,9 @@ use crate::Error;
 pub struct FormulaIdentity {
     pub version: String,
     pub revision: u32,
-    pub rebuild: u32,
+    /// Bottle `rebuild` when the `.rb` has a bottle block. Homebrew Cellar
+    /// receipts omit that block, so this is `None` and must not be treated as 0.
+    pub rebuild: Option<u32>,
     pub sha256: String,
 }
 
@@ -19,6 +21,26 @@ pub struct CaskIdentity {
 pub enum PkgIdentity {
     Formula(FormulaIdentity),
     Cask(CaskIdentity),
+}
+
+impl PkgIdentity {
+    /// Installed receipts omit the bottle block. Compare rebuild only when both
+    /// sides have one; version, revision, and source sha256 always compare.
+    pub fn same_artifact(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Formula(a), Self::Formula(b)) => {
+                a.version == b.version
+                    && a.revision == b.revision
+                    && a.sha256 == b.sha256
+                    && match (a.rebuild, b.rebuild) {
+                        (Some(x), Some(y)) => x == y,
+                        _ => true,
+                    }
+            }
+            (Self::Cask(a), Self::Cask(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
@@ -40,7 +62,7 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
         }
     };
     let revision = first_u32(rb, "revision ").unwrap_or(0);
-    let rebuild = first_u32(rb, "rebuild ").unwrap_or(0);
+    let rebuild = first_u32(rb, "rebuild ");
     let sha256 = first_sha256_before_bottle(rb)
         .or(git_rev)
         .or(git_tag)
@@ -376,7 +398,7 @@ end
         let id = parse_formula(WGET_FORMULA).unwrap();
         assert_eq!(id.version, "1.21.4");
         assert_eq!(id.revision, 1);
-        assert_eq!(id.rebuild, 2);
+        assert_eq!(id.rebuild, Some(2));
         assert_eq!(id.sha256, "aaa111");
     }
 
@@ -395,6 +417,32 @@ end
         assert_eq!(id.version, "3.0");
         assert_eq!(id.sha256, "ccc333");
         assert_eq!(id.url, "https://example.com/foo-3.0.dmg");
+    }
+
+    #[test]
+    fn receipt_without_bottle_has_no_rebuild() {
+        let rb = r#"
+class Wget < Formula
+  url "https://example.com/wget-1.21.4.tar.gz"
+  sha256 "aaa111"
+  revision 1
+end
+"#;
+        let id = parse_formula(rb).unwrap();
+        assert_eq!(id.rebuild, None);
+        let with_bottle = parse_formula(WGET_FORMULA).unwrap();
+        assert_eq!(with_bottle.rebuild, Some(2));
+        assert!(
+            PkgIdentity::Formula(id.clone())
+                .same_artifact(&PkgIdentity::Formula(with_bottle.clone()))
+        );
+        let other_rebuild = FormulaIdentity {
+            rebuild: Some(3),
+            ..with_bottle.clone()
+        };
+        assert!(
+            !PkgIdentity::Formula(with_bottle).same_artifact(&PkgIdentity::Formula(other_rebuild))
+        );
     }
 
     #[test]

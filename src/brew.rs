@@ -150,8 +150,10 @@ impl Brew for ProcessBrew {
 }
 
 /// Env for brewsoakr-driven `brew` children.
-/// `HOMEBREW_DEVELOPER` allows path installs (`brew install ./foo.rb`) and
-/// `--ignore-dependencies`. Unset FORBID so a user-level forbid cannot block us.
+/// `HOMEBREW_DEVELOPER` allows path installs (`brew install ./foo.rb`).
+/// Unset FORBID so a user-level forbid cannot block us.
+/// `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` stops brew from upgrading
+/// dependents of a cutoff install to HEAD.
 fn apply_brewsoakr_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
     for (key, value) in brewsoakr_brew_env_pairs(skip_tap_trust) {
         match value {
@@ -168,6 +170,7 @@ fn apply_brewsoakr_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
 fn brewsoakr_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'static str>)> {
     let mut pairs = vec![
         ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
+        ("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", Some("1")),
         ("HOMEBREW_DEVELOPER", Some("1")),
         ("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", None),
     ];
@@ -861,6 +864,11 @@ mod tests {
             pairs
                 .iter()
                 .any(|(k, v)| *k == "HOMEBREW_NO_AUTO_UPDATE" && *v == Some("1"))
+        );
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" && *v == Some("1"))
         );
     }
 

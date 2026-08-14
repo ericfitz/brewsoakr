@@ -87,22 +87,14 @@ impl<B: Brew, F: Fn(&str) -> bool> ClosureWalk<'_, B, F> {
     }
 }
 
-pub fn brew_install_args(
-    pkg: &PkgRef,
-    path: &Path,
-    user_flags: &[String],
-    ignore_deps: bool,
-) -> Vec<String> {
+pub fn brew_install_args(pkg: &PkgRef, path: &Path, user_flags: &[String]) -> Vec<String> {
     let mut args = vec!["install".to_string()];
     args.push(match pkg.kind {
         PkgKind::Formula => "--formula".into(),
         PkgKind::Cask => "--cask".into(),
     });
-    if ignore_deps {
-        args.push("--ignore-dependencies".into());
-    }
     for flag in user_flags {
-        if is_brew_subcommand(flag) {
+        if is_brew_subcommand(flag) || flag == "--ignore-dependencies" {
             continue;
         }
         args.push(flag.clone());
@@ -205,12 +197,12 @@ mod tests {
     }
 
     #[test]
-    fn brew_install_args_formula_ignore_deps() {
+    fn brew_install_args_formula_path_install_omits_ignore_deps() {
         let path = Path::new("/tmp/staging/Formula/wget.rb");
-        let args = brew_install_args(&formula("wget"), path, &[], true);
+        let args = brew_install_args(&formula("wget"), path, &[]);
         assert!(
-            args.iter().any(|a| a == "--ignore-dependencies"),
-            "{args:?}"
+            !args.iter().any(|a| a == "--ignore-dependencies"),
+            "Homebrew treats --ignore-dependencies as an unsupported developer option: {args:?}"
         );
         assert!(args.iter().any(|a| a == path.to_str().unwrap()), "{args:?}");
         assert_eq!(args[0], "install");
@@ -222,10 +214,22 @@ mod tests {
     }
 
     #[test]
+    fn brew_install_args_strips_user_ignore_dependencies() {
+        let path = Path::new("/tmp/staging/Formula/wget.rb");
+        let flags = ["--ignore-dependencies".to_string(), "--verbose".to_string()];
+        let args = brew_install_args(&formula("wget"), path, &flags);
+        assert!(
+            !args.iter().any(|a| a == "--ignore-dependencies"),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
+    }
+
+    #[test]
     fn brew_install_args_cask_forwards_user_flags_without_subcommand() {
         let path = Path::new("/tmp/staging/Casks/firefox.rb");
         let flags = ["install".to_string(), "--appdir=/Apps".to_string()];
-        let args = brew_install_args(&cask("firefox"), path, &flags, false);
+        let args = brew_install_args(&cask("firefox"), path, &flags);
         assert_eq!(
             args,
             vec![

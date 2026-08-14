@@ -412,7 +412,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
                     writeln!(self.out, "{name} is already installed")?;
-                } else {
+                } else if is_verbose(self.user_flags) {
                     writeln!(self.out, "{name} is already soaked")?;
                 }
             }
@@ -467,7 +467,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
 
-        let args = tap::brew_install_args(&pkg, &path, self.user_flags, true);
+        let args = tap::brew_install_args(&pkg, &path, self.user_flags);
         self.record_run(&args)
     }
 
@@ -516,7 +516,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             kind,
         };
         let path = tap::write_blob(self.tap_root, &pkg, blob)?;
-        let args = tap::brew_install_args(&pkg, &path, &[], false);
+        let args = tap::brew_install_args(&pkg, &path, &[]);
         self.record_run(&args)?;
         Ok(true)
     }
@@ -572,6 +572,10 @@ fn merge_status(slot: &mut Option<i32>, output: std::process::Output) {
         Some(prev) => prev.max(code),
         None => code,
     });
+}
+
+fn is_verbose(flags: &[String]) -> bool {
+    flags.iter().any(|f| f == "-v" || f == "--verbose")
 }
 
 fn already_installed_message(output: &std::process::Output) -> bool {
@@ -1138,7 +1142,7 @@ mod tests {
         runs.iter().any(|args| {
             args.first().map(String::as_str) == Some("install")
                 && args.iter().any(|a| a.ends_with(&suffix))
-                && args.iter().any(|a| a == "--ignore-dependencies")
+                && !args.iter().any(|a| a == "--ignore-dependencies")
         })
     }
 
@@ -1176,7 +1180,7 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(
             run_is_soaked_install(&runs, "ok"),
-            "expected soaked install of ok with --ignore-dependencies: {runs:?}"
+            "expected soaked path install of ok without --ignore-dependencies: {runs:?}"
         );
         assert!(
             !run_has_token(&runs, "new") && !run_has_token(&runs, "brewsoakr/soaked/new"),
@@ -1224,6 +1228,74 @@ mod tests {
         assert!(
             text.contains(&ahead_message("ahead")),
             "missing ahead message: {text}"
+        );
+    }
+
+    #[test]
+    fn upgrade_already_soaked_is_silent_by_default() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            !text.contains("already soaked"),
+            "already soaked must be silent without -v: {text}"
+        );
+        assert!(
+            lock_runs(&brew).is_empty(),
+            "already soaked must not invoke brew"
+        );
+    }
+
+    #[test]
+    fn upgrade_already_soaked_prints_when_verbose() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &[],
+            &["--verbose".to_string()],
+            &mut out,
+        )
+        .expect("upgrade");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains("wget is already soaked"),
+            "verbose upgrade must print already soaked: {text}"
         );
     }
 
@@ -1529,7 +1601,7 @@ mod tests {
         );
         assert!(
             run_is_soaked_install(&runs, "app"),
-            "cask target must install with --ignore-dependencies: {runs:?}"
+            "cask target must path-install without --ignore-dependencies: {runs:?}"
         );
         assert!(!result.refused);
     }
@@ -1582,7 +1654,7 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(
             !run_has_token(&runs, "brewsoakr/soaked/fresh"),
-            "must not --ignore-dependencies the target after git failure: {runs:?}"
+            "must not install the target after git failure: {runs:?}"
         );
     }
 
@@ -1681,7 +1753,7 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(
             run_is_soaked_install(&runs, "wget"),
-            "behind reinstall must tap-install cutoff with --ignore-dependencies: {runs:?}"
+            "behind reinstall must path-install cutoff without --ignore-dependencies: {runs:?}"
         );
         assert!(
             !runs
