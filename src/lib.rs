@@ -9,6 +9,7 @@ pub mod github;
 pub mod hours;
 pub mod identity;
 pub mod paths;
+pub mod report;
 pub mod resolve;
 pub mod snapshot;
 pub mod tap;
@@ -120,9 +121,30 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
     let resolved = config::resolve_hours(inv.soak_hours, env.as_deref(), file.as_deref())?;
-    config::apply_persist(resolved.persist, &world.config_path())?;
+    if inv.command.is_soaked() {
+        config::apply_persist(resolved.persist, &world.config_path())?;
+    }
 
     match inv.command {
+        cli::Command::Version => {
+            println!("{}", cli::version_line());
+            Ok(Dispatch::Exit(0))
+        }
+        cli::Command::Help { topic: None } => {
+            print!("{}", cli::help_text());
+            Ok(Dispatch::Exit(0))
+        }
+        cli::Command::Help { topic: Some(topic) } => {
+            if let Some(text) = cli::command_help(&topic) {
+                print!("{text}");
+                Ok(Dispatch::Exit(0))
+            } else {
+                Ok(Dispatch::Exec(
+                    world.brew().brew_bin().to_path_buf(),
+                    vec!["help".into(), topic],
+                ))
+            }
+        }
         cli::Command::Passthrough { args } => {
             Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), args))
         }
@@ -130,16 +152,15 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let cache = world.cache_path();
             let mut out = std::io::stdout();
             cmd::update(
+                world.brew(),
                 world.git(),
                 world.github(),
                 &cache,
                 resolved.hours,
                 world.now(),
+                cmd::is_verbose(&inv.brew_args),
                 &mut out,
             )?;
-            if let Ok(Some(snaps)) = snapshot::load_state(&cache) {
-                cmd::prefetch_installed(world.brew(), world.git(), &cache, &snaps);
-            }
             Ok(Dispatch::Exit(0))
         }
         cli::Command::Outdated => {
@@ -149,6 +170,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 return Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), argv));
             }
             let cache = world.cache_path();
+            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
@@ -157,8 +179,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 resolved.hours,
                 world.now(),
                 false,
+                &mut out,
             )?;
-            let mut out = std::io::stdout();
             soaked_exit(cmd::outdated(
                 world.brew(),
                 world.git(),
@@ -176,6 +198,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 return Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), argv));
             }
             let cache = world.cache_path();
+            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
@@ -184,8 +207,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 resolved.hours,
                 world.now(),
                 false,
+                &mut out,
             )?;
-            let mut out = std::io::stdout();
             soaked_exit(cmd::info(
                 world.brew(),
                 world.git(),
@@ -199,6 +222,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Upgrade { names } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
+            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
@@ -207,8 +231,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 resolved.hours,
                 world.now(),
                 true,
+                &mut out,
             )?;
-            let mut out = std::io::stdout();
             soaked_exit(cmd::upgrade(
                 world.brew(),
                 world.git(),
@@ -227,6 +251,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
+            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
@@ -235,8 +260,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 resolved.hours,
                 world.now(),
                 true,
+                &mut out,
             )?;
-            let mut out = std::io::stdout();
             soaked_exit(cmd::install(
                 world.brew(),
                 world.git(),
@@ -253,6 +278,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Reinstall { names } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
+            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
@@ -261,8 +287,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 resolved.hours,
                 world.now(),
                 true,
+                &mut out,
             )?;
-            let mut out = std::io::stdout();
             soaked_exit(cmd::reinstall(
                 world.brew(),
                 world.git(),
@@ -329,6 +355,10 @@ mod tests {
                 CommitInfo {
                     sha: "thirtyh".into(),
                     committer_time: now - Duration::hours(30),
+                },
+                CommitInfo {
+                    sha: "sixtyh".into(),
+                    committer_time: now - Duration::hours(60),
                 },
             ],
         }
@@ -450,6 +480,27 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        assert!(
+            !world.config_path().exists(),
+            "passthrough must not persist --soak-hours"
+        );
+    }
+
+    #[test]
+    fn soak_hours_persists_on_soaked_command() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["--soak-hours", "48", "--version"]), &world).expect("version") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !world.config_path().exists(),
+            "version must not persist --soak-hours"
+        );
+        match dispatch(&s(&["--soak-hours", "48", "outdated"]), &world).expect("outdated") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
         let text = std::fs::read_to_string(world.config_path()).expect("persisted config");
         assert_eq!(text, "SOAK_HOURS = 48\n");
     }
@@ -465,6 +516,42 @@ mod tests {
         assert!(
             world.github.refreshed.get(),
             "refresh should have queried github"
+        );
+    }
+
+    #[test]
+    fn help_install_is_soak_aware() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["help", "install"]), &world).expect("help") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !world.github.refreshed.get(),
+            "help install must not refresh"
+        );
+        match dispatch(&s(&["help", "services"]), &world).expect("help services") {
+            Dispatch::Exec(_bin, argv) => {
+                assert_eq!(argv, s(&["help", "services"]));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn version_and_help_exit_without_refresh() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["--version"]), &world).expect("version") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
+        match dispatch(&s(&["--help"]), &world).expect("help") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            !world.github.refreshed.get(),
+            "version/help must not refresh snapshots"
         );
     }
 

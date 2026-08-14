@@ -61,7 +61,7 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
             }
         }
     };
-    let revision = first_u32(rb, "revision ").unwrap_or(0);
+    let revision = first_u32_in(depth1_lines(rb), "revision ").unwrap_or(0);
     let rebuild = first_u32(rb, "rebuild ");
     let sha256 = first_sha256_before_bottle(rb)
         .or(git_rev)
@@ -197,8 +197,11 @@ fn starts_with_bang_call(line: &str, keyword: &str) -> bool {
 }
 
 fn first_quoted(rb: &str, key: &str) -> Option<String> {
-    for line in rb.lines() {
-        let t = line.trim_start();
+    first_quoted_in(depth1_lines(rb), key)
+}
+
+fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> Option<String> {
+    for t in lines {
         if let Some(q) = t.strip_prefix(key).and_then(first_double_quoted) {
             return Some(q);
         }
@@ -206,10 +209,41 @@ fn first_quoted(rb: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Quoted string, or a Ruby symbol such as `:latest` / `:no_check`.
-fn first_quoted_or_symbol(rb: &str, key: &str) -> Option<String> {
+/// Lines in the formula/cask body, not inside `resource`/`livecheck`/`bottle`/`on_*`.
+fn depth1_lines(rb: &str) -> Vec<&str> {
+    let mut depth = 0i32;
+    let mut out = Vec::new();
     for line in rb.lines() {
         let t = line.trim_start();
+        if is_ruby_end(t) {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        if depth == 1 {
+            out.push(t);
+        }
+        if opens_ruby_block(t) {
+            depth += 1;
+        }
+    }
+    out
+}
+
+fn is_ruby_end(t: &str) -> bool {
+    t == "end" || t.starts_with("end ") || t.starts_with("end;") || t.starts_with("end#")
+}
+
+fn opens_ruby_block(t: &str) -> bool {
+    if t.starts_with("class ") || t.starts_with("module ") || t.starts_with("cask ") {
+        return true;
+    }
+    let stripped = t.split('#').next().unwrap_or(t).trim_end();
+    stripped == "do" || stripped.ends_with(" do") || stripped.contains(" do |")
+}
+
+/// Quoted string, or a Ruby symbol such as `:latest` / `:no_check`.
+fn first_quoted_or_symbol(rb: &str, key: &str) -> Option<String> {
+    for t in depth1_lines(rb) {
         let Some(rest) = t.strip_prefix(key) else {
             continue;
         };
@@ -244,8 +278,11 @@ fn first_double_quoted(s: &str) -> Option<String> {
 }
 
 fn first_u32(rb: &str, key: &str) -> Option<u32> {
-    for line in rb.lines() {
-        let t = line.trim_start();
+    first_u32_in(rb.lines().map(str::trim_start), key)
+}
+
+fn first_u32_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> Option<u32> {
+    for t in lines {
         if let Some(rest) = t.strip_prefix(key) {
             let token = rest.split_whitespace().next()?;
             if let Ok(n) = token.parse::<u32>() {
@@ -276,11 +313,10 @@ fn is_bottle_do(line: &str) -> bool {
 }
 
 fn first_sha256_before_bottle(rb: &str) -> Option<String> {
-    for line in rb.lines() {
-        if is_bottle_do(line) {
+    for t in depth1_lines(rb) {
+        if is_bottle_do(t) {
             break;
         }
-        let t = line.trim_start();
         if let Some(q) = t.strip_prefix("sha256 ").and_then(first_double_quoted) {
             return Some(q);
         }
@@ -392,6 +428,23 @@ class Old < Formula
   deprecate! date: "2024-01-01", because: :unmaintained
 end
 "#;
+
+    #[test]
+    fn resource_url_does_not_steal_stable_version() {
+        let rb = r#"
+class Wget < Formula
+  resource "extra" do
+    url "https://example.com/extra-9.9.9.tar.gz"
+    sha256 "deadbeef"
+  end
+  url "https://example.com/wget-1.21.4.tar.gz"
+  sha256 "aaa111"
+end
+"#;
+        let id = parse_formula(rb).unwrap();
+        assert_eq!(id.version, "1.21.4");
+        assert_eq!(id.sha256, "aaa111");
+    }
 
     #[test]
     fn parse_formula_from_url_version_and_source_sha() {

@@ -25,26 +25,102 @@ pub enum Command {
     Info {
         names: Vec<String>,
     },
+    Version,
+    Help {
+        topic: Option<String>,
+    },
     Passthrough {
         args: Vec<String>,
     },
 }
 
+impl Command {
+    pub fn is_soaked(&self) -> bool {
+        matches!(
+            self,
+            Command::Update
+                | Command::Upgrade { .. }
+                | Command::Install { .. }
+                | Command::Reinstall { .. }
+                | Command::Outdated
+                | Command::Info { .. }
+        )
+    }
+}
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn version_line() -> String {
+    format!("brewsoakr {VERSION}")
+}
+
+pub fn help_text() -> &'static str {
+    "\
+Usage: brewsoakr [options] <command> [args...]
+
+A Homebrew wrapper that delays core/cask updates for a soak window.
+
+Soaked commands:
+  update, upgrade, install, reinstall, outdated, info
+Other brew commands are passed through unchanged.
+
+Options:
+  --soak-hours <N>   soak window in hours (default 24; also BREWSOAK_SOAK_HOURS)
+  -v, --verbose      show soak window, cutoff, and every package evaluated
+  -V, --version      print brewsoakr version and exit
+  -h, --help         show this help
+  help <command>     soak-aware help for a soaked command; else brew help
+
+Examples:
+  brewsoakr update
+  brewsoakr outdated
+  brewsoakr upgrade
+  brewsoakr info wget
+  brewsoakr --version
+"
+}
+
 pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
     if args.is_empty() {
-        return Err(Error::Usage(
-            "Usage: brewsoakr [--soak-hours <HOURS>] <command> [args...]\n\
-             Available commands: update, upgrade, install, reinstall, outdated, info"
-                .into(),
-        ));
+        return Err(Error::Usage(help_text().to_string()));
     }
 
     let (soak_hours, remaining) = extract_soak_hours(args)?;
+    if remaining.iter().any(|a| a == "--version" || a == "-V") {
+        return Ok(Invocation {
+            soak_hours,
+            command: Command::Version,
+            brew_args: Vec::new(),
+        });
+    }
+    if remaining.iter().all(|a| a.starts_with('-'))
+        && remaining
+            .iter()
+            .any(|a| a == "--help" || a == "-h" || a == "--verbose" || a == "-v")
+    {
+        return Ok(Invocation {
+            soak_hours,
+            command: Command::Help { topic: None },
+            brew_args: Vec::new(),
+        });
+    }
+
     let Some(sub_idx) = remaining.iter().position(|a| !a.starts_with('-')) else {
         return Ok(passthrough(soak_hours, remaining));
     };
 
     let subcommand = remaining[sub_idx].as_str();
+    if subcommand == "help" {
+        let topic = remaining[sub_idx + 1..]
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .cloned();
+        return Ok(Invocation {
+            soak_hours,
+            command: Command::Help { topic },
+            brew_args: Vec::new(),
+        });
+    }
     let before = &remaining[..sub_idx];
     let after = &remaining[sub_idx + 1..];
 
@@ -150,6 +226,81 @@ fn split_names_and_flags(before: &[String], after: &[String]) -> (Vec<String>, V
         }
     }
     (names, brew_args)
+}
+
+pub fn command_help(topic: &str) -> Option<&'static str> {
+    Some(match topic {
+        "update" => {
+            "\
+Usage: brewsoakr update
+
+Refresh soak snapshots for homebrew-core and homebrew-cask.
+Does not update the Homebrew tool itself.
+
+Prints soak hours, cutoff/HEAD SHAs (with cutoff time), fetch progress,
+and a summary of installed packages that became eligible, are still
+soaking, or are gone at HEAD.
+
+  -v, --verbose   print every installed package and why it classified that way
+"
+        }
+        "upgrade" => {
+            "\
+Usage: brewsoakr upgrade [formula|cask ...]
+
+Upgrade installed core/cask packages to the soaked (cutoff) artifact.
+Packages born inside the soak window are held. Ahead-of-soak installs
+are left unchanged. Pinned packages are skipped.
+
+With no names, considers every installed core formula and cask.
+Third-party tap tokens are passed through to brew.
+
+  -v, --verbose   print soak window and a line for every package evaluated
+"
+        }
+        "install" => {
+            "\
+Usage: brewsoakr install [--formula|--cask] <name> ...
+
+Install the soaked cutoff artifact if it is eligible.
+Too-new / yanked / deprecated names are refused; use brew to bypass.
+
+  -v, --verbose   print soak window and a line for every package evaluated
+"
+        }
+        "reinstall" => {
+            "\
+Usage: brewsoakr reinstall <name> ...
+
+If the installed identity equals HEAD, runs brew reinstall (true repair).
+Otherwise installs the soaked cutoff artifact. Ahead-of-soak is refused.
+
+  -v, --verbose   print soak window and a line for every package evaluated
+"
+        }
+        "outdated" => {
+            "\
+Usage: brewsoakr outdated
+
+List installed core/cask packages that upgrade would change, plus
+held, ahead-of-soak, and pinned sections.
+
+  -v, --verbose   print soak window and a line for every package evaluated
+"
+        }
+        "info" => {
+            "\
+Usage: brewsoakr info [formula|cask ...]
+
+Show installed, cutoff, and HEAD identities and what brewsoakr would do.
+With no names, prints one compact line per installed core/cask package.
+Named packages (or --verbose) print the long form.
+
+  -v, --verbose   long form for every package plus soak window
+"
+        }
+        _ => return None,
+    })
 }
 
 fn split_install_args(
@@ -287,17 +438,44 @@ mod tests {
     }
 
     #[test]
-    fn help_and_flags_only_are_passthrough() {
-        let help = parse_argv(&s(&["--help"])).unwrap();
-        match help.command {
-            Command::Passthrough { args } => assert_eq!(args, s(&["--help"])),
-            other => panic!("{other:?}"),
+    fn version_flag_is_version_command() {
+        for args in [s(&["--version"]), s(&["-V"]), s(&["upgrade", "--version"])] {
+            let i = parse_argv(&args).unwrap();
+            assert!(matches!(i.command, Command::Version), "{args:?} -> {i:?}");
+        }
+        let i = parse_argv(&s(&["-v"])).unwrap();
+        assert!(
+            matches!(i.command, Command::Help { topic: None }),
+            "bare -v is brewsoakr help, not brew -v: {i:?}"
+        );
+    }
+
+    #[test]
+    fn help_flag_is_help_command() {
+        for args in [s(&["--help"]), s(&["-h"]), s(&["help"])] {
+            let i = parse_argv(&args).unwrap();
+            assert!(
+                matches!(i.command, Command::Help { topic: None }),
+                "{args:?} -> {i:?}"
+            );
         }
         let help_cmd = parse_argv(&s(&["help", "install"])).unwrap();
         match help_cmd.command {
-            Command::Passthrough { args } => assert_eq!(args, s(&["help", "install"])),
+            Command::Help { topic: Some(topic) } => assert_eq!(topic, "install"),
             other => panic!("{other:?}"),
         }
+        assert!(command_help("install").unwrap().contains("soak"));
+        assert!(command_help("services").is_none());
+    }
+
+    #[test]
+    fn help_text_documents_verbose_and_version() {
+        let text = help_text();
+        assert!(text.contains("--verbose"), "{text}");
+        assert!(text.contains("--version"), "{text}");
+        assert!(text.contains("--soak-hours"), "{text}");
+        assert!(text.contains("outdated"), "{text}");
+        assert_eq!(version_line(), format!("brewsoakr {VERSION}"));
     }
 
     #[test]
@@ -310,6 +488,8 @@ mod tests {
                 assert!(msg.contains("reinstall"));
                 assert!(msg.contains("outdated"));
                 assert!(msg.contains("info"));
+                assert!(msg.contains("--verbose"));
+                assert!(msg.contains("--version"));
             }
             other => panic!("{other:?}"),
         }

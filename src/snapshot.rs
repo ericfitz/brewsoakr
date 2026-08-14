@@ -13,6 +13,7 @@ pub const CASK_REPO: &str = "Homebrew/homebrew-cask";
 pub struct TapSnapshot {
     pub cutoff_sha: String,
     pub head_sha: String,
+    pub cutoff_time: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,6 +30,10 @@ struct StateFile {
     core_head: String,
     cask_cutoff: String,
     cask_head: String,
+    #[serde(default)]
+    core_cutoff_time: Option<String>,
+    #[serde(default)]
+    cask_cutoff_time: Option<String>,
 }
 
 pub fn refresh(
@@ -37,9 +42,11 @@ pub fn refresh(
     cache: &Path,
     hours: SoakHours,
     now: time::OffsetDateTime,
+    progress: &mut impl std::io::Write,
 ) -> Result<Snapshots, Error> {
     std::fs::create_dir_all(cache)?;
     let until = cutoff_instant(now, hours);
+    writeln!(progress, "fetching {CORE_REPO}…")?;
     let core = refresh_tap(
         git,
         gh,
@@ -48,6 +55,7 @@ pub fn refresh(
         CORE_REPO,
         until,
     )?;
+    writeln!(progress, "fetching {CASK_REPO}…")?;
     let cask = refresh_tap(
         git,
         gh,
@@ -76,13 +84,20 @@ pub fn load_state(cache: &Path) -> Result<Option<Snapshots>, Error> {
         core: TapSnapshot {
             cutoff_sha: parsed.core_cutoff,
             head_sha: parsed.core_head,
+            cutoff_time: parse_state_time(parsed.core_cutoff_time.as_deref()),
         },
         cask: TapSnapshot {
             cutoff_sha: parsed.cask_cutoff,
             head_sha: parsed.cask_head,
+            cutoff_time: parse_state_time(parsed.cask_cutoff_time.as_deref()),
         },
         hours,
     }))
+}
+
+fn parse_state_time(raw: Option<&str>) -> Option<OffsetDateTime> {
+    let raw = raw?;
+    OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339).ok()
 }
 
 fn refresh_tap(
@@ -95,9 +110,9 @@ fn refresh_tap(
 ) -> Result<TapSnapshot, Error> {
     git.init_bare(dir)?;
     let head_sha = gh.head_sha(repo)?;
-    let cutoff_sha = match gh.latest_commit_until(repo, until) {
-        Ok(info) => info.sha,
-        Err(_) => cutoff_via_shallow(git, dir, remote, until)?,
+    let (cutoff_sha, cutoff_time) = match gh.latest_commit_until(repo, until) {
+        Ok(info) => (info.sha, Some(info.committer_time)),
+        Err(_) => (cutoff_via_shallow(git, dir, remote, until)?, None),
     };
     git.fetch_depth1(dir, remote, &cutoff_sha, REF_CUTOFF)?;
     git.fetch_depth1(dir, remote, &head_sha, REF_HEAD)?;
@@ -105,11 +120,12 @@ fn refresh_tap(
     Ok(TapSnapshot {
         cutoff_sha,
         head_sha,
+        cutoff_time,
     })
 }
 
 fn write_state(cache: &Path, snaps: &Snapshots) -> Result<(), Error> {
-    let body = format!(
+    let mut body = format!(
         "hours = {}\ncore_cutoff = \"{}\"\ncore_head = \"{}\"\ncask_cutoff = \"{}\"\ncask_head = \"{}\"\n",
         snaps.hours.get(),
         snaps.core.cutoff_sha,
@@ -117,6 +133,16 @@ fn write_state(cache: &Path, snaps: &Snapshots) -> Result<(), Error> {
         snaps.cask.cutoff_sha,
         snaps.cask.head_sha,
     );
+    if let Some(t) = snaps.core.cutoff_time
+        && let Ok(s) = t.format(&time::format_description::well_known::Rfc3339)
+    {
+        body.push_str(&format!("core_cutoff_time = \"{s}\"\n"));
+    }
+    if let Some(t) = snaps.cask.cutoff_time
+        && let Ok(s) = t.format(&time::format_description::well_known::Rfc3339)
+    {
+        body.push_str(&format!("cask_cutoff_time = \"{s}\"\n"));
+    }
     std::fs::write(cache.join("state.toml"), body)?;
     Ok(())
 }
@@ -174,7 +200,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
-        let snaps = refresh(&git, &fixture_gh(), dir.path(), hours, now()).expect("refresh");
+        let snaps = refresh(
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            hours,
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("refresh");
         assert_eq!(snaps.core.cutoff_sha, "thirtyh");
         assert_eq!(snaps.core.head_sha, "headsha");
         assert_eq!(snaps.cask.cutoff_sha, "thirtyh");
@@ -189,7 +223,15 @@ mod tests {
 
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
-        let snaps = refresh(&git, &fixture_gh(), dir.path(), hours, now()).expect("refresh");
+        let snaps = refresh(
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            hours,
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("refresh");
         let loaded = load_state(dir.path())
             .expect("load")
             .expect("state.toml written");
@@ -216,12 +258,20 @@ mod tests {
             dir.path(),
             SoakHours::new(24).expect("24"),
             now(),
+            &mut std::io::sink(),
         )
         .expect("refresh 24h");
         assert_eq!(first.core.cutoff_sha, "thirtyh");
 
-        let second = refresh(&git, &gh, dir.path(), SoakHours::new(8).expect("8"), now())
-            .expect("refresh 8h");
+        let second = refresh(
+            &git,
+            &gh,
+            dir.path(),
+            SoakHours::new(8).expect("8"),
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("refresh 8h");
         assert_eq!(second.core.cutoff_sha, "tenh");
         assert_eq!(second.core.head_sha, "headsha");
         assert_eq!(second.hours.get(), 8);

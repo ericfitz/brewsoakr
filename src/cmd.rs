@@ -3,6 +3,7 @@ use crate::eligibility::{self, DesiredAction, UpstreamStatus};
 use crate::git::GitStore;
 use crate::github::GithubApi;
 use crate::identity::{self, PkgIdentity};
+use crate::report::{self, Counts};
 use crate::resolve::{self, PkgKind, PkgRef};
 use crate::snapshot::{self, Snapshots};
 use crate::tap;
@@ -46,6 +47,7 @@ pub fn combine_exit(refused: bool, brew_status: Option<i32>) -> i32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn ensure_snapshots(
     git: &impl GitStore,
     gh: &impl GithubApi,
@@ -54,17 +56,118 @@ pub fn ensure_snapshots(
     hours: SoakHours,
     now: time::OffsetDateTime,
     force: bool,
+    progress: &mut impl Write,
 ) -> Result<Snapshots, Error> {
     let snaps = if force {
-        snapshot::refresh(git, gh, cache, hours, now)?
+        snapshot::refresh(git, gh, cache, hours, now, progress)?
     } else {
         match snapshot::load_state(cache)? {
             Some(s) => return Ok(s),
-            None => snapshot::refresh(git, gh, cache, hours, now)?,
+            None => snapshot::refresh(git, gh, cache, hours, now, progress)?,
         }
     };
     prefetch_installed(brew, git, cache, &snaps);
     Ok(snaps)
+}
+
+type Classified = (
+    String,
+    DesiredAction,
+    Option<PkgIdentity>,
+    Option<PkgIdentity>,
+    Option<PkgIdentity>,
+);
+
+fn classify_installed(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    cache: &Path,
+    snaps: &Snapshots,
+) -> Result<Vec<Classified>, Error> {
+    let mut out = Vec::new();
+    let installed = brew.installed_core()?;
+    for pkg in installed {
+        let Some(view) = resolve_view(
+            git,
+            snaps,
+            cache,
+            &pkg.name,
+            pkg.kind,
+            Some(&pkg.receipt_rb),
+        )?
+        else {
+            continue;
+        };
+        out.push((
+            pkg.name,
+            view.action,
+            view.installed,
+            view.cutoff,
+            view.head,
+        ));
+    }
+    Ok(out)
+}
+
+fn write_update_summary(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    cache: &Path,
+    snaps: &Snapshots,
+    before: &[Classified],
+    verbose: bool,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let after = classify_installed(brew, git, cache, snaps)?;
+    let before_map: std::collections::HashMap<_, _> = before
+        .iter()
+        .map(|(n, a, _, _, _)| (n.as_str(), *a))
+        .collect();
+    let mut eligible = Vec::new();
+    let mut soaking = Vec::new();
+    let mut gone = Vec::new();
+    for (name, action, inst, cut, head) in &after {
+        if verbose {
+            let did = match action {
+                DesiredAction::InstallCutoff => "eligible after this update",
+                DesiredAction::RefuseTooNew => "still soaking",
+                DesiredAction::RefuseYanked => "gone at HEAD",
+                DesiredAction::NoOpAlreadySoaked => "already at cutoff",
+                DesiredAction::LeaveAheadOfSoak => "ahead of soak",
+                DesiredAction::RefuseDeprecated => "deprecated at HEAD",
+            };
+            writeln!(
+                out,
+                "{}",
+                report::evaluate_line(
+                    name,
+                    *action,
+                    inst.as_ref(),
+                    cut.as_ref(),
+                    head.as_ref(),
+                    did
+                )
+            )?;
+        }
+        match action {
+            DesiredAction::InstallCutoff => {
+                let was = before_map.get(name.as_str());
+                if was.is_none() || matches!(was, Some(DesiredAction::RefuseTooNew)) {
+                    eligible.push(name.clone());
+                }
+            }
+            DesiredAction::RefuseTooNew => soaking.push(name.clone()),
+            DesiredAction::RefuseYanked => gone.push(name.clone()),
+            _ => {}
+        }
+    }
+    write_section(out, "==> Became eligible", &eligible)?;
+    write_section(out, "==> Still soaking", &soaking)?;
+    write_section(out, "==> Gone at HEAD", &gone)?;
+    if eligible.is_empty() && soaking.is_empty() && gone.is_empty() {
+        writeln!(out, "no installed packages changed soak status")?;
+    }
+    Ok(())
 }
 
 pub fn prefetch_installed(brew: &impl Brew, git: &impl GitStore, cache: &Path, snaps: &Snapshots) {
@@ -76,20 +179,46 @@ pub fn prefetch_installed(brew: &impl Brew, git: &impl GitStore, cache: &Path, s
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn update(
+    brew: &impl Brew,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
     hours: SoakHours,
     now: time::OffsetDateTime,
+    verbose: bool,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    let snaps = snapshot::refresh(git, gh, cache, hours, now)?;
-    writeln!(out, "soak hours: {}", snaps.hours.get())?;
-    writeln!(out, "core cutoff: {}", snaps.core.cutoff_sha)?;
-    writeln!(out, "core head: {}", snaps.core.head_sha)?;
-    writeln!(out, "cask cutoff: {}", snaps.cask.cutoff_sha)?;
-    writeln!(out, "cask head: {}", snaps.cask.head_sha)?;
+    writeln!(out, "updating soak snapshots; soak window {}h", hours.get())?;
+    let previous = snapshot::load_state(cache)?;
+    let before = match &previous {
+        Some(prev) => classify_installed(brew, git, cache, prev).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let snaps = snapshot::refresh(git, gh, cache, hours, now, out)?;
+    writeln!(
+        out,
+        "core cutoff: {}",
+        report::format_cutoff(&snaps.core.cutoff_sha, snaps.core.cutoff_time)
+    )?;
+    writeln!(
+        out,
+        "core head: {}",
+        report::short_sha(&snaps.core.head_sha)
+    )?;
+    writeln!(
+        out,
+        "cask cutoff: {}",
+        report::format_cutoff(&snaps.cask.cutoff_sha, snaps.cask.cutoff_time)
+    )?;
+    writeln!(
+        out,
+        "cask head: {}",
+        report::short_sha(&snaps.cask.head_sha)
+    )?;
+    prefetch_installed(brew, git, cache, &snaps);
+    write_update_summary(brew, git, cache, &snaps, &before, verbose, out)?;
     writeln!(out, "snapshots refreshed")?;
     Ok(())
 }
@@ -103,12 +232,31 @@ pub fn outdated(
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
     let brew_status = passthrough_third_party(brew, "outdated", extra_args, extra_args)?;
+    let verbose = is_verbose(extra_args);
+    if verbose {
+        writeln!(
+            out,
+            "{}",
+            report::soak_banner(
+                "checking outdated",
+                snaps.hours.get(),
+                &snaps.core,
+                &snaps.cask
+            )
+        )?;
+    }
     let installed = brew.installed_core()?;
     let mut upgrades = Vec::new();
     let mut held = Vec::new();
     let mut ahead = Vec::new();
+    let mut pinned = Vec::new();
+    let mut soaked = 0usize;
     for pkg in &installed {
         if pkg.pinned {
+            pinned.push(pkg.name.clone());
+            if verbose {
+                writeln!(out, "{}: pinned; skipped", pkg.name)?;
+            }
             continue;
         }
         let Some(view) = resolve_view(
@@ -121,19 +269,40 @@ pub fn outdated(
         )?
         else {
             held.push(format!("{}: unparseable identity", pkg.name));
+            if verbose {
+                writeln!(out, "{}: unparseable identity; skipped", pkg.name)?;
+            }
             continue;
         };
         for warn in &view.warnings {
             writeln!(out, "warning: {warn}")?;
+        }
+        if verbose {
+            writeln!(
+                out,
+                "{}",
+                report::evaluate_line(
+                    &pkg.name,
+                    view.action,
+                    view.installed.as_ref(),
+                    view.cutoff.as_ref(),
+                    view.head.as_ref(),
+                    "classified for outdated",
+                )
+            )?;
         }
         match view.action {
             DesiredAction::InstallCutoff => {
                 let installed_ver = view
                     .installed
                     .as_ref()
-                    .map(identity_version)
+                    .map(report::identity_version)
                     .unwrap_or("unknown");
-                let cutoff_ver = view.cutoff.as_ref().map(identity_version).unwrap_or("none");
+                let cutoff_ver = view
+                    .cutoff
+                    .as_ref()
+                    .map(report::identity_version)
+                    .unwrap_or("none");
                 upgrades.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
             }
             DesiredAction::RefuseTooNew
@@ -144,12 +313,16 @@ pub fn outdated(
                 }
             }
             DesiredAction::LeaveAheadOfSoak => ahead.push(pkg.name.clone()),
-            DesiredAction::NoOpAlreadySoaked => {}
+            DesiredAction::NoOpAlreadySoaked => soaked += 1,
         }
     }
-    write_section(out, "==> Outdated (will upgrade)", &upgrades)?;
-    write_section(out, "==> Held", &held)?;
-    write_section(out, "==> Ahead of soak", &ahead)?;
+    write_section_always(out, "==> Outdated (will upgrade)", &upgrades)?;
+    write_section_always(out, "==> Held", &held)?;
+    write_section_always(out, "==> Ahead of soak", &ahead)?;
+    write_section_always(out, "==> Pinned", &pinned)?;
+    if upgrades.is_empty() && held.is_empty() && ahead.is_empty() && pinned.is_empty() {
+        writeln!(out, "nothing outdated (already soaked: {soaked})")?;
+    }
     Ok(RunResult {
         refused: false,
         brew_status,
@@ -167,7 +340,21 @@ pub fn info(
 ) -> Result<RunResult, Error> {
     let mut brew_status = None;
     let installed = brew.installed_core()?;
-    for name in names {
+    let verbose = is_verbose(user_flags);
+    let long_form = verbose || !names.is_empty();
+    if verbose {
+        writeln!(
+            out,
+            "{}",
+            report::soak_banner("showing info", snaps.hours.get(), &snaps.core, &snaps.cask)
+        )?;
+    }
+    let owned_names: Vec<String> = if names.is_empty() {
+        installed.iter().map(|p| p.name.clone()).collect()
+    } else {
+        names.to_vec()
+    };
+    for (i, name) in owned_names.iter().enumerate() {
         if resolve::is_third_party(name) {
             let mut args = vec!["info".to_string()];
             args.extend(user_flags.iter().cloned());
@@ -175,32 +362,76 @@ pub fn info(
             merge_status(&mut brew_status, brew.run_visible(&args)?);
             continue;
         }
-        writeln!(out, "{name}")?;
+        if long_form && i > 0 {
+            writeln!(out)?;
+        }
         let Some(view) = resolve_named(git, snaps, cache, name, &installed)? else {
-            writeln!(out, "unparseable identity")?;
+            if long_form {
+                writeln!(out, "{name}")?;
+                writeln!(out, "unparseable identity")?;
+            } else {
+                writeln!(out, "{name}  -  unparseable identity")?;
+            }
+            if verbose {
+                writeln!(out, "{name}: unparseable identity; skipped")?;
+            }
             continue;
         };
-        writeln!(
-            out,
-            "installed: {}",
-            view.installed
-                .as_ref()
-                .map(identity_version)
-                .unwrap_or("not installed")
-        )?;
-        writeln!(
-            out,
-            "cutoff: {}",
-            view.cutoff.as_ref().map(identity_version).unwrap_or("none")
-        )?;
-        writeln!(
-            out,
-            "head: {}",
-            view.head.as_ref().map(identity_version).unwrap_or("none")
-        )?;
-        writeln!(out, "action: {}", action_label(view.action))?;
-        for warn in &view.warnings {
-            writeln!(out, "warning: {warn}")?;
+        if verbose {
+            writeln!(
+                out,
+                "{}",
+                report::evaluate_line(
+                    name,
+                    view.action,
+                    view.installed.as_ref(),
+                    view.cutoff.as_ref(),
+                    view.head.as_ref(),
+                    "classified for info",
+                )
+            )?;
+        }
+        if long_form {
+            writeln!(out, "{name}")?;
+            writeln!(
+                out,
+                "installed: {}",
+                view.installed
+                    .as_ref()
+                    .map(report::identity_version)
+                    .unwrap_or("not installed")
+            )?;
+            writeln!(
+                out,
+                "cutoff: {}",
+                view.cutoff
+                    .as_ref()
+                    .map(report::identity_version)
+                    .unwrap_or("none")
+            )?;
+            writeln!(
+                out,
+                "head: {}",
+                view.head
+                    .as_ref()
+                    .map(report::identity_version)
+                    .unwrap_or("none")
+            )?;
+            writeln!(out, "action: {}", report::human_action(view.action))?;
+            for warn in &view.warnings {
+                writeln!(out, "warning: {warn}")?;
+            }
+        } else {
+            writeln!(
+                out,
+                "{}",
+                report::compact_info_line(
+                    name,
+                    view.installed.as_ref(),
+                    view.cutoff.as_ref(),
+                    view.action,
+                )
+            )?;
         }
     }
     Ok(RunResult {
@@ -222,11 +453,7 @@ pub fn upgrade(
 ) -> Result<RunResult, Error> {
     let installed = brew.installed_core()?;
     let targets: Vec<String> = if names.is_empty() {
-        installed
-            .iter()
-            .filter(|p| !p.pinned)
-            .map(|p| p.name.clone())
-            .collect()
+        installed.iter().map(|p| p.name.clone()).collect()
     } else {
         names.to_vec()
     };
@@ -297,8 +524,16 @@ pub fn reinstall(
         force_formula: false,
         refused: false,
         brew_status: None,
+        counts: Counts::default(),
         out,
     };
+    if is_verbose(user_flags) {
+        writeln!(
+            session.out,
+            "{}",
+            report::soak_banner("reinstalling", snaps.hours.get(), &snaps.core, &snaps.cask)
+        )?;
+    }
     for name in names {
         if resolve::is_third_party(name) {
             session.apply_one(name)?;
@@ -315,14 +550,22 @@ pub fn reinstall(
             continue;
         };
         if view.installed.as_ref() == view.head.as_ref() {
+            if is_verbose(user_flags) {
+                writeln!(
+                    session.out,
+                    "{name}: installed matches HEAD; brew reinstall (true repair)"
+                )?;
+            }
             let mut args = vec!["reinstall".to_string()];
             args.extend(user_flags.iter().cloned());
             args.push(name.to_string());
             session.record_run(&args)?;
+            session.counts.upgraded += 1;
             continue;
         }
         session.apply_one(name)?;
     }
+    writeln!(session.out, "{}", report::counts_line(&session.counts))?;
     Ok(RunResult {
         refused: session.refused,
         brew_status: session.brew_status,
@@ -357,10 +600,32 @@ fn apply_many(
         force_formula,
         refused: false,
         brew_status: None,
+        counts: Counts::default(),
         out,
     };
+    if is_verbose(user_flags) {
+        let doing = match brew_verb {
+            "upgrade" => "upgrading installed formulae and casks",
+            "install" => "installing",
+            "reinstall" => "reinstalling",
+            other => other,
+        };
+        writeln!(
+            session.out,
+            "{}",
+            report::soak_banner(doing, snaps.hours.get(), &snaps.core, &snaps.cask)
+        )?;
+    }
     for name in names {
         session.apply_one(name)?;
+    }
+    writeln!(session.out, "{}", report::counts_line(&session.counts))?;
+    if session.counts.nothing_to_do() && session.counts.soaked > 0 && brew_verb == "upgrade" {
+        writeln!(
+            session.out,
+            "already soaked: {} formulae and casks",
+            session.counts.soaked
+        )?;
     }
     Ok(RunResult {
         refused: session.refused,
@@ -381,16 +646,34 @@ struct ApplySession<'a, B, G, W> {
     force_formula: bool,
     refused: bool,
     brew_status: Option<i32>,
+    counts: Counts,
     out: &'a mut W,
 }
 
 impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn apply_one(&mut self, name: &str) -> Result<(), Error> {
         if resolve::is_third_party(name) {
+            if is_verbose(self.user_flags) {
+                writeln!(
+                    self.out,
+                    "{name}: third-party; passing through to brew {}",
+                    self.brew_verb
+                )?;
+            }
             let mut args = vec![self.brew_verb.to_string()];
             args.extend(self.user_flags.iter().cloned());
             args.push(name.to_string());
             self.record_run(&args)?;
+            self.counts.upgraded += 1;
+            return Ok(());
+        }
+
+        if self.installed.iter().any(|p| p.name == name && p.pinned) && self.brew_verb == "upgrade"
+        {
+            self.counts.pinned += 1;
+            if is_verbose(self.user_flags) {
+                writeln!(self.out, "{name}: pinned; skipped")?;
+            }
             return Ok(());
         }
 
@@ -402,18 +685,40 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             .map(|p| p.receipt_rb.as_str());
         let Some(view) = resolve_view(self.git, self.snaps, self.cache, name, kind, receipt)?
         else {
+            self.counts.skipped += 1;
             writeln!(self.out, "{name}: unparseable identity; skipping")?;
             return Ok(());
         };
         for warn in &view.warnings {
             writeln!(self.out, "warning: {warn}")?;
         }
+        let did = match view.action {
+            DesiredAction::InstallCutoff => "installing cutoff",
+            DesiredAction::NoOpAlreadySoaked => "left unchanged",
+            DesiredAction::LeaveAheadOfSoak => "left unchanged",
+            DesiredAction::RefuseTooNew
+            | DesiredAction::RefuseYanked
+            | DesiredAction::RefuseDeprecated => "refused",
+        };
+        if is_verbose(self.user_flags) {
+            writeln!(
+                self.out,
+                "{}",
+                report::evaluate_line(
+                    name,
+                    view.action,
+                    view.installed.as_ref(),
+                    view.cutoff.as_ref(),
+                    view.head.as_ref(),
+                    did,
+                )
+            )?;
+        }
+        self.counts.note(view.action);
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
                     writeln!(self.out, "{name} is already installed")?;
-                } else if is_verbose(self.user_flags) {
-                    writeln!(self.out, "{name} is already soaked")?;
                 }
             }
             DesiredAction::LeaveAheadOfSoak => {
@@ -574,7 +879,7 @@ fn merge_status(slot: &mut Option<i32>, output: std::process::Output) {
     });
 }
 
-fn is_verbose(flags: &[String]) -> bool {
+pub fn is_verbose(flags: &[String]) -> bool {
     flags.iter().any(|f| f == "-v" || f == "--verbose")
 }
 
@@ -839,24 +1144,6 @@ fn parse_pkg_bytes(kind: PkgKind, bytes: &[u8]) -> Result<PkgIdentity, Error> {
     parse_pkg(kind, rb)
 }
 
-fn identity_version(id: &PkgIdentity) -> &str {
-    match id {
-        PkgIdentity::Formula(f) => f.version.as_str(),
-        PkgIdentity::Cask(c) => c.version.as_str(),
-    }
-}
-
-fn action_label(action: DesiredAction) -> &'static str {
-    match action {
-        DesiredAction::InstallCutoff => "install cutoff",
-        DesiredAction::NoOpAlreadySoaked => "already soaked",
-        DesiredAction::LeaveAheadOfSoak => "ahead of soak",
-        DesiredAction::RefuseTooNew => "too new",
-        DesiredAction::RefuseYanked => "yanked",
-        DesiredAction::RefuseDeprecated => "deprecated",
-    }
-}
-
 fn hold_why(action: DesiredAction) -> Option<&'static str> {
     match action {
         DesiredAction::RefuseTooNew => Some("too new (born inside the soak window)"),
@@ -870,9 +1157,17 @@ fn write_section(out: &mut impl Write, header: &str, lines: &[String]) -> Result
     if lines.is_empty() {
         return Ok(());
     }
+    write_section_always(out, header, lines)
+}
+
+fn write_section_always(out: &mut impl Write, header: &str, lines: &[String]) -> Result<(), Error> {
     writeln!(out, "{header}")?;
-    for line in lines {
-        writeln!(out, "{line}")?;
+    if lines.is_empty() {
+        writeln!(out, "(none)")?;
+    } else {
+        for line in lines {
+            writeln!(out, "{line}")?;
+        }
     }
     Ok(())
 }
@@ -973,10 +1268,22 @@ mod tests {
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
         let mut out = Vec::new();
-        update(&git, &fixture_gh(), dir.path(), hours, now(), &mut out).expect("update");
+        update(
+            &MockBrew::new(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            hours,
+            now(),
+            false,
+            &mut out,
+        )
+        .expect("update");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("thirtyh"), "{text}");
         assert!(text.contains("headsha"), "{text}");
+        assert!(text.contains("fetching Homebrew/homebrew-core"), "{text}");
+        assert!(text.contains("soak window 24h"), "{text}");
         assert!(
             dir.path().join("state.toml").is_file(),
             "state.toml missing"
@@ -1021,10 +1328,12 @@ mod tests {
             core: TapSnapshot {
                 cutoff_sha: "cutoffsha".into(),
                 head_sha: "headsha".into(),
+                cutoff_time: None,
             },
             cask: TapSnapshot {
                 cutoff_sha: "caskcut".into(),
                 head_sha: "caskhead".into(),
+                cutoff_time: None,
             },
             hours: SoakHours::new(24).expect("hours >= 1"),
         };
@@ -1099,15 +1408,33 @@ mod tests {
         assert!(!result.refused, "info is read-only");
     }
 
+    #[test]
+    fn info_without_names_lists_installed_core() {
+        let (brew, git, snaps) = view_world();
+        let mut out = Vec::new();
+        let result = info(&brew, &git, &snaps, unused_cache(), &[], &[], &mut out).expect("info");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("alpha"), "missing installed alpha: {text}");
+        assert!(text.contains("beta"), "missing installed beta: {text}");
+        assert!(text.contains("gamma"), "missing installed gamma: {text}");
+        assert!(
+            !text.contains("action:"),
+            "nameless info must be compact: {text}"
+        );
+        assert!(!result.refused, "info is read-only");
+    }
+
     fn core_snaps() -> Snapshots {
         Snapshots {
             core: TapSnapshot {
                 cutoff_sha: "cutoffsha".into(),
                 head_sha: "headsha".into(),
+                cutoff_time: None,
             },
             cask: TapSnapshot {
                 cutoff_sha: "caskcut".into(),
                 head_sha: "caskhead".into(),
+                cutoff_time: None,
             },
             hours: SoakHours::new(24).expect("hours >= 1"),
         }
@@ -1258,8 +1585,12 @@ mod tests {
         .expect("upgrade");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
-            !text.contains("already soaked"),
+            !text.contains("wget is already soaked"),
             "already soaked must be silent without -v: {text}"
+        );
+        assert!(
+            text.contains("already soaked"),
+            "summary must mention already soaked: {text}"
         );
         assert!(
             lock_runs(&brew).is_empty(),
@@ -1294,7 +1625,7 @@ mod tests {
         .expect("upgrade");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
-            text.contains("wget is already soaked"),
+            text.contains("wget:") && text.contains("soaked"),
             "verbose upgrade must print already soaked: {text}"
         );
     }
@@ -1947,7 +2278,16 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("ok"), "unpinned must list: {text}");
         assert!(
-            !text.contains("pin"),
+            text.contains("==> Pinned"),
+            "missing pinned section: {text}"
+        );
+        let outdated_block = text.split("==> Pinned").next().unwrap_or(&text);
+        assert!(
+            !outdated_block
+                .split("==> Held")
+                .next()
+                .unwrap_or("")
+                .contains("pin"),
             "pinned must not list as outdated: {text}"
         );
     }

@@ -131,11 +131,13 @@ File-hash / identity comparison is required so a same-version bottle rebuild sti
 
 ## Commands
 
-`brewsoakr` uses the same argv shape as `brew`. `--soak-hours N` is the only extra flag. Other flags (`-v`, `--debug`, `--formula`, `--cask`, …) are forwarded to `brew` when we invoke it.
+`brewsoakr` uses the same argv shape as `brew`. Extra flags brewsoakr owns: `--soak-hours N`, `-v`/`--verbose` (already-soaked lines), `-V`/`--version`, `-h`/`--help`. Other flags (`--debug`, `--formula`, `--cask`, …) are forwarded to `brew` when we invoke it.
+
+`brewsoakr --version` and `brewsoakr -V` print `brewsoakr <Cargo.toml version>` and exit 0. They are not passed through to `brew`. `brewsoakr --help`, `brewsoakr -h`, and `brewsoakr help` (no topic) print brewsoakr help and exit 0. `brewsoakr help <cmd>` still execs `brew help <cmd>`.
 
 ### `update`
 
-Fetches both remotes, moves cutoff, sets HEAD, prefetches installed blobs, prunes clones. Does **not** update the Homebrew tool. Prints soak hours, both SHAs per tap, and a short summary (became eligible / still soaking / gone at HEAD).
+Fetches both remotes, moves cutoff, sets HEAD, prefetches installed blobs, prunes clones. Does **not** update the Homebrew tool. Prints soak hours, cutoff SHAs **with committer time**, fetch progress per tap, and a short summary (became eligible / still soaking / gone at HEAD). `-v` also prints every installed package and why it classified that way.
 
 ### `outdated`
 
@@ -146,6 +148,9 @@ Held packages (soaking, yanked/deprecated) are printed separately with why, not 
 ### `info`
 
 Shows installed identity, soaked (cutoff) candidate, and HEAD. Makes clear which one `brewsoakr` would install.
+
+- With names: those packages (third-party tokens `exec brew info`).
+- With no names: every installed homebrew/core formula and homebrew/cask cask (including pinned).
 
 ### `upgrade` [names…]
 
