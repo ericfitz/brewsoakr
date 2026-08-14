@@ -1,7 +1,8 @@
 # brewsoak
 
 A Homebrew wrapper that delays `homebrew/core` and `homebrew/cask` updates
-for a soak window so a compromised package can be yanked before you install it.
+for a soak window. This gives security researchers time to discover and yank
+a compromised package before you install it.
 
 Third-party taps and every other `brew` subcommand pass through unchanged.
 There is no soak bypass flag: run `brew` directly if you need HEAD now.
