@@ -22,7 +22,7 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
         | DesiredAction::InstallCutoff => return None,
     };
     Some(format!(
-        "{why}; use `brew {brew_verb} {name}` to bypass brewsoakr."
+        "{why}; use `brew {brew_verb} {name}` to bypass brewsoak."
     ))
 }
 
@@ -725,7 +725,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 if self.brew_verb == "reinstall" {
                     writeln!(
                         self.out,
-                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {name}` to bypass brewsoakr."
+                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {name}` to bypass brewsoak."
                     )?;
                     self.refused = true;
                 } else {
@@ -845,7 +845,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         };
         writeln!(
             self.out,
-            "cannot install {target}: dependency {why}; use `brew {} {target}` to bypass brewsoakr.",
+            "cannot install {target}: dependency {why}; use `brew {} {target}` to bypass brewsoak.",
             self.brew_verb
         )?;
         Ok(())

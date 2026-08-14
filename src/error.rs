@@ -9,7 +9,7 @@ pub enum Error {
         message: String,
     },
     Io(std::io::Error),
-    /// A git invocation failed. `action` is what brewsoakr was doing;
+    /// A git invocation failed. `action` is what brewsoak was doing;
     /// `detail` is git's stderr (or why git could not be started).
     Git {
         action: String,

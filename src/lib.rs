@@ -88,7 +88,7 @@ impl World for RealWorld {
 
     fn tap_root(&self) -> PathBuf {
         // Must live outside Homebrew's Taps/ so `brew install /path/foo.rb`
-        // is not treated as brewsoakr/soaked (same-name tap conflict).
+        // is not treated as brewsoak/soaked (same-name tap conflict).
         self.cache_path().join("staging")
     }
 
@@ -110,7 +110,7 @@ pub fn run(args: &[String]) -> i32 {
         Ok(Dispatch::Exit(c)) => c,
         Ok(Dispatch::Exec(bin, argv)) => brew::exec(&bin, &argv),
         Err(e) => {
-            eprintln!("brewsoakr: {e}");
+            eprintln!("brewsoak: {e}");
             e.exit_code()
         }
     }
@@ -313,7 +313,7 @@ fn soaked_exit(result: Result<cmd::RunResult, Error>) -> Result<Dispatch, Error>
         Ok(r) => Ok(Dispatch::Exit(cmd::combine_exit(r.refused, r.brew_status))),
         Err(Error::Brew { status, message }) => {
             if !message.is_empty() {
-                eprintln!("brewsoakr: {message}");
+                eprintln!("brewsoak: {message}");
             }
             Ok(Dispatch::Exit(cmd::combine_exit(false, Some(status))))
         }

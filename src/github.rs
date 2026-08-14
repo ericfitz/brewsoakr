@@ -47,7 +47,7 @@ impl UreqGithub {
         until: Option<OffsetDateTime>,
     ) -> Result<CommitInfo, Error> {
         let url = format!("{}/repos/{}/commits", self.base, repo);
-        let mut req = ureq::get(&url).set("User-Agent", "brewsoakr");
+        let mut req = ureq::get(&url).set("User-Agent", "brewsoak");
         if let Some(until) = until {
             let until_s = until
                 .format(&Rfc3339)

@@ -51,12 +51,12 @@ impl Command {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn version_line() -> String {
-    format!("brewsoakr {VERSION}")
+    format!("brewsoak {VERSION}")
 }
 
 pub fn help_text() -> &'static str {
     "\
-Usage: brewsoakr [options] <command> [args...]
+Usage: brewsoak [options] <command> [args...]
 
 A Homebrew wrapper that delays core/cask updates for a soak window.
 
@@ -67,16 +67,16 @@ Other brew commands are passed through unchanged.
 Options:
   --soak-hours <N>   soak window in hours (default 24; also BREWSOAK_SOAK_HOURS)
   -v, --verbose      show soak window, cutoff, and every package evaluated
-  -V, --version      print brewsoakr version and exit
+  -V, --version      print brewsoak version and exit
   -h, --help         show this help
   help <command>     soak-aware help for a soaked command; else brew help
 
 Examples:
-  brewsoakr update
-  brewsoakr outdated
-  brewsoakr upgrade
-  brewsoakr info wget
-  brewsoakr --version
+  brewsoak update
+  brewsoak outdated
+  brewsoak upgrade
+  brewsoak info wget
+  brewsoak --version
 "
 }
 
@@ -232,7 +232,7 @@ pub fn command_help(topic: &str) -> Option<&'static str> {
     Some(match topic {
         "update" => {
             "\
-Usage: brewsoakr update
+Usage: brewsoak update
 
 Refresh soak snapshots for homebrew-core and homebrew-cask.
 Does not update the Homebrew tool itself.
@@ -246,7 +246,7 @@ soaking, or are gone at HEAD.
         }
         "upgrade" => {
             "\
-Usage: brewsoakr upgrade [formula|cask ...]
+Usage: brewsoak upgrade [formula|cask ...]
 
 Upgrade installed core/cask packages to the soaked (cutoff) artifact.
 Packages born inside the soak window are held. Ahead-of-soak installs
@@ -260,7 +260,7 @@ Third-party tap tokens are passed through to brew.
         }
         "install" => {
             "\
-Usage: brewsoakr install [--formula|--cask] <name> ...
+Usage: brewsoak install [--formula|--cask] <name> ...
 
 Install the soaked cutoff artifact if it is eligible.
 Too-new / yanked / deprecated names are refused; use brew to bypass.
@@ -270,7 +270,7 @@ Too-new / yanked / deprecated names are refused; use brew to bypass.
         }
         "reinstall" => {
             "\
-Usage: brewsoakr reinstall <name> ...
+Usage: brewsoak reinstall <name> ...
 
 If the installed identity equals HEAD, runs brew reinstall (true repair).
 Otherwise installs the soaked cutoff artifact. Ahead-of-soak is refused.
@@ -280,7 +280,7 @@ Otherwise installs the soaked cutoff artifact. Ahead-of-soak is refused.
         }
         "outdated" => {
             "\
-Usage: brewsoakr outdated
+Usage: brewsoak outdated
 
 List installed core/cask packages that upgrade would change, plus
 held, ahead-of-soak, and pinned sections.
@@ -290,9 +290,9 @@ held, ahead-of-soak, and pinned sections.
         }
         "info" => {
             "\
-Usage: brewsoakr info [formula|cask ...]
+Usage: brewsoak info [formula|cask ...]
 
-Show installed, cutoff, and HEAD identities and what brewsoakr would do.
+Show installed, cutoff, and HEAD identities and what brewsoak would do.
 With no names, prints one compact line per installed core/cask package.
 Named packages (or --verbose) print the long form.
 
@@ -446,7 +446,7 @@ mod tests {
         let i = parse_argv(&s(&["-v"])).unwrap();
         assert!(
             matches!(i.command, Command::Help { topic: None }),
-            "bare -v is brewsoakr help, not brew -v: {i:?}"
+            "bare -v is brewsoak help, not brew -v: {i:?}"
         );
     }
 
@@ -475,7 +475,7 @@ mod tests {
         assert!(text.contains("--version"), "{text}");
         assert!(text.contains("--soak-hours"), "{text}");
         assert!(text.contains("outdated"), "{text}");
-        assert_eq!(version_line(), format!("brewsoakr {VERSION}"));
+        assert_eq!(version_line(), format!("brewsoak {VERSION}"));
     }
 
     #[test]

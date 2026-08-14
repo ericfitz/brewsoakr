@@ -453,7 +453,7 @@ mod tests {
         assert!(text.contains("updating soak pin"), "missing action: {text}");
         assert!(
             text.contains("git failed"),
-            "missing brewsoakr framing: {text}"
+            "missing brewsoak framing: {text}"
         );
         assert!(
             text.to_lowercase()

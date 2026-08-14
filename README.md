@@ -1,4 +1,4 @@
-# brewsoakr
+# brewsoak
 
 A Homebrew wrapper that delays `homebrew/core` and `homebrew/cask` updates
 for a soak window so a compromised package can be yanked before you install it.
@@ -8,18 +8,27 @@ There is no soak bypass flag: run `brew` directly if you need HEAD now.
 
 ## Install
 
+Once published:
+
+```bash
+cargo install brewsoak
+```
+
+From this GitHub repo (no crates.io):
+
+```bash
+cargo install --git https://github.com/ericfitz/brewsoakr
+```
+
+From a local checkout:
+
 ```bash
 git clone git@github.com:ericfitz/brewsoakr.git
 cd brewsoakr
 cargo install --path .
 ```
 
-Or run the debug binary after `cargo build`:
-
-```bash
-cargo build
-./target/debug/brewsoakr --version
-```
+Or run `target/debug/brewsoak` after `cargo build`.
 
 ## Configuration
 
@@ -46,9 +55,9 @@ Precedence: CLI > environment > file > 24.
 | `upgrade` | Install soaked cutoff artifacts for eligible installed packages. |
 | `install` | Install the soaked cutoff artifact if eligible. |
 | `reinstall` | True repair via `brew` when installed == HEAD; otherwise cutoff. |
-| `info` | Installed / cutoff / HEAD and the action brewsoakr would take. |
-| `--version` / `-V` | Print `brewsoakr <version>`. |
-| `--help` / `-h` | brewsoakr help. `help install` is soak-aware; `help services` is `brew help`. |
+| `info` | Installed / cutoff / HEAD and the action brewsoak would take. |
+| `--version` / `-V` | Print `brewsoak <version>`. |
+| `--help` / `-h` | brewsoak help. `help install` is soak-aware; `help services` is `brew help`. |
 
 Other flags (`--formula`, `--cask`, `--debug`, …) are forwarded to `brew`.
 
@@ -58,11 +67,11 @@ line for every package evaluated (what happened and why).
 ## Example
 
 ```bash
-brewsoakr update
-brewsoakr outdated
-brewsoakr upgrade
-brewsoakr info wget
-brewsoakr upgrade -v
+brewsoak update
+brewsoak outdated
+brewsoak upgrade
+brewsoak info wget
+brewsoak upgrade -v
 ```
 
 A typical `upgrade` with nothing to do prints a counts line such as:
@@ -73,4 +82,4 @@ already soaked: 137 formulae and casks
 ```
 
 Refusals tell you to run `brew upgrade <name>` (or install/reinstall) to
-bypass brewsoakr.
+bypass brewsoak.

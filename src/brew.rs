@@ -149,13 +149,13 @@ impl Brew for ProcessBrew {
     }
 }
 
-/// Env for brewsoakr-driven `brew` children.
+/// Env for brewsoak-driven `brew` children.
 /// `HOMEBREW_DEVELOPER` allows path installs (`brew install ./foo.rb`).
 /// Unset FORBID so a user-level forbid cannot block us.
 /// `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` stops brew from upgrading
 /// dependents of a cutoff install to HEAD.
-fn apply_brewsoakr_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
-    for (key, value) in brewsoakr_brew_env_pairs(skip_tap_trust) {
+fn apply_brewsoak_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
+    for (key, value) in brewsoak_brew_env_pairs(skip_tap_trust) {
         match value {
             Some(v) => {
                 cmd.env(key, v);
@@ -167,7 +167,7 @@ fn apply_brewsoakr_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
     }
 }
 
-fn brewsoakr_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'static str>)> {
+fn brewsoak_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'static str>)> {
     let mut pairs = vec![
         ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
         ("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", Some("1")),
@@ -198,7 +198,7 @@ impl ProcessBrew {
     fn spawn_brew(&self, args: &[String], visible: bool) -> Result<Output, Error> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args);
-        apply_brewsoakr_brew_env(&mut cmd, self.skip_tap_trust.get());
+        apply_brewsoak_brew_env(&mut cmd, self.skip_tap_trust.get());
         if !visible {
             return match cmd.output() {
                 Ok(output) => Ok(output),
@@ -338,7 +338,7 @@ pub fn passthrough_exec(bin: &Path, args: &[String]) -> Error {
 /// `exec` brew; returns an exit code only if replacement fails.
 pub fn exec(bin: &Path, args: &[String]) -> i32 {
     let err = passthrough_exec(bin, args);
-    eprintln!("brewsoakr: {err}");
+    eprintln!("brewsoak: {err}");
     err.exit_code()
 }
 
@@ -848,8 +848,8 @@ mod tests {
     }
 
     #[test]
-    fn brewsoakr_brew_env_enables_path_installs() {
-        let pairs = brewsoakr_brew_env_pairs(false);
+    fn brewsoak_brew_env_enables_path_installs() {
+        let pairs = brewsoak_brew_env_pairs(false);
         assert!(
             pairs
                 .iter()

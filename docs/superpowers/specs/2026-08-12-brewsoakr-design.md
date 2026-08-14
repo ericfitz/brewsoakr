@@ -1,4 +1,4 @@
-# brewsoakr design
+# brewsoak design
 
 Date: 2026-08-12
 
@@ -16,7 +16,7 @@ A Rust CLI wrapper around Homebrew that only installs core formulae and casks wh
 - Installed newer than the soaked candidate: **leave it**. Do not downgrade. A soaked `reinstall`/`install` that would refresh a too-new artifact is a refusal.
 - History is two snapshots per tap: tree at T−soak (cutoff) and tree at HEAD. No intermediate blobs. Git history older than the cutoff is pruned.
 - Eligible artifact is the cutoff `.rb`. Survival is “name still resolves at HEAD and HEAD file has no `deprecate!` / `disable!`”.
-- `brew` is the only installer. brewsoakr writes cutoff files into a local tap and invokes `brew`.
+- `brew` is the only installer. brewsoak writes cutoff files into a local tap and invokes `brew`.
 
 ## Naming and configuration
 
@@ -44,7 +44,7 @@ Invalid `--soak-hours` (missing value, non-integer, `< 1`) is a usage error, exi
 
 ## Architecture
 
-`brewsoakr` owns soak policy and history. `brew` downloads bottles, compiles, links, and manages the Cellar/Caskroom.
+`brewsoak` owns soak policy and history. `brew` downloads bottles, compiles, links, and manages the Cellar/Caskroom.
 
 1. **CLI** — clap; same argv shape as `brew` plus `--soak-hours`.
 2. **Config** — resolve hours from CLI / env / file / default.
@@ -53,11 +53,11 @@ Invalid `--soak-hours` (missing value, non-integer, `< 1`) is a usage error, exi
    - only two commits persisted per tap: `refs/brewsoak/cutoff` and `refs/brewsoak/head` (depth-1 fetches)
    - files read via `git show <sha>:<path>`; blobs fetched on demand
 4. **Eligibility** — cutoff exists ∧ survived at HEAD. Install artifact = cutoff blob.
-5. **Local tap** — `brewsoakr/soaked` at `$(brew --repository)/Library/Taps/brewsoakr/homebrew-soaked`. Cutoff `.rb` written to `Formula/<name>.rb` or `Casks/<name>.rb`.
+5. **Local tap** — `brewsoak/soaked` at `$(brew --repository)/Library/Taps/brewsoak/homebrew-soaked`. Cutoff `.rb` written to `Formula/<name>.rb` or `Casks/<name>.rb`.
 
 `brew` binary: `$HOMEBREW_PREFIX/bin/brew` if `HOMEBREW_PREFIX` is set, else `brew` on `PATH`.
 
-Two concurrent `brewsoakr` processes are unsupported.
+Two concurrent `brewsoak` processes are unsupported.
 
 ## Snapshots
 
@@ -131,9 +131,9 @@ File-hash / identity comparison is required so a same-version bottle rebuild sti
 
 ## Commands
 
-`brewsoakr` uses the same argv shape as `brew`. Extra flags brewsoakr owns: `--soak-hours N`, `-v`/`--verbose` (already-soaked lines), `-V`/`--version`, `-h`/`--help`. Other flags (`--debug`, `--formula`, `--cask`, …) are forwarded to `brew` when we invoke it.
+`brewsoak` uses the same argv shape as `brew`. Extra flags brewsoak owns: `--soak-hours N`, `-v`/`--verbose` (already-soaked lines), `-V`/`--version`, `-h`/`--help`. Other flags (`--debug`, `--formula`, `--cask`, …) are forwarded to `brew` when we invoke it.
 
-`brewsoakr --version` and `brewsoakr -V` print `brewsoakr <Cargo.toml version>` and exit 0. They are not passed through to `brew`. `brewsoakr --help`, `brewsoakr -h`, and `brewsoakr help` (no topic) print brewsoakr help and exit 0. `brewsoakr help <cmd>` still execs `brew help <cmd>`.
+`brewsoak --version` and `brewsoak -V` print `brewsoak <Cargo.toml version>` and exit 0. They are not passed through to `brew`. `brewsoak --help`, `brewsoak -h`, and `brewsoak help` (no topic) print brewsoak help and exit 0. `brewsoak help <cmd>` still execs `brew help <cmd>`.
 
 ### `update`
 
@@ -147,7 +147,7 @@ Held packages (soaking, yanked/deprecated) are printed separately with why, not 
 
 ### `info`
 
-Shows installed identity, soaked (cutoff) candidate, and HEAD. Makes clear which one `brewsoakr` would install.
+Shows installed identity, soaked (cutoff) candidate, and HEAD. Makes clear which one `brewsoak` would install.
 
 - With names: those packages (third-party tokens `exec brew info`).
 - With no names: every installed homebrew/core formula and homebrew/cask cask (including pinned).
@@ -176,16 +176,16 @@ Otherwise treat as a soaked install of the cutoff artifact. If that would not re
 
 ## Invoking brew
 
-1. On first use: `brew tap-new brewsoakr/soaked --no-git`.
+1. On first use: `brew tap-new brewsoak/soaked --no-git`.
 2. Write each needed cutoff blob to the tap (`Formula/<name>.rb` or `Casks/<name>.rb`).
-3. `brew deps --formula brewsoakr/soaked/<name>` or `brew deps --cask brewsoakr/soaked/<name>` for the dependency name list. Keep names that exist in the cutoff core/cask trees; recurse; toposort. `uses_from_macos` and non-core deps stay with `brew`.
+3. `brew deps --formula brewsoak/soaked/<name>` or `brew deps --cask brewsoak/soaked/<name>` for the dependency name list. Keep names that exist in the cutoff core/cask trees; recurse; toposort. `uses_from_macos` and non-core deps stay with `brew`.
 4. For each dep in order:
    - already installed (any identity, including ahead of soak) → leave it
-   - eligible and missing → `brew install brewsoakr/soaked/<dep>`
+   - eligible and missing → `brew install brewsoak/soaked/<dep>`
    - missing and not eligible → refuse the **target**
 5. Install the target from the staged cutoff `.rb` without `--ignore-dependencies` (Homebrew treats that flag as an unsupported developer option). The cutoff dep closure is already installed, so `brew` should treat those deps as satisfied. Set `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` so `brew` does not then upgrade dependents to HEAD. Include build deps only when `brew deps` says they are needed.
 
-User flags are forwarded. `brew` keeps stdout/stderr. brewsoakr prints refusals and ahead-of-soak notes around that. If `brew` fails for an eligible package (missing bottle, compile error), that package takes `brew`’s exit code; remaining eligible packages still run.
+User flags are forwarded. `brew` keeps stdout/stderr. brewsoak prints refusals and ahead-of-soak notes around that. If `brew` fails for an eligible package (missing bottle, compile error), that package takes `brew`’s exit code; remaining eligible packages still run.
 
 ### Out of scope (v1)
 
@@ -193,7 +193,7 @@ User flags are forwarded. `brew` keeps stdout/stderr. brewsoakr prints refusals 
 - Following formula/cask renames
 - Third-party taps
 - Updating the Homebrew tool itself
-- Concurrent brewsoakr processes
+- Concurrent brewsoak processes
 
 ## Failures and exit status
 
