@@ -9,13 +9,26 @@ There is no soak bypass flag: run `brew` directly if you need HEAD now.
 
 ## Install
 
-Once published:
+### Homebrew (macOS, recommended)
+
+```bash
+brew install ericfitz/tap/brewsoak
+```
+
+Installs a prebuilt, code-signed and notarized universal (Apple Silicon +
+Intel) binary from the [GitHub release](https://github.com/ericfitz/brewsoakr/releases).
+Upgrade later with `brew upgrade brewsoak` (brewsoak itself lives in a
+third-party tap, so it is never soaked).
+
+### Cargo
+
+From [crates.io](https://crates.io/crates/brewsoak):
 
 ```bash
 cargo install brewsoak
 ```
 
-From this GitHub repo (no crates.io):
+From this GitHub repo:
 
 ```bash
 cargo install --git https://github.com/ericfitz/brewsoakr
@@ -84,3 +97,10 @@ already soaked: 137 formulae and casks
 
 Refusals tell you to run `brew upgrade <name>` (or install/reinstall) to
 bypass brewsoak.
+
+## Releasing
+
+Maintainer notes. `release/` holds the scripts that build a universal binary,
+sign and notarize it, attach it to a GitHub release, and render the Homebrew
+formula for `ericfitz/homebrew-tap`. See [release/README.md](release/README.md)
+for the step-by-step; the crates.io release is a separate `cargo publish`.

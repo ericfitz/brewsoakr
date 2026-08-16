@@ -4,3 +4,4 @@
 /brewsoak
 **/*.rs.bk
 *.pdb
+/dist
