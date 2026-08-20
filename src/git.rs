@@ -78,6 +78,19 @@ fn run_git(action: &str, args: &[&str]) -> Result<Output, Error> {
         })
 }
 
+/// Git date options go through `approxidate`, which reads a bare integer as a
+/// loose date (`0` means *now*, not the epoch) unless it is long enough to look
+/// like a Unix timestamp. Spell the instant out so every value is unambiguous.
+fn git_date_arg(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| unix.to_string())
+}
+
 fn missing_object(output: &Output) -> bool {
     output.status.code() == Some(128)
         || String::from_utf8_lossy(&output.stderr).contains("does not exist")
@@ -168,7 +181,7 @@ impl GitStore for ProcessGit {
     fn fetch_shallow_since(&self, dir: &Path, remote: &str, until_unix: i64) -> Result<(), Error> {
         let action = format!("fetching history from {remote} to find the soak cutoff");
         let dir = dir.to_string_lossy();
-        let since = format!("--shallow-since={until_unix}");
+        let since = format!("--shallow-since={}", git_date_arg(until_unix));
         let spec = format!("+HEAD:{REF_WINDOW}");
         let output = run_git(
             &action,
@@ -192,7 +205,7 @@ impl GitStore for ProcessGit {
     fn log_sha_before(&self, dir: &Path, until_unix: i64) -> Result<Option<String>, Error> {
         let action = "looking up the last commit at or before the soak cutoff";
         let dir = dir.to_string_lossy();
-        let before = format!("--before={until_unix}");
+        let before = format!("--before={}", git_date_arg(until_unix));
         let output = run_git(
             action,
             &[
@@ -375,6 +388,38 @@ mod tests {
     }
 
     #[test]
+    fn git_date_arg_spells_out_the_epoch() {
+        // A bare `0` would reach git's approxidate as "now"; the shallow window
+        // then selects nothing and the fetch fails.
+        assert_eq!(git_date_arg(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn git_date_arg_spells_out_a_cutoff() {
+        assert_eq!(git_date_arg(COMMIT_UNIX), "2023-11-14T22:13:20Z");
+    }
+
+    /// Commits with fixed author/committer dates so `--shallow-since` windows
+    /// are not a race against the wall clock.
+    const COMMIT_UNIX: i64 = 1_700_000_000;
+
+    fn git_commit_at(dir: &Path, message: &str, unix: i64) {
+        let date = format!("{unix} +0000");
+        let out = Command::new("git")
+            .current_dir(dir)
+            .args(["commit", "-m", message])
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .output()
+            .expect("git commit");
+        assert!(
+            out.status.success(),
+            "git commit -m {message}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
     fn process_git_fetch_replaces_non_fast_forward_cutoff() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
@@ -415,11 +460,11 @@ mod tests {
         git_ok(&src, &["config", "user.name", "Test"]);
         std::fs::write(src.join("f"), "one\n").unwrap();
         git_ok(&src, &["add", "f"]);
-        git_ok(&src, &["commit", "-m", "one"]);
+        git_commit_at(&src, "one", COMMIT_UNIX);
         let older = git_ok(&src, &["rev-parse", "HEAD"]);
         std::fs::write(src.join("f"), "two\n").unwrap();
         git_ok(&src, &["add", "f"]);
-        git_ok(&src, &["commit", "-m", "two"]);
+        git_commit_at(&src, "two", COMMIT_UNIX + 60);
         let newer = git_ok(&src, &["rev-parse", "HEAD"]);
 
         let git = ProcessGit;

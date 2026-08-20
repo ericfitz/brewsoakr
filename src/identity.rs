@@ -210,23 +210,38 @@ fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> O
 }
 
 /// Lines in the formula/cask body, not inside `resource`/`livecheck`/`bottle`/`on_*`.
+/// A body-level `stable do` block is transparent: it holds the stable spec's
+/// `url`/`version`/`sha256`, which are the formula's identity. `head do` and
+/// every other block stay opaque.
 fn depth1_lines(rb: &str) -> Vec<&str> {
     let mut depth = 0i32;
+    // One entry per open block; true when the block was transparent.
+    let mut open_blocks: Vec<bool> = Vec::new();
     let mut out = Vec::new();
     for line in rb.lines() {
         let t = line.trim_start();
         if is_ruby_end(t) {
-            depth = depth.saturating_sub(1);
+            if open_blocks.pop() != Some(true) {
+                depth = depth.saturating_sub(1);
+            }
             continue;
         }
-        if depth == 1 {
+        let transparent = depth == 1 && is_stable_do(t);
+        if depth == 1 && !transparent {
             out.push(t);
         }
         if opens_ruby_block(t) {
-            depth += 1;
+            open_blocks.push(transparent);
+            if !transparent {
+                depth += 1;
+            }
         }
     }
     out
+}
+
+fn is_stable_do(t: &str) -> bool {
+    t.split('#').next().unwrap_or(t).trim_end() == "stable do"
 }
 
 fn is_ruby_end(t: &str) -> bool {
@@ -327,8 +342,22 @@ fn first_sha256_before_bottle(rb: &str) -> Option<String> {
 fn version_from_url(url: &str) -> Option<String> {
     let path = url.split('?').next().unwrap_or(url);
     let segment = path.rsplit('/').next().filter(|s| !s.is_empty())?;
-    let base = strip_archive_suffix(segment);
+    let base = strip_alpha_extension(strip_archive_suffix(segment));
     Some(version_from_basename(base))
+}
+
+/// Homebrew also downloads plain files — `.pem`, `.jar`, `.crate`, a bare
+/// `.tar` — whose extension is not part of the version. Drop one trailing
+/// `.<ext>` when the extension is all letters, so `wget-1.21.4` keeps its `.4`
+/// and `foo-2.0.rc1` keeps its `.rc1`.
+fn strip_alpha_extension(name: &str) -> &str {
+    let Some((base, ext)) = name.rsplit_once('.') else {
+        return name;
+    };
+    if base.is_empty() || ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphabetic()) {
+        return name;
+    }
+    base
 }
 
 fn strip_archive_suffix(name: &str) -> &str {
@@ -388,6 +417,116 @@ fn version_from_basename(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_from_url_drops_a_non_archive_extension() {
+        // `ca-certificates` ships a bare `.pem`, not a tarball.
+        const RB: &str = r#"
+class CaCertificates < Formula
+  url "https://curl.se/ca/cacert-2026-08-13.pem"
+  sha256 "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9"
+end
+"#;
+        let got = parse_formula(RB).expect("parse ca-certificates");
+        assert_eq!(got.version, "2026-08-13");
+    }
+
+    #[test]
+    fn version_from_url_drops_an_uncompressed_tar() {
+        assert_eq!(
+            version_from_url("https://example.com/foo-1.2.3.tar"),
+            Some("1.2.3".to_string())
+        );
+    }
+
+    #[test]
+    fn version_from_url_keeps_a_numeric_last_component() {
+        assert_eq!(
+            version_from_url("https://example.com/wget-1.21.4.tar.gz"),
+            Some("1.21.4".to_string())
+        );
+        assert_eq!(
+            version_from_url("https://example.com/foo-2.0.rc1.zip"),
+            Some("2.0.rc1".to_string())
+        );
+    }
+
+    /// `bash`: the stable spec lives in a `stable do` block, so `url`,
+    /// `sha256`, and `version` are one level deeper than usual.
+    const STABLE_BLOCK_RB: &str = r#"
+class Bash < Formula
+  desc "Bourne-Again SHell, a UNIX command interpreter"
+  head "https://git.savannah.gnu.org/git/bash.git", branch: "master"
+
+  stable do
+    url "https://ftpmirror.gnu.org/gnu/bash/bash-5.3.tar.gz"
+    mirror "https://ftp.gnu.org/gnu/bash/bash-5.3.tar.gz"
+    sha256 "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba"
+    version "5.3.15"
+  end
+
+  revision 1
+
+  bottle do
+    rebuild 2
+    sha256 cellar: :any, arm64_tahoe: "bbb222"
+  end
+end
+"#;
+
+    #[test]
+    fn stable_block_supplies_identity() {
+        let got = parse_formula(STABLE_BLOCK_RB).expect("parse stable block");
+        assert_eq!(
+            got,
+            FormulaIdentity {
+                version: "5.3.15".into(),
+                revision: 1,
+                rebuild: Some(2),
+                sha256: "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn head_block_does_not_supply_identity() {
+        const RB: &str = r#"
+class Foo < Formula
+  head do
+    url "https://example.com/foo.git", branch: "main"
+    sha256 "headsha"
+  end
+
+  stable do
+    url "https://example.com/foo-1.0.tar.gz"
+    sha256 "aaa111"
+  end
+end
+"#;
+        let got = parse_formula(RB).expect("parse head + stable");
+        assert_eq!(got.version, "1.0");
+        assert_eq!(got.sha256, "aaa111");
+    }
+
+    #[test]
+    fn resource_inside_stable_block_is_ignored() {
+        const RB: &str = r#"
+class Foo < Formula
+  stable do
+    resource "vendored" do
+      url "https://example.com/vendored-9.9.tar.gz"
+      sha256 "resourcesha"
+    end
+
+    url "https://example.com/foo-1.0.tar.gz"
+    sha256 "aaa111"
+  end
+end
+"#;
+        let got = parse_formula(RB).expect("parse nested resource");
+        assert_eq!(got.version, "1.0");
+        assert_eq!(got.sha256, "aaa111");
+    }
 
     const WGET_FORMULA: &str = r#"
 class Wget < Formula

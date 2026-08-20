@@ -460,19 +460,24 @@ fn parse_installed_json(
     Ok(out)
 }
 
-/// Formula: `installed[0].version`. Cask: string `installed`.
+/// Formula: the newest keg. Homebrew sorts `installed` oldest-first, and
+/// `brew upgrade` compares against the newest keg, so reading any other one
+/// makes brewsoak ask brew to upgrade something brew already considers current.
+/// Falls back to `linked_keg`. Cask: string `installed`.
 fn installed_version(obj: &str) -> Option<String> {
     let after = find_json_key(obj, "installed")?;
     let after = after.trim_start();
-    if after.starts_with("null") {
-        return None;
-    }
     if after.starts_with('"') {
         return parse_json_string(after).filter(|s| !s.is_empty());
     }
-    let rest = after.strip_prefix('[')?;
-    let first = scan_array_objects(rest)?.into_iter().next()?;
-    json_string_value(first, "version").filter(|s| !s.is_empty())
+    if let Some(rest) = after.strip_prefix('[')
+        && let Some(kegs) = scan_array_objects(rest)
+        && let Some(newest) = kegs.into_iter().next_back()
+        && let Some(version) = json_string_value(newest, "version").filter(|s| !s.is_empty())
+    {
+        return Some(version);
+    }
+    json_string_value(obj, "linked_keg").filter(|s| !s.is_empty())
 }
 
 fn keep_tap(tap: Option<&str>) -> bool {
@@ -681,6 +686,52 @@ mod tests {
             runs.as_slice(),
             [vec!["install".to_string(), "wget".into()]]
         );
+    }
+
+    #[test]
+    fn parse_installed_json_reads_the_newest_keg_receipt() {
+        // Homebrew sorts `installed` oldest-first; the old keg's receipt would
+        // make brewsoak disagree with `brew upgrade` about what is installed.
+        let json = r#"{
+          "formulae": [
+            {
+              "name": "ca-certificates",
+              "tap": "homebrew/core",
+              "linked_keg": "2026-08-13",
+              "installed": [{"version": "2026-07-16"}, {"version": "2026-08-13"}]
+            }
+          ],
+          "casks": []
+        }"#;
+        let got = parse_installed_json(json, |name, kind, version| {
+            assert_eq!((name, kind), ("ca-certificates", PkgKind::Formula));
+            Some(format!("keg {}", version.expect("version")))
+        })
+        .expect("parse fixture");
+        assert_eq!(
+            got,
+            vec![pkg("ca-certificates", PkgKind::Formula, "keg 2026-08-13")]
+        );
+    }
+
+    #[test]
+    fn parse_installed_json_falls_back_to_linked_keg_without_installed_kegs() {
+        let json = r#"{
+          "formulae": [
+            {
+              "name": "wget",
+              "tap": "homebrew/core",
+              "linked_keg": "1.21.4",
+              "installed": []
+            }
+          ],
+          "casks": []
+        }"#;
+        let got = parse_installed_json(json, |_name, _kind, version| {
+            Some(format!("keg {}", version.expect("version")))
+        })
+        .expect("parse fixture");
+        assert_eq!(got, vec![pkg("wget", PkgKind::Formula, "keg 1.21.4")]);
     }
 
     #[test]
