@@ -78,6 +78,27 @@ Other flags (`--formula`, `--cask`, `--debug`, …) are forwarded to `brew`.
 `-v` / `--verbose` prints the soak window, cutoff SHAs and times, and a
 line for every package evaluated (what happened and why).
 
+`--raw` turns off output summarizing and forwards `brew`'s output byte for
+byte.
+
+## Output
+
+brewsoak summarizes `brew`'s install output: one line announcing each package
+it changes, then a short line per download and install step. Bottle manifests,
+plan previews, cleanup, `==>` markers, emoji, and `already installed and
+up-to-date` notices are dropped from the terminal.
+
+Nothing is lost. Every byte `brew` writes is appended to a per-run log under
+`$TMPDIR`, and the path is printed at the end of the run.
+
+Holds, skips, and deprecation warnings are collected into a `notes:` block
+after the counts line so they are not buried in the install scroll, and
+`caveats:` follows with the caveats worth reading — brew's "shell completions
+have been installed to ..." notices are dropped, anything telling you to run
+something is kept.
+
+Deprecations more than a year away are not reported.
+
 ## Example
 
 ```bash
@@ -93,6 +114,26 @@ A typical `upgrade` with nothing to do prints a counts line such as:
 ```
 upgraded 0, already soaked 137, held 0, ahead 0, pinned 0, skipped 0
 already soaked: 137 formulae and casks
+```
+
+An `upgrade` with work to do looks like:
+
+```
+upgrading 26 of 150 packages
+[1/26] upgrading aws-c-auth 0.10.5 -> 1.0.0
+  downloading aws-c-common 1.0.0
+  installing aws-c-common 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-common/1.0.0 (109 files, 1MB)
+  ...
+upgraded 26, already soaked 124, held 0, ahead 0, pinned 0, skipped 1
+installed 989.3MB, freed 1.2GB
+notes:
+  bash: unparseable identity; skipping
+caveats:
+  git-lfs:
+    Update your git config to finish installation:
+      $ git lfs install
+full brew log: /var/folders/.../brewsoak-53417.log
 ```
 
 Refusals tell you to run `brew upgrade <name>` (or install/reinstall) to

@@ -1,8 +1,9 @@
 use crate::Error;
+use crate::quiet;
 use crate::resolve::PkgKind;
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{BufRead, ErrorKind, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -16,6 +17,16 @@ pub struct InstalledPkg {
     pub pinned: bool,
 }
 
+/// What a whole brewsoak session accumulated across every visible brew run:
+/// the caveats worth showing, the byte delta, and where the raw log went.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SessionReport {
+    pub caveats: Vec<String>,
+    pub added_bytes: u64,
+    pub freed_bytes: u64,
+    pub log_path: Option<PathBuf>,
+}
+
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
     /// Capturing run for JSON, deps, `--repository`, tap-new, and trust.
@@ -25,11 +36,50 @@ pub trait Brew {
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn tap_new_soaked(&self) -> Result<(), Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
+    /// Turn the output filter off; brew output is forwarded byte for byte.
+    fn set_raw(&self, _raw: bool) {}
+    fn session_report(&self) -> SessionReport {
+        SessionReport::default()
+    }
 }
 
 pub struct ProcessBrew {
     pub bin: PathBuf,
     skip_tap_trust: Cell<bool>,
+    raw: Cell<bool>,
+    sink: Mutex<Sink>,
+}
+
+/// Shared destination for every visible brew run: the summarizing filter plus
+/// the lazily created raw log under `$TMPDIR`.
+#[derive(Default)]
+struct Sink {
+    filter: quiet::Filter,
+    log: Option<std::fs::File>,
+    log_path: Option<PathBuf>,
+    log_failed: bool,
+}
+
+impl Sink {
+    /// Open the log on first use. A log we cannot open is not fatal: brewsoak
+    /// keeps going without one and stops retrying.
+    fn log(&mut self) -> Option<&mut std::fs::File> {
+        if self.log.is_none() && !self.log_failed {
+            let path = std::env::temp_dir().join(format!("brewsoak-{}.log", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                Ok(f) => {
+                    self.log = Some(f);
+                    self.log_path = Some(path);
+                }
+                Err(_) => self.log_failed = true,
+            }
+        }
+        self.log.as_mut()
+    }
 }
 
 impl ProcessBrew {
@@ -37,6 +87,8 @@ impl ProcessBrew {
         Self {
             bin,
             skip_tap_trust: Cell::new(false),
+            raw: Cell::new(false),
+            sink: Mutex::new(Sink::default()),
         }
     }
 }
@@ -104,6 +156,20 @@ impl Brew for ProcessBrew {
 
     fn run_visible(&self, args: &[String]) -> Result<Output, Error> {
         self.spawn_brew(args, true)
+    }
+
+    fn set_raw(&self, raw: bool) {
+        self.raw.set(raw);
+    }
+
+    fn session_report(&self) -> SessionReport {
+        let sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        SessionReport {
+            caveats: sink.filter.caveat_report(),
+            added_bytes: sink.filter.added_bytes(),
+            freed_bytes: sink.filter.freed_bytes(),
+            log_path: sink.log_path.clone(),
+        }
     }
 
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -208,9 +274,14 @@ impl ProcessBrew {
                 Err(e) => Err(Error::from(e)),
             };
         }
+        // One pipe for both streams: the summarizer needs brew's stdout and
+        // stderr in the order brew wrote them, which two reader threads cannot
+        // guarantee. Everything lands in Output.stdout; the only callers that
+        // read a visible run's output already concatenate both streams.
+        let (reader, writer) = std::io::pipe()?;
         cmd.stdin(Stdio::inherit())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stdout(writer.try_clone()?)
+            .stderr(writer);
         let mut child = match cmd.spawn() {
             Ok(child) => child,
             Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -218,23 +289,17 @@ impl ProcessBrew {
             }
             Err(e) => return Err(Error::from(e)),
         };
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
-        let out_thread = std::thread::spawn(move || match stdout_pipe.as_mut() {
-            Some(pipe) => copy_and_forward(pipe, &mut std::io::stdout()),
-            None => Vec::new(),
-        });
-        let err_thread = std::thread::spawn(move || match stderr_pipe.as_mut() {
-            Some(pipe) => copy_and_forward(pipe, &mut std::io::stderr()),
-            None => Vec::new(),
-        });
+        // Drop our copies of the write end, or the reader never sees EOF.
+        drop(cmd);
+        let raw = self.raw.get();
+        let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
+        let captured = forward_run(reader, &mut sink, args, raw);
+        drop(sink);
         let status = child.wait()?;
-        let stdout = out_thread.join().unwrap_or_default();
-        let stderr = err_thread.join().unwrap_or_default();
         Ok(Output {
             status,
-            stdout,
-            stderr,
+            stdout: captured,
+            stderr: Vec::new(),
         })
     }
 
@@ -253,23 +318,39 @@ impl ProcessBrew {
     }
 }
 
-fn copy_and_forward(src: &mut impl Read, dst: &mut impl Write) -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 8192];
+/// Read one brew run to EOF: raw bytes to the log and to the returned capture,
+/// one summarized line at a time to the terminal. Returns the raw output.
+fn forward_run(src: impl Read, sink: &mut Sink, args: &[String], raw: bool) -> Vec<u8> {
+    let mut reader = std::io::BufReader::new(src);
+    let mut captured = Vec::new();
+    let mut stdout = std::io::stdout();
+    if let Some(log) = sink.log() {
+        let _ = writeln!(log, "\n$ brew {}", args.join(" "));
+    }
+    sink.filter.start_run();
+    let mut line = Vec::new();
     loop {
-        match src.read(&mut tmp) {
+        line.clear();
+        match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
-            Ok(n) => {
-                let chunk = &tmp[..n];
-                buf.extend_from_slice(chunk);
-                let _ = dst.write_all(chunk);
-            }
+            Ok(_) => {}
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(_) => break,
         }
+        captured.extend_from_slice(&line);
+        if let Some(log) = sink.log() {
+            let _ = log.write_all(&line);
+        }
+        let text = String::from_utf8_lossy(&line);
+        if raw {
+            let _ = stdout.write_all(&line);
+        } else if let Some(out) = sink.filter.line(&text) {
+            let _ = writeln!(stdout, "{out}");
+        }
+        let _ = stdout.flush();
     }
-    let _ = dst.flush();
-    buf
+    let _ = stdout.flush();
+    captured
 }
 
 fn trust_command_unavailable(output: &Output) -> bool {
@@ -921,6 +1002,26 @@ mod tests {
                 .iter()
                 .any(|(k, v)| *k == "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" && *v == Some("1"))
         );
+    }
+
+    #[test]
+    fn process_brew_run_visible_merges_stderr_summarizes_and_logs_raw() {
+        // Cleanup on stdout, its Removing line on stderr: the summarizer only
+        // sees them in the right order because both share one pipe.
+        let brew = ProcessBrew::new(PathBuf::from("/bin/sh"));
+        let script = "echo '==> Cleanup'; echo 'Removing: /x... (1 files, 1KB)' 1>&2";
+        let output = brew
+            .run_visible(&["-c".into(), script.into()])
+            .expect("run_visible");
+        assert!(output.status.success());
+        let captured = String::from_utf8_lossy(&output.stdout);
+        assert!(captured.contains("==> Cleanup"), "{captured}");
+        assert!(captured.contains("Removing:"), "{captured}");
+
+        let report = brew.session_report();
+        assert_eq!(report.freed_bytes, 1024, "cleanup sizes are tallied");
+        let log = std::fs::read_to_string(report.log_path.expect("log path")).expect("log");
+        assert!(log.contains("Removing:"), "raw output must reach the log");
     }
 
     #[test]

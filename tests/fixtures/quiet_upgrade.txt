@@ -1,0 +1,110 @@
+  downloading aws-c-compression 1.0.0
+  downloading aws-c-cal 1.0.0
+  downloading aws-c-auth 1.0.0
+  downloading aws-c-common 1.0.0
+  downloading aws-c-io 1.0.0
+  downloading aws-c-http 1.0.0
+  downloading aws-c-sdkutils 1.0.0
+  installing aws-c-common 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-common/1.0.0 (109 files, 1MB)
+  installing aws-c-cal 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-cal/1.0.0 (23 files, 187.6KB)
+  installing aws-c-compression 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-compression/1.0.0 (16 files, 92.2KB)
+  installing aws-c-io 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-io/1.0.0 (38 files, 709.7KB)
+  installing aws-c-http 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-http/1.0.0 (24 files, 573.7KB)
+  installing aws-c-sdkutils 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-sdkutils/1.0.0 (20 files, 189.9KB)
+  installing aws-c-auth 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-auth/1.0.0 (21 files, 418.7KB)
+  downloading aws-checksums 1.0.0
+  downloading aws-c-event-stream 1.0.0
+  installing aws-checksums 1.0.0
+  installed to /opt/homebrew/Cellar/aws-checksums/1.0.0 (16 files, 157.3KB)
+  installing aws-c-event-stream 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-event-stream/1.0.0 (19 files, 206.2KB)
+  downloading aws-c-mqtt 1.0.0
+  installing aws-c-mqtt 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-mqtt/1.0.0 (22 files, 500.7KB)
+  downloading aws-c-s3 1.0.0
+  installing aws-c-s3 1.0.0
+  installed to /opt/homebrew/Cellar/aws-c-s3/1.0.0 (19 files, 431.8KB)
+  downloading awscli 2.36.34
+  installing awscli 2.36.34
+  installed to /opt/homebrew/Cellar/awscli/2.36.34 (14,680 files, 161.6MB)
+  downloading cmake 4.4.3
+  installing cmake 4.4.3
+  installed to /opt/homebrew/Cellar/cmake/4.4.3 (4,159 files, 67.2MB)
+  downloading cryptography 50.0.1
+  installing cryptography 50.0.1
+  installed to /opt/homebrew/Cellar/cryptography/50.0.1 (248 files, 13.3MB)
+  downloading git-lfs 3.8.0
+  installing git-lfs 3.8.0
+  installed to /opt/homebrew/Cellar/git-lfs/3.8.0 (82 files, 15.0MB)
+  downloading grype 0.118.0
+  installing grype 0.118.0
+  installed to /opt/homebrew/Cellar/grype/0.118.0 (9 files, 83.3MB)
+  downloading harfbuzz 14.4.0
+  installing harfbuzz 14.4.0
+  installed to /opt/homebrew/Cellar/harfbuzz/14.4.0 (96 files, 13.5MB)
+  downloading kubernetes-cli 1.37.0
+  installing kubernetes-cli 1.37.0
+  installed to /opt/homebrew/Cellar/kubernetes-cli/1.37.0 (261 files, 64.2MB)
+  downloading libgcrypt 1.12.3
+  installing libgcrypt 1.12.3
+  installed to /opt/homebrew/Cellar/libgcrypt/1.12.3 (24 files, 4.1MB)
+  downloading simdjson 4.6.9
+  downloading node 26.8.1
+  installing simdjson 4.6.9
+  installed to /opt/homebrew/Cellar/simdjson/4.6.9 (19 files, 8.0MB)
+  installing node 26.8.1
+  installed to /opt/homebrew/Cellar/node/26.8.1 (2,077 files, 70.4MB)
+  downloading nss 3.128
+  installing nss 3.128
+  installed to /opt/homebrew/Cellar/nss/3.128 (210 files, 19.8MB)
+  downloading oci-cli 3.91.0
+  installing oci-cli 3.91.0
+  installed to /opt/homebrew/Cellar/oci-cli/3.91.0 (33,758 files, 339.5MB)
+  downloading syft 1.51.1
+  installing syft 1.51.1
+  installed to /opt/homebrew/Cellar/syft/1.51.1 (10 files, 80.6MB)
+  downloading uv 0.12.7
+  installing uv 0.12.7
+  installed to /opt/homebrew/Cellar/uv/0.12.7 (17 files, 44.4MB)
+caveats:
+  awscli:
+    The "examples" directory has been installed to:
+      /opt/homebrew/share/awscli/examples
+  cmake:
+    Emacs Lisp files have been installed to:
+      /opt/homebrew/share/emacs/site-lisp/cmake
+    To install the CMake documentation, run:
+      brew install cmake-docs
+  git-lfs:
+    Update your git config to finish installation:
+    
+      # Update global git config
+      $ git lfs install
+    
+      # Update system git config
+      $ git lfs install --system
+  kubernetes-cli:
+    The following kubernetes-cli executables are shadowed by other commands earlier in your PATH:
+      kubectl (shadowed by /Applications/Docker.app/Contents/Resources/bin/kubectl)
+    Running these by name will not invoke the version provided by Homebrew.
+  node:
+    Single Executable Application is disabled as it doesn't work with shared libnode.
+    Temporal support is disabled as it doesn't work with shared ICU library.
+    
+    The following node executables are shadowed by other commands earlier in your PATH:
+      node (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/node)
+      npm (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npm)
+      npx (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npx)
+    Running these by name will not invoke the version provided by Homebrew.
+  nss:
+    The following nss executables are shadowed by other commands earlier in your PATH:
+      derdump (shadowed by /Users/efitz/Scripts/derdump)
+    Running these by name will not invoke the version provided by Homebrew.
+installed 989.3MB, freed 1.2GB

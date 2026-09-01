@@ -10,6 +10,14 @@
 - Persist `--soak-hours` only on soaked commands, never on passthrough/`--version`/`--help`.
 - Do not uninstall a `homebrew/core` keg to switch taps.
 
+## Output
+
+- Every byte of `brew` output goes to the per-run log under `$TMPDIR`; the terminal gets a summary. Never suppress a line without logging it.
+- Visible `brew` runs share one pipe for stdout and stderr so the summarizer sees them in the order brew wrote them. `Output.stderr` is empty for visible runs; callers must read `Output.stdout`.
+- Unrecognized brew lines pass through verbatim (minus the `==>` marker). The filter is a summarizer, not an allowlist: never swallow the unknown.
+- `--raw` must always be able to turn the summarizer off.
+- The installed snapshot is taken once and goes stale as soon as brew upgrades a dependency for us. Compare against what brew reported installing (`quiet::installed_from_output`) before spawning another `brew install`.
+
 ## Git
 
 - Every git invocation goes through `ProcessGit` / `GitStore` in `src/git.rs`. Do not spawn `git` from other modules.

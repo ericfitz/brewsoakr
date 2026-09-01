@@ -41,6 +41,17 @@ pub fn identity_version(id: &PkgIdentity) -> &str {
     }
 }
 
+/// The version as it appears in the Cellar path: `1.0.0`, or `1.0.0_2` when
+/// the formula carries a revision. Lets a session compare what it wanted
+/// against what brew reported installing.
+pub fn cellar_version(id: &PkgIdentity) -> String {
+    match id {
+        PkgIdentity::Formula(f) if f.revision > 0 => format!("{}_{}", f.version, f.revision),
+        PkgIdentity::Formula(f) => f.version.clone(),
+        PkgIdentity::Cask(c) => c.version.clone(),
+    }
+}
+
 pub fn human_action(action: DesiredAction) -> &'static str {
     match action {
         DesiredAction::InstallCutoff => "would upgrade",

@@ -9,6 +9,7 @@ pub mod github;
 pub mod hours;
 pub mod identity;
 pub mod paths;
+pub mod quiet;
 pub mod report;
 pub mod resolve;
 pub mod snapshot;
@@ -118,6 +119,7 @@ pub fn run(args: &[String]) -> i32 {
 
 pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> {
     let inv = cli::parse_argv(args)?;
+    world.brew().set_raw(inv.raw);
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
     let resolved = config::resolve_hours(inv.soak_hours, env.as_deref(), file.as_deref())?;

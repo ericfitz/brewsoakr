@@ -3,12 +3,13 @@ use crate::eligibility::{self, DesiredAction, UpstreamStatus};
 use crate::git::GitStore;
 use crate::github::GithubApi;
 use crate::identity::{self, PkgIdentity};
+use crate::quiet;
 use crate::report::{self, Counts};
 use crate::resolve::{self, PkgKind, PkgRef};
 use crate::snapshot::{self, Snapshots};
 use crate::tap;
 use crate::{Error, SoakHours};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -457,10 +458,46 @@ pub fn upgrade(
     } else {
         names.to_vec()
     };
+    // A bare `brew soak upgrade` walks everything installed, so say up front
+    // how many will actually change and count them off as they go.
+    let plan_total = (names.is_empty()).then(|| plan_size(git, snaps, cache, &installed));
+    if let Some(total) = plan_total {
+        writeln!(out, "upgrading {total} of {} packages", installed.len())?;
+    }
     apply_many(
         brew, git, snaps, cache, tap_root, &targets, "upgrade", false, false, user_flags,
-        &installed, out,
+        &installed, plan_total, out,
     )
+}
+
+/// How many installed packages the soak window says to change. Resolution is
+/// cheap (cached blobs) and errors just mean "no total to show".
+fn plan_size(
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    installed: &[InstalledPkg],
+) -> usize {
+    installed
+        .iter()
+        .filter(|pkg| !pkg.pinned)
+        .filter(|pkg| {
+            matches!(
+                resolve_view(
+                    git,
+                    snaps,
+                    cache,
+                    &pkg.name,
+                    pkg.kind,
+                    Some(&pkg.receipt_rb)
+                ),
+                Ok(Some(ResolvedView {
+                    action: DesiredAction::InstallCutoff,
+                    ..
+                }))
+            )
+        })
+        .count()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -492,6 +529,7 @@ pub fn install(
         force_formula,
         user_flags,
         &installed,
+        None,
         out,
     )
 }
@@ -511,6 +549,7 @@ pub fn reinstall(
         return Err(Error::Usage("reinstall: no packages specified".into()));
     }
     let installed = brew.installed_core()?;
+    let plan_total = None;
     let mut session = ApplySession {
         brew,
         git,
@@ -525,6 +564,10 @@ pub fn reinstall(
         refused: false,
         brew_status: None,
         counts: Counts::default(),
+        done: BTreeMap::new(),
+        deferred: Vec::new(),
+        plan_total,
+        plan_index: 0,
         out,
     };
     if is_verbose(user_flags) {
@@ -556,6 +599,7 @@ pub fn reinstall(
                     "{name}: installed matches HEAD; brew reinstall (true repair)"
                 )?;
             }
+            writeln!(session.out, "reinstalling {name}")?;
             let mut args = vec!["reinstall".to_string()];
             args.extend(user_flags.iter().cloned());
             args.push(name.to_string());
@@ -565,7 +609,7 @@ pub fn reinstall(
         }
         session.apply_one(name)?;
     }
-    writeln!(session.out, "{}", report::counts_line(&session.counts))?;
+    session.write_tail()?;
     Ok(RunResult {
         refused: session.refused,
         brew_status: session.brew_status,
@@ -585,6 +629,7 @@ fn apply_many(
     force_formula: bool,
     user_flags: &[String],
     installed: &[InstalledPkg],
+    plan_total: Option<usize>,
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
     let mut session = ApplySession {
@@ -601,6 +646,10 @@ fn apply_many(
         refused: false,
         brew_status: None,
         counts: Counts::default(),
+        done: BTreeMap::new(),
+        deferred: Vec::new(),
+        plan_total,
+        plan_index: 0,
         out,
     };
     if is_verbose(user_flags) {
@@ -619,7 +668,7 @@ fn apply_many(
     for name in names {
         session.apply_one(name)?;
     }
-    writeln!(session.out, "{}", report::counts_line(&session.counts))?;
+    session.write_tail()?;
     if session.counts.nothing_to_do() && session.counts.soaked > 0 && brew_verb == "upgrade" {
         writeln!(
             session.out,
@@ -647,7 +696,89 @@ struct ApplySession<'a, B, G, W> {
     refused: bool,
     brew_status: Option<i32>,
     counts: Counts,
+    /// Cellar versions brew has reported installing so far this session,
+    /// including transitive dependencies nobody asked for by name. The
+    /// installed snapshot is taken once and goes stale as soon as brew
+    /// upgrades a dependency for us.
+    done: BTreeMap<String, String>,
+    /// Holds, skips, and warnings, printed as one block at the end so they
+    /// are not lost in the middle of the install scroll.
+    deferred: Vec<String>,
+    /// Number of packages this run expects to change, when known up front.
+    plan_total: Option<usize>,
+    plan_index: usize,
     out: &'a mut W,
+}
+
+impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
+    fn defer(&mut self, msg: String) {
+        self.deferred.push(msg);
+    }
+
+    /// `[3/26] upgrading node 26.7.0 -> 26.8.1`, so each package announces
+    /// itself once instead of leaving brew's output to speak for it.
+    fn announce(&mut self, name: &str, view: &ResolvedView) -> Result<(), Error> {
+        self.plan_index += 1;
+        let counter = match self.plan_total {
+            Some(total) => format!("[{}/{}] ", self.plan_index, total),
+            None => String::new(),
+        };
+        let to = view
+            .cutoff
+            .as_ref()
+            .map(report::identity_version)
+            .unwrap_or("?");
+        let doing = match self.brew_verb {
+            "install" => "installing",
+            "reinstall" => "reinstalling",
+            _ => "upgrading",
+        };
+        match view.installed.as_ref().map(report::identity_version) {
+            Some(from) if from != to => {
+                writeln!(self.out, "{counter}{doing} {name} {from} -> {to}")?
+            }
+            _ => writeln!(self.out, "{counter}{doing} {name} {to}")?,
+        }
+        Ok(())
+    }
+
+    /// Everything worth saying once the packages are done: the counts, the
+    /// byte delta, held/skipped packages, caveats, and where the raw brew log
+    /// went for anyone who wants the detail we filtered out.
+    fn write_tail(&mut self) -> Result<(), Error> {
+        writeln!(self.out, "{}", report::counts_line(&self.counts))?;
+        let report = self.brew.session_report();
+        if report.added_bytes > 0 || report.freed_bytes > 0 {
+            writeln!(
+                self.out,
+                "installed {}, freed {}",
+                quiet::human_size(report.added_bytes),
+                quiet::human_size(report.freed_bytes)
+            )?;
+        }
+        if !self.deferred.is_empty() {
+            writeln!(self.out, "notes:")?;
+            for line in &self.deferred {
+                writeln!(self.out, "  {line}")?;
+            }
+        }
+        for line in &report.caveats {
+            writeln!(self.out, "{line}")?;
+        }
+        if let Some(path) = &report.log_path {
+            writeln!(self.out, "full brew log: {}", path.display())?;
+        }
+        Ok(())
+    }
+
+    /// True when brew already put this package at the version we wanted,
+    /// as a dependency of something installed earlier in this session.
+    fn already_done(&self, name: &str, want: Option<&PkgIdentity>) -> bool {
+        match (self.done.get(name), want) {
+            (Some(have), Some(want)) => *have == report::cellar_version(want),
+            _ => false,
+        }
+    }
 }
 
 impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
@@ -686,11 +817,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let Some(view) = resolve_view(self.git, self.snaps, self.cache, name, kind, receipt)?
         else {
             self.counts.skipped += 1;
-            writeln!(self.out, "{name}: unparseable identity; skipping")?;
+            self.defer(format!("{name}: unparseable identity; skipping"));
             return Ok(());
         };
-        for warn in &view.warnings {
-            writeln!(self.out, "warning: {warn}")?;
+        for warn in view.warnings.clone() {
+            self.defer(format!("warning: {warn}"));
         }
         let did = match view.action {
             DesiredAction::InstallCutoff => "installing cutoff",
@@ -723,24 +854,30 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
             DesiredAction::LeaveAheadOfSoak => {
                 if self.brew_verb == "reinstall" {
-                    writeln!(
-                        self.out,
+                    self.defer(format!(
                         "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {name}` to bypass brewsoak."
-                    )?;
+                    ));
                     self.refused = true;
                 } else {
-                    writeln!(self.out, "{}", ahead_message(name))?;
+                    self.defer(ahead_message(name));
                 }
             }
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
             | DesiredAction::RefuseDeprecated => {
                 if let Some(msg) = refusal_message(view.action, name, self.brew_verb) {
-                    writeln!(self.out, "{msg}")?;
+                    self.defer(msg);
                 }
                 self.refused = true;
             }
             DesiredAction::InstallCutoff => {
+                // brew may already have upgraded this as a dependency of an
+                // earlier package; running it again just prints a warning.
+                if self.already_done(name, view.cutoff.as_ref()) {
+                    self.plan_index += 1;
+                    return Ok(());
+                }
+                self.announce(name, &view)?;
                 self.install_cutoff(name, kind, &view)?;
             }
         }
@@ -813,6 +950,13 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.refuse_ineligible_dep(target, dep, status)?;
             return Ok(false);
         }
+        let want = blobs
+            .cutoff
+            .as_deref()
+            .and_then(|bytes| parse_pkg_bytes(kind, bytes).ok());
+        if self.already_done(dep, want.as_ref()) {
+            return Ok(true);
+        }
         let blob = blobs.cutoff.as_deref().ok_or_else(|| {
             Error::Other(format!("{dep} is eligible but the cutoff blob is missing"))
         })?;
@@ -863,6 +1007,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     fn record_run(&mut self, args: &[String]) -> Result<(), Error> {
         let output = self.brew.run_visible(args)?;
+        self.done
+            .extend(quiet::installed_from_output(&output.stdout));
         merge_status(&mut self.brew_status, output);
         Ok(())
     }
@@ -1366,8 +1512,12 @@ mod tests {
     fn outdated_warns_future_deprecate_and_does_not_hold() {
         let old = formula_rb("py", "3.13.0", "oldsha");
         let mid = formula_rb("py", "3.14.0", "midsha");
+        // Inside the one-year warning horizon whatever day the test runs:
+        // later than today, no later than today + 1 year.
+        let year: u32 = calendar_today()[..4].parse().unwrap();
+        let soon = format!("{}-01-01", year + 1);
         let new = format!(
-            "{}\n  deprecate! date: \"2099-11-01\", because: :deprecated_upstream\n",
+            "{}\n  deprecate! date: \"{soon}\", because: :deprecated_upstream\n",
             formula_rb("py", "3.14.1", "newsha").trim_end()
         );
         let git = InMemoryGit::new();
@@ -1382,7 +1532,7 @@ mod tests {
         outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
-            text.contains("warning: py scheduled to be deprecated on 2099-11-01"),
+            text.contains(&format!("warning: py scheduled to be deprecated on {soon}")),
             "{text}"
         );
         assert!(text.contains("==> Outdated"), "{text}");
@@ -1471,6 +1621,118 @@ mod tests {
                 && args.iter().any(|a| a.ends_with(&suffix))
                 && !args.iter().any(|a| a == "--ignore-dependencies")
         })
+    }
+
+    fn two_outdated_world(next_stdout: &str) -> (MockBrew, InMemoryGit) {
+        let git = InMemoryGit::new();
+        for name in ["left", "right"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "cutoffsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.2.0", "newsha"),
+            );
+        }
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("left", formula_rb("left", "1.0.0", "oldsha")),
+                formula_pkg("right", formula_rb("right", "1.0.0", "oldsha")),
+            ],
+            next_stdout: next_stdout.as_bytes().to_vec(),
+            ..MockBrew::new()
+        };
+        (brew, git)
+    }
+
+    fn upgrade_both(brew: &MockBrew, git: &InMemoryGit) -> String {
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        upgrade(
+            brew,
+            git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &["left".to_string(), "right".to_string()],
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn package_brew_already_upgraded_as_a_dependency_is_not_installed_again() {
+        // brew reports pouring `right` at the cutoff version while installing
+        // `left`, so the installed snapshot taken at startup is already stale.
+        let (brew, git) =
+            two_outdated_world("\u{1f37a}  /opt/homebrew/Cellar/right/1.1.0: 5 files, 1MB\n");
+        let text = upgrade_both(&brew, &git);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(
+            visible.len(),
+            1,
+            "right was already at cutoff; expected no second brew run: {visible:?}"
+        );
+        assert!(text.contains("upgrading left 1.0.0 -> 1.1.0"), "{text}");
+        assert!(!text.contains("upgrading right"), "{text}");
+    }
+
+    #[test]
+    fn package_at_a_different_version_is_still_installed() {
+        // Same shape, but brew left `right` on a version we did not want.
+        let (brew, git) =
+            two_outdated_world("\u{1f37a}  /opt/homebrew/Cellar/right/1.0.9: 5 files, 1MB\n");
+        upgrade_both(&brew, &git);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(visible.len(), 2, "{visible:?}");
+    }
+
+    #[test]
+    fn holds_print_after_the_package_work_not_during() {
+        let ok_old = formula_rb("ok", "1.0.0", "oldsha");
+        let ok_mid = formula_rb("ok", "1.1.0", "midsha");
+        let new_old = formula_rb("new", "1.0.0", "oldsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/o/ok.rb", ok_mid);
+        git.insert_blob(
+            "headsha",
+            "Formula/o/ok.rb",
+            formula_rb("ok", "1.2.0", "newsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/n/new.rb",
+            formula_rb("new", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg("ok", ok_old), formula_pkg("new", new_old)],
+            ..MockBrew::new()
+        };
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(text.contains("upgrading 1 of 2 packages"), "{text}");
+        assert!(text.contains("notes:"), "{text}");
+        let counts = text.find("upgraded 1,").expect("counts line");
+        let hold = text.find("new is too new").expect("hold line");
+        assert!(hold > counts, "holds belong after the counts line: {text}");
     }
 
     #[test]

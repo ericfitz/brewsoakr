@@ -5,6 +5,8 @@ pub struct Invocation {
     pub soak_hours: Option<u32>,
     pub command: Command,
     pub brew_args: Vec<String>,
+    /// Forward brew's output byte for byte instead of summarizing it.
+    pub raw: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +69,7 @@ Other brew commands are passed through unchanged.
 Options:
   --soak-hours <N>   soak window in hours (default 24; also BREWSOAK_SOAK_HOURS)
   -v, --verbose      show soak window, cutoff, and every package evaluated
+      --raw          print brew's output unfiltered (also in $TMPDIR log)
   -V, --version      print brewsoak version and exit
   -h, --help         show this help
   help <command>     soak-aware help for a soaked command; else brew help
@@ -85,12 +88,14 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
         return Err(Error::Usage(help_text().to_string()));
     }
 
-    let (soak_hours, remaining) = extract_soak_hours(args)?;
+    let (raw, args) = extract_raw(args);
+    let (soak_hours, remaining) = extract_soak_hours(&args)?;
     if remaining.iter().any(|a| a == "--version" || a == "-V") {
         return Ok(Invocation {
             soak_hours,
             command: Command::Version,
             brew_args: Vec::new(),
+            raw,
         });
     }
     if remaining.iter().all(|a| a.starts_with('-'))
@@ -102,11 +107,12 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             soak_hours,
             command: Command::Help { topic: None },
             brew_args: Vec::new(),
+            raw,
         });
     }
 
     let Some(sub_idx) = remaining.iter().position(|a| !a.starts_with('-')) else {
-        return Ok(passthrough(soak_hours, remaining));
+        return Ok(passthrough(soak_hours, remaining, raw));
     };
 
     let subcommand = remaining[sub_idx].as_str();
@@ -119,6 +125,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             soak_hours,
             command: Command::Help { topic },
             brew_args: Vec::new(),
+            raw,
         });
     }
     let before = &remaining[..sub_idx];
@@ -129,11 +136,13 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             soak_hours,
             command: Command::Update,
             brew_args: chain_args(before, after),
+            raw,
         },
         "outdated" => Invocation {
             soak_hours,
             command: Command::Outdated,
             brew_args: chain_args(before, after),
+            raw,
         },
         "upgrade" => {
             let (names, brew_args) = split_names_and_flags(before, after);
@@ -141,6 +150,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
                 soak_hours,
                 command: Command::Upgrade { names },
                 brew_args,
+                raw,
             }
         }
         "reinstall" => {
@@ -149,6 +159,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
                 soak_hours,
                 command: Command::Reinstall { names },
                 brew_args,
+                raw,
             }
         }
         "info" => {
@@ -157,6 +168,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
                 soak_hours,
                 command: Command::Info { names },
                 brew_args,
+                raw,
             }
         }
         "install" => {
@@ -169,9 +181,10 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
                     force_formula,
                 },
                 brew_args,
+                raw,
             }
         }
-        _ => passthrough(soak_hours, remaining),
+        _ => passthrough(soak_hours, remaining, raw),
     };
     Ok(invocation)
 }
@@ -201,14 +214,27 @@ fn parse_soak_value(value: &str) -> Result<u32, Error> {
         .map_err(|_| Error::Usage(format!("--soak-hours must be an integer, got {value:?}")))
 }
 
-fn passthrough(soak_hours: Option<u32>, remaining: Vec<String>) -> Invocation {
+fn passthrough(soak_hours: Option<u32>, remaining: Vec<String>, raw: bool) -> Invocation {
     Invocation {
         soak_hours,
         command: Command::Passthrough {
             args: remaining.clone(),
         },
         brew_args: remaining,
+        raw,
     }
+}
+
+/// `--raw` is ours, not brew's; strip it before anything reaches brew.
+fn extract_raw(args: &[String]) -> (bool, Vec<String>) {
+    let raw = args.iter().any(|a| a == "--raw");
+    if !raw {
+        return (false, args.to_vec());
+    }
+    (
+        true,
+        args.iter().filter(|a| *a != "--raw").cloned().collect(),
+    )
 }
 
 fn chain_args(before: &[String], after: &[String]) -> Vec<String> {
@@ -256,6 +282,8 @@ With no names, considers every installed core formula and cask.
 Third-party tap tokens are passed through to brew.
 
   -v, --verbose   print soak window and a line for every package evaluated
+      --raw       print brew's output unfiltered (a full log is always
+                  written under $TMPDIR; its path is printed at the end)
 "
         }
         "install" => {
@@ -266,6 +294,8 @@ Install the soaked cutoff artifact if it is eligible.
 Too-new / yanked / deprecated names are refused; use brew to bypass.
 
   -v, --verbose   print soak window and a line for every package evaluated
+      --raw       print brew's output unfiltered (a full log is always
+                  written under $TMPDIR; its path is printed at the end)
 "
         }
         "reinstall" => {
@@ -276,6 +306,8 @@ If the installed identity equals HEAD, runs brew reinstall (true repair).
 Otherwise installs the soaked cutoff artifact. Ahead-of-soak is refused.
 
   -v, --verbose   print soak window and a line for every package evaluated
+      --raw       print brew's output unfiltered (a full log is always
+                  written under $TMPDIR; its path is printed at the end)
 "
         }
         "outdated" => {
@@ -286,6 +318,8 @@ List installed core/cask packages that upgrade would change, plus
 held, ahead-of-soak, and pinned sections.
 
   -v, --verbose   print soak window and a line for every package evaluated
+      --raw       print brew's output unfiltered (a full log is always
+                  written under $TMPDIR; its path is printed at the end)
 "
         }
         "info" => {
@@ -359,6 +393,28 @@ mod tests {
     #[test]
     fn no_args_is_usage() {
         assert!(matches!(parse_argv(&[]), Err(Error::Usage(_))));
+    }
+
+    #[test]
+    fn raw_flag_is_ours_and_never_reaches_brew() {
+        let i = parse_argv(&s(&["upgrade", "--raw", "wget"])).unwrap();
+        assert!(i.raw);
+        assert!(
+            !i.brew_args.iter().any(|a| a == "--raw"),
+            "{:?}",
+            i.brew_args
+        );
+        assert!(matches!(i.command, Command::Upgrade { ref names } if names == &["wget"]));
+    }
+
+    #[test]
+    fn raw_flag_survives_passthrough() {
+        let i = parse_argv(&s(&["--raw", "services", "list"])).unwrap();
+        assert!(i.raw);
+        match i.command {
+            Command::Passthrough { args } => assert_eq!(args, s(&["services", "list"])),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

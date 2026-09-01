@@ -141,12 +141,18 @@ pub fn is_deprecated_or_disabled(rb: &str, today: &str) -> bool {
         .any(|flag| flag_in_effect(flag, today))
 }
 
+/// Deprecations more than a year out are not actionable; only warn about the
+/// ones close enough to plan around.
 pub fn upcoming_lifecycle_messages(rb: &str, today: &str) -> Vec<String> {
+    let horizon = one_year_out(today);
     lifecycle_flags(rb)
         .into_iter()
         .filter(|flag| !flag_in_effect(flag, today))
         .filter_map(|flag| {
             let date = flag.date?;
+            if horizon.as_deref().is_some_and(|h| date.as_str() > h) {
+                return None;
+            }
             let word = match flag.kind {
                 LifecycleKind::Deprecated => "deprecated",
                 LifecycleKind::Disabled => "disabled",
@@ -154,6 +160,17 @@ pub fn upcoming_lifecycle_messages(rb: &str, today: &str) -> Vec<String> {
             Some(format!("scheduled to be {word} on {date}"))
         })
         .collect()
+}
+
+/// `2026-09-01` -> `2027-09-01`. ISO dates compare lexically, so bumping the
+/// year field is enough; Feb 29 lands on a date that never exists, which still
+/// orders correctly.
+fn one_year_out(today: &str) -> Option<String> {
+    if !is_iso_date(today) {
+        return None;
+    }
+    let year: u32 = today[..4].parse().ok()?;
+    Some(format!("{:04}{}", year + 1, &today[4..]))
 }
 
 fn flag_in_effect(flag: &LifecycleFlag, today: &str) -> bool {
@@ -687,6 +704,23 @@ end
     }
 
     #[test]
+    fn deprecation_inside_a_year_still_warns() {
+        let rb = r#"
+class Soon < Formula
+  url "https://example.com/soon-1.0.tar.gz"
+  sha256 "eee555"
+  deprecate! date: "2027-01-15", because: :deprecated_upstream
+  disable! date: "2029-01-15", because: :deprecated_upstream
+end
+"#;
+        assert_eq!(
+            upcoming_lifecycle_messages(rb, "2026-08-13"),
+            ["scheduled to be deprecated on 2027-01-15"],
+            "warn inside a year, stay quiet beyond it"
+        );
+    }
+
+    #[test]
     fn detects_deprecate_bang() {
         assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA, "2024-01-01"));
         assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA, "2026-08-13"));
@@ -703,14 +737,8 @@ class New < Formula
 end
 "#;
         assert!(!is_deprecated_or_disabled(rb, "2026-08-13"));
-        let msgs = upcoming_lifecycle_messages(rb, "2026-08-13");
-        assert_eq!(
-            msgs,
-            [
-                "scheduled to be deprecated on 2030-11-01",
-                "scheduled to be disabled on 2031-11-01",
-            ]
-        );
+        // Both dates are years out, so neither is worth a warning today.
+        assert!(upcoming_lifecycle_messages(rb, "2026-08-13").is_empty());
     }
 
     #[test]

@@ -1,0 +1,412 @@
+2026-08-31T11:25:16EDT  ~ efitz@macmini % brewsoak update
+updating soak snapshots; soak window 24h
+fetching Homebrew/homebrew-core…
+fetching Homebrew/homebrew-cask…
+core cutoff: 90e92415 (2026-08-30 15:25 UTC)
+core head: 408d76a0
+cask cutoff: 1abb12eb (2026-08-30 15:10 UTC)
+cask head: e899f7c1
+no installed packages changed soak status
+snapshots refreshed
+2026-08-31T11:26:06EDT  ~ efitz@macmini % brewsoak upgrade
+fetching Homebrew/homebrew-core…
+fetching Homebrew/homebrew-cask…
+aws-c-auth 0.10.5 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest aws-c-auth (1.0.0)
+==> Would install 1 formula:
+aws-c-auth
+==> Would upgrade 6 dependencies for aws-c-auth:
+aws-c-common
+aws-c-cal
+aws-c-compression
+aws-c-io
+aws-c-http
+aws-c-sdkutils
+==> Fetching downloads for: aws-c-auth
+✔︎ Bottle Manifest aws-c-common (1.0.0)
+✔︎ Bottle Manifest aws-c-cal (1.0.0)
+✔︎ Bottle Manifest aws-c-compression (1.0.0)
+✔︎ Bottle Manifest aws-c-io (1.0.0)
+✔︎ Bottle aws-c-compression (1.0.0)
+✔︎ Bottle aws-c-cal (1.0.0)
+✔︎ Bottle aws-c-auth (1.0.0)
+✔︎ Bottle Manifest aws-c-http (1.0.0)
+✔︎ Bottle aws-c-common (1.0.0)
+✔︎ Bottle aws-c-io (1.0.0)
+✔︎ Bottle aws-c-http (1.0.0)
+✔︎ Bottle Manifest aws-c-sdkutils (1.0.0)
+✔︎ Bottle aws-c-sdkutils (1.0.0)
+==> Upgrading aws-c-auth
+  0.10.5 -> 1.0.0 
+==> Installing dependencies for aws-c-auth: aws-c-common, aws-c-cal, aws-c-compression, aws-c-io, aws-c-http and aws-c-sdkutils
+==> Upgrading aws-c-auth dependency: aws-c-common
+==> Pouring aws-c-common--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-common/1.0.0: 109 files, 1MB
+==> Upgrading aws-c-auth dependency: aws-c-cal
+==> Pouring aws-c-cal--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-cal/1.0.0: 23 files, 187.6KB
+==> Upgrading aws-c-auth dependency: aws-c-compression
+==> Pouring aws-c-compression--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-compression/1.0.0: 16 files, 92.2KB
+==> Upgrading aws-c-auth dependency: aws-c-io
+==> Pouring aws-c-io--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-io/1.0.0: 38 files, 709.7KB
+==> Upgrading aws-c-auth dependency: aws-c-http
+==> Pouring aws-c-http--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-http/1.0.0: 24 files, 573.7KB
+==> Upgrading aws-c-auth dependency: aws-c-sdkutils
+==> Pouring aws-c-sdkutils--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-sdkutils/1.0.0: 20 files, 189.9KB
+==> Installing aws-c-auth
+==> Pouring aws-c-auth--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-auth/1.0.0: 21 files, 418.7KB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/aws-c-auth/0.10.5... (19 files, 418.3KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-auth--0.10.5... (107.4KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-auth_bottle_manifest--0.10.5... (71.2KB)
+Warning: aws-c-cal 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-c-cal
+Warning: aws-c-common 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-c-common
+Warning: aws-c-compression 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-c-compression
+aws-c-event-stream 0.7.2 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest aws-c-event-stream (1.0.0)
+==> Would install 1 formula:
+aws-c-event-stream
+==> Would upgrade 1 dependency for aws-c-event-stream:
+aws-checksums
+==> Fetching downloads for: aws-c-event-stream
+✔︎ Bottle Manifest aws-checksums (1.0.0)
+✔︎ Bottle aws-checksums (1.0.0)
+✔︎ Bottle aws-c-event-stream (1.0.0)
+==> Upgrading aws-c-event-stream
+  0.7.2 -> 1.0.0 
+==> Upgrading aws-c-event-stream dependency: aws-checksums
+==> Pouring aws-checksums--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-checksums/1.0.0: 16 files, 157.3KB
+==> Installing aws-c-event-stream
+==> Pouring aws-c-event-stream--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-event-stream/1.0.0: 19 files, 206.2KB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/aws-c-event-stream/0.7.2... (17 files, 205.8KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-event-stream--0.7.2... (46.8KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-event-stream_bottle_manifest--0.7.2... (59KB)
+Warning: aws-c-http 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-c-http
+Warning: aws-c-io 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-c-io
+aws-c-mqtt 0.16.2 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest aws-c-mqtt (1.0.0)
+==> Would install 1 formula:
+aws-c-mqtt
+==> Fetching downloads for: aws-c-mqtt
+✔︎ Bottle aws-c-mqtt (1.0.0)
+==> Upgrading aws-c-mqtt
+  0.16.2 -> 1.0.0 
+==> Pouring aws-c-mqtt--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-mqtt/1.0.0: 22 files, 500.7KB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/aws-c-mqtt/0.16.2... (20 files, 500.3KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-mqtt--0.16.2... (145KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-mqtt_bottle_manifest--0.16.2... (64.8KB)
+aws-c-s3 0.13.7 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest aws-c-s3 (1.0.0)
+==> Would install 1 formula:
+aws-c-s3
+==> Fetching downloads for: aws-c-s3
+✔︎ Bottle aws-c-s3 (1.0.0)
+==> Upgrading aws-c-s3
+  0.13.7 -> 1.0.0 
+==> Pouring aws-c-s3--1.0.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/aws-c-s3/1.0.0: 19 files, 431.8KB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/aws-c-s3/0.13.7... (18 files, 431.5KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-s3--0.13.7... (128.5KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/aws-c-s3_bottle_manifest--0.13.7... (83.7KB)
+Warning: aws-c-sdkutils 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-c-sdkutils
+Warning: aws-checksums 1.0.0 is already installed and up-to-date.
+To reinstall 1.0.0, run:
+  brew reinstall aws-checksums
+awscli 2.36.31 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest awscli (2.36.34)
+==> Would install 1 formula:
+awscli
+==> Fetching downloads for: awscli
+✔︎ Bottle awscli (2.36.34)
+==> Upgrading awscli
+  2.36.31 -> 2.36.34 
+==> Pouring awscli--2.36.34.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/awscli/2.36.34: 14,680 files, 161.6MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/awscli/2.36.31... (14,680 files, 161.5MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/awscli--2.36.31... (23.3MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/awscli_bottle_manifest--2.36.29... (164.7KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/awscli_bottle_manifest--2.36.31... (165.5KB)
+==> Caveats
+zsh completions and functions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+==> awscli
+The "examples" directory has been installed to:
+  /opt/homebrew/share/awscli/examples
+bash: unparseable identity; skipping
+cmake 4.4.2 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest cmake (4.4.3)
+==> Fetching downloads for: cmake
+==> Would install 1 formula:
+cmake
+✔︎ Bottle cmake (4.4.3)
+==> Upgrading cmake
+  4.4.2 -> 4.4.3 
+==> Pouring cmake--4.4.3.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/cmake/4.4.3: 4,159 files, 67.2MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/cmake/4.4.2... (4,159 files, 67.2MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/cmake--4.4.2... (19.8MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/cmake_bottle_manifest--4.4.2... (27.6KB)
+==> Caveats
+Emacs Lisp files have been installed to:
+  /opt/homebrew/share/emacs/site-lisp/cmake
+==> cmake
+To install the CMake documentation, run:
+  brew install cmake-docs
+cryptography 50.0.0 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest cryptography (50.0.1)
+==> Would install 1 formula:
+cryptography
+==> Fetching downloads for: cryptography
+✔︎ Bottle cryptography (50.0.1)
+==> Upgrading cryptography
+  50.0.0 -> 50.0.1 
+==> Pouring cryptography--50.0.1.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/cryptography/50.0.1: 248 files, 13.3MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/cryptography/50.0.0... (302 files, 13.9MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/cryptography--50.0.0... (3.8MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/cryptography_bottle_manifest--50.0.0... (41.9KB)
+git-lfs 3.7.1 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest git-lfs (3.8.0)
+==> Would install 1 formula:
+git-lfs
+==> Fetching downloads for: git-lfs
+✔︎ Bottle git-lfs (3.8.0)
+==> Upgrading git-lfs
+  3.7.1 -> 3.8.0 
+==> Pouring git-lfs--3.8.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/git-lfs/3.8.0: 82 files, 15.0MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/git-lfs/3.7.1... (82 files, 14MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/git-lfs--3.7.1... (5.1MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/git-lfs_bottle_manifest--3.7.1... (7.4KB)
+==> Caveats
+zsh completions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+==> git-lfs
+Update your git config to finish installation:
+
+  # Update global git config
+  $ git lfs install
+
+  # Update system git config
+  $ git lfs install --system
+grype 0.117.0 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest grype (0.118.0)
+==> Fetching downloads for: grype
+==> Would install 1 formula:
+grype
+✔︎ Bottle grype (0.118.0)
+==> Upgrading grype
+  0.117.0 -> 0.118.0 
+==> Pouring grype--0.118.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/grype/0.118.0: 9 files, 83.3MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/grype/0.117.0... (9 files, 84.3MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/grype--0.117.0... (27.7MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/grype_bottle_manifest--0.117.0... (14.8KB)
+==> Caveats
+zsh completions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+harfbuzz 14.3.1 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest harfbuzz (14.4.0)
+==> Would install 1 formula:
+harfbuzz
+==> Fetching downloads for: harfbuzz
+✔︎ Bottle harfbuzz (14.4.0)
+==> Upgrading harfbuzz
+  14.3.1 -> 14.4.0 
+==> Pouring harfbuzz--14.4.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/harfbuzz/14.4.0: 96 files, 13.5MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/harfbuzz/14.3.1... (96 files, 13.3MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/harfbuzz--14.3.1... (3.6MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/harfbuzz_bottle_manifest--14.3.1... (171.3KB)
+kubernetes-cli 1.36.4 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest kubernetes-cli (1.37.0)
+==> Fetching downloads for: kubernetes-cli
+==> Would install 1 formula:
+kubernetes-cli
+✔︎ Bottle kubernetes-cli (1.37.0)
+==> Upgrading kubernetes-cli
+  1.36.4 -> 1.37.0 
+==> Pouring kubernetes-cli--1.37.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/kubernetes-cli/1.37.0: 261 files, 64.2MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/kubernetes-cli/1.36.4... (261 files, 62.5MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/kubernetes-cli--1.36.4... (18.3MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/kubernetes-cli_bottle_manifest--1.36.4... (15.6KB)
+==> Caveats
+zsh completions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+==> kubernetes-cli
+The following kubernetes-cli executables are shadowed by other commands earlier in your PATH:
+  kubectl (shadowed by /Applications/Docker.app/Contents/Resources/bin/kubectl)
+Running these by name will not invoke the version provided by Homebrew.
+libgcrypt 1.12.2 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest libgcrypt (1.12.3)
+==> Would install 1 formula:
+libgcrypt
+==> Fetching downloads for: libgcrypt
+✔︎ Bottle libgcrypt (1.12.3)
+==> Upgrading libgcrypt
+  1.12.2 -> 1.12.3 
+==> Pouring libgcrypt--1.12.3.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/libgcrypt/1.12.3: 24 files, 4.1MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/libgcrypt/1.12.2... (24 files, 4MB)
+node 26.7.0 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest node (26.8.1)
+==> Would install 1 formula:
+node
+==> Would upgrade 1 dependency for node:
+simdjson
+==> Fetching downloads for: node
+✔︎ Bottle Manifest simdjson (4.6.9)
+✔︎ Bottle simdjson (4.6.9)
+✔︎ Bottle node (26.8.1)
+==> Upgrading node
+  26.7.0 -> 26.8.1 
+==> Upgrading node dependency: simdjson
+==> Pouring simdjson--4.6.9.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/simdjson/4.6.9: 19 files, 8.0MB
+==> Installing node
+==> Pouring node--26.8.1.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/node/26.8.1: 2,077 files, 70.4MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/node/26.7.0... (2,077 files, 89.3MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/node--26.7.0... (21.7MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/node_bottle_manifest--26.7.0... (176.2KB)
+==> Caveats
+==> node
+Single Executable Application is disabled as it doesn't work with shared libnode.
+Temporal support is disabled as it doesn't work with shared ICU library.
+
+The following node executables are shadowed by other commands earlier in your PATH:
+  node (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/node)
+  npm (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npm)
+  npx (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npx)
+Running these by name will not invoke the version provided by Homebrew.
+nss 3.127 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest nss (3.128)
+==> Would install 1 formula:
+nss
+==> Fetching downloads for: nss
+✔︎ Bottle nss (3.128)
+==> Upgrading nss
+  3.127 -> 3.128 
+==> Pouring nss--3.128.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/nss/3.128: 210 files, 19.8MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/nss/3.127... (210 files, 19MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/nss--3.127... (6.1MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/nss_bottle_manifest--3.127... (33.7KB)
+==> Caveats
+==> nss
+The following nss executables are shadowed by other commands earlier in your PATH:
+  derdump (shadowed by /Users/efitz/Scripts/derdump)
+Running these by name will not invoke the version provided by Homebrew.
+oci-cli 3.90.3 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest oci-cli (3.91.0)
+==> Would install 1 formula:
+oci-cli
+==> Fetching downloads for: oci-cli
+✔︎ Bottle oci-cli (3.91.0)
+==> Upgrading oci-cli
+  3.90.3 -> 3.91.0 
+==> Pouring oci-cli--3.91.0.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/oci-cli/3.91.0: 33,758 files, 339.5MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/oci-cli/3.90.3... (33,501 files, 335.2MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/oci-cli--3.90.3... (28.2MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/oci-cli_bottle_manifest--3.90.2... (116.8KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/oci-cli_bottle_manifest--3.90.3... (116.8KB)
+==> Caveats
+zsh completions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+warning: python@3.14 scheduled to be deprecated on 2030-11-01
+warning: python@3.14 scheduled to be disabled on 2031-11-01
+Warning: simdjson 4.6.9 is already installed and up-to-date.
+To reinstall 4.6.9, run:
+  brew reinstall simdjson
+syft 1.51.0 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest syft (1.51.1)
+==> Would install 1 formula:
+syft
+==> Fetching downloads for: syft
+✔︎ Bottle syft (1.51.1)
+==> Upgrading syft
+  1.51.0 -> 1.51.1 
+==> Pouring syft--1.51.1.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/syft/1.51.1: 10 files, 80.6MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/syft/1.51.0... (10 files, 81.4MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/syft--1.51.0... (26.6MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/syft_bottle_manifest--1.51.0... (14.8KB)
+==> Caveats
+zsh completions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+uv 0.12.6 is already installed but outdated (so it will be upgraded).
+==> Downloading bottle manifests
+✔︎ Bottle Manifest uv (0.12.7)
+==> Fetching downloads for: uv
+==> Would install 1 formula:
+uv
+✔︎ Bottle uv (0.12.7)
+==> Upgrading uv
+  0.12.6 -> 0.12.7 
+==> Pouring uv--0.12.7.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/uv/0.12.7: 17 files, 44.4MB
+==> Cleanup
+Removing: /opt/homebrew/Cellar/uv/0.12.6... (17 files, 45.7MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/uv--0.12.6... (19.1MB)
+Removing: /Users/efitz/Library/Caches/Homebrew/uv_bottle_manifest--0.12.5... (18.7KB)
+Removing: /Users/efitz/Library/Caches/Homebrew/uv_bottle_manifest--0.12.6... (19.1KB)
+==> Caveats
+zsh completions have been installed to:
+  /opt/homebrew/share/zsh/site-functions
+Warning: x265 4.3 is already installed and up-to-date.
+To reinstall 4.3, run:
+  brew reinstall x265
+upgraded 26, already soaked 124, held 0, ahead 0, pinned 0, skipped 1
