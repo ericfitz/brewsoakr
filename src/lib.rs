@@ -118,6 +118,7 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> {
+    paths::warn_duplicate_install();
     let inv = cli::parse_argv(args)?;
     world.brew().set_raw(inv.raw);
     let env = world.env_soak();
