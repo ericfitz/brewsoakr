@@ -9,6 +9,7 @@ pub mod github;
 pub mod hours;
 pub mod identity;
 pub mod nosoak;
+pub mod origin;
 pub mod paths;
 pub mod quiet;
 pub mod report;

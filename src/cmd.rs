@@ -1596,6 +1596,7 @@ mod tests {
             kind: PkgKind::Formula,
             receipt_rb,
             pinned: false,
+            tap: None,
         }
     }
 

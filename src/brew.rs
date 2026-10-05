@@ -15,6 +15,8 @@ pub struct InstalledPkg {
     pub kind: PkgKind,
     pub receipt_rb: String,
     pub pinned: bool,
+    /// Receipt tap from `brew info`; `None` for null/empty/staging.
+    pub tap: Option<String>,
 }
 
 /// What a whole brewsoak session accumulated across every visible brew run:
@@ -508,9 +510,12 @@ fn parse_installed_json(
         let Some(name) = json_string_value(obj, "name").filter(|n| !n.is_empty()) else {
             continue;
         };
-        if !keep_tap(json_string_value(obj, "tap").as_deref()) {
+        let tap = json_string_value(obj, "tap");
+        if !keep_tap(tap.as_deref()) {
             continue;
         }
+        let tap =
+            tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
         let version = installed_version(obj);
         if let Some(receipt_rb) = read_receipt(&name, PkgKind::Formula, version.as_deref()) {
             out.push(InstalledPkg {
@@ -518,6 +523,7 @@ fn parse_installed_json(
                 kind: PkgKind::Formula,
                 receipt_rb,
                 pinned: json_bool_value(obj, "pinned").unwrap_or(false),
+                tap,
             });
         }
     }
@@ -525,9 +531,12 @@ fn parse_installed_json(
         let Some(name) = json_string_value(obj, "token").filter(|n| !n.is_empty()) else {
             continue;
         };
-        if !keep_tap(json_string_value(obj, "tap").as_deref()) {
+        let tap = json_string_value(obj, "tap");
+        if !keep_tap(tap.as_deref()) {
             continue;
         }
+        let tap =
+            tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
         let version = installed_version(obj);
         if let Some(receipt_rb) = read_receipt(&name, PkgKind::Cask, version.as_deref()) {
             out.push(InstalledPkg {
@@ -535,6 +544,7 @@ fn parse_installed_json(
                 kind: PkgKind::Cask,
                 receipt_rb,
                 pinned: json_bool_value(obj, "pinned").unwrap_or(false),
+                tap,
             });
         }
     }
@@ -564,7 +574,7 @@ fn installed_version(obj: &str) -> Option<String> {
 fn keep_tap(tap: Option<&str>) -> bool {
     matches!(
         tap,
-        None | Some("") | Some("homebrew/core") | Some("homebrew/cask")
+        None | Some("") | Some("homebrew/core") | Some("homebrew/cask") | Some("brewsoakr/soaked")
     )
 }
 
@@ -723,12 +733,13 @@ mod tests {
         }
     }
 
-    fn pkg(name: &str, kind: PkgKind, receipt_rb: &str) -> InstalledPkg {
+    fn pkg(name: &str, kind: PkgKind, receipt_rb: &str, tap: Option<&str>) -> InstalledPkg {
         InstalledPkg {
             name: name.into(),
             kind,
             receipt_rb: receipt_rb.into(),
             pinned: false,
+            tap: tap.map(str::to_string),
         }
     }
 
@@ -744,8 +755,8 @@ mod tests {
     #[test]
     fn mock_installed_core_returns_the_vec() {
         let installed = vec![
-            pkg("wget", PkgKind::Formula, "class Wget; end"),
-            pkg("firefox", PkgKind::Cask, "cask \"firefox\""),
+            pkg("wget", PkgKind::Formula, "class Wget; end", None),
+            pkg("firefox", PkgKind::Cask, "cask \"firefox\"", None),
         ];
         let brew = mock_with(installed.clone(), BTreeMap::new());
         let got = brew.installed_core().expect("mock installed");
@@ -791,7 +802,12 @@ mod tests {
         .expect("parse fixture");
         assert_eq!(
             got,
-            vec![pkg("ca-certificates", PkgKind::Formula, "keg 2026-08-13")]
+            vec![pkg(
+                "ca-certificates",
+                PkgKind::Formula,
+                "keg 2026-08-13",
+                Some("homebrew/core")
+            )]
         );
     }
 
@@ -812,7 +828,15 @@ mod tests {
             Some(format!("keg {}", version.expect("version")))
         })
         .expect("parse fixture");
-        assert_eq!(got, vec![pkg("wget", PkgKind::Formula, "keg 1.21.4")]);
+        assert_eq!(
+            got,
+            vec![pkg(
+                "wget",
+                PkgKind::Formula,
+                "keg 1.21.4",
+                Some("homebrew/core")
+            )]
+        );
     }
 
     #[test]
@@ -849,10 +873,35 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                pkg("wget", PkgKind::Formula, "class Wget; end"),
-                pkg("firefox", PkgKind::Cask, "cask \"firefox\""),
+                pkg(
+                    "wget",
+                    PkgKind::Formula,
+                    "class Wget; end",
+                    Some("homebrew/core")
+                ),
+                pkg(
+                    "firefox",
+                    PkgKind::Cask,
+                    "cask \"firefox\"",
+                    Some("homebrew/cask")
+                ),
             ]
         );
+    }
+
+    #[test]
+    fn parse_installed_json_maps_null_empty_and_staging_tap_to_none() {
+        let json = r#"{
+          "formulae": [
+            {"name": "a", "tap": null, "installed": [{"version": "1"}]},
+            {"name": "b", "tap": "", "installed": [{"version": "1"}]},
+            {"name": "c", "tap": "brewsoakr/soaked", "installed": [{"version": "1"}]}
+          ],
+          "casks": []
+        }"#;
+        let got = parse_installed_json(json, |_, _, _| Some("rb".into())).expect("parse");
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().all(|p| p.tap.is_none()), "{got:?}");
     }
 
     #[test]
@@ -951,7 +1000,15 @@ mod tests {
             read_formula_receipt(&cellar, name, version)
         })
         .expect("parse");
-        assert_eq!(got, vec![pkg("wget", PkgKind::Formula, "new-receipt")]);
+        assert_eq!(
+            got,
+            vec![pkg(
+                "wget",
+                PkgKind::Formula,
+                "new-receipt",
+                Some("homebrew/core")
+            )]
+        );
     }
 
     #[test]
