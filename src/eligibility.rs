@@ -12,6 +12,10 @@ pub enum UpstreamStatus {
 pub enum DesiredAction {
     NoOpAlreadySoaked,
     LeaveAheadOfSoak,
+    /// An installed cask with `auto_updates true` that is behind the cutoff.
+    /// The app updates itself; brew skips it on a bare `upgrade`/`outdated`
+    /// without `--greedy`. Set only by bare runs, never by `desired_action`.
+    LeaveAutoUpdates,
     InstallCutoff,
     RefuseTooNew,
     RefuseYanked,

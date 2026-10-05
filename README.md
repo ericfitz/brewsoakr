@@ -170,6 +170,13 @@ upgraded 0, already soaked 137, held 0, ahead 0, pinned 0, skipped 0
 already soaked: 137 formulae and casks
 ```
 
+Casks that update themselves (`auto_updates true`) are left to the app on a
+bare `upgrade`, as `brew upgrade` leaves them without `--greedy`; they are
+counted as `auto-updates N` and `outdated` lists them under their own
+heading. Name one (`brewsoak upgrade alt-tab`) to upgrade it anyway. Installed
+casks carry only a version (Homebrew keeps no cask source in the Caskroom),
+so a cask is compared to its cutoff by version alone.
+
 An `upgrade` with work to do looks like:
 
 ```

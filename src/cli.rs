@@ -288,6 +288,8 @@ Packages in NO_SOAK (no-soak) are handed to brew after the soaked work
 (one brew update, then one brew upgrade); their outdated dependencies go
 with them.
 Taps without an HTTPS remote are not soakable and are noted, not upgraded.
+Casks that update themselves (auto_updates true) are left to the app on a
+bare upgrade, as brew leaves them without --greedy; name one to upgrade it.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always

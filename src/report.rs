@@ -59,6 +59,7 @@ pub fn human_action(action: DesiredAction) -> &'static str {
         DesiredAction::InstallCutoff => "would upgrade",
         DesiredAction::NoOpAlreadySoaked => "up to date (soaked)",
         DesiredAction::LeaveAheadOfSoak => "ahead of soak (leave installed)",
+        DesiredAction::LeaveAutoUpdates => "auto-updates (left to the app; name it to upgrade)",
         DesiredAction::RefuseTooNew => "held: too new",
         DesiredAction::RefuseYanked => "held: yanked",
         DesiredAction::RefuseDeprecated => "held: deprecated",
@@ -107,6 +108,11 @@ pub fn evaluate_line(
             inst.unwrap_or("?"),
             hd.unwrap_or("?")
         ),
+        DesiredAction::LeaveAutoUpdates => format!(
+            "auto-updates; installed {} is left to the app, cutoff {}; {did}",
+            inst.unwrap_or("?"),
+            cut.unwrap_or("?")
+        ),
         DesiredAction::RefuseTooNew => {
             format!("held; too new (born inside the soak window); {did}")
         }
@@ -121,10 +127,14 @@ pub fn evaluate_line(
 }
 
 pub fn counts_line(c: &Counts) -> String {
-    format!(
+    let mut line = format!(
         "upgraded {}, already soaked {}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
         c.upgraded, c.soaked, c.held, c.ahead, c.pinned, c.skipped, c.no_soak
-    )
+    );
+    if c.auto_updates > 0 {
+        line.push_str(&format!(", auto-updates {}", c.auto_updates));
+    }
+    line
 }
 
 pub fn origin_line(name: &str, origin: &str, hours: SoakHours, class: PkgClass) -> String {
@@ -144,6 +154,8 @@ pub struct Counts {
     pub pinned: usize,
     pub skipped: usize,
     pub no_soak: usize,
+    /// Self-updating casks a bare run left to the app (brew's `--greedy` skip).
+    pub auto_updates: usize,
 }
 
 impl Counts {
@@ -152,6 +164,7 @@ impl Counts {
             DesiredAction::InstallCutoff => self.upgraded += 1,
             DesiredAction::NoOpAlreadySoaked => self.soaked += 1,
             DesiredAction::LeaveAheadOfSoak => self.ahead += 1,
+            DesiredAction::LeaveAutoUpdates => self.auto_updates += 1,
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
             | DesiredAction::RefuseDeprecated => self.held += 1,

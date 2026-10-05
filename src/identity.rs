@@ -13,8 +13,10 @@ pub struct FormulaIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaskIdentity {
     pub version: String,
-    pub sha256: String,
-    pub url: String,
+    /// `None` for a version-only installed receipt
+    /// (`brew::version_only_cask_receipt`); compared only when both sides have one.
+    pub sha256: Option<String>,
+    pub url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,9 +39,20 @@ impl PkgIdentity {
                         _ => true,
                     }
             }
-            (Self::Cask(a), Self::Cask(b)) => a == b,
+            (Self::Cask(a), Self::Cask(b)) => {
+                a.version == b.version
+                    && both_or_skip(&a.sha256, &b.sha256)
+                    && both_or_skip(&a.url, &b.url)
+            }
             _ => false,
         }
+    }
+}
+
+fn both_or_skip(a: &Option<String>, b: &Option<String>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
     }
 }
 
@@ -86,12 +99,20 @@ fn keyword_quoted(rb: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Top-level `auto_updates true`: the app updates itself, and `brew upgrade`
+/// / `brew outdated` skip it unless `--greedy` or it is named explicitly.
+pub fn cask_auto_updates(rb: &str) -> bool {
+    depth1_lines(rb).iter().any(|t| {
+        t.strip_prefix("auto_updates")
+            .is_some_and(|r| r.trim() == "true")
+    })
+}
+
 pub fn parse_cask(rb: &str) -> Result<CaskIdentity, Error> {
     let version = first_quoted_or_symbol(rb, "version ")
         .ok_or_else(|| Error::Other("cask missing version".into()))?;
-    let sha256 = first_quoted_or_symbol(rb, "sha256 ")
-        .ok_or_else(|| Error::Other("cask missing sha256".into()))?;
-    let url = first_quoted(rb, "url ").ok_or_else(|| Error::Other("cask missing url".into()))?;
+    let sha256 = first_quoted_or_symbol(rb, "sha256 ");
+    let url = first_quoted(rb, "url ");
     Ok(CaskIdentity {
         version,
         sha256,
@@ -624,8 +645,8 @@ end
     fn parse_cask_fields() {
         let id = parse_cask(FOO_CASK).unwrap();
         assert_eq!(id.version, "3.0");
-        assert_eq!(id.sha256, "ccc333");
-        assert_eq!(id.url, "https://example.com/foo-3.0.dmg");
+        assert_eq!(id.sha256.as_deref(), Some("ccc333"));
+        assert_eq!(id.url.as_deref(), Some("https://example.com/foo-3.0.dmg"));
     }
 
     #[test]
@@ -699,8 +720,44 @@ end
 "#;
         let id = parse_cask(rb).unwrap();
         assert_eq!(id.version, ":latest");
-        assert_eq!(id.sha256, ":no_check");
-        assert_eq!(id.url, "https://example.com/nightly.dmg");
+        assert_eq!(id.sha256.as_deref(), Some(":no_check"));
+        assert_eq!(id.url.as_deref(), Some("https://example.com/nightly.dmg"));
+    }
+
+    #[test]
+    fn version_only_cask_receipt_matches_on_version_alone() {
+        // Installed casks on Homebrew >= 4 carry only a version (see
+        // `brew::version_only_cask_receipt`); sha256 and url compare only
+        // when both sides have them, like a formula's bottle rebuild.
+        let installed = parse_cask("cask \"ant\" do\n  version \"1.38.0\"\nend\n").unwrap();
+        assert_eq!(installed.version, "1.38.0");
+        assert_eq!(installed.sha256, None);
+        assert_eq!(installed.url, None);
+        let full = |v: &str, sha: &str| {
+            parse_cask(&format!(
+                "cask \"ant\" do\n  version \"{v}\"\n  sha256 \"{sha}\"\n  url \"https://e.com/ant-{v}.zip\"\nend\n"
+            ))
+            .unwrap()
+        };
+        let cask = PkgIdentity::Cask;
+        assert!(cask(installed.clone()).same_artifact(&cask(full("1.38.0", "aaa"))));
+        assert!(!cask(installed).same_artifact(&cask(full("1.39.0", "aaa"))));
+        assert!(
+            !cask(full("1.38.0", "aaa")).same_artifact(&cask(full("1.38.0", "bbb"))),
+            "two full receipts still compare sha256"
+        );
+        let latest = parse_cask("cask \"font-x\" do\n  version :latest\nend\n").unwrap();
+        assert_eq!(latest.version, ":latest");
+    }
+
+    #[test]
+    fn cask_auto_updates_reads_the_top_level_stanza() {
+        let yes = "cask \"alt-tab\" do\n  version \"11.8.0\"\n  auto_updates true\nend\n";
+        let no = "cask \"alt-tab\" do\n  version \"11.8.0\"\nend\n";
+        let off = "cask \"alt-tab\" do\n  version \"11.8.0\"\n  auto_updates false\nend\n";
+        assert!(cask_auto_updates(yes));
+        assert!(!cask_auto_updates(no));
+        assert!(!cask_auto_updates(off));
     }
 
     #[test]

@@ -25,6 +25,7 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
         DesiredAction::RefuseDeprecated => format!("{name} is deprecated or disabled at HEAD"),
         DesiredAction::NoOpAlreadySoaked
         | DesiredAction::LeaveAheadOfSoak
+        | DesiredAction::LeaveAutoUpdates
         | DesiredAction::InstallCutoff => return None,
     };
     Some(format!(
@@ -144,7 +145,7 @@ fn classify_installed(
 ) -> Result<Vec<Classified>, Error> {
     let mut out = Vec::new();
     for pkg in snapshotted_pkgs(inv, snaps) {
-        let Some(view) = resolve_view(
+        let Some(mut view) = resolve_view(
             git,
             snaps,
             cache,
@@ -156,6 +157,7 @@ fn classify_installed(
         else {
             continue;
         };
+        view.action = bare_action(&view);
         out.push((
             pkg.name.clone(),
             view.action,
@@ -192,6 +194,7 @@ fn write_update_summary(
                 DesiredAction::RefuseYanked => "gone at HEAD",
                 DesiredAction::NoOpAlreadySoaked => "already at cutoff",
                 DesiredAction::LeaveAheadOfSoak => "ahead of soak",
+                DesiredAction::LeaveAutoUpdates => "updates itself",
                 DesiredAction::RefuseDeprecated => "deprecated at HEAD",
             };
             writeln!(
@@ -363,9 +366,10 @@ struct Resolved {
 
 fn resolve_token(raw: &str, inv: &Inventory, cfg: &Config) -> Result<Resolved, Error> {
     let token = inventory::parse_token(raw)?;
-    let installed = inv
-        .find(&token.name)
-        .filter(|p| token.origin.as_deref().is_none_or(|o| o == p.origin));
+    let installed = match &token.origin {
+        Some(o) => inv.find_in(o, &token.name),
+        None => inv.find(&token.name),
+    };
     let origin_tap = match (&token.origin, installed) {
         (Some(o), _) => o.clone(),
         (None, Some(p)) => p.origin.clone(),
@@ -423,6 +427,7 @@ pub fn outdated(
     let mut upgrades = Vec::new();
     let mut held = Vec::new();
     let mut ahead = Vec::new();
+    let mut auto_updates = Vec::new();
     let mut pinned = Vec::new();
     let mut soaked = 0usize;
     let mut no_soak_names = Vec::new();
@@ -472,7 +477,7 @@ pub fn outdated(
             held.push(held_tap_note(&pkg.name, &pkg.origin, err));
             continue;
         }
-        let Some(view) = resolve_view(
+        let Some(mut view) = resolve_view(
             git,
             snaps,
             cache,
@@ -488,6 +493,7 @@ pub fn outdated(
             }
             continue;
         };
+        view.action = bare_action(&view);
         for warn in &view.warnings {
             writeln!(out, "warning: {warn}")?;
         }
@@ -527,6 +533,19 @@ pub fn outdated(
                 }
             }
             DesiredAction::LeaveAheadOfSoak => ahead.push(pkg.name.clone()),
+            DesiredAction::LeaveAutoUpdates => {
+                let installed_ver = view
+                    .installed
+                    .as_ref()
+                    .map(report::identity_version)
+                    .unwrap_or("unknown");
+                let cutoff_ver = view
+                    .cutoff
+                    .as_ref()
+                    .map(report::identity_version)
+                    .unwrap_or("none");
+                auto_updates.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
+            }
             DesiredAction::NoOpAlreadySoaked => soaked += 1,
         }
     }
@@ -544,6 +563,11 @@ pub fn outdated(
     write_section_always(out, "==> No-soak (brew)", &no_soak)?;
     write_section_always(out, "==> Held", &held)?;
     write_section_always(out, "==> Ahead of soak", &ahead)?;
+    write_section_always(
+        out,
+        "==> Auto-updates (left to the app; name it to upgrade)",
+        &auto_updates,
+    )?;
     write_section_always(out, "==> Pinned", &pinned)?;
     if upgrades.is_empty()
         && no_soak.is_empty()
@@ -606,7 +630,7 @@ pub fn info(
         match r.class {
             PkgClass::NoSoak => {
                 let installed = inv
-                    .find(&r.name)
+                    .find_in(&r.origin, &r.name)
                     .and_then(|p| parse_pkg(p.kind, &p.receipt_rb).ok());
                 let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
@@ -649,8 +673,7 @@ pub fn info(
         }
         let kind = kind.expect("soaked packages have a kind");
         let receipt = inv
-            .find(&r.name)
-            .filter(|p| p.origin == r.origin)
+            .find_in(&r.origin, &r.name)
             .map(|p| p.receipt_rb.as_str());
         let Some(view) = resolve_view(git, snaps, cache, &r.origin, &r.name, kind, receipt)? else {
             if long_form {
@@ -903,7 +926,7 @@ pub fn reinstall(
             }
             PkgClass::Soaked => {}
         }
-        let Some(pkg) = inv.find(&r.name).filter(|p| p.origin == r.origin) else {
+        let Some(pkg) = inv.find_in(&r.origin, &r.name) else {
             return Err(Error::Refusal(format!(
                 "reinstall: no installed keg: {}",
                 r.name
@@ -1134,15 +1157,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// brewsoak never uninstalls a keg to switch taps. Returns true when it
     /// refused.
     fn refuses_tap_switch(&mut self, r: &Resolved) -> bool {
-        if !r.named_origin {
+        if !r.named_origin || self.inv.find_in(&r.origin, &r.name).is_some() {
             return false;
         }
-        let Some(other) = self
-            .inv
-            .find(&r.name)
-            .map(|p| p.origin.clone())
-            .filter(|o| *o != r.origin)
-        else {
+        let Some(other) = self.inv.find(&r.name).map(|p| p.origin.clone()) else {
             return false;
         };
         let token = nosoak::brew_token(&r.origin, &r.name);
@@ -1159,7 +1177,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         nosoak::Target {
             switch_tap: r.receipt_tap.is_none()
                 && !origin::is_core_or_cask(&r.origin)
-                && self.inv.find(&r.name).is_some(),
+                && self.inv.find_in(&r.origin, &r.name).is_some(),
             origin: r.origin,
             name: r.name,
         }
@@ -1171,7 +1189,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             return Ok(());
         }
         let name = r.name.clone();
-        let pinned = self.inv.find(&name).is_some_and(|p| p.pinned);
+        let pinned = self.inv.find_in(&r.origin, &name).is_some_and(|p| p.pinned);
         if pinned && self.brew_verb == "upgrade" && (self.bare_run || r.class != PkgClass::NoSoak) {
             self.counts.pinned += 1;
             if is_verbose(self.user_flags) {
@@ -1231,10 +1249,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         let receipt = self
             .inv
-            .find(&name)
-            .filter(|p| p.origin == r.origin)
+            .find_in(&r.origin, &name)
             .map(|p| p.receipt_rb.as_str());
-        let Some(view) = resolve_view(
+        let Some(mut view) = resolve_view(
             self.git, self.snaps, self.cache, &r.origin, &name, kind, receipt,
         )?
         else {
@@ -1247,7 +1264,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             && origin::is_core_or_cask(&r.origin)
             && self
                 .inv
-                .find(&name)
+                .find_in(&r.origin, &name)
                 .is_some_and(|p| p.receipt_tap.is_none())
         {
             // Staged from a tap, the origin record is gone, and the name
@@ -1262,10 +1279,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         for warn in view.warnings.clone() {
             self.defer(format!("warning: {warn}"));
         }
+        if self.bare_run {
+            view.action = bare_action(&view);
+        }
         let did = match view.action {
             DesiredAction::InstallCutoff => "installing cutoff",
             DesiredAction::NoOpAlreadySoaked => "left unchanged",
             DesiredAction::LeaveAheadOfSoak => "left unchanged",
+            DesiredAction::LeaveAutoUpdates => "left to the app",
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
             | DesiredAction::RefuseDeprecated => "refused",
@@ -1292,6 +1313,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     writeln!(self.out, "{name} is already installed")?;
                 }
             }
+            // Silent, as brew is: the app updates itself. `-v` shows the line.
+            DesiredAction::LeaveAutoUpdates => {}
             DesiredAction::LeaveAheadOfSoak => {
                 if self.brew_verb == "reinstall" {
                     self.defer(format!(
@@ -1767,6 +1790,20 @@ struct ResolvedView {
     action: DesiredAction,
     cutoff_blob: Option<Vec<u8>>,
     warnings: Vec<String>,
+    /// The HEAD cask says `auto_updates true`.
+    auto_updates: bool,
+}
+
+/// What a bare `upgrade`/`outdated` does: an installed self-updating cask
+/// that is behind the cutoff is left to the app, as brew leaves it without
+/// `--greedy`. Everything else keeps its action.
+fn bare_action(view: &ResolvedView) -> DesiredAction {
+    if view.auto_updates && view.installed.is_some() && view.action == DesiredAction::InstallCutoff
+    {
+        DesiredAction::LeaveAutoUpdates
+    } else {
+        view.action
+    }
 }
 
 fn resolve_view(
@@ -1805,17 +1842,18 @@ fn resolve_view(
         eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref(), &today);
     let action =
         eligibility::desired_action(status, installed.as_ref(), cutoff.as_ref(), head.as_ref());
-    let warnings = match blobs
+    let head_rb = blobs
         .head
         .as_deref()
-        .and_then(|b| std::str::from_utf8(b).ok())
-    {
+        .and_then(|b| std::str::from_utf8(b).ok());
+    let warnings = match head_rb {
         Some(rb) => identity::upcoming_lifecycle_messages(rb, &today)
             .into_iter()
             .map(|msg| format!("{name} {msg}"))
             .collect(),
         None => Vec::new(),
     };
+    let auto_updates = kind == PkgKind::Cask && head_rb.is_some_and(identity::cask_auto_updates);
     Ok(Some(ResolvedView {
         installed,
         cutoff,
@@ -1823,6 +1861,7 @@ fn resolve_view(
         action,
         cutoff_blob: blobs.cutoff,
         warnings,
+        auto_updates,
     }))
 }
 
@@ -1902,7 +1941,11 @@ fn natural_kind(
     let same_origin = |o: &str| {
         o == origin_tap || (origin::is_core_or_cask(o) && origin::is_core_or_cask(origin_tap))
     };
-    if let Some(pkg) = inv.find(name).filter(|p| same_origin(&p.origin)) {
+    if let Some(pkg) = inv
+        .pkgs
+        .iter()
+        .find(|p| p.name == name && same_origin(&p.origin))
+    {
         return Ok(pkg.kind);
     }
     let formula = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, PkgKind::Formula)?;
@@ -4456,6 +4499,280 @@ mod tests {
             !run_has_token(&lock_runs(&brew), "hashicorp/tap/terraform"),
             "soaked tap packages are never brew tokens"
         );
+    }
+
+    fn cask_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
+        InstalledPkg {
+            name: name.into(),
+            kind: PkgKind::Cask,
+            receipt_rb,
+            pinned: false,
+            tap: Some(tap.into()),
+        }
+    }
+
+    /// Installed cask `ant` from anthropics/tap (version-only receipt, as
+    /// Homebrew >= 4 leaves it) while core also carries a formula `ant`.
+    fn tap_cask_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/ant.rb",
+            formula_rb("ant", "1.10.0", "c"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/ant.rb",
+            formula_rb("ant", "1.10.0", "c"),
+        );
+        git.insert_blob("tapcut", "Casks/ant.rb", cask_rb("ant", "1.38.0"));
+        git.insert_blob("taphead", "Casks/ant.rb", cask_rb("ant", "1.39.0"));
+        let brew = MockBrew {
+            installed: vec![cask_pkg_from(
+                "ant",
+                "anthropics/tap",
+                crate::brew::version_only_cask_receipt("ant", "1.37.0"),
+            )],
+            taps: vec![tapped(
+                "anthropics/tap",
+                Some("https://github.com/anthropics/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let snaps = tap_snaps(&git, "anthropics/tap", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Casks/ant.rb"]);
+        git.insert_tree("taphead", &["Casks/ant.rb"]);
+        (brew, git, snaps)
+    }
+
+    #[test]
+    fn info_bare_name_uses_installed_tap_cask_not_core_formula() {
+        let (brew, git, snaps) = tap_cask_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        info(
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &["ant".into()],
+            &["-v".into()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("ant: origin anthropics/tap; soak 24h"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "ant\ninstalled: 1.37.0\ncutoff: 1.38.0\nhead: 1.39.0\norigin: anthropics/tap\nsoak hours: 24\naction: would upgrade"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("homebrew/core"), "{text}");
+    }
+
+    #[test]
+    fn upgrade_bare_soaks_tap_cask_from_its_tap_snapshot() {
+        let (brew, git, snaps) = tap_cask_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &["-v".into()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("ant: origin anthropics/tap; soak 24h"),
+            "{text}"
+        );
+        assert!(text.contains("upgrading ant 1.37.0 -> 1.38.0"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "ant"), "{runs:?}");
+        assert!(
+            runs.iter().any(|a| a.iter().any(|x| x == "--cask")
+                && a.iter().any(|x| x.ends_with("/Casks/ant.rb"))),
+            "staged from the tap's Casks/ path: {runs:?}"
+        );
+        assert!(!r.refused);
+    }
+
+    #[test]
+    fn info_explicit_tap_token_finds_installed_cask_sharing_a_core_formula_name() {
+        let git = InMemoryGit::new();
+        let core = formula_rb("vacuum", "0.30.6", "s");
+        git.insert_blob("cutoffsha", "Formula/v/vacuum.rb", core.clone());
+        git.insert_blob("headsha", "Formula/v/vacuum.rb", core.clone());
+        git.insert_blob("tapcut", "Casks/vacuum.rb", cask_rb("vacuum", "0.30.6"));
+        git.insert_blob("taphead", "Casks/vacuum.rb", cask_rb("vacuum", "0.31.0"));
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg_from("vacuum", "homebrew/core", core),
+                cask_pkg_from(
+                    "vacuum",
+                    "daveshanley/vacuum",
+                    crate::brew::version_only_cask_receipt("vacuum", "0.30.6"),
+                ),
+            ],
+            taps: vec![tapped(
+                "daveshanley/vacuum",
+                Some("https://github.com/daveshanley/homebrew-vacuum"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "daveshanley/vacuum", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Casks/vacuum.rb"]);
+        git.insert_tree("taphead", &["Casks/vacuum.rb"]);
+        let mut out = Vec::new();
+        info(
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &["daveshanley/vacuum/vacuum".into(), "vacuum".into()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "daveshanley/vacuum/vacuum\ninstalled: 0.30.6\ncutoff: 0.30.6\nhead: 0.31.0\norigin: daveshanley/vacuum\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "vacuum\ninstalled: 0.30.6\ncutoff: 0.30.6\nhead: 0.30.6\norigin: homebrew/core\n"
+            ),
+            "bare name is the core formula: {text}"
+        );
+    }
+
+    /// Installed `alt-tab` 7.38.1 (self-updating app) behind a cask cutoff
+    /// of 11.8.0 that says `auto_updates true`, like brew's own skip.
+    fn auto_updates_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        let rb = format!("{}  auto_updates true\n", cask_rb("alt-tab", "11.8.0"));
+        git.insert_blob("caskcut", "Casks/a/alt-tab.rb", rb.clone());
+        git.insert_blob("caskhead", "Casks/a/alt-tab.rb", rb);
+        let brew = MockBrew {
+            installed: vec![cask_pkg_from(
+                "alt-tab",
+                "homebrew/cask",
+                crate::brew::version_only_cask_receipt("alt-tab", "7.38.1"),
+            )],
+            ..MockBrew::new()
+        };
+        (brew, git, core_snaps())
+    }
+
+    #[test]
+    fn auto_updates_cask_is_left_alone_on_bare_upgrade_but_upgraded_when_named() {
+        let (brew, git, snaps) = auto_updates_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &["-v".into()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            "bare run must not reinstall a self-updating app: {text}"
+        );
+        assert!(
+            text.contains("alt-tab: auto-updates; installed 7.38.1 is left to the app"),
+            "{text}"
+        );
+        assert!(
+            text.contains("upgraded 0, already soaked 0, held 0, ahead 0, pinned 0, skipped 0, no-soak 0, auto-updates 1"),
+            "{text}"
+        );
+
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alt-tab".into()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("upgrading alt-tab 7.38.1 -> 11.8.0"),
+            "{text}"
+        );
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            "named explicitly, it upgrades like `brew upgrade alt-tab`: {text}"
+        );
+    }
+
+    #[test]
+    fn outdated_lists_auto_updates_cask_in_its_own_section() {
+        let (brew, git, snaps) = auto_updates_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("==> Outdated (will upgrade)\n(none)\n"),
+            "brew does not list auto_updates casks without --greedy: {text}"
+        );
+        assert!(
+            text.contains("==> Auto-updates (left to the app; name it to upgrade)\nalt-tab (7.38.1) < 11.8.0\n"),
+            "{text}"
+        );
+        assert!(text.contains("nothing outdated"), "{text}");
     }
 
     #[test]

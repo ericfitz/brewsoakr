@@ -74,8 +74,20 @@ impl Inventory {
         Ok(Self::build(installed, &taps, &origins, cfg))
     }
 
+    /// Bare-name lookup. When a formula and a cask share a name, the
+    /// formula wins, as `brew` does for a bare token.
     pub fn find(&self, name: &str) -> Option<&Pkg> {
-        self.pkgs.iter().find(|p| p.name == name)
+        self.pkgs
+            .iter()
+            .find(|p| p.name == name && p.kind == PkgKind::Formula)
+            .or_else(|| self.pkgs.iter().find(|p| p.name == name))
+    }
+
+    /// The installed package with this name from exactly this origin tap.
+    pub fn find_in(&self, origin: &str, name: &str) -> Option<&Pkg> {
+        self.pkgs
+            .iter()
+            .find(|p| p.name == name && p.origin.eq_ignore_ascii_case(origin))
     }
 
     pub fn tap_class(&self, tap: &str) -> Option<TapClass> {
@@ -387,6 +399,55 @@ mod tests {
         );
         assert!(matches!(parse_token("user/foo"), Err(Error::Usage(_))));
         assert!(matches!(parse_token("a/b/c/d"), Err(Error::Usage(_))));
+    }
+
+    #[test]
+    fn third_party_cask_is_soaked_from_its_tap_and_find_in_separates_same_names() {
+        let mut t = taps();
+        t.push(TapInfo {
+            name: "anthropics/tap".into(),
+            remote: Some("https://github.com/anthropics/homebrew-tap".into()),
+        });
+        t.push(TapInfo {
+            name: "daveshanley/vacuum".into(),
+            remote: Some("https://github.com/daveshanley/homebrew-vacuum".into()),
+        });
+        let inv = Inventory::build(
+            vec![
+                installed("vacuum", PkgKind::Formula, Some("homebrew/core")),
+                installed("vacuum", PkgKind::Cask, Some("daveshanley/vacuum")),
+                installed("ant", PkgKind::Cask, Some("anthropics/tap")),
+            ],
+            &t,
+            &OriginRecords::default(),
+            &cfg("[\"ericfitz/tap\"]"),
+        );
+        let ant = inv.find("ant").unwrap();
+        assert_eq!(
+            (ant.kind, ant.origin.as_str(), ant.class),
+            (PkgKind::Cask, "anthropics/tap", PkgClass::Soaked)
+        );
+        assert_eq!(
+            inv.find("vacuum").unwrap().kind,
+            PkgKind::Formula,
+            "bare name: formula first, as brew does"
+        );
+        assert_eq!(
+            inv.find_in("daveshanley/vacuum", "vacuum").unwrap().kind,
+            PkgKind::Cask
+        );
+        assert_eq!(
+            inv.find_in("homebrew/core", "vacuum").unwrap().kind,
+            PkgKind::Formula
+        );
+        assert!(inv.find_in("homebrew/cask", "vacuum").is_none());
+        assert!(inv.find_in("DaveShanley/Vacuum", "vacuum").is_some());
+        let needed: Vec<String> = inv
+            .needed_taps(&[], &cfg("[\"ericfitz/tap\"]"))
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        assert_eq!(needed, vec!["anthropics/tap", "daveshanley/vacuum"]);
     }
 
     #[test]

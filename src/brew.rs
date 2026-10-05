@@ -526,6 +526,22 @@ fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Opti
     walk_metadata_for_file(&metadata, &target)
 }
 
+/// Homebrew >= 4 saves an installed cask as
+/// `.metadata/<version>/<timestamp>/Casks/<token>.json`
+/// (`Cask::Installer#save_caskfile`: `to_installed_json_hash`, which holds
+/// uninstall artifacts and nothing identifying) and writes `<token>.rb` only
+/// for casks with uninstall flight blocks. Without a `.rb`, the installed
+/// identity is the version `brew info --json=v2 --installed` reports.
+/// `identity::parse_cask` reads this as a version-only `CaskIdentity`.
+pub fn version_only_cask_receipt(name: &str, version: &str) -> String {
+    let version = if version == "latest" {
+        ":latest".to_string()
+    } else {
+        format!("\"{version}\"")
+    };
+    format!("cask \"{name}\" do\n  version {version}\nend\n")
+}
+
 /// Walk only `dir` (a `.metadata` tree). Unreadable subdirs are skipped.
 fn walk_metadata_for_file(dir: &Path, target: &str) -> Option<String> {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -582,7 +598,12 @@ fn parse_installed_json(
         let tap =
             tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
         let version = installed_version(obj);
-        if let Some(receipt_rb) = read_receipt(&name, PkgKind::Cask, version.as_deref()) {
+        let receipt_rb = read_receipt(&name, PkgKind::Cask, version.as_deref()).or_else(|| {
+            version
+                .as_deref()
+                .map(|v| version_only_cask_receipt(&name, v))
+        });
+        if let Some(receipt_rb) = receipt_rb {
             out.push(InstalledPkg {
                 name,
                 kind: PkgKind::Cask,
@@ -1005,6 +1026,62 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "ca-certificates");
         assert_eq!(got[0].kind, PkgKind::Formula);
+    }
+
+    #[test]
+    fn parse_installed_json_cask_without_rb_receipt_uses_brew_version() {
+        // Homebrew >= 4 saves `.metadata/<v>/<ts>/Casks/<token>.json`, not
+        // `<token>.rb`; every installed cask used to be dropped here.
+        let json = r#"{
+          "formulae": [
+            {"name": "vacuum", "tap": "homebrew/core", "installed": [{"version": "0.30.6"}]}
+          ],
+          "casks": [
+            {"token": "vacuum", "full_token": "daveshanley/vacuum/vacuum",
+             "tap": "daveshanley/vacuum", "installed": "0.30.6"},
+            {"token": "ant", "full_token": "anthropics/tap/ant",
+             "tap": "anthropics/tap", "installed": "1.38.0"},
+            {"token": "font-open-sans", "tap": "homebrew/cask", "installed": "latest"},
+            {"token": "flighty", "tap": "homebrew/cask", "installed": "2.0"}
+          ]
+        }"#;
+        let got = parse_installed_json(json, |name, kind, _version| match (name, kind) {
+            ("vacuum", PkgKind::Formula) => Some("class Vacuum; end".into()),
+            ("flighty", PkgKind::Cask) => Some("cask \"flighty\"".into()),
+            (_, PkgKind::Cask) => None,
+            (other, _) => panic!("unexpected receipt read for {other}"),
+        })
+        .expect("parse fixture");
+        let summary: Vec<(&str, PkgKind, Option<&str>)> = got
+            .iter()
+            .map(|p| (p.name.as_str(), p.kind, p.tap.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("vacuum", PkgKind::Formula, Some("homebrew/core")),
+                ("vacuum", PkgKind::Cask, Some("daveshanley/vacuum")),
+                ("ant", PkgKind::Cask, Some("anthropics/tap")),
+                ("font-open-sans", PkgKind::Cask, Some("homebrew/cask")),
+                ("flighty", PkgKind::Cask, Some("homebrew/cask")),
+            ]
+        );
+        let version = |i: usize| {
+            crate::identity::parse_cask(&got[i].receipt_rb)
+                .unwrap()
+                .version
+        };
+        assert_eq!(version(1), "0.30.6");
+        assert_eq!(version(2), "1.38.0");
+        assert_eq!(
+            version(3),
+            ":latest",
+            "brew reports `latest`; the cask says `:latest`"
+        );
+        assert_eq!(
+            got[4].receipt_rb, "cask \"flighty\"",
+            "a real .rb receipt still wins"
+        );
     }
 
     #[test]
