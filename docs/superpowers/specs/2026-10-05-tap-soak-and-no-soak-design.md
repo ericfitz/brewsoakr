@@ -47,6 +47,10 @@ File `~/.config/brewsoak/config.toml`:
 
 ```toml
 SOAK_HOURS = 48                  # default for every package, core and cask included
+NO_SOAK = ["ericfitz/tap", "wget", "hashicorp/tap/terraform"]
+
+# Top-level keys must come before the first [[TAP]] table: TOML assigns any
+# key written after a [[TAP]] header to that table.
 
 [[TAP]]
 name = "hashicorp/tap"
@@ -54,9 +58,12 @@ soak_hours = 72                  # optional; applies to every package in this ta
 
 [[TAP]]
 name = "cyclonedx/cyclonedx"     # no soak_hours: uses SOAK_HOURS
-
-NO_SOAK = ["ericfitz/tap", "wget", "hashicorp/tap/terraform"]
 ```
+
+A `NO_SOAK` key found inside a `[[TAP]]` table is a misplaced top-level key.
+brewsoak warns on stderr on every run (not only under `-v`), naming the fix,
+and does not apply it, since a silently ignored no-soak list is the failure a
+user would least expect.
 
 ### Effective soak hours for a package
 
