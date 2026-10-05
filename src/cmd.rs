@@ -295,7 +295,8 @@ pub fn update(
     for (name, err) in &snaps.held_taps {
         writeln!(
             out,
-            "tap {name} could not be refreshed; its packages are held. {err}"
+            "tap {name} could not be refreshed; its packages are held.\n{}",
+            indented_detail(err)
         )?;
     }
     prefetch_installed(git, cache, inv, &snaps);
@@ -303,6 +304,7 @@ pub fn update(
     if inv.any_no_soak() {
         writeln!(out, "no-soak packages installed; updating brew")?;
         let output = brew.run_visible(&["update".to_string()])?;
+        write_session_tail(&brew.session_report(), out)?;
         if !output.status.success() {
             let status = output.status.code().unwrap_or(1);
             writeln!(out, "brew update failed (exit {status})")?;
@@ -330,8 +332,21 @@ fn unsoakable_note(name: &str, origin_tap: &str, tapped: bool) -> String {
     }
 }
 
+/// Detail text (often git's multi-line stderr) on its own lines, each
+/// indented two spaces so it reads as belonging to the line above it.
+fn indented_detail(detail: &str) -> String {
+    detail
+        .lines()
+        .map(|l| format!("  {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn held_tap_note(name: &str, origin_tap: &str, err: &str) -> String {
-    format!("{name}: tap {origin_tap} could not be refreshed; held. {err}")
+    format!(
+        "{name}: tap {origin_tap} could not be refreshed; held.\n{}",
+        indented_detail(err)
+    )
 }
 
 /// origin + name + class for a command-line token, installed or not.
@@ -426,7 +441,9 @@ pub fn outdated(
         }
         match pkg.class {
             PkgClass::NoSoak => {
-                if !pkg.pinned {
+                if pkg.pinned {
+                    pinned.push(pkg.name.clone());
+                } else {
                     no_soak_names.push(pkg.name.clone());
                 }
                 if verbose {
@@ -1089,17 +1106,17 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         if !self.deferred.is_empty() {
             writeln!(self.out, "notes:")?;
-            for line in &self.deferred {
-                writeln!(self.out, "  {line}")?;
+            for note in &self.deferred {
+                for (i, line) in note.lines().enumerate() {
+                    if i == 0 {
+                        writeln!(self.out, "  {line}")?;
+                    } else {
+                        writeln!(self.out, "    {}", line.trim_start())?;
+                    }
+                }
             }
         }
-        for line in &report.caveats {
-            writeln!(self.out, "{line}")?;
-        }
-        if let Some(path) = &report.log_path {
-            writeln!(self.out, "full brew log: {}", path.display())?;
-        }
-        Ok(())
+        write_session_tail(&report, self.out)
     }
 
     /// True when brew already put this package at the version we wanted,
@@ -1951,6 +1968,20 @@ fn write_section(out: &mut impl Write, header: &str, lines: &[String]) -> Result
         return Ok(());
     }
     write_section_always(out, header, lines)
+}
+
+/// Caveats brew printed and where the raw brew log went.
+fn write_session_tail(
+    report: &crate::brew::SessionReport,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    for line in &report.caveats {
+        writeln!(out, "{line}")?;
+    }
+    if let Some(path) = &report.log_path {
+        writeln!(out, "full brew log: {}", path.display())?;
+    }
+    Ok(())
 }
 
 fn write_section_always(out: &mut impl Write, header: &str, lines: &[String]) -> Result<(), Error> {
@@ -5414,7 +5445,8 @@ mod tests {
         if std::env::var_os("BREWSOAK_BLESS").is_some() {
             std::fs::write(&path, &got).unwrap();
         }
-        let want = std::fs::read_to_string(&path).unwrap_or_default();
+        let want = std::fs::read_to_string(&path)
+            .expect("fixture missing; run with BREWSOAK_BLESS=1 to create it");
         assert_eq!(
             got, want,
             "upgrade summary changed; rerun with BREWSOAK_BLESS=1 if intended"
@@ -5429,5 +5461,31 @@ mod tests {
             got.contains("terraform: tap hashicorp/tap could not be refreshed"),
             "{got}"
         );
+    }
+
+    #[test]
+    fn outdated_lists_a_pinned_no_soak_package_under_pinned() {
+        let brew = MockBrew {
+            installed: vec![formula_pkg_pinned("wget", formula_rb("wget", "1.0.0", "a"))],
+            outdated: vec!["wget".into()],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"wget\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        outdated(
+            &brew,
+            &InMemoryGit::new(),
+            &core_snaps(),
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("==> Pinned\nwget"), "{text}");
+        assert!(!text.contains("wget (no-soak"), "{text}");
     }
 }
