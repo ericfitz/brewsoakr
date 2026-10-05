@@ -1,10 +1,11 @@
 # brewsoak
 
-A Homebrew wrapper that delays `homebrew/core` and `homebrew/cask` updates
-for a soak window. This gives security researchers time to discover and yank
+A Homebrew wrapper that delays `homebrew/core`, `homebrew/cask`, and
+third-party tap updates for a soak window. This gives security researchers time to discover and yank
 a compromised package before you install it.
 
-Third-party taps and every other `brew` subcommand pass through unchanged.
+Every other `brew` subcommand passes through unchanged. Packages and taps you
+list under `NO_SOAK` skip soaking and end in the same state as `brew upgrade`.
 There is no soak bypass flag: run `brew` directly if you need HEAD now.
 
 ## Install
@@ -17,8 +18,9 @@ brew install ericfitz/tap/brewsoak
 
 Installs a prebuilt, code-signed and notarized universal (Apple Silicon +
 Intel) binary from the [GitHub release](https://github.com/ericfitz/brewsoakr/releases).
-Upgrade later with `brew upgrade brewsoak` (brewsoak itself lives in a
-third-party tap, so it is never soaked).
+Upgrade later with `brew upgrade brewsoak`. Add `ericfitz/tap` to `NO_SOAK`
+(below) so `brewsoak upgrade` keeps brewsoak itself current without a soak
+delay.
 
 ### Cargo
 
@@ -60,11 +62,62 @@ Precedence: CLI > environment > file > 24.
 (`update`, `upgrade`, `install`, `reinstall`, `outdated`, `info`).
 `N == 24` deletes the config file.
 
+### Per-tap soak hours and the no-soak list
+
+```toml
+# Top-level keys go first. TOML assigns any key after a [[TAP]] header to
+# that table.
+SOAK_HOURS = 48                  # default for every package, core and cask included
+NO_SOAK = ["ericfitz/tap", "wget", "hashicorp/tap/terraform"]
+
+[[TAP]]
+name = "hashicorp/tap"
+soak_hours = 72                  # optional; applies to every package in this tap
+
+[[TAP]]
+name = "cyclonedx/cyclonedx"     # no soak_hours: uses SOAK_HOURS
+```
+
+Effective soak hours for a package: a `NO_SOAK` match means no soak at all;
+else the origin tap's `[[TAP]]` `soak_hours`; else `SOAK_HOURS`. `[[TAP]]` and
+`NO_SOAK` are file-only (no flag, no environment variable). `homebrew/core`
+and `homebrew/cask` are valid tap names in both.
+
+`NO_SOAK` entries:
+
+| Entry | Matches |
+|---|---|
+| `wget` | that formula or cask from any tap |
+| `ericfitz/tap` | every package in that tap |
+| `hashicorp/tap/terraform` | that one package from that tap |
+
+Matching is case-insensitive. Invalid entries are skipped and reported under
+`-v`. A `NO_SOAK` key inside a `[[TAP]]` table is ignored, with a warning on
+stderr every run.
+
+`--soak-hours N` edits only the `SOAK_HOURS` key; `[[TAP]]` and `NO_SOAK` are
+kept. A config file that is not valid TOML is left alone with a warning.
+
+### Third-party taps
+
+Every installed tap with an HTTPS remote is soaked like core and cask, from a
+blobless clone under brewsoak's cache. brew's own tap checkouts are never
+touched. A tap with no remote, or a non-HTTPS remote, is not soakable:
+brewsoak notes its packages and leaves them to `brew`, unless they are in
+`NO_SOAK`.
+
+No-soak packages are installed by `brew` itself from their real tap after all
+soaked work: one `brew update`, then one `brew upgrade` (or `install` /
+`reinstall`) naming every no-soak package. `brew upgrade` also upgrades a
+no-soak package's outdated dependencies to brew's latest, so no-soak extends
+to its dependencies. Soaked dependents of a no-soak package are not upgraded
+by that step.
+
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `update` | Refresh cutoff/HEAD snapshots. Does not update Homebrew itself. |
+| `update` | Refresh cutoff/HEAD snapshots. Runs `brew update` once when any installed package is no-soak. |
 | `outdated` | What `upgrade` would change, plus held / ahead / pinned. |
 | `upgrade` | Install soaked cutoff artifacts for eligible installed packages. |
 | `install` | Install the soaked cutoff artifact if eligible. |

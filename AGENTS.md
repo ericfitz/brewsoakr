@@ -10,6 +10,16 @@
 - Persist `--soak-hours` only on soaked commands, never on passthrough/`--version`/`--help`.
 - Do not uninstall a `homebrew/core` keg to switch taps.
 
+## Origins and staging
+
+- A package's origin is the receipt `tap` from `brew info --json=v2 --installed` when it is non-empty and not `brewsoakr/soaked`; else `<cache>/origins.toml` (`"formula:<name>" = "user/repo"`); else `homebrew/core` / `homebrew/cask`. A staged install leaves the receipt tap null, so write the origin record after every successful staged tap install and remove it after a staged core/cask install.
+- Tap packages are staged under `<cache>/staging/taps/<user>/<repo>/{Formula,Casks}/<name>.rb`; core and cask stay directly under `<cache>/staging/`. Never let a tap formula land in the core staging root.
+- Tap history lives in `<cache>/taps/<user>/<repo>.git`: a bare clone with a named `origin` remote, fetched `--filter=blob:none` (retry without the filter if the server rejects it). Never fetch into, or move the checkout of, anything under `$(brew --repository)/Library/Taps`. No GitHub API calls for taps.
+- `NO_SOAK` packages are never staged. They go to brew as full tokens (`user/repo/name` for tap packages) in one `brew update` + one `brew upgrade|install|reinstall` after all soaked work. A no-soak package whose keg was staged by brewsoak is moved to its real tap with `brew install user/repo/name`.
+- `brew tap-info --json --installed` reports `remote: null` for API-mode `homebrew/core` and `homebrew/cask` and for the staging tap; classify those by name before applying the "no HTTPS remote = unsoakable" rule.
+- A tap whose fetch fails holds only that tap's packages (`Error::Git` note). Core or cask fetch failure still aborts the run.
+- Config: top-level keys (`SOAK_HOURS`, `NO_SOAK`) must precede the first `[[TAP]]` table in every example; a `NO_SOAK` inside `[[TAP]]` is ignored with a stderr warning.
+
 ## Output
 
 - Every byte of `brew` output goes to the per-run log under `$TMPDIR`; the terminal gets a summary. Never suppress a line without logging it.

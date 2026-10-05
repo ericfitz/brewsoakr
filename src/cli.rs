@@ -60,11 +60,12 @@ pub fn help_text() -> &'static str {
     "\
 Usage: brewsoak [options] <command> [args...]
 
-A Homebrew wrapper that delays core/cask updates for a soak window.
+A Homebrew wrapper that delays core, cask, and third-party tap updates for a soak window.
 
 Soaked commands:
   update, upgrade, install, reinstall, outdated, info
-Other brew commands are passed through unchanged.
+Other brew commands are passed through unchanged. Packages and taps listed
+under NO_SOAK in ~/.config/brewsoak/config.toml skip soaking and go to brew.
 
 Options:
   --soak-hours <N>   soak window in hours (default 24; also BREWSOAK_SOAK_HOURS)
@@ -260,14 +261,16 @@ pub fn command_help(topic: &str) -> Option<&'static str> {
             "\
 Usage: brewsoak update
 
-Refresh soak snapshots for homebrew-core and homebrew-cask.
-Does not update the Homebrew tool itself.
+Refresh soak snapshots for homebrew-core, homebrew-cask, and every soaked tap.
+Runs brew update once when any installed package is no-soak.
 
 Prints soak hours, cutoff/HEAD SHAs (with cutoff time), fetch progress,
 and a summary of installed packages that became eligible, are still
 soaking, or are gone at HEAD.
 
   -v, --verbose   print every installed package and why it classified that way
+      --raw       print brew's output unfiltered (a full log is always
+                  written under $TMPDIR; its path is printed at the end)
 "
         }
         "upgrade" => {
@@ -279,7 +282,10 @@ Packages born inside the soak window are held. Ahead-of-soak installs
 are left unchanged. Pinned packages are skipped.
 
 With no names, considers every installed core formula and cask.
-Third-party tap tokens are passed through to brew.
+Third-party tap packages are soaked from brewsoak's own tap clones.
+Packages in NO_SOAK (no-soak) are handed to brew after the soaked work (one brew update,
+then one brew upgrade); their outdated dependencies go with them.
+Taps without an HTTPS remote are not soakable and are noted, not upgraded.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
@@ -292,6 +298,7 @@ Usage: brewsoak install [--formula|--cask] <name> ...
 
 Install the soaked cutoff artifact if it is eligible.
 Too-new / yanked / deprecated names are refused; use brew to bypass.
+user/repo/name tokens are soaked (or no-soak) like any other package.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
@@ -304,6 +311,7 @@ Usage: brewsoak reinstall <name> ...
 
 If the installed identity equals HEAD, runs brew reinstall (true repair).
 Otherwise installs the soaked cutoff artifact. Ahead-of-soak is refused.
+user/repo/name tokens are soaked (or no-soak) like any other package.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
@@ -316,6 +324,7 @@ Usage: brewsoak outdated
 
 List installed core/cask packages that upgrade would change, plus
 held, ahead-of-soak, and pinned sections.
+user/repo/name tokens are soaked (or no-soak) like any other package.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
@@ -329,6 +338,8 @@ Usage: brewsoak info [formula|cask ...]
 Show installed, cutoff, and HEAD identities and what brewsoak would do.
 With no names, prints one compact line per installed core/cask package.
 Named packages (or --verbose) print the long form.
+user/repo/name tokens are soaked (or no-soak) like any other package.
+Shows origin tap and effective soak hours; no-soak packages are marked.
 
   -v, --verbose   long form for every package plus soak window
 "
@@ -393,6 +404,18 @@ mod tests {
     #[test]
     fn no_args_is_usage() {
         assert!(matches!(parse_argv(&[]), Err(Error::Usage(_))));
+    }
+
+    #[test]
+    fn help_mentions_no_soak_and_taps() {
+        assert!(help_text().contains("NO_SOAK"));
+        assert!(command_help("upgrade").unwrap().contains("no-soak"));
+        assert!(
+            !command_help("upgrade")
+                .unwrap()
+                .contains("passed through to brew")
+        );
+        assert!(command_help("update").unwrap().contains("brew update"));
     }
 
     #[test]
