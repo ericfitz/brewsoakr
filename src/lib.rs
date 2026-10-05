@@ -125,6 +125,14 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
     let cfg = config::resolve_config(inv.soak_hours, env.as_deref(), file.as_deref())?;
+    if !matches!(
+        inv.command,
+        cli::Command::Version | cli::Command::Help { .. }
+    ) {
+        for w in &cfg.warnings {
+            eprintln!("brewsoak: warning: {w}");
+        }
+    }
     if inv.command.is_soaked() {
         if let Some(warning) = config::apply_persist(cfg.persist, &world.config_path())? {
             eprintln!("brewsoak: warning: {warning}");

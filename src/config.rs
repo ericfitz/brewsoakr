@@ -16,6 +16,8 @@ pub struct ParsedFile {
     pub no_soak: NoSoakList,
     /// Invalid entries, worded for `-v`.
     pub notes: Vec<String>,
+    /// Always printed to stderr (not only under `-v`).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +28,8 @@ pub struct Config {
     pub taps: Vec<TapEntry>,
     pub no_soak: NoSoakList,
     pub notes: Vec<String>,
+    /// Always printed to stderr (not only under `-v`).
+    pub warnings: Vec<String>,
 }
 
 impl Config {
@@ -36,6 +40,7 @@ impl Config {
             taps: Vec::new(),
             no_soak: NoSoakList::default(),
             notes: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -118,6 +123,7 @@ pub fn resolve_config(
         taps: parsed.taps,
         no_soak: parsed.no_soak,
         notes: parsed.notes,
+        warnings: parsed.warnings,
     })
 }
 
@@ -150,6 +156,15 @@ fn parse_taps(v: &toml::Value, out: &mut ParsedFile) {
         return;
     };
     for entry in entries {
+        if entry.get("NO_SOAK").is_some() {
+            let label = entry
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("(unnamed)");
+            out.warnings.push(format!(
+                "config: NO_SOAK inside [[TAP]] {label} is ignored; move it above the first [[TAP]] table"
+            ));
+        }
         let Some(name) = entry.get("name").and_then(toml::Value::as_str) else {
             out.notes
                 .push("config: [[TAP]] entry is missing name; skipped".into());
@@ -241,6 +256,7 @@ pub fn apply_persist(action: PersistAction, path: &Path) -> Result<Option<String
         },
     };
     match action {
+        PersistAction::None => return Ok(None),
         PersistAction::Write(hours) => {
             table.insert(
                 "SOAK_HOURS".into(),
@@ -250,7 +266,6 @@ pub fn apply_persist(action: PersistAction, path: &Path) -> Result<Option<String
         PersistAction::Delete => {
             table.remove("SOAK_HOURS");
         }
-        PersistAction::None => unreachable!(),
     }
     if table.is_empty() {
         return match std::fs::remove_file(path) {
@@ -461,6 +476,16 @@ name = "cyclonedx/cyclonedx"
         assert!(p.no_soak.matches("homebrew/core", "wget"));
         assert!(!p.no_soak.matches("a/b", "c"));
         assert_eq!(p.notes.len(), 2, "{:?}", p.notes);
+    }
+
+    #[test]
+    fn no_soak_inside_tap_table_warns_and_is_not_applied() {
+        let p = parse_file("[[TAP]]\nname = \"a/b\"\nNO_SOAK = [\"wget\"]\n");
+        assert!(p.no_soak.is_empty());
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(p.warnings[0].contains("NO_SOAK") && p.warnings[0].contains("a/b"));
+        assert!(p.warnings[0].contains("above the first [[TAP]]"));
+        assert!(parse_file(FULL).warnings.is_empty());
     }
 
     #[test]
