@@ -174,18 +174,23 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let cache = world.cache_path();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
-            cmd::update(
-                world.brew(),
-                world.git(),
-                world.github(),
-                &cache,
-                &cfg,
-                &pkgs,
-                world.now(),
-                cmd::is_verbose(&inv.brew_args),
-                &mut out,
-            )?;
-            Ok(Dispatch::Exit(0))
+            soaked_exit(
+                cmd::update(
+                    world.brew(),
+                    world.git(),
+                    world.github(),
+                    &cache,
+                    &cfg,
+                    &pkgs,
+                    world.now(),
+                    cmd::is_verbose(&inv.brew_args),
+                    &mut out,
+                )
+                .map(|()| cmd::RunResult {
+                    refused: false,
+                    brew_status: None,
+                }),
+            )
         }
         cli::Command::Outdated => {
             let cache = world.cache_path();
@@ -194,7 +199,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
-                world.brew(),
                 &cache,
                 &cfg,
                 &pkgs,
@@ -221,7 +225,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
-                world.brew(),
                 &cache,
                 &cfg,
                 &pkgs,
@@ -231,7 +234,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &mut out,
             )?;
             soaked_exit(cmd::info(
-                world.brew(),
                 world.git(),
                 &snaps,
                 &cache,
@@ -250,7 +252,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
-                world.brew(),
                 &cache,
                 &cfg,
                 &pkgs,
@@ -284,7 +285,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
-                world.brew(),
                 &cache,
                 &cfg,
                 &pkgs,
@@ -316,7 +316,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
-                world.brew(),
                 &cache,
                 &cfg,
                 &pkgs,

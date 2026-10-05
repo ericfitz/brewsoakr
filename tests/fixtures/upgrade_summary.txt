@@ -1,0 +1,9 @@
+upgrading 1 of 5 packages
+[1/1] upgrading alpha 1.0.0 -> 1.1.0
+no-soak: updating brew
+no-soak: brew upgrade ericfitz/tap/brewsoak
+upgraded 1, already soaked 0, held 1, ahead 0, pinned 1, skipped 0, no-soak 1
+notes:
+  thing: tap local/tap has no HTTPS remote; not soakable. Use brew, or add it to NO_SOAK
+  terraform: tap hashicorp/tap could not be refreshed; held. while fetching history from origin to find the tap's soak cutoff, git failed:
+fatal: unable to access

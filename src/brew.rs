@@ -41,6 +41,8 @@ pub trait Brew {
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error>;
+    /// Names brew itself considers outdated right now (no `brew update`).
+    fn outdated_names(&self) -> Result<Vec<String>, Error>;
     /// Turn the output filter off; brew output is forwarded byte for byte.
     fn set_raw(&self, _raw: bool) {}
     fn session_report(&self) -> SessionReport {
@@ -110,6 +112,8 @@ pub struct MockBrew {
     /// Queued `(status, stdout)` results popped by `run_visible` before it
     /// falls back to `next_status`/`next_stdout`.
     pub next_outputs: Mutex<VecDeque<(i32, Vec<u8>)>>,
+    /// What `outdated_names` reports.
+    pub outdated: Vec<String>,
 }
 
 impl Default for MockBrew {
@@ -124,6 +128,7 @@ impl Default for MockBrew {
             next_stdout: Vec::new(),
             next_stderr: Vec::new(),
             next_outputs: Mutex::new(VecDeque::new()),
+            outdated: Vec::new(),
         }
     }
 }
@@ -219,6 +224,14 @@ impl Brew for ProcessBrew {
             return Err(brew_fail(&output));
         }
         crate::taps::parse_tap_info_json(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn outdated_names(&self) -> Result<Vec<String>, Error> {
+        let output = self.run(&["outdated".into(), "--json=v2".into()])?;
+        if !output.status.success() {
+            return Err(brew_fail(&output));
+        }
+        parse_outdated_json(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
@@ -427,6 +440,10 @@ impl Brew for MockBrew {
         Ok(self.taps.clone())
     }
 
+    fn outdated_names(&self) -> Result<Vec<String>, Error> {
+        Ok(self.outdated.clone())
+    }
+
     fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
         let stem = Path::new(token)
             .file_stem()
@@ -598,6 +615,19 @@ fn installed_version(obj: &str) -> Option<String> {
     json_string_value(obj, "linked_keg").filter(|s| !s.is_empty())
 }
 
+/// Formula and cask names from `brew outdated --json=v2`.
+pub(crate) fn parse_outdated_json(json: &str) -> Result<Vec<String>, Error> {
+    let mut out = Vec::new();
+    for key in ["formulae", "casks"] {
+        for obj in json_objects_in_array(json, key)? {
+            if let Some(name) = json_string_value(obj, "name").filter(|n| !n.is_empty()) {
+                out.push(name);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<&'a str>, Error> {
     let Some(after_key) = find_json_key(json, key) else {
         return Ok(Vec::new());
@@ -744,6 +774,24 @@ fn parse_json_string(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_outdated_names() {
+        let brew = MockBrew {
+            outdated: vec!["brewsoak".into()],
+            ..MockBrew::new()
+        };
+        assert_eq!(brew.outdated_names().unwrap(), vec!["brewsoak".to_string()]);
+    }
+
+    #[test]
+    fn parse_outdated_json_reads_formula_and_cask_names() {
+        let json = r#"{"formulae": [{"name": "brewsoak", "installed_versions": ["1.0"], "current_version": "1.1"}], "casks": [{"name": "firefox"}]}"#;
+        assert_eq!(
+            parse_outdated_json(json).unwrap(),
+            vec!["brewsoak".to_string(), "firefox".to_string()]
+        );
+    }
 
     fn mock_with(installed: Vec<InstalledPkg>, deps: BTreeMap<String, Vec<String>>) -> MockBrew {
         MockBrew {

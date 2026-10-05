@@ -85,7 +85,6 @@ pub fn refresh_plan(cfg: &Config, inv: &Inventory, extra: &[(String, String)]) -
 pub fn ensure_snapshots(
     git: &impl GitStore,
     gh: &impl GithubApi,
-    _brew: &impl Brew,
     cache: &Path,
     cfg: &Config,
     inv: &Inventory,
@@ -237,7 +236,7 @@ pub fn prefetch_installed(git: &impl GitStore, cache: &Path, inv: &Inventory, sn
 
 #[allow(clippy::too_many_arguments)]
 pub fn update(
-    _brew: &impl Brew,
+    brew: &impl Brew,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
@@ -301,6 +300,19 @@ pub fn update(
     }
     prefetch_installed(git, cache, inv, &snaps);
     write_update_summary(git, cache, &snaps, inv, &before, verbose, out)?;
+    if inv.any_no_soak() {
+        writeln!(out, "no-soak packages installed; updating brew")?;
+        let output = brew.run_visible(&["update".to_string()])?;
+        if !output.status.success() {
+            let status = output.status.code().unwrap_or(1);
+            writeln!(out, "brew update failed (exit {status})")?;
+            writeln!(out, "snapshots refreshed")?;
+            return Err(Error::Brew {
+                status,
+                message: String::new(),
+            });
+        }
+    }
     writeln!(out, "snapshots refreshed")?;
     Ok(())
 }
@@ -371,7 +383,7 @@ fn settle_origin(r: &mut Resolved, kind: PkgKind, inv: &Inventory, cfg: &Config)
 
 #[allow(clippy::too_many_arguments)]
 pub fn outdated(
-    _brew: &impl Brew,
+    brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -398,6 +410,7 @@ pub fn outdated(
     let mut ahead = Vec::new();
     let mut pinned = Vec::new();
     let mut soaked = 0usize;
+    let mut no_soak_names = Vec::new();
     for pkg in &inv.pkgs {
         if verbose {
             writeln!(
@@ -413,6 +426,9 @@ pub fn outdated(
         }
         match pkg.class {
             PkgClass::NoSoak => {
+                if !pkg.pinned {
+                    no_soak_names.push(pkg.name.clone());
+                }
                 if verbose {
                     writeln!(out, "{}: no-soak; brew decides", pkg.name)?;
                 }
@@ -497,11 +513,27 @@ pub fn outdated(
             DesiredAction::NoOpAlreadySoaked => soaked += 1,
         }
     }
+    let brew_outdated = if no_soak_names.is_empty() {
+        Vec::new()
+    } else {
+        brew.outdated_names()?
+    };
+    let no_soak: Vec<String> = no_soak_names
+        .iter()
+        .filter(|n| brew_outdated.contains(n))
+        .map(|n| format!("{n} (no-soak, brew)"))
+        .collect();
     write_section_always(out, "==> Outdated (will upgrade)", &upgrades)?;
+    write_section_always(out, "==> No-soak (brew)", &no_soak)?;
     write_section_always(out, "==> Held", &held)?;
     write_section_always(out, "==> Ahead of soak", &ahead)?;
     write_section_always(out, "==> Pinned", &pinned)?;
-    if upgrades.is_empty() && held.is_empty() && ahead.is_empty() && pinned.is_empty() {
+    if upgrades.is_empty()
+        && no_soak.is_empty()
+        && held.is_empty()
+        && ahead.is_empty()
+        && pinned.is_empty()
+    {
         writeln!(out, "nothing outdated (already soaked: {soaked})")?;
     }
     Ok(RunResult {
@@ -512,7 +544,6 @@ pub fn outdated(
 
 #[allow(clippy::too_many_arguments)]
 pub fn info(
-    _brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -557,13 +588,18 @@ pub fn info(
         }
         match r.class {
             PkgClass::NoSoak => {
+                let installed = inv
+                    .find(&r.name)
+                    .and_then(|p| parse_pkg(p.kind, &p.receipt_rb).ok());
+                let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
                     writeln!(out, "{raw}")?;
+                    writeln!(out, "installed: {}", inst.unwrap_or("not installed"))?;
                     writeln!(out, "origin: {}", r.origin)?;
-                    writeln!(out, "soak hours: no-soak")?;
-                    writeln!(out, "action: no-soak; brew decides")?;
+                    writeln!(out, "soak: no-soak (brew decides)")?;
+                    writeln!(out, "action: no-soak")?;
                 } else {
-                    writeln!(out, "{raw}  -  no-soak; brew decides")?;
+                    writeln!(out, "{raw}  {}  no-soak (brew)", inst.unwrap_or("-"))?;
                 }
                 continue;
             }
@@ -2247,7 +2283,6 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = info(
-            &brew,
             &git,
             &snaps,
             unused_cache(),
@@ -2273,18 +2308,8 @@ mod tests {
         let mut out = Vec::new();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        let result = info(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &[],
-            &mut out,
-        )
-        .expect("info");
+        let result =
+            info(&git, &snaps, unused_cache(), &inv, &cfg, &[], &[], &mut out).expect("info");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "missing installed alpha: {text}");
         assert!(text.contains("beta"), "missing installed beta: {text}");
@@ -2674,6 +2699,9 @@ mod tests {
             }
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()
+            }
+            fn outdated_names(&self) -> Result<Vec<String>, Error> {
+                self.0.outdated_names()
             }
             fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
                 Err(Error::Brew {
@@ -4164,7 +4192,6 @@ mod tests {
         let mut out = Vec::new();
         let names = ["alpha".to_string(), "local/tap/thing".to_string()];
         let r = info(
-            &brew,
             &git,
             &core_snaps(),
             unused_cache(),
@@ -5152,6 +5179,255 @@ mod tests {
         assert!(
             text.contains("alpha: origin homebrew/core; soak 48h"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn update_runs_brew_update_once_only_when_a_no_soak_package_is_installed() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = InMemoryGit::new();
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", formula_rb("wget", "1.0.0", "a"))],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        update(
+            &brew,
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &cfg,
+            &inv,
+            now(),
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            !run_has_token(&lock_runs(&brew), "update"),
+            "no no-soak package: no brew update"
+        );
+        let cfg = cfg_with("NO_SOAK = [\"wget\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        update(
+            &brew,
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &cfg,
+            &inv,
+            now(),
+            false,
+            &mut out,
+        )
+        .unwrap();
+        let updates = lock_runs(&brew)
+            .iter()
+            .filter(|a| a == &&vec!["update".to_string()])
+            .count();
+        assert_eq!(updates, 1);
+        assert!(String::from_utf8(out).unwrap().contains("updating brew"));
+    }
+
+    #[test]
+    fn update_reports_a_failed_brew_update_after_writing_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = InMemoryGit::new();
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", formula_rb("wget", "1.0.0", "a"))],
+            next_status: 3,
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"wget\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        let err = update(
+            &brew,
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &cfg,
+            &inv,
+            now(),
+            false,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Brew { status: 3, .. }), "{err:?}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("brew update failed (exit 3)"), "{text}");
+        assert!(dir.path().join("state.toml").is_file());
+    }
+
+    #[test]
+    fn outdated_lists_no_soak_from_brews_view_without_updating() {
+        let (mut brew, git, snaps) = view_world();
+        brew.installed.push(formula_pkg_from(
+            "brewsoak",
+            "ericfitz/tap",
+            formula_rb("brewsoak", "1.0.0", "b"),
+        ));
+        brew.taps.push(tapped(
+            "ericfitz/tap",
+            Some("https://github.com/ericfitz/homebrew-tap"),
+        ));
+        brew.outdated = vec!["brewsoak".into(), "alpha".into()];
+        let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("==> No-soak (brew)\nbrewsoak (no-soak, brew)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("alpha (no-soak"),
+            "soaked packages are not listed from brew's view: {text}"
+        );
+        assert!(!run_has_token(&lock_runs(&brew), "update"));
+    }
+
+    #[test]
+    fn info_shows_origin_hours_and_no_soak() {
+        let (mut brew, git, snaps) = view_world();
+        brew.installed.push(formula_pkg_from(
+            "brewsoak",
+            "ericfitz/tap",
+            formula_rb("brewsoak", "1.0.0", "b"),
+        ));
+        brew.taps.push(tapped(
+            "ericfitz/tap",
+            Some("https://github.com/ericfitz/homebrew-tap"),
+        ));
+        let cfg = cfg_with(
+            "NO_SOAK = [\"ericfitz/tap\"]\n[[TAP]]\nname = \"homebrew/core\"\nsoak_hours = 48\n",
+        );
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        info(
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &["alpha".into(), "brewsoak".into()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("alpha\ninstalled: 1.0.0\ncutoff: 1.1.0\nhead: 1.2.0\norigin: homebrew/core\nsoak hours: 48\naction: would upgrade"),
+            "{text}"
+        );
+        assert!(
+            text.contains("brewsoak\ninstalled: 1.0.0\n")
+                && text.contains(
+                    "origin: ericfitz/tap\nsoak: no-soak (brew decides)\naction: no-soak"
+                ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn upgrade_summary_golden() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("alpha", formula_rb("alpha", "1.0.0", "oldsha")),
+                formula_pkg_from(
+                    "brewsoak",
+                    "ericfitz/tap",
+                    formula_rb("brewsoak", "1.0.0", "b"),
+                ),
+                formula_pkg_from("thing", "local/tap", formula_rb("thing", "1.0.0", "t")),
+                formula_pkg_from(
+                    "terraform",
+                    "hashicorp/tap",
+                    formula_rb("terraform", "1.0.0", "t"),
+                ),
+                formula_pkg_pinned("curl", formula_rb("curl", "1.0.0", "c")),
+            ],
+            taps: vec![
+                tapped(
+                    "ericfitz/tap",
+                    Some("https://github.com/ericfitz/homebrew-tap"),
+                ),
+                tapped("local/tap", None),
+                tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                ),
+            ],
+            next_stdout: b"\xf0\x9f\x8d\xba  /opt/homebrew/Cellar/alpha/1.1.0: 5 files, 1MB\n"
+                .to_vec(),
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut snaps = core_snaps();
+        snaps.held_taps.insert(
+            "hashicorp/tap".into(),
+            "while fetching history from origin to find the tap's soak cutoff, git failed:\nfatal: unable to access".into(),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let got = String::from_utf8(out).unwrap();
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/upgrade_summary.txt");
+        if std::env::var_os("BREWSOAK_BLESS").is_some() {
+            std::fs::write(&path, &got).unwrap();
+        }
+        let want = std::fs::read_to_string(&path).unwrap_or_default();
+        assert_eq!(
+            got, want,
+            "upgrade summary changed; rerun with BREWSOAK_BLESS=1 if intended"
+        );
+        assert!(got.contains("no-soak 1"), "{got}");
+        assert!(got.contains("notes:"), "{got}");
+        assert!(
+            got.contains("thing: tap local/tap has no HTTPS remote"),
+            "{got}"
+        );
+        assert!(
+            got.contains("terraform: tap hashicorp/tap could not be refreshed"),
+            "{got}"
         );
     }
 }
