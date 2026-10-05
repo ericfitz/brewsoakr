@@ -3,7 +3,7 @@ use crate::quiet;
 use crate::resolve::PkgKind;
 use crate::taps::TapInfo;
 use std::cell::Cell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, ErrorKind, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -107,6 +107,9 @@ pub struct MockBrew {
     pub next_status: i32,
     pub next_stdout: Vec<u8>,
     pub next_stderr: Vec<u8>,
+    /// Queued `(status, stdout)` results popped by `run_visible` before it
+    /// falls back to `next_status`/`next_stdout`.
+    pub next_outputs: Mutex<VecDeque<(i32, Vec<u8>)>>,
 }
 
 impl Default for MockBrew {
@@ -120,6 +123,7 @@ impl Default for MockBrew {
             next_status: 0,
             next_stdout: Vec::new(),
             next_stderr: Vec::new(),
+            next_outputs: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -390,7 +394,19 @@ impl Brew for MockBrew {
     fn run_visible(&self, args: &[String]) -> Result<Output, Error> {
         self.record(args);
         self.record_visible(args);
-        Ok(self.mock_output())
+        let queued = self
+            .next_outputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop_front();
+        Ok(match queued {
+            Some((status, stdout)) => Output {
+                status: std::process::ExitStatus::from_raw(exit_status_raw(status)),
+                stdout,
+                stderr: Vec::new(),
+            },
+            None => self.mock_output(),
+        })
     }
 
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -1209,5 +1225,26 @@ mod tests {
         std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))
             .expect("chmod restore");
         assert_eq!(got.as_deref(), Some("from-metadata"));
+    }
+
+    #[test]
+    fn mock_run_visible_pops_queued_outputs() {
+        let brew = MockBrew {
+            next_outputs: Mutex::new(std::collections::VecDeque::from(vec![(
+                2,
+                b"first\n".to_vec(),
+            )])),
+            next_status: 0,
+            ..MockBrew::new()
+        };
+        let a = brew.run_visible(&["x".into()]).unwrap();
+        assert_eq!(a.status.code(), Some(2));
+        assert_eq!(a.stdout, b"first\n");
+        let b = brew.run_visible(&["y".into()]).unwrap();
+        assert_eq!(
+            b.status.code(),
+            Some(0),
+            "queue empty: falls back to next_status"
+        );
     }
 }

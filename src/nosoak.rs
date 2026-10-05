@@ -67,6 +67,124 @@ impl NoSoakList {
     }
 }
 
+use crate::Error;
+use crate::brew::Brew;
+use crate::cmd::merge_status;
+use crate::origin;
+use crate::quiet;
+use crate::tap::is_brew_subcommand;
+use std::collections::BTreeMap;
+use std::io::Write;
+
+/// One no-soak package handed to brew. `switch_tap`: the installed keg was
+/// staged by brewsoak (receipt tap empty) and the origin is a third-party tap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Target {
+    pub origin: String,
+    pub name: String,
+    pub switch_tap: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StepResult {
+    pub status: Option<i32>,
+    pub notes: Vec<String>,
+    /// Targets handed to brew (the `no-soak N` count).
+    pub count: usize,
+    /// Cellar versions brew reported installing, for the staleness check.
+    pub installed: BTreeMap<String, String>,
+}
+
+pub fn brew_token(origin_tap: &str, name: &str) -> String {
+    if origin::is_core_or_cask(origin_tap) {
+        name.to_string()
+    } else {
+        format!("{origin_tap}/{name}")
+    }
+}
+
+/// Spec "No-soak packages": one `brew update`, then one `brew <verb>` with
+/// full tokens; tap-switch targets go through `brew install` on `upgrade`.
+pub fn run_step(
+    brew: &impl Brew,
+    verb: &str,
+    user_flags: &[String],
+    targets: &[Target],
+    out: &mut impl Write,
+) -> Result<StepResult, Error> {
+    let mut result = StepResult::default();
+    if targets.is_empty() {
+        return Ok(result);
+    }
+    result.count = targets.len();
+    let tokens: Vec<String> = targets
+        .iter()
+        .map(|t| brew_token(&t.origin, &t.name))
+        .collect();
+
+    writeln!(out, "no-soak: updating brew")?;
+    let update = brew.run_visible(&["update".to_string()])?;
+    if !update.status.success() {
+        let code = update.status.code().unwrap_or(1);
+        result.notes.push(format!(
+            "no-soak: brew update failed (exit {code}); not {verb}d: {}",
+            tokens.join(", ")
+        ));
+        result.status = Some(code);
+        return Ok(result);
+    }
+
+    let flags: Vec<String> = user_flags
+        .iter()
+        .filter(|f| !is_brew_subcommand(f))
+        .cloned()
+        .collect();
+    let (switch, plain): (Vec<&Target>, Vec<&Target>) = targets
+        .iter()
+        .partition(|t| t.switch_tap && verb == "upgrade");
+
+    if !plain.is_empty() {
+        let mut args = vec![verb.to_string()];
+        args.extend(flags.iter().cloned());
+        args.extend(plain.iter().map(|t| brew_token(&t.origin, &t.name)));
+        writeln!(out, "no-soak: brew {}", args.join(" "))?;
+        let output = brew.run_visible(&args)?;
+        result
+            .installed
+            .extend(quiet::installed_from_output(&output.stdout));
+        merge_status(&mut result.status, output);
+    }
+
+    if !switch.is_empty() {
+        let mut args = vec!["install".to_string()];
+        args.extend(flags.iter().cloned());
+        args.extend(switch.iter().map(|t| brew_token(&t.origin, &t.name)));
+        writeln!(
+            out,
+            "no-soak: brew {} (moving staged kegs to their tap)",
+            args.join(" ")
+        )?;
+        let output = brew.run_visible(&args)?;
+        let installed = quiet::installed_from_output(&output.stdout);
+        // No already-installed masking here: brew not replacing the staged
+        // keg is the failure this run exists to catch.
+        let mut code = output.status.code().unwrap_or(1);
+        for t in &switch {
+            if code != 0 || !installed.contains_key(&t.name) {
+                result.notes.push(format!(
+                    "{}: brew did not replace the staged keg; run brew reinstall {}",
+                    t.name,
+                    brew_token(&t.origin, &t.name)
+                ));
+                code = code.max(1);
+            }
+        }
+        result.installed.extend(installed);
+        result.status = Some(result.status.map_or(code, |prev| prev.max(code)));
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +235,210 @@ mod tests {
     fn empty_list_matches_nothing() {
         assert!(NoSoakList::default().is_empty());
         assert!(!NoSoakList::default().matches("homebrew/core", "wget"));
+    }
+
+    use crate::brew::MockBrew;
+    use std::collections::VecDeque;
+
+    fn t(origin: &str, name: &str) -> Target {
+        Target {
+            origin: origin.into(),
+            name: name.into(),
+            switch_tap: false,
+        }
+    }
+
+    fn runs(brew: &MockBrew) -> Vec<Vec<String>> {
+        brew.visible_runs.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn brew_token_is_bare_for_core_and_cask() {
+        assert_eq!(brew_token("homebrew/core", "wget"), "wget");
+        assert_eq!(brew_token("homebrew/cask", "firefox"), "firefox");
+        assert_eq!(
+            brew_token("ericfitz/tap", "brewsoak"),
+            "ericfitz/tap/brewsoak"
+        );
+    }
+
+    #[test]
+    fn no_targets_runs_nothing() {
+        let brew = MockBrew::new();
+        let r = run_step(&brew, "upgrade", &[], &[], &mut Vec::new()).unwrap();
+        assert_eq!(r, StepResult::default());
+        assert!(runs(&brew).is_empty());
+    }
+
+    #[test]
+    fn one_update_then_one_upgrade_with_full_tokens() {
+        let brew = MockBrew::new();
+        let mut out = Vec::new();
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &["--verbose".into()],
+            &[t("ericfitz/tap", "brewsoak"), t("homebrew/core", "wget")],
+            &mut out,
+        )
+        .unwrap();
+        let got = runs(&brew);
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], vec!["update".to_string()]);
+        assert_eq!(
+            got[1],
+            vec!["upgrade", "--verbose", "ericfitz/tap/brewsoak", "wget"]
+        );
+        assert_eq!(r.count, 2);
+        assert_eq!(r.status, Some(0));
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("no-soak: updating brew")
+        );
+    }
+
+    #[test]
+    fn install_verb_uses_install_and_strips_subcommand_words_from_flags() {
+        let brew = MockBrew::new();
+        run_step(
+            &brew,
+            "install",
+            &["install".into(), "--cask".into()],
+            &[t("homebrew/cask", "firefox")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let got = runs(&brew);
+        assert_eq!(got[1], vec!["install", "--cask", "firefox"]);
+    }
+
+    #[test]
+    fn tap_switch_targets_use_install_in_a_separate_run() {
+        let brew = MockBrew {
+            next_outputs: std::sync::Mutex::new(VecDeque::from(vec![
+                (0, Vec::new()),
+                (0, Vec::new()),
+                (
+                    0,
+                    b"\xf0\x9f\x8d\xba  /opt/homebrew/Cellar/vault/1.2.0: 5 files, 1MB\n".to_vec(),
+                ),
+            ])),
+            ..MockBrew::new()
+        };
+        let targets = [
+            t("homebrew/core", "wget"),
+            Target {
+                origin: "hashicorp/tap".into(),
+                name: "vault".into(),
+                switch_tap: true,
+            },
+        ];
+        let r = run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
+        let got = runs(&brew);
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[1], vec!["upgrade", "wget"]);
+        assert_eq!(got[2], vec!["install", "hashicorp/tap/vault"]);
+        assert_eq!(r.status, Some(0));
+        assert_eq!(r.installed.get("vault").map(String::as_str), Some("1.2.0"));
+        assert!(r.notes.is_empty(), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn switch_install_that_did_not_replace_keg_keeps_status_and_notes() {
+        let brew = MockBrew {
+            next_outputs: std::sync::Mutex::new(VecDeque::from(vec![
+                (0, Vec::new()),
+                (
+                    1,
+                    b"Warning: hashicorp/tap/vault 1.2.0 is already installed and up-to-date.\n"
+                        .to_vec(),
+                ),
+            ])),
+            ..MockBrew::new()
+        };
+        let targets = [Target {
+            origin: "hashicorp/tap".into(),
+            name: "vault".into(),
+            switch_tap: true,
+        }];
+        let r = run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
+        assert_eq!(
+            r.status,
+            Some(1),
+            "already-installed masking must not apply to the switch run"
+        );
+        assert!(
+            r.notes.iter().any(|n| n.contains("did not replace")
+                && n.contains("brew reinstall hashicorp/tap/vault")),
+            "{:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn switch_only_applies_to_upgrade() {
+        let brew = MockBrew::new();
+        let targets = [Target {
+            origin: "hashicorp/tap".into(),
+            name: "vault".into(),
+            switch_tap: true,
+        }];
+        run_step(&brew, "reinstall", &[], &targets, &mut Vec::new()).unwrap();
+        assert_eq!(runs(&brew)[1], vec!["reinstall", "hashicorp/tap/vault"]);
+    }
+
+    #[test]
+    fn failed_brew_update_fails_the_step_only() {
+        let brew = MockBrew {
+            next_outputs: std::sync::Mutex::new(VecDeque::from(vec![(
+                3,
+                b"Error: no network\n".to_vec(),
+            )])),
+            ..MockBrew::new()
+        };
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("ericfitz/tap", "brewsoak"), t("homebrew/core", "wget")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(runs(&brew).len(), 1, "no upgrade after a failed update");
+        assert_eq!(r.status, Some(3));
+        assert_eq!(r.count, 2);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("brew update failed (exit 3)")
+                    && n.contains("ericfitz/tap/brewsoak, wget")),
+            "{:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn plain_run_already_installed_nonzero_is_success() {
+        let brew = MockBrew {
+            next_outputs: std::sync::Mutex::new(VecDeque::from(vec![
+                (0, Vec::new()),
+                (
+                    1,
+                    b"Warning: wget 1.0 is already installed and up-to-date.\n".to_vec(),
+                ),
+            ])),
+            ..MockBrew::new()
+        };
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(r.status, Some(0));
     }
 }

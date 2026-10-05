@@ -1014,7 +1014,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     }
 }
 
-fn merge_status(slot: &mut Option<i32>, output: std::process::Output) {
+pub(crate) fn merge_status(slot: &mut Option<i32>, output: std::process::Output) {
     let mut code = output.status.code().unwrap_or(1);
     if code != 0 && already_installed_message(&output) {
         code = 0;

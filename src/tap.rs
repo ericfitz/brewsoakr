@@ -105,7 +105,7 @@ pub fn brew_install_args(pkg: &PkgRef, path: &Path, user_flags: &[String]) -> Ve
     args
 }
 
-fn is_brew_subcommand(s: &str) -> bool {
+pub(crate) fn is_brew_subcommand(s: &str) -> bool {
     matches!(
         s,
         "install" | "upgrade" | "reinstall" | "update" | "outdated" | "info"
