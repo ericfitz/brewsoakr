@@ -7,7 +7,7 @@ use crate::github::GithubApi;
 use crate::identity::{self, PkgIdentity};
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
 use crate::nosoak;
-use crate::origin;
+use crate::origin::{self, OriginRecords};
 use crate::quiet;
 use crate::report::{self, Counts};
 use crate::resolve::{self, PkgKind, PkgRef};
@@ -817,6 +817,7 @@ pub fn reinstall(
         done: BTreeMap::new(),
         deferred: Vec::new(),
         nosoak: Vec::new(),
+        origins: OriginRecords::load(cache),
         plan_total,
         plan_index: 0,
         out,
@@ -933,6 +934,7 @@ fn apply_many(
         done: BTreeMap::new(),
         deferred: Vec::new(),
         nosoak: Vec::new(),
+        origins: OriginRecords::load(cache),
         plan_total,
         plan_index: 0,
         out,
@@ -995,6 +997,8 @@ struct ApplySession<'a, B, G, W> {
     deferred: Vec<String>,
     /// No-soak packages collected for the single brew step after soaked work.
     nosoak: Vec<nosoak::Target>,
+    /// Where each tap-staged keg came from; saved after every real install.
+    origins: OriginRecords,
     /// Number of packages this run expects to change, when known up front.
     plan_total: Option<usize>,
     plan_index: usize,
@@ -1281,28 +1285,44 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let blob = view.cutoff_blob.as_deref().ok_or_else(|| {
             Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
         })?;
-        let path = tap::write_blob(self.tap_root, &pkg, blob)?;
+        let path = tap::write_blob(&staging_dir(self.tap_root, origin_tap), &pkg, blob)?;
 
-        let target = nosoak::brew_token(origin_tap, name);
-        let deps = self.collect_cutoff_deps(name, kind)?;
-        for (dep, dep_kind) in deps {
+        let token = nosoak::brew_token(origin_tap, name);
+        let walked = match self.collect_cutoff_deps(origin_tap, name, kind) {
+            Ok(w) => w,
+            // brew could not even read the staged tap file's dependencies.
+            Err(Error::Brew { .. }) if !origin::is_core_or_cask(origin_tap) => {
+                self.hold_target_staged_copy(name);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(held) = walked.held {
+            return self.refuse_held_dep(name, &token, &held);
+        }
+        for (dep_origin, dep, dep_kind) in walked.deps {
+            // Already installed, from any origin: leave it to brew.
             if self.inv.find(&dep).is_some() {
                 continue;
             }
-            if !self.install_missing_dep(&target, dep_kind, &dep)? {
+            if !self.install_missing_dep(name, &token, &dep_origin, dep_kind, &dep)? {
                 return Ok(());
             }
         }
 
         let args = tap::brew_install_args(&pkg, &path, self.user_flags);
-        self.record_run(&args)
+        if !self.record_staged_install(origin_tap, name, kind, &args)? {
+            self.hold_target_staged_copy(name);
+        }
+        Ok(())
     }
 
     fn collect_cutoff_deps(
         &self,
+        root_origin: &str,
         root: &str,
         root_kind: PkgKind,
-    ) -> Result<Vec<(String, PkgKind)>, Error> {
+    ) -> Result<CutoffDeps, Error> {
         let mut walk = CutoffDepWalk {
             brew: self.brew,
             git: self.git,
@@ -1310,36 +1330,37 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             cache: self.cache,
             tap_root: self.tap_root,
             inv: self.inv,
+            cfg: self.cfg,
             visiting: HashSet::new(),
             visited: HashSet::new(),
             out: Vec::new(),
+            held: None,
         };
-        walk.visit(root, root_kind, false)?;
-        Ok(walk.out)
+        walk.visit(root_origin, root, root_kind, false)?;
+        Ok(CutoffDeps {
+            deps: walk.out,
+            held: walk.held,
+        })
     }
 
-    /// Install a missing cutoff dep. Returns false when the target was refused.
+    /// Install a missing cutoff dep from its own origin. Returns false when
+    /// the target was refused.
     fn install_missing_dep(
         &mut self,
         target: &str,
+        target_token: &str,
+        dep_origin: &str,
         kind: PkgKind,
         dep: &str,
     ) -> Result<bool, Error> {
-        let blobs = resolve_pkg_blobs(
-            self.git,
-            self.snaps,
-            self.cache,
-            origin::default_origin(kind),
-            dep,
-            kind,
-        )?;
+        let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, dep_origin, dep, kind)?;
         let status = eligibility::upstream_status(
             blobs.cutoff.as_deref(),
             blobs.head.as_deref(),
             &calendar_today(),
         );
         if status != UpstreamStatus::Eligible {
-            self.refuse_ineligible_dep(target, dep, status)?;
+            self.refuse_ineligible_dep(target, target_token, dep, status)?;
             return Ok(false);
         }
         let want = blobs
@@ -1356,15 +1377,20 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             name: dep.to_string(),
             kind,
         };
-        let path = tap::write_blob(self.tap_root, &pkg, blob)?;
+        let path = tap::write_blob(&staging_dir(self.tap_root, dep_origin), &pkg, blob)?;
         let args = tap::brew_install_args(&pkg, &path, &[]);
-        self.record_run(&args)?;
+        // A dep that brew cannot load is held by name; the target is still
+        // attempted and brew reports the missing dependency.
+        if !self.record_staged_install(dep_origin, dep, kind, &args)? {
+            self.hold_staged_copy(dep);
+        }
         Ok(true)
     }
 
     fn refuse_ineligible_dep(
         &mut self,
         target: &str,
+        target_token: &str,
         dep: &str,
         status: UpstreamStatus,
     ) -> Result<(), Error> {
@@ -1381,10 +1407,85 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         };
         writeln!(
             self.out,
-            "cannot install {target}: dependency {why}; use `brew {} {target}` to bypass brewsoak.",
+            "cannot install {target}: dependency {why}; use `brew {} {target_token}` to bypass brewsoak.",
             self.brew_verb
         )?;
         Ok(())
+    }
+
+    /// A dependency lives in a tap whose history could not be refreshed this
+    /// run, so its cutoff is unknown: refuse the target.
+    fn refuse_held_dep(
+        &mut self,
+        target: &str,
+        target_token: &str,
+        held: &HeldDep,
+    ) -> Result<(), Error> {
+        self.refused = true;
+        writeln!(
+            self.out,
+            "cannot install {target}: dependency {}: tap {} could not be refreshed; {}; use `brew {} {target_token}` to bypass brewsoak.",
+            held.dep, held.tap, held.err, self.brew_verb
+        )?;
+        Ok(())
+    }
+
+    /// brew could not load a tap package from its staged copy.
+    fn hold_staged_copy(&mut self, name: &str) {
+        self.defer(format!(
+            "{name}: cannot be installed from a staged copy; use brew, or add it to NO_SOAK"
+        ));
+        self.counts.held += 1;
+        self.refused = true;
+    }
+
+    /// The target was already counted as upgraded when it was announced.
+    fn hold_target_staged_copy(&mut self, name: &str) {
+        self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+        self.hold_staged_copy(name);
+    }
+
+    /// Tap packages are remembered by origin; core and cask need no record.
+    fn record_origin(&mut self, origin_tap: &str, name: &str, kind: PkgKind) -> Result<(), Error> {
+        let want = (!origin::is_core_or_cask(origin_tap)).then(|| origin_tap.to_ascii_lowercase());
+        if self.origins.get(kind, name) == want.as_deref() {
+            return Ok(());
+        }
+        match want {
+            Some(tap) => self.origins.set(kind, name, &tap),
+            None => self.origins.remove(kind, name),
+        }
+        self.origins.save(self.cache)
+    }
+
+    /// Runs one staged install and records where the keg came from.
+    /// Returns false, with brew's status left out of the run, when brew could
+    /// not load a tap package's staged copy; the caller holds it.
+    fn record_staged_install(
+        &mut self,
+        origin_tap: &str,
+        name: &str,
+        kind: PkgKind,
+        args: &[String],
+    ) -> Result<bool, Error> {
+        let output = self.brew.run_visible(args)?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        if !output.status.success()
+            && !origin::is_core_or_cask(origin_tap)
+            && taps::staged_load_failure(&text)
+        {
+            return Ok(false);
+        }
+        self.done
+            .extend(quiet::installed_from_output(&output.stdout));
+        // Only a real install proves the keg came from this origin; brew's
+        // "already installed" answer says nothing about where the keg came from.
+        let installed_now = output.status.success() && !already_installed_message(&output);
+        merge_status(&mut self.brew_status, output);
+        if installed_now {
+            self.record_origin(origin_tap, name, kind)?;
+        }
+        Ok(true)
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1452,6 +1553,25 @@ fn already_installed_message(output: &std::process::Output) -> bool {
         .contains("already installed")
 }
 
+/// Where `dir`'s staged `.rb` files live for this origin; tap names are
+/// lowercase everywhere they are compared or used as paths.
+fn staging_dir(tap_root: &Path, origin_tap: &str) -> PathBuf {
+    taps::staging_root(tap_root, &origin_tap.to_ascii_lowercase())
+}
+
+/// A dependency in a tap that could not be refreshed this run.
+struct HeldDep {
+    dep: String,
+    tap: String,
+    err: String,
+}
+
+struct CutoffDeps {
+    /// (origin, name, kind), dependencies first.
+    deps: Vec<(String, String, PkgKind)>,
+    held: Option<HeldDep>,
+}
+
 struct CutoffDepWalk<'a, B, G> {
     brew: &'a B,
     git: &'a G,
@@ -1459,53 +1579,107 @@ struct CutoffDepWalk<'a, B, G> {
     cache: &'a Path,
     tap_root: &'a Path,
     inv: &'a Inventory,
+    cfg: &'a Config,
     visiting: HashSet<String>,
     visited: HashSet<String>,
-    out: Vec<(String, PkgKind)>,
+    out: Vec<(String, String, PkgKind)>,
+    held: Option<HeldDep>,
 }
 
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
-    fn visit(&mut self, name: &str, kind: PkgKind, include_self: bool) -> Result<(), Error> {
-        if self.visiting.contains(name) || self.visited.contains(name) {
+    fn visit(
+        &mut self,
+        origin_tap: &str,
+        name: &str,
+        kind: PkgKind,
+        include_self: bool,
+    ) -> Result<(), Error> {
+        let key = format!("{origin_tap}/{name}");
+        if self.visiting.contains(&key) || self.visited.contains(&key) {
             return Ok(());
         }
-        self.visiting.insert(name.to_string());
+        self.visiting.insert(key.clone());
         if include_self {
             write_cutoff_blob(
                 self.git,
                 self.snaps,
                 self.cache,
                 self.tap_root,
-                origin::default_origin(kind),
+                origin_tap,
                 name,
                 kind,
             )?;
         }
+        let root = staging_dir(self.tap_root, origin_tap);
         let staged = match kind {
-            PkgKind::Formula => tap::tap_formula_path(self.tap_root, name),
-            PkgKind::Cask => tap::tap_cask_path(self.tap_root, name),
+            PkgKind::Formula => tap::tap_formula_path(&root, name),
+            PkgKind::Cask => tap::tap_cask_path(&root, name),
         };
         let token = staged.to_string_lossy().into_owned();
         for dep in self.brew.deps(kind, &token)? {
-            if !cutoff_in_either_tree(self.git, self.snaps, self.cache, origin::CORE, &dep)? {
+            let Some((dep_origin, dep_name)) = self.dep_origin(&dep, origin_tap)? else {
                 continue;
+            };
+            if self.inv.class_for(&dep_origin, &dep_name, self.cfg) != PkgClass::Soaked {
+                continue; // no-soak or unsoakable deps are brew's
+            }
+            if let Some(err) = self.snaps.held_taps.get(&dep_origin) {
+                // Its cutoff is unknown: refuse before staging anything.
+                self.held = Some(HeldDep {
+                    dep: dep_name,
+                    tap: dep_origin,
+                    err: err.clone(),
+                });
+                return Ok(());
             }
             let dep_kind = natural_kind(
                 self.git,
                 self.snaps,
                 self.cache,
                 self.inv,
-                origin::CORE,
-                &dep,
+                &dep_origin,
+                &dep_name,
             )?;
-            self.visit(&dep, dep_kind, true)?;
+            self.visit(&dep_origin, &dep_name, dep_kind, true)?;
+            if self.held.is_some() {
+                return Ok(());
+            }
         }
-        self.visiting.remove(name);
-        self.visited.insert(name.to_string());
+        self.visiting.remove(&key);
+        self.visited.insert(key);
         if include_self {
-            self.out.push((name.to_string(), kind));
+            self.out
+                .push((origin_tap.to_string(), name.to_string(), kind));
         }
         Ok(())
+    }
+
+    /// (origin, name) a `brew deps` token resolves to, or None when brew keeps it.
+    fn dep_origin(
+        &self,
+        dep: &str,
+        dependent_origin: &str,
+    ) -> Result<Option<(String, String)>, Error> {
+        if let Ok(tok) = inventory::parse_token(dep)
+            && let Some(o) = tok.origin
+        {
+            return Ok(Some((o, tok.name)));
+        }
+        let exists =
+            |o: &str, kind| cutoff_blob_exists(self.git, self.snaps, self.cache, o, dep, kind);
+        if !origin::is_core_or_cask(dependent_origin)
+            && !self.snaps.held_taps.contains_key(dependent_origin)
+            && exists(dependent_origin, PkgKind::Formula)?
+        {
+            return Ok(Some((dependent_origin.to_string(), dep.to_string())));
+        }
+        if exists(origin::CORE, PkgKind::Formula)? {
+            return Ok(Some((origin::CORE.to_string(), dep.to_string())));
+        }
+        if exists(origin::CASK, PkgKind::Cask)? {
+            return Ok(Some((origin::CASK.to_string(), dep.to_string())));
+        }
+        Ok(None)
     }
 }
 
@@ -1640,19 +1814,6 @@ fn cutoff_blob_exists(
     )
 }
 
-fn cutoff_in_either_tree(
-    git: &impl GitStore,
-    snaps: &Snapshots,
-    cache: &Path,
-    origin_tap: &str,
-    name: &str,
-) -> Result<bool, Error> {
-    Ok(
-        cutoff_blob_exists(git, snaps, cache, origin_tap, name, PkgKind::Formula)?
-            || cutoff_blob_exists(git, snaps, cache, origin_tap, name, PkgKind::Cask)?,
-    )
-}
-
 fn natural_kind(
     git: &impl GitStore,
     snaps: &Snapshots,
@@ -1692,7 +1853,7 @@ fn write_cutoff_blob(
         name: name.to_string(),
         kind,
     };
-    tap::write_blob(tap_root, &pkg, blob)?;
+    tap::write_blob(&staging_dir(tap_root, origin_tap), &pkg, blob)?;
     Ok(())
 }
 
@@ -2109,6 +2270,512 @@ mod tests {
             "nameless info must be compact: {text}"
         );
         assert!(!result.refused, "info is read-only");
+    }
+
+    #[test]
+    fn soaked_tap_install_stages_under_tap_dir_and_writes_origin_record() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let staged = tap.path().join("taps/hashicorp/tap/Formula/terraform.rb");
+        assert!(staged.exists(), "staged under the per-tap directory");
+        assert!(
+            !tap.path().join("Formula/terraform.rb").exists(),
+            "never under the core staging root"
+        );
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.iter()
+                .any(|a| a.iter().any(|x| x == staged.to_str().unwrap())),
+            "{runs:?}"
+        );
+        let records = OriginRecords::load(cache.path());
+        assert_eq!(
+            records.get(PkgKind::Formula, "terraform"),
+            Some("hashicorp/tap")
+        );
+    }
+
+    #[test]
+    fn core_install_removes_a_stale_origin_record() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let mut records = OriginRecords::default();
+        records.set(PkgKind::Formula, "alpha", "old/tap");
+        records.save(cache.path()).unwrap();
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alpha".into()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "alpha"),
+            None
+        );
+    }
+
+    #[test]
+    fn dep_closure_crosses_taps_and_core() {
+        // terraform (hashicorp/tap) depends on bare `helper` (same tap) and `zlib` (core);
+        // helper depends on `acme/tools/widget` (another soakable tap).
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        git.insert_blob(
+            "tapcut",
+            "Formula/helper.rb",
+            formula_rb("helper", "0.1.0", "h1"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/helper.rb",
+            formula_rb("helper", "0.1.0", "h1"),
+        );
+        git.insert_blob(
+            "acmecut",
+            "Formula/widget.rb",
+            formula_rb("widget", "2.0.0", "w1"),
+        );
+        git.insert_blob(
+            "acmehead",
+            "Formula/widget.rb",
+            formula_rb("widget", "2.0.0", "w1"),
+        );
+        git.insert_tree("acmecut", &["Formula/widget.rb"]);
+        git.insert_tree("acmehead", &["Formula/widget.rb"]);
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/z/zlib.rb",
+            formula_rb("zlib", "1.3", "z1"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/z/zlib.rb",
+            formula_rb("zlib", "1.3", "z1"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let staged = |p: &str| tap.path().join(p).to_string_lossy().into_owned();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            staged("taps/hashicorp/tap/Formula/terraform.rb"),
+            vec!["helper".to_string(), "zlib".to_string()],
+        );
+        deps.insert(
+            staged("taps/hashicorp/tap/Formula/helper.rb"),
+            vec!["acme/tools/widget".to_string()],
+        );
+        let brew = MockBrew {
+            deps,
+            taps: vec![
+                tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                ),
+                tapped("acme/tools", Some("https://github.com/acme/homebrew-tools")),
+            ],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Formula/terraform.rb", "Formula/helper.rb"]);
+        git.insert_tree("taphead", &["Formula/terraform.rb", "Formula/helper.rb"]);
+        snaps.taps.insert(
+            "acme/tools".into(),
+            TapState {
+                hours: SoakHours::new(24).unwrap(),
+                cutoff_sha: Some("acmecut".into()),
+                head_sha: "acmehead".into(),
+                cutoff_time: None,
+            },
+        );
+        let cache = tempfile::tempdir().unwrap();
+        install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        let installs: Vec<&str> = runs
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .map(|a| a.last().unwrap().as_str())
+            .collect();
+        assert_eq!(
+            installs,
+            vec![
+                staged("taps/acme/tools/Formula/widget.rb"),
+                staged("taps/hashicorp/tap/Formula/helper.rb"),
+                staged("Formula/zlib.rb"),
+                staged("taps/hashicorp/tap/Formula/terraform.rb"),
+            ],
+            "deps first, each from its own origin's staging dir: {runs:?}"
+        );
+        let records = OriginRecords::load(cache.path());
+        assert_eq!(records.get(PkgKind::Formula, "widget"), Some("acme/tools"));
+        assert_eq!(
+            records.get(PkgKind::Formula, "helper"),
+            Some("hashicorp/tap")
+        );
+        assert_eq!(records.get(PkgKind::Formula, "zlib"), None);
+    }
+
+    #[test]
+    fn no_soak_and_unsoakable_deps_are_left_to_brew() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            tap.path()
+                .join("taps/hashicorp/tap/Formula/terraform.rb")
+                .to_string_lossy()
+                .into_owned(),
+            vec![
+                "ericfitz/tap/brewsoak".to_string(),
+                "local/tap/thing".to_string(),
+            ],
+        );
+        let brew = MockBrew {
+            deps,
+            taps: vec![
+                tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                ),
+                tapped(
+                    "ericfitz/tap",
+                    Some("https://github.com/ericfitz/homebrew-tap"),
+                ),
+                tapped("local/tap", None),
+            ],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!r.refused);
+        let runs = lock_runs(&brew);
+        let installs: Vec<&Vec<String>> = runs
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .collect();
+        assert_eq!(installs.len(), 1, "only the target: {runs:?}");
+        assert!(!run_has_token(&runs, "ericfitz/tap/brewsoak"));
+    }
+
+    #[test]
+    fn staged_load_failure_holds_with_note_and_does_not_fail_the_run() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            next_status: 1,
+            next_stdout: b"Error: cannot load such file -- ../lib/helper\n".to_vec(),
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused);
+        assert_eq!(
+            r.brew_status, None,
+            "a staged-load hold is not a brew failure"
+        );
+        assert!(
+            text.contains(
+                "terraform: cannot be installed from a staged copy; use brew, or add it to NO_SOAK"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("held 1"), "{text}");
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
+            None
+        );
+    }
+
+    #[test]
+    fn deps_failure_on_staged_tap_formula_holds_with_note() {
+        struct FailDepsBrew(MockBrew);
+        impl Brew for FailDepsBrew {
+            fn brew_bin(&self) -> &Path {
+                self.0.brew_bin()
+            }
+            fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
+                self.0.run(a)
+            }
+            fn run_visible(&self, a: &[String]) -> Result<std::process::Output, Error> {
+                self.0.run_visible(a)
+            }
+            fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
+                self.0.installed_packages()
+            }
+            fn tap_new_soaked(&self) -> Result<(), Error> {
+                self.0.tap_new_soaked()
+            }
+            fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
+                self.0.tap_info()
+            }
+            fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+                Err(Error::Brew {
+                    status: 1,
+                    message: format!(
+                        "Error: No available formula with the name \"helper\" ({token})"
+                    ),
+                })
+            }
+        }
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = FailDepsBrew(MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        });
+        let cfg = cfg24();
+        let inv = inv_from(&brew.0, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("cannot be installed from a staged copy")
+        );
+        assert!(
+            lock_runs(&brew.0)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("install"))
+        );
+    }
+
+    #[test]
+    fn dep_in_held_tap_refuses_the_target() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            tap.path()
+                .join("taps/hashicorp/tap/Formula/terraform.rb")
+                .to_string_lossy()
+                .into_owned(),
+            vec!["acme/tools/widget".to_string()],
+        );
+        let brew = MockBrew {
+            deps,
+            taps: vec![
+                tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                ),
+                tapped("acme/tools", Some("https://github.com/acme/homebrew-tools")),
+            ],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        snaps.held_taps.insert(
+            "acme/tools".into(),
+            "while fetching history from origin, git failed:\nfatal: boom".into(),
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cannot install terraform: dependency widget")
+                && text.contains("acme/tools could not be refreshed"),
+            "{text}"
+        );
     }
 
     fn core_snaps() -> Snapshots {
@@ -3386,13 +4053,14 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            cache.path(),
             tap.path(),
             &inv,
             &cfg,
@@ -3441,13 +4109,14 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            cache.path(),
             tap.path(),
             &inv,
             &cfg,
