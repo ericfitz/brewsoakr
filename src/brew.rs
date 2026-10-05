@@ -1,6 +1,7 @@
 use crate::Error;
 use crate::quiet;
 use crate::resolve::PkgKind;
+use crate::taps::TapInfo;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, ErrorKind, Read, Write};
@@ -38,6 +39,8 @@ pub trait Brew {
     fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn tap_new_soaked(&self) -> Result<(), Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
+    /// Every installed tap, as `brew tap-info --json --installed` reports it.
+    fn tap_info(&self) -> Result<Vec<TapInfo>, Error>;
     /// Turn the output filter off; brew output is forwarded byte for byte.
     fn set_raw(&self, _raw: bool) {}
     fn session_report(&self) -> SessionReport {
@@ -98,6 +101,7 @@ impl ProcessBrew {
 pub struct MockBrew {
     pub installed: Vec<InstalledPkg>,
     pub deps: BTreeMap<String, Vec<String>>,
+    pub taps: Vec<TapInfo>,
     pub runs: Mutex<Vec<Vec<String>>>,
     pub visible_runs: Mutex<Vec<Vec<String>>>,
     pub next_status: i32,
@@ -110,6 +114,7 @@ impl Default for MockBrew {
         Self {
             installed: Vec::new(),
             deps: BTreeMap::new(),
+            taps: Vec::new(),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
             next_status: 0,
@@ -202,6 +207,14 @@ impl Brew for ProcessBrew {
             return Err(brew_fail(&output));
         }
         self.trust_soaked_tap()
+    }
+
+    fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
+        let output = self.run(&["tap-info".into(), "--json".into(), "--installed".into()])?;
+        if !output.status.success() {
+            return Err(brew_fail(&output));
+        }
+        crate::taps::parse_tap_info_json(&String::from_utf8_lossy(&output.stdout))
     }
 
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
@@ -394,6 +407,10 @@ impl Brew for MockBrew {
         Ok(())
     }
 
+    fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
+        Ok(self.taps.clone())
+    }
+
     fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
         let stem = Path::new(token)
             .file_stem()
@@ -578,7 +595,7 @@ fn keep_tap(tap: Option<&str>) -> bool {
     )
 }
 
-fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<&'a str>, Error> {
+pub(crate) fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<&'a str>, Error> {
     let Some(after_key) = find_json_key(json, key) else {
         return Ok(Vec::new());
     };
@@ -592,7 +609,7 @@ fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<&'a str>, E
     scan_array_objects(rest).ok_or_else(|| Error::Other(format!("json {key} array is malformed")))
 }
 
-fn find_json_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn find_json_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     let pat = format!("\"{key}\"");
     let mut search = json;
     loop {
@@ -605,7 +622,7 @@ fn find_json_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
     }
 }
 
-fn scan_array_objects(s: &str) -> Option<Vec<&str>> {
+pub(crate) fn scan_array_objects(s: &str) -> Option<Vec<&str>> {
     let b = s.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -671,7 +688,7 @@ fn skip_delimited(b: &[u8], start: usize, open: u8, close: u8) -> Option<usize> 
     None
 }
 
-fn json_string_value(obj: &str, key: &str) -> Option<String> {
+pub(crate) fn json_string_value(obj: &str, key: &str) -> Option<String> {
     let after = find_json_key(obj, key)?;
     let after = after.trim_start();
     if after.starts_with("null") {
@@ -680,7 +697,7 @@ fn json_string_value(obj: &str, key: &str) -> Option<String> {
     parse_json_string(after)
 }
 
-fn json_bool_value(obj: &str, key: &str) -> Option<bool> {
+pub(crate) fn json_bool_value(obj: &str, key: &str) -> Option<bool> {
     let after = find_json_key(obj, key)?;
     let after = after.trim_start();
     if after.starts_with("true") {
@@ -750,6 +767,18 @@ mod tests {
         let brew = mock_with(Vec::new(), deps);
         let got = brew.deps(PkgKind::Formula, "wget").expect("mock deps");
         assert_eq!(got, vec!["libidn2", "openssl@3"]);
+    }
+
+    #[test]
+    fn mock_tap_info_returns_the_vec() {
+        let brew = MockBrew {
+            taps: vec![crate::taps::TapInfo {
+                name: "a/b".into(),
+                remote: None,
+            }],
+            ..MockBrew::new()
+        };
+        assert_eq!(brew.tap_info().unwrap().len(), 1);
     }
 
     #[test]

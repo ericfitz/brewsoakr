@@ -1,3 +1,5 @@
+//! Writing staged `.rb` files and building `brew install` args.
+
 use crate::Error;
 use crate::brew::Brew;
 use crate::resolve::{PkgKind, PkgRef};

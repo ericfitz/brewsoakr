@@ -16,6 +16,7 @@ pub mod report;
 pub mod resolve;
 pub mod snapshot;
 pub mod tap;
+pub mod taps;
 
 pub use error::Error;
 pub use hours::SoakHours;
