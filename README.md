@@ -1,8 +1,8 @@
 # brewsoak
 
 A Homebrew wrapper that delays `homebrew/core`, `homebrew/cask`, and
-third-party tap updates for a soak window. This gives security researchers time to discover and yank
-a compromised package before you install it.
+third-party tap updates for a soak window. This gives security researchers
+time to discover and yank a compromised package before you install it.
 
 Every other `brew` subcommand passes through unchanged. Packages and taps you
 list under `NO_SOAK` skip soaking and end in the same state as `brew upgrade`.
@@ -60,7 +60,8 @@ Precedence: CLI > environment > file > 24.
 
 `--soak-hours` is persisted only when used with a soaked command
 (`update`, `upgrade`, `install`, `reinstall`, `outdated`, `info`).
-`N == 24` deletes the config file.
+`N == 24` removes the `SOAK_HOURS` key; the file is deleted only if nothing
+else remains.
 
 ### Per-tap soak hours and the no-soak list
 

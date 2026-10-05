@@ -60,7 +60,8 @@ pub fn help_text() -> &'static str {
     "\
 Usage: brewsoak [options] <command> [args...]
 
-A Homebrew wrapper that delays core, cask, and third-party tap updates for a soak window.
+A Homebrew wrapper that delays core, cask, and third-party tap updates for a
+soak window.
 
 Soaked commands:
   update, upgrade, install, reinstall, outdated, info
@@ -277,14 +278,15 @@ soaking, or are gone at HEAD.
             "\
 Usage: brewsoak upgrade [formula|cask ...]
 
-Upgrade installed core/cask packages to the soaked (cutoff) artifact.
+Upgrade installed packages to the soaked (cutoff) artifact.
 Packages born inside the soak window are held. Ahead-of-soak installs
 are left unchanged. Pinned packages are skipped.
 
-With no names, considers every installed core formula and cask.
+With no names, considers every installed formula and cask.
 Third-party tap packages are soaked from brewsoak's own tap clones.
-Packages in NO_SOAK (no-soak) are handed to brew after the soaked work (one brew update,
-then one brew upgrade); their outdated dependencies go with them.
+Packages in NO_SOAK (no-soak) are handed to brew after the soaked work
+(one brew update, then one brew upgrade); their outdated dependencies go
+with them.
 Taps without an HTTPS remote are not soakable and are noted, not upgraded.
 
   -v, --verbose   print soak window and a line for every package evaluated
@@ -322,9 +324,8 @@ user/repo/name tokens are soaked (or no-soak) like any other package.
             "\
 Usage: brewsoak outdated
 
-List installed core/cask packages that upgrade would change, plus
-held, ahead-of-soak, and pinned sections.
-user/repo/name tokens are soaked (or no-soak) like any other package.
+List installed packages that upgrade would change, plus held,
+ahead-of-soak, and pinned sections.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
@@ -336,7 +337,7 @@ user/repo/name tokens are soaked (or no-soak) like any other package.
 Usage: brewsoak info [formula|cask ...]
 
 Show installed, cutoff, and HEAD identities and what brewsoak would do.
-With no names, prints one compact line per installed core/cask package.
+With no names, prints one compact line per installed package.
 Named packages (or --verbose) print the long form.
 user/repo/name tokens are soaked (or no-soak) like any other package.
 Shows origin tap and effective soak hours; no-soak packages are marked.
