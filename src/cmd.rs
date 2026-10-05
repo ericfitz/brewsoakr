@@ -1019,10 +1019,11 @@ pub(crate) fn merge_status(slot: &mut Option<i32>, output: std::process::Output)
     if code != 0 && already_installed_message(&output) {
         code = 0;
     }
-    *slot = Some(match *slot {
-        Some(prev) => prev.max(code),
-        None => code,
-    });
+    max_status(slot, code);
+}
+
+pub(crate) fn max_status(slot: &mut Option<i32>, code: i32) {
+    *slot = Some(slot.map_or(code, |prev| prev.max(code)));
 }
 
 pub fn is_verbose(flags: &[String]) -> bool {

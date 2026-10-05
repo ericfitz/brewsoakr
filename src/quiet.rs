@@ -388,6 +388,16 @@ fn parse_size(s: &str) -> Option<u64> {
 /// captured output. Lets a session notice that a package it still has queued
 /// was already brought up to date as somebody else's dependency.
 pub fn installed_from_output(bytes: &[u8]) -> BTreeMap<String, String> {
+    installed_versions(bytes, true)
+}
+
+/// Like `installed_from_output`, but only `/Cellar/<name>/<ver>` lines count:
+/// an "already installed" warning is not evidence brew wrote a keg.
+pub fn cellar_installed_from_output(bytes: &[u8]) -> BTreeMap<String, String> {
+    installed_versions(bytes, false)
+}
+
+fn installed_versions(bytes: &[u8], include_warnings: bool) -> BTreeMap<String, String> {
     let text = String::from_utf8_lossy(bytes);
     let mut out = BTreeMap::new();
     for line in text.lines() {
@@ -402,7 +412,8 @@ pub fn installed_from_output(bytes: &[u8]) -> BTreeMap<String, String> {
             continue;
         }
         // `Warning: x 1.0.0 is already installed and up-to-date.`
-        if let Some(rest) = line.strip_prefix("Warning: ")
+        if include_warnings
+            && let Some(rest) = line.strip_prefix("Warning: ")
             && is_already_up_to_date(line)
         {
             let mut parts = rest.split_whitespace();

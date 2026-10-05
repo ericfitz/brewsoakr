@@ -69,10 +69,10 @@ impl NoSoakList {
 
 use crate::Error;
 use crate::brew::Brew;
-use crate::cmd::merge_status;
+use crate::cmd::{max_status, merge_status};
 use crate::origin;
 use crate::quiet;
-use crate::tap::is_brew_subcommand;
+use crate::tap::is_stripped_flag;
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -121,6 +121,7 @@ pub fn run_step(
         .iter()
         .map(|t| brew_token(&t.origin, &t.name))
         .collect();
+    let token_of = |t: &Target| brew_token(&t.origin, &t.name);
 
     writeln!(out, "no-soak: updating brew")?;
     let update = brew.run_visible(&["update".to_string()])?;
@@ -136,7 +137,7 @@ pub fn run_step(
 
     let flags: Vec<String> = user_flags
         .iter()
-        .filter(|f| !is_brew_subcommand(f))
+        .filter(|f| !is_stripped_flag(f))
         .cloned()
         .collect();
     let (switch, plain): (Vec<&Target>, Vec<&Target>) = targets
@@ -146,7 +147,7 @@ pub fn run_step(
     if !plain.is_empty() {
         let mut args = vec![verb.to_string()];
         args.extend(flags.iter().cloned());
-        args.extend(plain.iter().map(|t| brew_token(&t.origin, &t.name)));
+        args.extend(plain.iter().map(|t| token_of(t)));
         writeln!(out, "no-soak: brew {}", args.join(" "))?;
         let output = brew.run_visible(&args)?;
         result
@@ -158,29 +159,35 @@ pub fn run_step(
     if !switch.is_empty() {
         let mut args = vec!["install".to_string()];
         args.extend(flags.iter().cloned());
-        args.extend(switch.iter().map(|t| brew_token(&t.origin, &t.name)));
+        args.extend(switch.iter().map(|t| token_of(t)));
         writeln!(
             out,
             "no-soak: brew {} (moving staged kegs to their tap)",
             args.join(" ")
         )?;
         let output = brew.run_visible(&args)?;
-        let installed = quiet::installed_from_output(&output.stdout);
-        // No already-installed masking here: brew not replacing the staged
-        // keg is the failure this run exists to catch.
+        // Only Cellar lines are evidence of a written keg; casks have none, so
+        // for them (and formulae alike) success means exit 0 with no
+        // already-installed message for the target.
+        let installed = quiet::cellar_installed_from_output(&output.stdout);
+        let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
         let mut code = output.status.code().unwrap_or(1);
         for t in &switch {
-            if code != 0 || !installed.contains_key(&t.name) {
+            let name = t.name.to_ascii_lowercase();
+            let said_installed = text
+                .lines()
+                .any(|l| l.contains("already installed") && l.contains(&name));
+            if code != 0 || said_installed {
                 result.notes.push(format!(
                     "{}: brew did not replace the staged keg; run brew reinstall {}",
                     t.name,
-                    brew_token(&t.origin, &t.name)
+                    token_of(t)
                 ));
                 code = code.max(1);
             }
         }
         result.installed.extend(installed);
-        result.status = Some(result.status.map_or(code, |prev| prev.max(code)));
+        max_status(&mut result.status, code);
     }
     Ok(result)
 }
@@ -305,7 +312,11 @@ mod tests {
         run_step(
             &brew,
             "install",
-            &["install".into(), "--cask".into()],
+            &[
+                "install".into(),
+                "--cask".into(),
+                "--ignore-dependencies".into(),
+            ],
             &[t("homebrew/cask", "firefox")],
             &mut Vec::new(),
         )
@@ -440,5 +451,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.status, Some(0));
+    }
+
+    fn switch_target(origin: &str, name: &str) -> [Target; 1] {
+        [Target {
+            origin: origin.into(),
+            name: name.into(),
+            switch_tap: true,
+        }]
+    }
+
+    fn switch_with(out: (i32, &[u8]), targets: &[Target]) -> StepResult {
+        let brew = MockBrew {
+            next_outputs: std::sync::Mutex::new(VecDeque::from(vec![
+                (0, Vec::new()),
+                (out.0, out.1.to_vec()),
+            ])),
+            ..MockBrew::new()
+        };
+        run_step(&brew, "upgrade", &[], targets, &mut Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn switch_exit_zero_already_installed_is_not_a_replacement() {
+        let r = switch_with(
+            (
+                0,
+                b"Warning: vault 1.2.0 is already installed and up-to-date.\n",
+            ),
+            &switch_target("hashicorp/tap", "vault"),
+        );
+        assert_eq!(r.status, Some(1));
+        assert!(
+            r.notes.iter().any(|n| n.contains("did not replace")),
+            "{:?}",
+            r.notes
+        );
+        assert!(r.installed.is_empty(), "{:?}", r.installed);
+    }
+
+    #[test]
+    fn cask_switch_success_is_replaced_and_already_installed_is_not() {
+        let ok = switch_with(
+            (0, b"==> Installing Cask foo\n"),
+            &switch_target("acme/tap", "foo"),
+        );
+        assert_eq!(ok.status, Some(0));
+        assert!(ok.notes.is_empty(), "{:?}", ok.notes);
+        let stale = switch_with(
+            (0, b"Warning: Cask 'foo' is already installed.\n"),
+            &switch_target("acme/tap", "foo"),
+        );
+        assert_eq!(stale.status, Some(1));
+        assert!(
+            stale
+                .notes
+                .iter()
+                .any(|n| n.contains("brew reinstall acme/tap/foo")),
+            "{:?}",
+            stale.notes
+        );
     }
 }

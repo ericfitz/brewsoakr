@@ -96,13 +96,19 @@ pub fn brew_install_args(pkg: &PkgRef, path: &Path, user_flags: &[String]) -> Ve
         PkgKind::Cask => "--cask".into(),
     });
     for flag in user_flags {
-        if is_brew_subcommand(flag) || flag == "--ignore-dependencies" {
+        if is_stripped_flag(flag) {
             continue;
         }
         args.push(flag.clone());
     }
     args.push(path.to_string_lossy().into_owned());
     args
+}
+
+/// Flags brewsoak never forwards to brew: subcommand words and the
+/// unsupported `--ignore-dependencies` developer option.
+pub(crate) fn is_stripped_flag(s: &str) -> bool {
+    is_brew_subcommand(s) || s == "--ignore-dependencies"
 }
 
 pub(crate) fn is_brew_subcommand(s: &str) -> bool {
