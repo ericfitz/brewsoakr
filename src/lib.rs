@@ -124,9 +124,16 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
     world.brew().set_raw(inv.raw);
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
-    let resolved = config::resolve_hours(inv.soak_hours, env.as_deref(), file.as_deref())?;
+    let cfg = config::resolve_config(inv.soak_hours, env.as_deref(), file.as_deref())?;
     if inv.command.is_soaked() {
-        config::apply_persist(resolved.persist, &world.config_path())?;
+        if let Some(warning) = config::apply_persist(cfg.persist, &world.config_path())? {
+            eprintln!("brewsoak: warning: {warning}");
+        }
+        if cmd::is_verbose(&inv.brew_args) {
+            for note in &cfg.notes {
+                println!("{note}");
+            }
+        }
     }
 
     match inv.command {
@@ -160,7 +167,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.git(),
                 world.github(),
                 &cache,
-                resolved.hours,
+                cfg.hours,
                 world.now(),
                 cmd::is_verbose(&inv.brew_args),
                 &mut out,
@@ -180,7 +187,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.github(),
                 world.brew(),
                 &cache,
-                resolved.hours,
+                cfg.hours,
                 world.now(),
                 false,
                 &mut out,
@@ -208,7 +215,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.github(),
                 world.brew(),
                 &cache,
-                resolved.hours,
+                cfg.hours,
                 world.now(),
                 false,
                 &mut out,
@@ -232,7 +239,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.github(),
                 world.brew(),
                 &cache,
-                resolved.hours,
+                cfg.hours,
                 world.now(),
                 true,
                 &mut out,
@@ -261,7 +268,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.github(),
                 world.brew(),
                 &cache,
-                resolved.hours,
+                cfg.hours,
                 world.now(),
                 true,
                 &mut out,
@@ -288,7 +295,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.github(),
                 world.brew(),
                 &cache,
-                resolved.hours,
+                cfg.hours,
                 world.now(),
                 true,
                 &mut out,
