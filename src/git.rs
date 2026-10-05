@@ -3,7 +3,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::rc::Rc;
 
 pub const REF_CUTOFF: &str = "refs/brewsoak/cutoff";
 pub const REF_HEAD: &str = "refs/brewsoak/head";
@@ -82,7 +81,7 @@ pub trait GitStore {
     }
 }
 
-type TreeCache = RefCell<HashMap<(PathBuf, String), Rc<Vec<String>>>>;
+type TreeCache = RefCell<HashMap<(PathBuf, String), Vec<String>>>;
 
 #[derive(Default)]
 pub struct ProcessGit {
@@ -104,6 +103,8 @@ impl ProcessGit {
     fn git() -> Command {
         let mut cmd = Command::new("git");
         cmd.stdin(Stdio::null());
+        // Callers match git's English stderr (`already exists`, filter refusals).
+        cmd.env("LC_ALL", "C");
         cmd
     }
 }
@@ -380,7 +381,13 @@ impl GitStore for ProcessGit {
             ],
         )?;
         if !output.status.success() {
-            return if missing_object(&output) {
+            // Only an unresolvable rev means "no history yet"; any other fatal
+            // (corrupt or missing clone) must surface rather than refuse everything.
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return if stderr.contains("unknown revision")
+                || stderr.contains("bad revision")
+                || stderr.contains("ambiguous argument")
+            {
                 Ok(None)
             } else {
                 Err(git_fail(action, &output))
@@ -414,7 +421,7 @@ impl GitStore for ProcessGit {
     fn ls_tree(&self, dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
         let key = (dir.to_path_buf(), sha.to_string());
         if let Some(cached) = self.trees.borrow().get(&key) {
-            return Ok(cached.as_ref().clone());
+            return Ok(cached.clone());
         }
         let action = format!("listing the files of tap commit {sha}");
         let dir_s = dir.to_string_lossy();
@@ -436,7 +443,7 @@ impl GitStore for ProcessGit {
             .lines()
             .map(str::to_string)
             .collect();
-        self.trees.borrow_mut().insert(key, Rc::new(paths.clone()));
+        self.trees.borrow_mut().insert(key, paths.clone());
         Ok(paths)
     }
 }
@@ -983,5 +990,36 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("fetching history"), "{text}");
         assert!(text.contains("git failed"), "{text}");
+    }
+
+    #[test]
+    fn rev_list_before_on_a_non_repo_is_error_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ProcessGit::default()
+            .rev_list_before(tmp.path(), REF_HEAD, COMMIT_UNIX)
+            .unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+    }
+
+    #[test]
+    fn rev_list_before_missing_ref_in_a_real_repo_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("tap.git");
+        let git = ProcessGit::default();
+        git.init_bare(&bare).unwrap();
+        assert_eq!(
+            git.rev_list_before(&bare, REF_HEAD, COMMIT_UNIX).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn git_children_run_with_c_locale() {
+        let cmd = ProcessGit::git();
+        let lc = cmd
+            .get_envs()
+            .find(|(k, _)| *k == "LC_ALL")
+            .and_then(|(_, v)| v);
+        assert_eq!(lc, Some(std::ffi::OsStr::new("C")));
     }
 }
