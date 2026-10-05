@@ -1,5 +1,7 @@
+use crate::SoakHours;
 use crate::eligibility::DesiredAction;
 use crate::identity::PkgIdentity;
+use crate::inventory::PkgClass;
 use crate::snapshot::TapSnapshot;
 use time::OffsetDateTime;
 
@@ -120,9 +122,17 @@ pub fn evaluate_line(
 
 pub fn counts_line(c: &Counts) -> String {
     format!(
-        "upgraded {}, already soaked {}, held {}, ahead {}, pinned {}, skipped {}",
-        c.upgraded, c.soaked, c.held, c.ahead, c.pinned, c.skipped
+        "upgraded {}, already soaked {}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
+        c.upgraded, c.soaked, c.held, c.ahead, c.pinned, c.skipped, c.no_soak
     )
+}
+
+pub fn origin_line(name: &str, origin: &str, hours: SoakHours, class: PkgClass) -> String {
+    match class {
+        PkgClass::Soaked => format!("{name}: origin {origin}; soak {}h", hours.get()),
+        PkgClass::NoSoak => format!("{name}: origin {origin}; no-soak"),
+        PkgClass::Unsoakable => format!("{name}: origin {origin}; unsoakable"),
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -133,6 +143,7 @@ pub struct Counts {
     pub ahead: usize,
     pub pinned: usize,
     pub skipped: usize,
+    pub no_soak: usize,
 }
 
 impl Counts {
@@ -148,13 +159,44 @@ impl Counts {
     }
 
     pub fn nothing_to_do(&self) -> bool {
-        self.upgraded == 0 && self.held == 0
+        self.upgraded == 0 && self.held == 0 && self.no_soak == 0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_line_ends_with_no_soak() {
+        let c = Counts {
+            upgraded: 1,
+            no_soak: 2,
+            ..Counts::default()
+        };
+        assert_eq!(
+            counts_line(&c),
+            "upgraded 1, already soaked 0, held 0, ahead 0, pinned 0, skipped 0, no-soak 2"
+        );
+    }
+
+    #[test]
+    fn origin_line_shows_hours_or_class() {
+        use crate::inventory::PkgClass;
+        let h = crate::SoakHours::new(72).unwrap();
+        assert_eq!(
+            origin_line("terraform", "hashicorp/tap", h, PkgClass::Soaked),
+            "terraform: origin hashicorp/tap; soak 72h"
+        );
+        assert_eq!(
+            origin_line("brewsoak", "ericfitz/tap", h, PkgClass::NoSoak),
+            "brewsoak: origin ericfitz/tap; no-soak"
+        );
+        assert_eq!(
+            origin_line("x", "local/tap", h, PkgClass::Unsoakable),
+            "x: origin local/tap; unsoakable"
+        );
+    }
 
     #[test]
     fn compact_line_for_upgrade() {

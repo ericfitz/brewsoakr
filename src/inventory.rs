@@ -68,7 +68,7 @@ impl Inventory {
     }
 
     pub fn load(brew: &impl Brew, cache: &Path, cfg: &Config) -> Result<Self, Error> {
-        let installed = brew.installed_core()?;
+        let installed = brew.installed_packages()?;
         let taps = brew.tap_info()?;
         let origins = OriginRecords::load(cache);
         Ok(Self::build(installed, &taps, &origins, cfg))

@@ -172,13 +172,15 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         }
         cli::Command::Update => {
             let cache = world.cache_path();
+            let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             cmd::update(
                 world.brew(),
                 world.git(),
                 world.github(),
                 &cache,
-                cfg.hours,
+                &cfg,
+                &pkgs,
                 world.now(),
                 cmd::is_verbose(&inv.brew_args),
                 &mut out,
@@ -186,19 +188,17 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             Ok(Dispatch::Exit(0))
         }
         cli::Command::Outdated => {
-            if third_party_only_names(&inv.brew_args) {
-                let mut argv = vec!["outdated".to_string()];
-                argv.extend(inv.brew_args);
-                return Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), argv));
-            }
             let cache = world.cache_path();
+            let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
                 world.brew(),
                 &cache,
-                cfg.hours,
+                &cfg,
+                &pkgs,
+                &[],
                 world.now(),
                 false,
                 &mut out,
@@ -208,25 +208,24 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.git(),
                 &snaps,
                 &cache,
+                &pkgs,
+                &cfg,
                 &inv.brew_args,
                 &mut out,
             ))
         }
         cli::Command::Info { names } => {
-            if !names.is_empty() && names.iter().all(|n| crate::resolve::is_third_party(n)) {
-                let mut argv = vec!["info".to_string()];
-                argv.extend(inv.brew_args.iter().cloned());
-                argv.extend(names);
-                return Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), argv));
-            }
             let cache = world.cache_path();
+            let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
                 world.brew(),
                 &cache,
-                cfg.hours,
+                &cfg,
+                &pkgs,
+                &cmd::explicit_tap_tokens(&names),
                 world.now(),
                 false,
                 &mut out,
@@ -236,6 +235,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.git(),
                 &snaps,
                 &cache,
+                &pkgs,
+                &cfg,
                 &names,
                 &inv.brew_args,
                 &mut out,
@@ -244,13 +245,16 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Upgrade { names } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
+            let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
                 world.brew(),
                 &cache,
-                cfg.hours,
+                &cfg,
+                &pkgs,
+                &cmd::explicit_tap_tokens(&names),
                 world.now(),
                 true,
                 &mut out,
@@ -261,6 +265,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &snaps,
                 &cache,
                 &tap_root,
+                &pkgs,
+                &cfg,
                 &names,
                 &inv.brew_args,
                 &mut out,
@@ -273,13 +279,16 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
+            let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
                 world.brew(),
                 &cache,
-                cfg.hours,
+                &cfg,
+                &pkgs,
+                &cmd::explicit_tap_tokens(&names),
                 world.now(),
                 true,
                 &mut out,
@@ -290,6 +299,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &snaps,
                 &cache,
                 &tap_root,
+                &pkgs,
+                &cfg,
                 &names,
                 force_cask,
                 force_formula,
@@ -300,13 +311,16 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Reinstall { names } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
+            let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 world.git(),
                 world.github(),
                 world.brew(),
                 &cache,
-                cfg.hours,
+                &cfg,
+                &pkgs,
+                &cmd::explicit_tap_tokens(&names),
                 world.now(),
                 true,
                 &mut out,
@@ -317,17 +331,14 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &snaps,
                 &cache,
                 &tap_root,
+                &pkgs,
+                &cfg,
                 &names,
                 &inv.brew_args,
                 &mut out,
             ))
         }
     }
-}
-
-fn third_party_only_names(args: &[String]) -> bool {
-    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
-    !names.is_empty() && names.iter().all(|n| crate::resolve::is_third_party(n))
 }
 
 fn soaked_exit(result: Result<cmd::RunResult, Error>) -> Result<Dispatch, Error> {
@@ -346,9 +357,11 @@ fn soaked_exit(result: Result<cmd::RunResult, Error>) -> Result<Dispatch, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::brew::MockBrew;
+    use crate::brew::{InstalledPkg, MockBrew};
     use crate::git::InMemoryGit;
     use crate::github::{CommitInfo, StaticGithub};
+    use crate::resolve::PkgKind;
+    use crate::taps::TapInfo;
     use std::cell::Cell;
     use std::path::PathBuf;
     use time::{Duration, OffsetDateTime};
@@ -578,32 +591,70 @@ mod tests {
     }
 
     #[test]
-    fn info_third_party_is_exec_without_refresh() {
+    fn info_untapped_token_is_soak_aware_not_exec() {
         let world = TestWorld::new();
         match dispatch(&s(&["info", "acme/tools/foo"]), &world).expect("dispatch") {
-            Dispatch::Exec(_bin, argv) => {
-                assert_eq!(argv, s(&["info", "acme/tools/foo"]));
-            }
-            other => panic!("{other:?}"),
+            Dispatch::Exit(1) => {}
+            other => panic!("untapped tap token is refused, not exec'd: {other:?}"),
         }
-        assert!(
-            !world.github.refreshed.get(),
-            "third-party info must not refresh snapshots"
-        );
     }
 
     #[test]
-    fn outdated_third_party_is_exec_without_refresh() {
+    fn outdated_ignores_names_and_does_not_exec() {
         let world = TestWorld::new();
         match dispatch(&s(&["outdated", "acme/tools/foo"]), &world).expect("dispatch") {
-            Dispatch::Exec(_bin, argv) => {
-                assert_eq!(argv, s(&["outdated", "acme/tools/foo"]));
-            }
+            Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn ensure_snapshots_refreshes_only_needed_taps() {
+        let world = TestWorld::new();
+        world.git.insert_commits(
+            "https://github.com/hashicorp/homebrew-tap",
+            &[
+                ("hc2", now().unix_timestamp() - 3600),
+                ("hc1", now().unix_timestamp() - 200 * 3600),
+            ],
+        );
+        let brew = MockBrew {
+            installed: vec![InstalledPkg {
+                name: "terraform".into(),
+                kind: PkgKind::Formula,
+                receipt_rb: "class X < Formula\n  url \"https://e.com/terraform-1.0.0.tar.gz\"\n  sha256 \"a\"\nend\n".into(),
+                pinned: false,
+                tap: Some("hashicorp/tap".into()),
+            }],
+            taps: vec![
+                TapInfo {
+                    name: "hashicorp/tap".into(),
+                    remote: Some("https://github.com/hashicorp/homebrew-tap".into()),
+                },
+                TapInfo {
+                    name: "ericfitz/tap".into(),
+                    remote: Some("https://github.com/ericfitz/homebrew-tap".into()),
+                },
+            ],
+            ..MockBrew::new()
+        };
+        let world = TestWorld { brew, ..world };
+        std::fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
+        std::fs::write(
+            world.config_path(),
+            "[[TAP]]\nname = \"hashicorp/tap\"\nsoak_hours = 100\n",
+        )
+        .unwrap();
+        match dispatch(&s(&["update"]), &world).expect("update") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
+        let state = std::fs::read_to_string(world.cache_path().join("state.toml")).unwrap();
+        assert!(state.contains("[taps.\"hashicorp/tap\"]"), "{state}");
+        assert!(state.contains("hours = 100"), "{state}");
         assert!(
-            !world.github.refreshed.get(),
-            "third-party outdated must not refresh snapshots"
+            !state.contains("ericfitz/tap"),
+            "no installed soaked package: not refreshed\n{state}"
         );
     }
 }

@@ -1,14 +1,19 @@
-use crate::brew::{Brew, InstalledPkg};
+use crate::Error;
+use crate::brew::Brew;
+use crate::config::Config;
 use crate::eligibility::{self, DesiredAction, UpstreamStatus};
 use crate::git::GitStore;
 use crate::github::GithubApi;
 use crate::identity::{self, PkgIdentity};
+use crate::inventory::{self, Inventory, Pkg, PkgClass};
+use crate::nosoak;
+use crate::origin;
 use crate::quiet;
 use crate::report::{self, Counts};
 use crate::resolve::{self, PkgKind, PkgRef};
-use crate::snapshot::{self, Snapshots};
+use crate::snapshot::{self, RefreshPlan, Snapshots, TapPlan};
 use crate::tap;
-use crate::{Error, SoakHours};
+use crate::taps;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -48,26 +53,70 @@ pub fn combine_exit(refused: bool, brew_status: Option<i32>) -> i32 {
     }
 }
 
+/// `(origin, name)` of every `user/tap/name` token on the command line.
+pub fn explicit_tap_tokens(names: &[String]) -> Vec<(String, String)> {
+    names
+        .iter()
+        .filter_map(|n| {
+            let token = inventory::parse_token(n).ok()?;
+            token.origin.map(|o| (o, token.name))
+        })
+        .collect()
+}
+
+pub fn refresh_plan(cfg: &Config, inv: &Inventory, extra: &[(String, String)]) -> RefreshPlan {
+    RefreshPlan {
+        hours: cfg.hours,
+        core_hours: cfg.effective_hours(origin::CORE),
+        cask_hours: cfg.effective_hours(origin::CASK),
+        taps: inv
+            .needed_taps(extra, cfg)
+            .into_iter()
+            .map(|(name, remote)| TapPlan {
+                hours: cfg.effective_hours(&name),
+                name,
+                remote,
+            })
+            .collect(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ensure_snapshots(
     git: &impl GitStore,
     gh: &impl GithubApi,
-    brew: &impl Brew,
+    _brew: &impl Brew,
     cache: &Path,
-    hours: SoakHours,
+    cfg: &Config,
+    inv: &Inventory,
+    extra: &[(String, String)],
     now: time::OffsetDateTime,
     force: bool,
     progress: &mut impl Write,
 ) -> Result<Snapshots, Error> {
+    let plan = refresh_plan(cfg, inv, extra);
     let snaps = if force {
-        snapshot::refresh(git, gh, cache, hours, now, progress)?
+        snapshot::refresh_with(git, gh, cache, &plan, now, progress)?
     } else {
         match snapshot::load_state(cache)? {
-            Some(s) => return Ok(s),
-            None => snapshot::refresh(git, gh, cache, hours, now, progress)?,
+            Some(mut s) => {
+                // outdated/info reuse the stored snapshot, but refresh any
+                // tap with no state or a different soak window.
+                let stale: Vec<TapPlan> = plan
+                    .taps
+                    .iter()
+                    .filter(|t| snapshot::tap_needs_refresh(&s, &t.name, t.hours))
+                    .cloned()
+                    .collect();
+                if !stale.is_empty() {
+                    snapshot::refresh_taps(git, cache, &mut s, &stale, now, progress)?;
+                }
+                return Ok(s);
+            }
+            None => snapshot::refresh_with(git, gh, cache, &plan, now, progress)?,
         }
     };
-    prefetch_installed(brew, git, cache, &snaps);
+    prefetch_installed(git, cache, inv, &snaps);
     Ok(snaps)
 }
 
@@ -79,19 +128,28 @@ type Classified = (
     Option<PkgIdentity>,
 );
 
+/// Installed soaked packages whose origin has a snapshot in this run. A tap
+/// that failed to refresh (or has no state) contributes nothing.
+fn snapshotted_pkgs<'a>(inv: &'a Inventory, snaps: &'a Snapshots) -> impl Iterator<Item = &'a Pkg> {
+    inv.pkgs.iter().filter(|p| {
+        p.class == PkgClass::Soaked
+            && (origin::is_core_or_cask(&p.origin) || snaps.tap(&p.origin).is_some())
+    })
+}
+
 fn classify_installed(
-    brew: &impl Brew,
     git: &impl GitStore,
     cache: &Path,
     snaps: &Snapshots,
+    inv: &Inventory,
 ) -> Result<Vec<Classified>, Error> {
     let mut out = Vec::new();
-    let installed = brew.installed_core()?;
-    for pkg in installed {
+    for pkg in snapshotted_pkgs(inv, snaps) {
         let Some(view) = resolve_view(
             git,
             snaps,
             cache,
+            &pkg.origin,
             &pkg.name,
             pkg.kind,
             Some(&pkg.receipt_rb),
@@ -100,7 +158,7 @@ fn classify_installed(
             continue;
         };
         out.push((
-            pkg.name,
+            pkg.name.clone(),
             view.action,
             view.installed,
             view.cutoff,
@@ -111,15 +169,15 @@ fn classify_installed(
 }
 
 fn write_update_summary(
-    brew: &impl Brew,
     git: &impl GitStore,
     cache: &Path,
     snaps: &Snapshots,
+    inv: &Inventory,
     before: &[Classified],
     verbose: bool,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    let after = classify_installed(brew, git, cache, snaps)?;
+    let after = classify_installed(git, cache, snaps, inv)?;
     let before_map: std::collections::HashMap<_, _> = before
         .iter()
         .map(|(n, a, _, _, _)| (n.as_str(), *a))
@@ -171,33 +229,36 @@ fn write_update_summary(
     Ok(())
 }
 
-pub fn prefetch_installed(brew: &impl Brew, git: &impl GitStore, cache: &Path, snaps: &Snapshots) {
-    let Ok(installed) = brew.installed_core() else {
-        return;
-    };
-    for pkg in installed {
-        let _ = resolve_pkg_blobs(git, snaps, cache, &pkg.name, pkg.kind);
+pub fn prefetch_installed(git: &impl GitStore, cache: &Path, inv: &Inventory, snaps: &Snapshots) {
+    for pkg in snapshotted_pkgs(inv, snaps) {
+        let _ = resolve_pkg_blobs(git, snaps, cache, &pkg.origin, &pkg.name, pkg.kind);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn update(
-    brew: &impl Brew,
+    _brew: &impl Brew,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
-    hours: SoakHours,
+    cfg: &Config,
+    inv: &Inventory,
     now: time::OffsetDateTime,
     verbose: bool,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    writeln!(out, "updating soak snapshots; soak window {}h", hours.get())?;
+    writeln!(
+        out,
+        "updating soak snapshots; soak window {}h",
+        cfg.hours.get()
+    )?;
     let previous = snapshot::load_state(cache)?;
     let before = match &previous {
-        Some(prev) => classify_installed(brew, git, cache, prev).unwrap_or_default(),
+        Some(prev) => classify_installed(git, cache, prev, inv).unwrap_or_default(),
         None => Vec::new(),
     };
-    let snaps = snapshot::refresh(git, gh, cache, hours, now, out)?;
+    let plan = refresh_plan(cfg, inv, &[]);
+    let snaps = snapshot::refresh_with(git, gh, cache, &plan, now, out)?;
     writeln!(
         out,
         "core cutoff: {}",
@@ -218,21 +279,107 @@ pub fn update(
         "cask head: {}",
         report::short_sha(&snaps.cask.head_sha)
     )?;
-    prefetch_installed(brew, git, cache, &snaps);
-    write_update_summary(brew, git, cache, &snaps, &before, verbose, out)?;
+    for (name, state) in &snaps.taps {
+        match &state.cutoff_sha {
+            Some(sha) => writeln!(
+                out,
+                "{name} cutoff: {}",
+                report::format_cutoff(sha, state.cutoff_time)
+            )?,
+            None => writeln!(
+                out,
+                "{name} cutoff: none (no commit is older than the soak window)"
+            )?,
+        }
+        writeln!(out, "{name} head: {}", report::short_sha(&state.head_sha))?;
+    }
+    for (name, err) in &snaps.held_taps {
+        writeln!(
+            out,
+            "tap {name} could not be refreshed; its packages are held. {err}"
+        )?;
+    }
+    prefetch_installed(git, cache, inv, &snaps);
+    write_update_summary(git, cache, &snaps, inv, &before, verbose, out)?;
     writeln!(out, "snapshots refreshed")?;
     Ok(())
 }
 
+/// Why a package cannot be soaked, worded for a note.
+fn unsoakable_note(name: &str, origin_tap: &str, tapped: bool) -> String {
+    if tapped {
+        format!(
+            "{name}: tap {origin_tap} has no HTTPS remote; not soakable. Use brew, or add it to NO_SOAK"
+        )
+    } else {
+        format!(
+            "{name}: tap {origin_tap} is not installed; run brew tap {origin_tap} first, or add it to NO_SOAK"
+        )
+    }
+}
+
+fn held_tap_note(name: &str, origin_tap: &str, err: &str) -> String {
+    format!("{name}: tap {origin_tap} could not be refreshed; held. {err}")
+}
+
+/// origin + name + class for a command-line token, installed or not.
+struct Resolved {
+    origin: String,
+    name: String,
+    class: PkgClass,
+    receipt_tap: Option<String>,
+    /// origin is core/cask or appears in `brew tap-info --installed`.
+    tapped: bool,
+    /// The token spelled out `user/tap/name`.
+    named_origin: bool,
+}
+
+fn resolve_token(raw: &str, inv: &Inventory, cfg: &Config) -> Result<Resolved, Error> {
+    let token = inventory::parse_token(raw)?;
+    let installed = inv
+        .find(&token.name)
+        .filter(|p| token.origin.as_deref().is_none_or(|o| o == p.origin));
+    let origin_tap = match (&token.origin, installed) {
+        (Some(o), _) => o.clone(),
+        (None, Some(p)) => p.origin.clone(),
+        // Not installed, bare name: core. `natural_kind` may flip it to cask.
+        (None, None) => origin::CORE.to_string(),
+    };
+    let tapped = origin::is_core_or_cask(&origin_tap) || inv.tap_class(&origin_tap).is_some();
+    let class = match installed {
+        Some(p) if token.origin.is_none() => p.class,
+        _ => inv.class_for(&origin_tap, &token.name, cfg),
+    };
+    Ok(Resolved {
+        origin: origin_tap,
+        name: token.name,
+        class,
+        receipt_tap: installed.and_then(|p| p.receipt_tap.clone()),
+        tapped,
+        named_origin: token.origin.is_some(),
+    })
+}
+
+/// A bare name that resolved as a cask belongs to `homebrew/cask`, which may
+/// itself be on the `NO_SOAK` list.
+fn settle_origin(r: &mut Resolved, kind: PkgKind, inv: &Inventory, cfg: &Config) {
+    if origin::is_core_or_cask(&r.origin) {
+        r.origin = origin::default_origin(kind).to_string();
+        r.class = inv.class_for(&r.origin, &r.name, cfg);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn outdated(
-    brew: &impl Brew,
+    _brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    inv: &Inventory,
+    cfg: &Config,
     extra_args: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
-    let brew_status = passthrough_third_party(brew, "outdated", extra_args, extra_args)?;
     let verbose = is_verbose(extra_args);
     if verbose {
         writeln!(
@@ -246,13 +393,41 @@ pub fn outdated(
             )
         )?;
     }
-    let installed = brew.installed_core()?;
     let mut upgrades = Vec::new();
     let mut held = Vec::new();
     let mut ahead = Vec::new();
     let mut pinned = Vec::new();
     let mut soaked = 0usize;
-    for pkg in &installed {
+    for pkg in &inv.pkgs {
+        if verbose {
+            writeln!(
+                out,
+                "{}",
+                report::origin_line(
+                    &pkg.name,
+                    &pkg.origin,
+                    cfg.effective_hours(&pkg.origin),
+                    pkg.class
+                )
+            )?;
+        }
+        match pkg.class {
+            PkgClass::NoSoak => {
+                if verbose {
+                    writeln!(out, "{}: no-soak; brew decides", pkg.name)?;
+                }
+                continue;
+            }
+            PkgClass::Unsoakable => {
+                held.push(unsoakable_note(
+                    &pkg.name,
+                    &pkg.origin,
+                    inv.tap_class(&pkg.origin).is_some(),
+                ));
+                continue;
+            }
+            PkgClass::Soaked => {}
+        }
         if pkg.pinned {
             pinned.push(pkg.name.clone());
             if verbose {
@@ -260,10 +435,15 @@ pub fn outdated(
             }
             continue;
         }
+        if let Some(err) = snaps.held_taps.get(&pkg.origin) {
+            held.push(held_tap_note(&pkg.name, &pkg.origin, err));
+            continue;
+        }
         let Some(view) = resolve_view(
             git,
             snaps,
             cache,
+            &pkg.origin,
             &pkg.name,
             pkg.kind,
             Some(&pkg.receipt_rb),
@@ -326,21 +506,23 @@ pub fn outdated(
     }
     Ok(RunResult {
         refused: false,
-        brew_status,
+        brew_status: None,
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn info(
-    brew: &impl Brew,
+    _brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    inv: &Inventory,
+    cfg: &Config,
     names: &[String],
     user_flags: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
-    let mut brew_status = None;
-    let installed = brew.installed_core()?;
+    let mut refused = false;
     let verbose = is_verbose(user_flags);
     let long_form = verbose || !names.is_empty();
     if verbose {
@@ -351,30 +533,81 @@ pub fn info(
         )?;
     }
     let owned_names: Vec<String> = if names.is_empty() {
-        installed.iter().map(|p| p.name.clone()).collect()
+        inv.pkgs.iter().map(|p| p.name.clone()).collect()
     } else {
         names.to_vec()
     };
-    for (i, name) in owned_names.iter().enumerate() {
-        if resolve::is_third_party(name) {
-            let mut args = vec!["info".to_string()];
-            args.extend(user_flags.iter().cloned());
-            args.push(name.clone());
-            merge_status(&mut brew_status, brew.run_visible(&args)?);
-            continue;
-        }
+    for (i, raw) in owned_names.iter().enumerate() {
         if long_form && i > 0 {
             writeln!(out)?;
         }
-        let Some(view) = resolve_named(git, snaps, cache, name, &installed)? else {
+        let mut r = resolve_token(raw, inv, cfg)?;
+        let mut kind = None;
+        if r.class == PkgClass::Soaked && !snaps.held_taps.contains_key(&r.origin) {
+            let k = natural_kind(git, snaps, cache, inv, &r.origin, &r.name)?;
+            settle_origin(&mut r, k, inv, cfg);
+            kind = Some(k);
+        }
+        if verbose {
+            writeln!(
+                out,
+                "{}",
+                report::origin_line(&r.name, &r.origin, cfg.effective_hours(&r.origin), r.class)
+            )?;
+        }
+        match r.class {
+            PkgClass::NoSoak => {
+                if long_form {
+                    writeln!(out, "{raw}")?;
+                    writeln!(out, "origin: {}", r.origin)?;
+                    writeln!(out, "soak hours: no-soak")?;
+                    writeln!(out, "action: no-soak; brew decides")?;
+                } else {
+                    writeln!(out, "{raw}  -  no-soak; brew decides")?;
+                }
+                continue;
+            }
+            PkgClass::Unsoakable => {
+                if long_form {
+                    writeln!(out, "{raw}")?;
+                    writeln!(out, "origin: {}", r.origin)?;
+                    writeln!(out, "action: unsoakable")?;
+                } else {
+                    writeln!(out, "{raw}  -  unsoakable")?;
+                }
+                if !names.is_empty() {
+                    let token = nosoak::brew_token(&r.origin, &r.name);
+                    writeln!(
+                        out,
+                        "{}; use `brew info {token}` to bypass brewsoak.",
+                        unsoakable_note(&r.name, &r.origin, r.tapped)
+                    )?;
+                    refused = true;
+                }
+                continue;
+            }
+            PkgClass::Soaked => {}
+        }
+        if let Some(err) = snaps.held_taps.get(&r.origin) {
+            writeln!(out, "{raw}")?;
+            writeln!(out, "origin: {}", r.origin)?;
+            writeln!(out, "{}", held_tap_note(&r.name, &r.origin, err))?;
+            continue;
+        }
+        let kind = kind.expect("soaked packages have a kind");
+        let receipt = inv
+            .find(&r.name)
+            .filter(|p| p.origin == r.origin)
+            .map(|p| p.receipt_rb.as_str());
+        let Some(view) = resolve_view(git, snaps, cache, &r.origin, &r.name, kind, receipt)? else {
             if long_form {
-                writeln!(out, "{name}")?;
+                writeln!(out, "{raw}")?;
                 writeln!(out, "unparseable identity")?;
             } else {
-                writeln!(out, "{name}  -  unparseable identity")?;
+                writeln!(out, "{raw}  -  unparseable identity")?;
             }
             if verbose {
-                writeln!(out, "{name}: unparseable identity; skipped")?;
+                writeln!(out, "{raw}: unparseable identity; skipped")?;
             }
             continue;
         };
@@ -383,7 +616,7 @@ pub fn info(
                 out,
                 "{}",
                 report::evaluate_line(
-                    name,
+                    raw,
                     view.action,
                     view.installed.as_ref(),
                     view.cutoff.as_ref(),
@@ -393,7 +626,7 @@ pub fn info(
             )?;
         }
         if long_form {
-            writeln!(out, "{name}")?;
+            writeln!(out, "{raw}")?;
             writeln!(
                 out,
                 "installed: {}",
@@ -418,6 +651,8 @@ pub fn info(
                     .map(report::identity_version)
                     .unwrap_or("none")
             )?;
+            writeln!(out, "origin: {}", r.origin)?;
+            writeln!(out, "soak hours: {}", cfg.effective_hours(&r.origin).get())?;
             writeln!(out, "action: {}", report::human_action(view.action))?;
             for warn in &view.warnings {
                 writeln!(out, "warning: {warn}")?;
@@ -427,7 +662,7 @@ pub fn info(
                 out,
                 "{}",
                 report::compact_info_line(
-                    name,
+                    raw,
                     view.installed.as_ref(),
                     view.cutoff.as_ref(),
                     view.action,
@@ -436,8 +671,8 @@ pub fn info(
         }
     }
     Ok(RunResult {
-        refused: false,
-        brew_status,
+        refused,
+        brew_status: None,
     })
 }
 
@@ -448,38 +683,46 @@ pub fn upgrade(
     snaps: &Snapshots,
     cache: &Path,
     tap_root: &Path,
+    inv: &Inventory,
+    cfg: &Config,
     names: &[String],
     user_flags: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
-    let installed = brew.installed_core()?;
     let targets: Vec<String> = if names.is_empty() {
-        installed.iter().map(|p| p.name.clone()).collect()
+        inv.pkgs.iter().map(|p| p.name.clone()).collect()
     } else {
         names.to_vec()
     };
     // A bare `brew soak upgrade` walks everything installed, so say up front
     // how many will actually change and count them off as they go.
-    let plan_total = (names.is_empty()).then(|| plan_size(git, snaps, cache, &installed));
+    let plan_total = (names.is_empty()).then(|| plan_size(git, snaps, cache, inv));
     if let Some(total) = plan_total {
-        writeln!(out, "upgrading {total} of {} packages", installed.len())?;
+        writeln!(out, "upgrading {total} of {} packages", inv.pkgs.len())?;
     }
     apply_many(
-        brew, git, snaps, cache, tap_root, &targets, "upgrade", false, false, user_flags,
-        &installed, plan_total, out,
+        brew,
+        git,
+        snaps,
+        cache,
+        tap_root,
+        inv,
+        cfg,
+        &targets,
+        names.is_empty(),
+        "upgrade",
+        false,
+        false,
+        user_flags,
+        plan_total,
+        out,
     )
 }
 
 /// How many installed packages the soak window says to change. Resolution is
 /// cheap (cached blobs) and errors just mean "no total to show".
-fn plan_size(
-    git: &impl GitStore,
-    snaps: &Snapshots,
-    cache: &Path,
-    installed: &[InstalledPkg],
-) -> usize {
-    installed
-        .iter()
+fn plan_size(git: &impl GitStore, snaps: &Snapshots, cache: &Path, inv: &Inventory) -> usize {
+    snapshotted_pkgs(inv, snaps)
         .filter(|pkg| !pkg.pinned)
         .filter(|pkg| {
             matches!(
@@ -487,6 +730,7 @@ fn plan_size(
                     git,
                     snaps,
                     cache,
+                    &pkg.origin,
                     &pkg.name,
                     pkg.kind,
                     Some(&pkg.receipt_rb)
@@ -507,6 +751,8 @@ pub fn install(
     snaps: &Snapshots,
     cache: &Path,
     tap_root: &Path,
+    inv: &Inventory,
+    cfg: &Config,
     names: &[String],
     force_cask: bool,
     force_formula: bool,
@@ -516,19 +762,20 @@ pub fn install(
     if names.is_empty() {
         return Err(Error::Usage("install: no packages specified".into()));
     }
-    let installed = brew.installed_core()?;
     apply_many(
         brew,
         git,
         snaps,
         cache,
         tap_root,
+        inv,
+        cfg,
         names,
+        false,
         "install",
         force_cask,
         force_formula,
         user_flags,
-        &installed,
         None,
         out,
     )
@@ -541,6 +788,8 @@ pub fn reinstall(
     snaps: &Snapshots,
     cache: &Path,
     tap_root: &Path,
+    inv: &Inventory,
+    cfg: &Config,
     names: &[String],
     user_flags: &[String],
     out: &mut impl Write,
@@ -548,7 +797,6 @@ pub fn reinstall(
     if names.is_empty() {
         return Err(Error::Usage("reinstall: no packages specified".into()));
     }
-    let installed = brew.installed_core()?;
     let plan_total = None;
     let mut session = ApplySession {
         brew,
@@ -557,8 +805,10 @@ pub fn reinstall(
         cache,
         tap_root,
         user_flags,
-        installed: &installed,
+        inv,
+        cfg,
         brew_verb: "reinstall",
+        bare_run: false,
         force_cask: false,
         force_formula: false,
         refused: false,
@@ -566,6 +816,7 @@ pub fn reinstall(
         counts: Counts::default(),
         done: BTreeMap::new(),
         deferred: Vec::new(),
+        nosoak: Vec::new(),
         plan_total,
         plan_index: 0,
         out,
@@ -577,38 +828,67 @@ pub fn reinstall(
             report::soak_banner("reinstalling", snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
-    for name in names {
-        if resolve::is_third_party(name) {
-            session.apply_one(name)?;
+    for raw in names {
+        let r = resolve_token(raw, inv, cfg)?;
+        if session.refuses_tap_switch(&r) {
             continue;
         }
-        let Some(pkg) = installed.iter().find(|p| p.name == *name) else {
+        match r.class {
+            PkgClass::NoSoak => {
+                session.nosoak.push(nosoak::Target {
+                    origin: r.origin,
+                    name: r.name,
+                    switch_tap: false,
+                });
+                continue;
+            }
+            PkgClass::Unsoakable => {
+                // apply_one produces the refusal.
+                session.apply_one(raw)?;
+                continue;
+            }
+            PkgClass::Soaked => {}
+        }
+        let Some(pkg) = inv.find(&r.name).filter(|p| p.origin == r.origin) else {
             return Err(Error::Refusal(format!(
-                "reinstall: no installed keg: {name}"
+                "reinstall: no installed keg: {}",
+                r.name
             )));
         };
-        let Some(view) = resolve_view(git, snaps, cache, name, pkg.kind, Some(&pkg.receipt_rb))?
+        let Some(view) = resolve_view(
+            git,
+            snaps,
+            cache,
+            &r.origin,
+            &r.name,
+            pkg.kind,
+            Some(&pkg.receipt_rb),
+        )?
         else {
-            writeln!(session.out, "{name}: unparseable identity; skipping")?;
+            writeln!(session.out, "{}: unparseable identity; skipping", r.name)?;
             continue;
         };
         if view.installed.as_ref() == view.head.as_ref() {
             if is_verbose(user_flags) {
                 writeln!(
                     session.out,
-                    "{name}: installed matches HEAD; brew reinstall (true repair)"
+                    "{}: installed matches HEAD; brew reinstall (true repair)",
+                    r.name
                 )?;
             }
-            writeln!(session.out, "reinstalling {name}")?;
+            // Full token, so a tap formula resolves in its own tap.
+            let token = nosoak::brew_token(&r.origin, &r.name);
+            writeln!(session.out, "reinstalling {}", r.name)?;
             let mut args = vec!["reinstall".to_string()];
             args.extend(user_flags.iter().cloned());
-            args.push(name.to_string());
+            args.push(token);
             session.record_run(&args)?;
             session.counts.upgraded += 1;
             continue;
         }
-        session.apply_one(name)?;
+        session.apply_one(raw)?;
     }
+    session.run_nosoak()?;
     session.write_tail()?;
     Ok(RunResult {
         refused: session.refused,
@@ -623,12 +903,14 @@ fn apply_many(
     snaps: &Snapshots,
     cache: &Path,
     tap_root: &Path,
+    inv: &Inventory,
+    cfg: &Config,
     names: &[String],
+    bare_run: bool,
     brew_verb: &str,
     force_cask: bool,
     force_formula: bool,
     user_flags: &[String],
-    installed: &[InstalledPkg],
     plan_total: Option<usize>,
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
@@ -639,8 +921,10 @@ fn apply_many(
         cache,
         tap_root,
         user_flags,
-        installed,
+        inv,
+        cfg,
         brew_verb,
+        bare_run,
         force_cask,
         force_formula,
         refused: false,
@@ -648,6 +932,7 @@ fn apply_many(
         counts: Counts::default(),
         done: BTreeMap::new(),
         deferred: Vec::new(),
+        nosoak: Vec::new(),
         plan_total,
         plan_index: 0,
         out,
@@ -668,6 +953,7 @@ fn apply_many(
     for name in names {
         session.apply_one(name)?;
     }
+    session.run_nosoak()?;
     session.write_tail()?;
     if session.counts.nothing_to_do() && session.counts.soaked > 0 && brew_verb == "upgrade" {
         writeln!(
@@ -689,8 +975,11 @@ struct ApplySession<'a, B, G, W> {
     cache: &'a Path,
     tap_root: &'a Path,
     user_flags: &'a [String],
-    installed: &'a [InstalledPkg],
+    inv: &'a Inventory,
+    cfg: &'a Config,
     brew_verb: &'a str,
+    /// A bare `upgrade`: every installed package, none named by the user.
+    bare_run: bool,
     force_cask: bool,
     force_formula: bool,
     refused: bool,
@@ -704,6 +993,8 @@ struct ApplySession<'a, B, G, W> {
     /// Holds, skips, and warnings, printed as one block at the end so they
     /// are not lost in the middle of the install scroll.
     deferred: Vec<String>,
+    /// No-soak packages collected for the single brew step after soaked work.
+    nosoak: Vec<nosoak::Target>,
     /// Number of packages this run expects to change, when known up front.
     plan_total: Option<usize>,
     plan_index: usize,
@@ -782,44 +1073,135 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 }
 
 impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
-    fn apply_one(&mut self, name: &str) -> Result<(), Error> {
-        if resolve::is_third_party(name) {
-            if is_verbose(self.user_flags) {
-                writeln!(
-                    self.out,
-                    "{name}: third-party; passing through to brew {}",
-                    self.brew_verb
-                )?;
-            }
-            let mut args = vec![self.brew_verb.to_string()];
-            args.extend(self.user_flags.iter().cloned());
-            args.push(name.to_string());
-            self.record_run(&args)?;
-            self.counts.upgraded += 1;
+    /// An explicit `user/tap/name` over a keg from another origin is refused:
+    /// brewsoak never uninstalls a keg to switch taps. Returns true when it
+    /// refused.
+    fn refuses_tap_switch(&mut self, r: &Resolved) -> bool {
+        if !r.named_origin {
+            return false;
+        }
+        let Some(other) = self
+            .inv
+            .find(&r.name)
+            .map(|p| p.origin.clone())
+            .filter(|o| *o != r.origin)
+        else {
+            return false;
+        };
+        let token = nosoak::brew_token(&r.origin, &r.name);
+        self.defer(format!(
+            "{} is installed from {other}; brewsoak does not switch taps; use brew {} {token}",
+            r.name, self.brew_verb
+        ));
+        self.counts.held += 1;
+        self.refused = true;
+        true
+    }
+
+    fn nosoak_target(&self, r: Resolved) -> nosoak::Target {
+        nosoak::Target {
+            switch_tap: r.receipt_tap.is_none()
+                && !origin::is_core_or_cask(&r.origin)
+                && self.inv.find(&r.name).is_some(),
+            origin: r.origin,
+            name: r.name,
+        }
+    }
+
+    fn apply_one(&mut self, raw: &str) -> Result<(), Error> {
+        let mut r = resolve_token(raw, self.inv, self.cfg)?;
+        if self.refuses_tap_switch(&r) {
             return Ok(());
         }
-
-        if self.installed.iter().any(|p| p.name == name && p.pinned) && self.brew_verb == "upgrade"
-        {
+        let name = r.name.clone();
+        let pinned = self.inv.find(&name).is_some_and(|p| p.pinned);
+        if pinned && self.brew_verb == "upgrade" && (self.bare_run || r.class != PkgClass::NoSoak) {
             self.counts.pinned += 1;
             if is_verbose(self.user_flags) {
                 writeln!(self.out, "{name}: pinned; skipped")?;
             }
             return Ok(());
         }
-
-        let kind = self.resolve_kind(name)?;
+        if is_verbose(self.user_flags) {
+            writeln!(
+                self.out,
+                "{}",
+                report::origin_line(
+                    &name,
+                    &r.origin,
+                    self.cfg.effective_hours(&r.origin),
+                    r.class
+                )
+            )?;
+        }
+        match r.class {
+            PkgClass::NoSoak => {
+                let target = self.nosoak_target(r);
+                self.nosoak.push(target);
+                return Ok(());
+            }
+            PkgClass::Unsoakable => {
+                let msg = unsoakable_note(&name, &r.origin, r.tapped);
+                if self.bare_run {
+                    self.defer(msg);
+                } else {
+                    let token = nosoak::brew_token(&r.origin, &name);
+                    self.defer(format!(
+                        "{msg}; use `brew {} {token}` to bypass brewsoak.",
+                        self.brew_verb
+                    ));
+                    self.counts.held += 1;
+                    self.refused = true;
+                }
+                return Ok(());
+            }
+            PkgClass::Soaked => {}
+        }
+        if let Some(err) = self.snaps.held_taps.get(&r.origin) {
+            let note = held_tap_note(&name, &r.origin, err);
+            self.defer(note);
+            self.counts.held += 1;
+            self.refused = true;
+            return Ok(());
+        }
+        let kind = self.resolve_kind(&r.origin, &name)?;
+        settle_origin(&mut r, kind, self.inv, self.cfg);
+        if r.class == PkgClass::NoSoak {
+            // A fresh cask install under `NO_SOAK = ["homebrew/cask"]`.
+            let target = self.nosoak_target(r);
+            self.nosoak.push(target);
+            return Ok(());
+        }
         let receipt = self
-            .installed
-            .iter()
-            .find(|p| p.name == name)
+            .inv
+            .find(&name)
+            .filter(|p| p.origin == r.origin)
             .map(|p| p.receipt_rb.as_str());
-        let Some(view) = resolve_view(self.git, self.snaps, self.cache, name, kind, receipt)?
+        let Some(view) = resolve_view(
+            self.git, self.snaps, self.cache, &r.origin, &name, kind, receipt,
+        )?
         else {
             self.counts.skipped += 1;
             self.defer(format!("{name}: unparseable identity; skipping"));
             return Ok(());
         };
+        if view.action == DesiredAction::RefuseYanked
+            && view.cutoff.is_none()
+            && origin::is_core_or_cask(&r.origin)
+            && self
+                .inv
+                .find(&name)
+                .is_some_and(|p| p.receipt_tap.is_none())
+        {
+            // Staged from a tap, the origin record is gone, and the name
+            // resolves nowhere in core or cask.
+            self.defer(format!(
+                "{name}: origin unknown; reinstall it from its tap with brew"
+            ));
+            self.counts.held += 1;
+            self.refused = true;
+            return Ok(());
+        }
         for warn in view.warnings.clone() {
             self.defer(format!("warning: {warn}"));
         }
@@ -836,7 +1218,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 self.out,
                 "{}",
                 report::evaluate_line(
-                    name,
+                    &name,
                     view.action,
                     view.installed.as_ref(),
                     view.cutoff.as_ref(),
@@ -846,6 +1228,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             )?;
         }
         self.counts.note(view.action);
+        let token = nosoak::brew_token(&r.origin, &name);
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
@@ -855,17 +1238,17 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::LeaveAheadOfSoak => {
                 if self.brew_verb == "reinstall" {
                     self.defer(format!(
-                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {name}` to bypass brewsoak."
+                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {token}` to bypass brewsoak."
                     ));
                     self.refused = true;
                 } else {
-                    self.defer(ahead_message(name));
+                    self.defer(ahead_message(&name));
                 }
             }
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
             | DesiredAction::RefuseDeprecated => {
-                if let Some(msg) = refusal_message(view.action, name, self.brew_verb) {
+                if let Some(msg) = refusal_message(view.action, &token, self.brew_verb) {
                     self.defer(msg);
                 }
                 self.refused = true;
@@ -873,12 +1256,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::InstallCutoff => {
                 // brew may already have upgraded this as a dependency of an
                 // earlier package; running it again just prints a warning.
-                if self.already_done(name, view.cutoff.as_ref()) {
+                if self.already_done(&name, view.cutoff.as_ref()) {
                     self.plan_index += 1;
                     return Ok(());
                 }
-                self.announce(name, &view)?;
-                self.install_cutoff(name, kind, &view)?;
+                self.announce(&name, &view)?;
+                self.install_cutoff(&name, &r.origin, kind, &view)?;
             }
         }
         Ok(())
@@ -887,6 +1270,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn install_cutoff(
         &mut self,
         name: &str,
+        origin_tap: &str,
         kind: PkgKind,
         view: &ResolvedView,
     ) -> Result<(), Error> {
@@ -899,12 +1283,13 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         })?;
         let path = tap::write_blob(self.tap_root, &pkg, blob)?;
 
+        let target = nosoak::brew_token(origin_tap, name);
         let deps = self.collect_cutoff_deps(name, kind)?;
         for (dep, dep_kind) in deps {
-            if self.installed.iter().any(|p| p.name == dep) {
+            if self.inv.find(&dep).is_some() {
                 continue;
             }
-            if !self.install_missing_dep(name, dep_kind, &dep)? {
+            if !self.install_missing_dep(&target, dep_kind, &dep)? {
                 return Ok(());
             }
         }
@@ -924,7 +1309,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             snaps: self.snaps,
             cache: self.cache,
             tap_root: self.tap_root,
-            installed: self.installed,
+            inv: self.inv,
             visiting: HashSet::new(),
             visited: HashSet::new(),
             out: Vec::new(),
@@ -940,7 +1325,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         kind: PkgKind,
         dep: &str,
     ) -> Result<bool, Error> {
-        let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, dep, kind)?;
+        let blobs = resolve_pkg_blobs(
+            self.git,
+            self.snaps,
+            self.cache,
+            origin::default_origin(kind),
+            dep,
+            kind,
+        )?;
         let status = eligibility::upstream_status(
             blobs.cutoff.as_deref(),
             blobs.head.as_deref(),
@@ -995,14 +1387,36 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
-    fn resolve_kind(&self, name: &str) -> Result<PkgKind, Error> {
+    fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
         if self.force_cask {
             return Ok(PkgKind::Cask);
         }
         if self.force_formula {
             return Ok(PkgKind::Formula);
         }
-        natural_kind(self.git, self.snaps, self.cache, self.installed, name)
+        natural_kind(self.git, self.snaps, self.cache, self.inv, origin_tap, name)
+    }
+
+    /// Spec "No-soak packages": after all soaked work, one `brew update` and
+    /// one `brew <verb>` with every no-soak package as a full token.
+    fn run_nosoak(&mut self) -> Result<(), Error> {
+        let targets = std::mem::take(&mut self.nosoak);
+        let step = nosoak::run_step(
+            self.brew,
+            self.brew_verb,
+            self.user_flags,
+            &targets,
+            self.out,
+        )?;
+        self.counts.no_soak += step.count;
+        self.done.extend(step.installed);
+        for note in step.notes {
+            self.defer(note);
+        }
+        if let Some(code) = step.status {
+            max_status(&mut self.brew_status, code);
+        }
+        Ok(())
     }
 
     fn record_run(&mut self, args: &[String]) -> Result<(), Error> {
@@ -1038,36 +1452,13 @@ fn already_installed_message(output: &std::process::Output) -> bool {
         .contains("already installed")
 }
 
-fn passthrough_third_party(
-    brew: &impl Brew,
-    verb: &str,
-    extra_args: &[String],
-    name_args: &[String],
-) -> Result<Option<i32>, Error> {
-    let third: Vec<String> = name_args
-        .iter()
-        .filter(|a| !a.starts_with('-') && resolve::is_third_party(a))
-        .cloned()
-        .collect();
-    if third.is_empty() {
-        return Ok(None);
-    }
-    let mut args = vec![verb.to_string()];
-    args.extend(extra_args.iter().filter(|a| a.starts_with('-')).cloned());
-    args.extend(third);
-    let output = brew.run_visible(&args)?;
-    let mut status = None;
-    merge_status(&mut status, output);
-    Ok(status)
-}
-
 struct CutoffDepWalk<'a, B, G> {
     brew: &'a B,
     git: &'a G,
     snaps: &'a Snapshots,
     cache: &'a Path,
     tap_root: &'a Path,
-    installed: &'a [InstalledPkg],
+    inv: &'a Inventory,
     visiting: HashSet<String>,
     visited: HashSet<String>,
     out: Vec<(String, PkgKind)>,
@@ -1080,7 +1471,15 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         }
         self.visiting.insert(name.to_string());
         if include_self {
-            write_cutoff_blob(self.git, self.snaps, self.cache, self.tap_root, name, kind)?;
+            write_cutoff_blob(
+                self.git,
+                self.snaps,
+                self.cache,
+                self.tap_root,
+                origin::default_origin(kind),
+                name,
+                kind,
+            )?;
         }
         let staged = match kind {
             PkgKind::Formula => tap::tap_formula_path(self.tap_root, name),
@@ -1088,10 +1487,17 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         };
         let token = staged.to_string_lossy().into_owned();
         for dep in self.brew.deps(kind, &token)? {
-            if !cutoff_in_either_tree(self.git, self.snaps, self.cache, &dep)? {
+            if !cutoff_in_either_tree(self.git, self.snaps, self.cache, origin::CORE, &dep)? {
                 continue;
             }
-            let dep_kind = natural_kind(self.git, self.snaps, self.cache, self.installed, &dep)?;
+            let dep_kind = natural_kind(
+                self.git,
+                self.snaps,
+                self.cache,
+                self.inv,
+                origin::CORE,
+                &dep,
+            )?;
             self.visit(&dep, dep_kind, true)?;
         }
         self.visiting.remove(name);
@@ -1112,32 +1518,16 @@ struct ResolvedView {
     warnings: Vec<String>,
 }
 
-fn resolve_named(
-    git: &impl GitStore,
-    snaps: &Snapshots,
-    cache: &Path,
-    name: &str,
-    installed: &[InstalledPkg],
-) -> Result<Option<ResolvedView>, Error> {
-    if let Some(pkg) = installed.iter().find(|p| p.name == name) {
-        return resolve_view(git, snaps, cache, name, pkg.kind, Some(&pkg.receipt_rb));
-    }
-    let formula_blobs = resolve_pkg_blobs(git, snaps, cache, name, PkgKind::Formula)?;
-    if formula_blobs.cutoff.is_some() || formula_blobs.head.is_some() {
-        return resolve_view(git, snaps, cache, name, PkgKind::Formula, None);
-    }
-    resolve_view(git, snaps, cache, name, PkgKind::Cask, None)
-}
-
 fn resolve_view(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    origin_tap: &str,
     name: &str,
     kind: PkgKind,
     receipt_rb: Option<&str>,
 ) -> Result<Option<ResolvedView>, Error> {
-    let blobs = resolve_pkg_blobs(git, snaps, cache, name, kind)?;
+    let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
     let installed = match receipt_rb {
         Some(rb) => match parse_pkg(kind, rb) {
             Ok(id) => Some(id),
@@ -1190,46 +1580,76 @@ fn calendar_today() -> String {
     format!("{:04}-{:02}-{:02}", d.year(), u8::from(d.month()), d.day())
 }
 
+/// Which snapshot a package resolves against: core and cask use their own
+/// repos; a tap uses its clone and the tap's state in `state.toml`. Only the
+/// state's `cutoff_sha` is ever the cutoff; a stale ref in the clone is not.
 fn resolve_pkg_blobs(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    origin_tap: &str,
     name: &str,
     kind: PkgKind,
 ) -> Result<resolve::ResolvedBlobs, Error> {
-    let repo = tap_repo(cache, kind);
-    let tap = match kind {
-        PkgKind::Formula => &snaps.core,
-        PkgKind::Cask => &snaps.cask,
+    if origin::is_core_or_cask(origin_tap) {
+        let repo = tap_repo(cache, kind);
+        let tap = match kind {
+            PkgKind::Formula => &snaps.core,
+            PkgKind::Cask => &snaps.cask,
+        };
+        let pkg = PkgRef {
+            name: name.to_string(),
+            kind,
+        };
+        return resolve::resolve_blobs(git, &repo, &tap.cutoff_sha, &tap.head_sha, &pkg);
+    }
+    let Some(state) = snaps.tap(origin_tap) else {
+        return Ok(resolve::ResolvedBlobs {
+            cutoff: None,
+            head: None,
+        });
     };
-    let pkg = PkgRef {
-        name: name.to_string(),
-        kind,
+    let dir = taps::clone_dir(cache, &origin_tap.to_ascii_lowercase());
+    let show_at = |sha: &str| -> Result<Option<Vec<u8>>, Error> {
+        let tree = git.ls_tree(&dir, sha)?;
+        match taps::resolve_path(&tree, kind, name) {
+            Some(path) => git.show(&dir, sha, &path),
+            None => Ok(None),
+        }
     };
-    resolve::resolve_blobs(git, &repo, &tap.cutoff_sha, &tap.head_sha, &pkg)
+    let cutoff = match state.cutoff_sha.as_deref() {
+        Some(sha) => show_at(sha)?,
+        None => None,
+    };
+    let head = show_at(&state.head_sha)?;
+    Ok(resolve::ResolvedBlobs { cutoff, head })
 }
 
 fn cutoff_blob_exists(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    origin_tap: &str,
     name: &str,
     kind: PkgKind,
 ) -> Result<bool, Error> {
-    Ok(resolve_pkg_blobs(git, snaps, cache, name, kind)?
-        .cutoff
-        .is_some())
+    Ok(
+        resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?
+            .cutoff
+            .is_some(),
+    )
 }
 
 fn cutoff_in_either_tree(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
+    origin_tap: &str,
     name: &str,
 ) -> Result<bool, Error> {
     Ok(
-        cutoff_blob_exists(git, snaps, cache, name, PkgKind::Formula)?
-            || cutoff_blob_exists(git, snaps, cache, name, PkgKind::Cask)?,
+        cutoff_blob_exists(git, snaps, cache, origin_tap, name, PkgKind::Formula)?
+            || cutoff_blob_exists(git, snaps, cache, origin_tap, name, PkgKind::Cask)?,
     )
 }
 
@@ -1237,13 +1657,17 @@ fn natural_kind(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    installed: &[InstalledPkg],
+    inv: &Inventory,
+    origin_tap: &str,
     name: &str,
 ) -> Result<PkgKind, Error> {
-    if let Some(pkg) = installed.iter().find(|p| p.name == name) {
+    let same_origin = |o: &str| {
+        o == origin_tap || (origin::is_core_or_cask(o) && origin::is_core_or_cask(origin_tap))
+    };
+    if let Some(pkg) = inv.find(name).filter(|p| same_origin(&p.origin)) {
         return Ok(pkg.kind);
     }
-    let formula = resolve_pkg_blobs(git, snaps, cache, name, PkgKind::Formula)?;
+    let formula = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, PkgKind::Formula)?;
     if formula.cutoff.is_some() || formula.head.is_some() {
         Ok(PkgKind::Formula)
     } else {
@@ -1256,10 +1680,11 @@ fn write_cutoff_blob(
     snaps: &Snapshots,
     cache: &Path,
     tap_root: &Path,
+    origin_tap: &str,
     name: &str,
     kind: PkgKind,
 ) -> Result<(), Error> {
-    let blobs = resolve_pkg_blobs(git, snaps, cache, name, kind)?;
+    let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
     let blob = blobs.cutoff.as_deref().ok_or_else(|| {
         Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
     })?;
@@ -1322,14 +1747,75 @@ fn write_section_always(out: &mut impl Write, header: &str, lines: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SoakHours;
     use crate::brew::{InstalledPkg, MockBrew};
+    use crate::config::Config;
     use crate::eligibility::DesiredAction;
     use crate::git::InMemoryGit;
     use crate::github::{CommitInfo, StaticGithub};
+    use crate::inventory::Inventory;
+    use crate::origin::OriginRecords;
     use crate::resolve::PkgKind;
-    use crate::snapshot::TapSnapshot;
+    use crate::snapshot::{TapSnapshot, TapState};
+    use crate::taps::TapInfo;
     use std::path::Path;
     use time::{Duration, OffsetDateTime};
+
+    fn cfg24() -> Config {
+        Config::uniform(SoakHours::new(24).expect("hours >= 1"))
+    }
+
+    fn cfg_with(file: &str) -> Config {
+        let p = crate::config::parse_file(file);
+        Config {
+            taps: p.taps,
+            no_soak: p.no_soak,
+            ..cfg24()
+        }
+    }
+
+    fn inv_from(brew: &MockBrew, cfg: &Config) -> Inventory {
+        Inventory::build(
+            brew.installed.clone(),
+            &brew.taps,
+            &OriginRecords::default(),
+            cfg,
+        )
+    }
+
+    fn tapped(name: &str, remote: Option<&str>) -> TapInfo {
+        TapInfo {
+            name: name.into(),
+            remote: remote.map(str::to_string),
+        }
+    }
+
+    fn formula_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
+        InstalledPkg {
+            tap: Some(tap.into()),
+            ..formula_pkg(name, receipt_rb)
+        }
+    }
+
+    /// Snapshots with core/cask plus one soaked tap whose cutoff/head trees
+    /// hold `Formula/<name>.rb` blobs.
+    fn tap_snaps(git: &InMemoryGit, tap: &str, cutoff: Option<&str>, head: &str) -> Snapshots {
+        let mut snaps = core_snaps();
+        snaps.taps.insert(
+            tap.into(),
+            TapState {
+                hours: SoakHours::new(24).unwrap(),
+                cutoff_sha: cutoff.map(str::to_string),
+                head_sha: head.into(),
+                cutoff_time: None,
+            },
+        );
+        if let Some(c) = cutoff {
+            git.insert_tree(c, &["Formula/terraform.rb", "README.md"]);
+        }
+        git.insert_tree(head, &["Formula/terraform.rb", "README.md"]);
+        snaps
+    }
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed now")
@@ -1413,14 +1899,16 @@ mod tests {
     fn update_writes_shas_and_creates_state_toml() {
         let dir = tempfile::tempdir().unwrap();
         let git = InMemoryGit::new();
-        let hours = SoakHours::new(24).expect("hours >= 1");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&MockBrew::new(), &cfg);
         update(
             &MockBrew::new(),
             &git,
             &fixture_gh(),
             dir.path(),
-            hours,
+            &cfg,
+            &inv,
             now(),
             false,
             &mut out,
@@ -1491,8 +1979,19 @@ mod tests {
     fn outdated_lists_upgrade_held_and_ahead_sections() {
         let (brew, git, snaps) = view_world();
         let mut out = Vec::new();
-        let result =
-            outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let result = outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains("==> Outdated (will upgrade)"),
@@ -1530,7 +2029,19 @@ mod tests {
         };
         let snaps = core_snaps();
         let mut out = Vec::new();
-        outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains(&format!("warning: py scheduled to be deprecated on {soon}")),
@@ -1548,8 +2059,20 @@ mod tests {
         let (brew, git, snaps) = view_world();
         let mut out = Vec::new();
         let names = ["alpha".to_string()];
-        let result =
-            info(&brew, &git, &snaps, unused_cache(), &names, &[], &mut out).expect("info");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let result = info(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &names,
+            &[],
+            &mut out,
+        )
+        .expect("info");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("1.1.0"), "missing cutoff version: {text}");
         assert!(
@@ -1563,7 +2086,20 @@ mod tests {
     fn info_without_names_lists_installed_core() {
         let (brew, git, snaps) = view_world();
         let mut out = Vec::new();
-        let result = info(&brew, &git, &snaps, unused_cache(), &[], &[], &mut out).expect("info");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let result = info(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("info");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "missing installed alpha: {text}");
         assert!(text.contains("beta"), "missing installed beta: {text}");
@@ -1654,12 +2190,16 @@ mod tests {
     fn upgrade_both(brew: &MockBrew, git: &InMemoryGit) -> String {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
         upgrade(
             brew,
             git,
             &core_snaps(),
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &["left".to_string(), "right".to_string()],
             &[],
             &mut out,
@@ -1718,12 +2258,16 @@ mod tests {
         };
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         upgrade(
             &brew,
             &git,
             &core_snaps(),
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &[],
             &mut out,
@@ -1757,12 +2301,16 @@ mod tests {
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = upgrade(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &[],
             &mut out,
@@ -1796,12 +2344,16 @@ mod tests {
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = upgrade(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &[],
             &mut out,
@@ -1836,12 +2388,16 @@ mod tests {
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         upgrade(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &[],
             &mut out,
@@ -1876,12 +2432,16 @@ mod tests {
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         upgrade(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &["--verbose".to_string()],
             &mut out,
@@ -1908,12 +2468,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -1941,12 +2505,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -1990,12 +2558,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -2009,39 +2581,6 @@ mod tests {
             "yanked dep must refuse target install: {runs:?}"
         );
         assert!(result.refused, "missing yanked dep refuses the target");
-    }
-
-    #[test]
-    fn upgrade_third_party_passthrough() {
-        let brew = MockBrew::new();
-        let git = InMemoryGit::new();
-        let snaps = core_snaps();
-        let tap = tempfile::tempdir().expect("tap");
-        let mut out = Vec::new();
-        let names = ["acme/tools/foo".to_string()];
-        let result = upgrade(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            tap.path(),
-            &names,
-            &[],
-            &mut out,
-        )
-        .expect("upgrade");
-        let runs = lock_runs(&brew);
-        assert!(
-            run_has_token(&runs, "acme/tools/foo"),
-            "third-party must brew.run original name: {runs:?}"
-        );
-        assert!(
-            !runs
-                .iter()
-                .any(|args| args.iter().any(|a| a.contains("brewsoakr/soaked"))),
-            "third-party must not use soaked tap: {runs:?}"
-        );
-        let _ = result;
     }
 
     fn cask_rb(name: &str, version: &str) -> String {
@@ -2124,12 +2663,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -2176,12 +2719,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["app".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             true,
             false,
@@ -2229,12 +2776,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let err = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -2261,7 +2812,20 @@ mod tests {
         names: &[String],
         out: &mut Vec<u8>,
     ) -> Result<RunResult, Error> {
-        reinstall(brew, git, snaps, unused_cache(), tap, names, &[], out)
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        reinstall(
+            brew,
+            git,
+            snaps,
+            unused_cache(),
+            tap,
+            &inv,
+            &cfg,
+            names,
+            &[],
+            out,
+        )
     }
 
     #[test]
@@ -2411,8 +2975,19 @@ mod tests {
         };
         let snaps = core_snaps();
         let mut out = Vec::new();
-        let result =
-            outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let result = outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "good pkg must still list: {text}");
         assert!(
@@ -2443,12 +3018,16 @@ mod tests {
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = upgrade(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &[],
             &mut out,
@@ -2491,12 +3070,16 @@ mod tests {
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = upgrade(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &[],
             &[],
             &mut out,
@@ -2538,7 +3121,19 @@ mod tests {
         };
         let snaps = core_snaps();
         let mut out = Vec::new();
-        outdated(&brew, &git, &snaps, unused_cache(), &[], &mut out).expect("outdated");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("ok"), "unpinned must list: {text}");
         assert!(
@@ -2556,56 +3151,88 @@ mod tests {
         );
     }
 
-    #[test]
-    fn info_mixed_third_party_passthrough() {
+    fn local_tap_world() -> (MockBrew, InMemoryGit) {
         let alpha_old = formula_rb("alpha", "1.0.0", "oldsha");
-        let alpha_mid = formula_rb("alpha", "1.1.0", "midsha");
-        let alpha_new = formula_rb("alpha", "1.2.0", "newsha");
         let git = InMemoryGit::new();
-        git.insert_blob("cutoffsha", "Formula/a/alpha.rb", alpha_mid);
-        git.insert_blob("headsha", "Formula/a/alpha.rb", alpha_new);
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
         let brew = MockBrew {
-            installed: vec![formula_pkg("alpha", alpha_old)],
+            installed: vec![
+                formula_pkg("alpha", alpha_old),
+                formula_pkg_from("thing", "local/tap", formula_rb("thing", "1.0.0", "oldsha")),
+            ],
+            taps: vec![tapped("local/tap", None)],
             ..MockBrew::new()
         };
-        let snaps = core_snaps();
+        (brew, git)
+    }
+
+    #[test]
+    fn info_names_an_unsoakable_tap_package_and_refuses_it() {
+        let (brew, git) = local_tap_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
-        let names = ["alpha".to_string(), "acme/tools/foo".to_string()];
-        info(&brew, &git, &snaps, unused_cache(), &names, &[], &mut out).expect("info");
+        let names = ["alpha".to_string(), "local/tap/thing".to_string()];
+        let r = info(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            &inv,
+            &cfg,
+            &names,
+            &[],
+            &mut out,
+        )
+        .expect("info");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "core name still soaked: {text}");
-        let visible = brew.visible_runs.lock().expect("visible");
+        assert!(text.contains("origin: local/tap"), "{text}");
+        assert!(text.contains("unsoakable"), "{text}");
+        assert!(text.contains("use `brew info local/tap/thing`"), "{text}");
+        assert!(r.refused, "explicitly named unsoakable package is refused");
         assert!(
-            visible
-                .iter()
-                .any(|args| args == &["info".to_string(), "acme/tools/foo".into()]),
-            "third-party must brew.run_visible info: {visible:?}"
+            brew.visible_runs.lock().expect("visible").is_empty(),
+            "info never hands a tap package to brew"
         );
     }
 
     #[test]
-    fn outdated_mixed_third_party_passthrough() {
-        let (brew, git, snaps) = view_world();
+    fn outdated_notes_unsoakable_packages_without_brew() {
+        let (brew, git) = local_tap_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
-        outdated(
+        let r = outdated(
             &brew,
             &git,
-            &snaps,
+            &core_snaps(),
             unused_cache(),
+            &inv,
+            &cfg,
             &["acme/tools/foo".to_string()],
             &mut out,
         )
         .expect("outdated");
-        let visible = brew.visible_runs.lock().expect("visible");
-        assert!(
-            visible
-                .iter()
-                .any(|args| args.first().map(String::as_str) == Some("outdated")
-                    && args.iter().any(|a| a == "acme/tools/foo")),
-            "third-party must brew.run_visible outdated: {visible:?}"
-        );
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "soaked listing still runs: {text}");
+        assert!(
+            text.contains(
+                "thing: tap local/tap has no HTTPS remote; not soakable. Use brew, or add it to NO_SOAK"
+            ),
+            "{text}"
+        );
+        assert!(!r.refused);
+        assert!(brew.visible_runs.lock().expect("visible").is_empty());
     }
 
     #[test]
@@ -2620,12 +3247,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -2656,12 +3287,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -2695,12 +3330,16 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let names = ["fresh".to_string()];
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
         let result = install(
             &brew,
             &git,
             &snaps,
             unused_cache(),
             tap.path(),
+            &inv,
+            &cfg,
             &names,
             false,
             false,
@@ -2716,6 +3355,820 @@ mod tests {
             result.brew_status,
             Some(0),
             "non-zero already-installed must be treated as success"
+        );
+    }
+
+    #[test]
+    fn upgrade_bare_soaks_tap_package_from_its_tap_snapshot() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "hashicorp/tap",
+                formula_rb("terraform", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("upgrading terraform 1.0.0 -> 1.1.0"),
+            "{text}"
+        );
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew), "terraform"),
+            "{:?}",
+            lock_runs(&brew)
+        );
+        assert!(!r.refused);
+        assert!(
+            !run_has_token(&lock_runs(&brew), "hashicorp/tap/terraform"),
+            "soaked tap packages are never brew tokens"
+        );
+    }
+
+    #[test]
+    fn upgrade_explicit_tap_token_is_soaked_not_passed_through() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "terraform"), "{runs:?}");
+        assert!(!run_has_token(&runs, "hashicorp/tap/terraform"), "{runs:?}");
+    }
+
+    #[test]
+    fn tap_without_cutoff_holds_its_packages_as_too_new() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "hashicorp/tap",
+                formula_rb("terraform", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", None, "taphead");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused);
+        assert!(text.contains("terraform is too new"), "{text}");
+        assert!(
+            lock_runs(&brew)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("install")),
+            "nothing installed"
+        );
+    }
+
+    #[test]
+    fn held_tap_holds_only_its_packages_with_git_note() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("alpha", formula_rb("alpha", "1.0.0", "oldsha")),
+                formula_pkg_from(
+                    "terraform",
+                    "hashicorp/tap",
+                    formula_rb("terraform", "1.0.0", "oldsha"),
+                ),
+            ],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut snaps = core_snaps();
+        snaps.held_taps.insert(
+            "hashicorp/tap".into(),
+            "while fetching history from origin, git failed:\nfatal: boom".into(),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew), "alpha"),
+            "core package still upgraded"
+        );
+        assert!(r.refused);
+        assert!(
+            text.contains("terraform: tap hashicorp/tap could not be refreshed")
+                && text.contains("fatal: boom"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn unsoakable_tap_package_is_noted_in_bare_upgrade_and_refused_when_named() {
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "thing",
+                "local/tap",
+                formula_rb("thing", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped("local/tap", None)],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git_empty(),
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!r.refused, "bare upgrade only notes unsoakable packages");
+        assert!(text.contains("thing: tap local/tap has no HTTPS remote; not soakable. Use brew, or add it to NO_SOAK"), "{text}");
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git_empty(),
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["local/tap/thing".into()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused, "explicit unsoakable is a refusal");
+        assert!(
+            text.contains("use `brew upgrade local/tap/thing`"),
+            "{text}"
+        );
+        assert!(lock_runs(&brew).is_empty());
+    }
+
+    fn git_empty() -> InMemoryGit {
+        InMemoryGit::new()
+    }
+
+    #[test]
+    fn explicit_token_for_untapped_tap_is_refused_with_tap_hint() {
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["nobody/tap/x".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("tap nobody/tap is not installed; run brew tap nobody/tap first, or add it to NO_SOAK"), "{text}");
+        assert!(lock_runs(&brew).is_empty());
+        // No-soak entry: brew handles it (brew auto-taps).
+        let cfg = cfg_with("NO_SOAK = [\"nobody/tap\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["nobody/tap/x".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(!r.refused);
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[0], vec!["update".to_string()]);
+        assert_eq!(runs[1], vec!["install", "nobody/tap/x"]);
+    }
+
+    #[test]
+    fn upgrade_runs_soaked_work_first_then_one_update_and_one_upgrade_for_no_soak() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("alpha", formula_rb("alpha", "1.0.0", "oldsha")),
+                formula_pkg_from(
+                    "brewsoak",
+                    "ericfitz/tap",
+                    formula_rb("brewsoak", "1.0.0", "oldsha"),
+                ),
+                formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha")),
+            ],
+            taps: vec![tapped(
+                "ericfitz/tap",
+                Some("https://github.com/ericfitz/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\", \"wget\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert!(
+            run_is_soaked_install(&runs[..1], "alpha"),
+            "soaked first: {runs:?}"
+        );
+        assert_eq!(runs[1], vec!["update".to_string()]);
+        assert_eq!(runs[2], vec!["upgrade", "ericfitz/tap/brewsoak", "wget"]);
+        assert_eq!(runs.len(), 3);
+        assert!(!r.refused);
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("no-soak 2"), "{text}");
+    }
+
+    #[test]
+    fn upgrade_without_no_soak_packages_never_runs_brew_update() {
+        let (brew, git) = two_outdated_world("");
+        let _ = upgrade_both(&brew, &git);
+        assert!(!run_has_token(&lock_runs(&brew), "update"));
+    }
+
+    #[test]
+    fn upgrade_bare_leaves_pinned_no_soak_out_of_brew_tokens() {
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg_pinned("wget", formula_rb("wget", "1.0.0", "oldsha")),
+                formula_pkg("curl", formula_rb("curl", "1.0.0", "oldsha")),
+            ],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"wget\", \"curl\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[1], vec!["upgrade", "curl"], "{runs:?}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("pinned 1") && text.contains("no-soak 1"),
+            "{text}"
+        );
+        // Explicitly named: handed to brew, which errors as it would by hand.
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["wget".into()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert_eq!(
+            runs.last().unwrap(),
+            &vec!["upgrade".to_string(), "wget".to_string()]
+        );
+    }
+
+    #[test]
+    fn no_soak_staged_keg_switches_tap_with_install() {
+        let brew = MockBrew {
+            installed: vec![InstalledPkg {
+                tap: None,
+                ..formula_pkg("vault", formula_rb("vault", "1.0.0", "oldsha"))
+            }],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"hashicorp/tap\"]\n");
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "vault", "hashicorp/tap");
+        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[1], vec!["install", "hashicorp/tap/vault"], "{runs:?}");
+    }
+
+    #[test]
+    fn staged_package_with_lost_origin_record_notes_unknown_origin() {
+        // vault was staged from a tap (receipt tap null); origins.toml was lost;
+        // the name resolves nowhere in core or cask.
+        let brew = MockBrew {
+            installed: vec![InstalledPkg {
+                tap: None,
+                ..formula_pkg("vault", formula_rb("vault", "1.0.0", "v"))
+            }],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused);
+        assert!(
+            text.contains("vault: origin unknown; reinstall it from its tap with brew"),
+            "{text}"
+        );
+        assert!(!text.contains("vault is missing at HEAD"), "{text}");
+        assert!(text.contains("held 1"), "{text}");
+    }
+
+    #[test]
+    fn reinstall_no_soak_goes_to_brew_reinstall_after_update() {
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "brewsoak",
+                "ericfitz/tap",
+                formula_rb("brewsoak", "1.0.0", "b"),
+            )],
+            taps: vec![tapped(
+                "ericfitz/tap",
+                Some("https://github.com/ericfitz/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let r = reinstall(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["brewsoak".into()],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!r.refused);
+        let runs = lock_runs(&brew);
+        assert_eq!(
+            runs,
+            vec![
+                vec!["update".to_string()],
+                vec!["reinstall".to_string(), "ericfitz/tap/brewsoak".to_string()]
+            ]
+        );
+    }
+
+    #[test]
+    fn reinstall_true_repair_of_tap_package_uses_full_token() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "hashicorp/tap",
+                formula_rb("terraform", "1.2.0", "newsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let tap = tempfile::tempdir().unwrap();
+        reinstall(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["terraform".into()],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            lock_runs(&brew),
+            vec![vec![
+                "reinstall".to_string(),
+                "hashicorp/tap/terraform".to_string()
+            ]]
+        );
+    }
+
+    #[test]
+    fn explicit_tap_token_over_a_core_keg_is_refused_not_switched() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "homebrew/core",
+                formula_rb("terraform", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let tap = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        assert!(String::from_utf8(out).unwrap().contains(
+            "terraform is installed from homebrew/core; brewsoak does not switch taps; use brew"
+        ));
+        assert!(lock_runs(&brew).is_empty());
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_no_soak_tap_token_over_a_core_keg_is_also_refused() {
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "homebrew/core",
+                formula_rb("terraform", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg_with("NO_SOAK = [\"hashicorp/tap\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("use brew install hashicorp/tap/terraform"),
+            "{text}"
+        );
+        assert!(lock_runs(&brew).is_empty());
+    }
+
+    #[test]
+    fn fresh_cask_install_honors_no_soak_for_homebrew_cask() {
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/f/firefox.rb", cask_rb("firefox", "1.0"));
+        git.insert_blob("caskhead", "Casks/f/firefox.rb", cask_rb("firefox", "1.0"));
+        let brew = MockBrew::new();
+        let cfg = cfg_with("NO_SOAK = [\"homebrew/cask\"]\n");
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["firefox".into()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert_eq!(
+            runs,
+            vec![
+                vec!["update".to_string()],
+                vec!["install".to_string(), "firefox".to_string()]
+            ],
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn tap_package_refusal_hint_uses_full_token() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", None, "taphead");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        install(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("use `brew install hashicorp/tap/terraform` to bypass")
+        );
+    }
+
+    #[test]
+    fn verbose_prints_origin_and_hours_per_package() {
+        let (brew, git, snaps) = view_world();
+        let cfg = cfg_with("[[TAP]]\nname = \"homebrew/core\"\nsoak_hours = 48\n");
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &["-v".into()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("alpha: origin homebrew/core; soak 48h"),
+            "{text}"
         );
     }
 }

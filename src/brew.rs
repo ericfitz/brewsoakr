@@ -36,7 +36,7 @@ pub trait Brew {
     fn run(&self, args: &[String]) -> Result<Output, Error>;
     /// Live stdout/stderr for install/upgrade/reinstall and brew passthrough.
     fn run_visible(&self, args: &[String]) -> Result<Output, Error>;
-    fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error>;
+    fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn tap_new_soaked(&self) -> Result<(), Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
@@ -183,7 +183,7 @@ impl Brew for ProcessBrew {
         }
     }
 
-    fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error> {
+    fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
         let output = self.run(&["info".into(), "--json=v2".into(), "--installed".into()])?;
         if !output.status.success() {
             return Err(brew_fail(&output));
@@ -409,7 +409,7 @@ impl Brew for MockBrew {
         })
     }
 
-    fn installed_core(&self) -> Result<Vec<InstalledPkg>, Error> {
+    fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
         Ok(self.installed.clone())
     }
 
@@ -544,9 +544,6 @@ fn parse_installed_json(
             continue;
         };
         let tap = json_string_value(obj, "tap");
-        if !keep_tap(tap.as_deref()) {
-            continue;
-        }
         let tap =
             tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
         let version = installed_version(obj);
@@ -565,9 +562,6 @@ fn parse_installed_json(
             continue;
         };
         let tap = json_string_value(obj, "tap");
-        if !keep_tap(tap.as_deref()) {
-            continue;
-        }
         let tap =
             tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
         let version = installed_version(obj);
@@ -602,13 +596,6 @@ fn installed_version(obj: &str) -> Option<String> {
         return Some(version);
     }
     json_string_value(obj, "linked_keg").filter(|s| !s.is_empty())
-}
-
-fn keep_tap(tap: Option<&str>) -> bool {
-    matches!(
-        tap,
-        None | Some("") | Some("homebrew/core") | Some("homebrew/cask") | Some("brewsoakr/soaked")
-    )
 }
 
 pub(crate) fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<&'a str>, Error> {
@@ -798,13 +785,13 @@ mod tests {
     }
 
     #[test]
-    fn mock_installed_core_returns_the_vec() {
+    fn mock_installed_packages_returns_the_vec() {
         let installed = vec![
             pkg("wget", PkgKind::Formula, "class Wget; end", None),
             pkg("firefox", PkgKind::Cask, "cask \"firefox\"", None),
         ];
         let brew = mock_with(installed.clone(), BTreeMap::new());
-        let got = brew.installed_core().expect("mock installed");
+        let got = brew.installed_packages().expect("mock installed");
         assert_eq!(got, installed);
     }
 
@@ -885,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_installed_json_keeps_core_and_cask_drops_third_party() {
+    fn parse_installed_json_keeps_third_party() {
         let json = r#"{
           "formulae": [
             {
@@ -911,7 +898,7 @@ mod tests {
         let got = parse_installed_json(json, |name, kind, _version| match (name, kind) {
             ("wget", PkgKind::Formula) => Some("class Wget; end".into()),
             ("firefox", PkgKind::Cask) => Some("cask \"firefox\"".into()),
-            ("foo", _) => panic!("third-party tap should be dropped before receipt read"),
+            ("foo", PkgKind::Formula) => Some("class Foo; end".into()),
             (other, _) => panic!("unexpected receipt read for {other}"),
         })
         .expect("parse fixture");
@@ -923,6 +910,12 @@ mod tests {
                     PkgKind::Formula,
                     "class Wget; end",
                     Some("homebrew/core")
+                ),
+                pkg(
+                    "foo",
+                    PkgKind::Formula,
+                    "class Foo; end",
+                    Some("acme/tools")
                 ),
                 pkg(
                     "firefox",
