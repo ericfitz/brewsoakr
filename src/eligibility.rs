@@ -67,7 +67,7 @@ pub fn desired_action(
     }
 }
 
-fn identities_match(a: Option<&PkgIdentity>, b: Option<&PkgIdentity>) -> bool {
+pub(crate) fn identities_match(a: Option<&PkgIdentity>, b: Option<&PkgIdentity>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a.same_artifact(b),
         _ => false,

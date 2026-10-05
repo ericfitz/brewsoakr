@@ -391,6 +391,14 @@ fn resolve_token(raw: &str, inv: &Inventory, cfg: &Config) -> Result<Resolved, E
     })
 }
 
+/// Reject a malformed explicit token before anything is installed, so a bad
+/// name late in the list cannot cut a run short after side effects.
+fn validate_tokens(names: &[String]) -> Result<(), Error> {
+    names
+        .iter()
+        .try_for_each(|raw| inventory::parse_token(raw).map(drop))
+}
+
 /// A bare name that resolved as a cask belongs to `homebrew/cask`, which may
 /// itself be on the `NO_SOAK` list.
 fn settle_origin(r: &mut Resolved, kind: PkgKind, inv: &Inventory, cfg: &Config) {
@@ -573,6 +581,7 @@ pub fn outdated(
         && no_soak.is_empty()
         && held.is_empty()
         && ahead.is_empty()
+        && auto_updates.is_empty()
         && pinned.is_empty()
     {
         writeln!(out, "nothing outdated (already soaked: {soaked})")?;
@@ -811,10 +820,7 @@ fn plan_size(git: &impl GitStore, snaps: &Snapshots, cache: &Path, inv: &Invento
                     pkg.kind,
                     Some(&pkg.receipt_rb)
                 ),
-                Ok(Some(ResolvedView {
-                    action: DesiredAction::InstallCutoff,
-                    ..
-                }))
+                Ok(Some(view)) if bare_action(&view) == DesiredAction::InstallCutoff
             )
         })
         .count()
@@ -873,6 +879,7 @@ pub fn reinstall(
     if names.is_empty() {
         return Err(Error::Usage("reinstall: no packages specified".into()));
     }
+    validate_tokens(names)?;
     let plan_total = None;
     let mut session = ApplySession {
         brew,
@@ -945,7 +952,7 @@ pub fn reinstall(
             writeln!(session.out, "{}: unparseable identity; skipping", r.name)?;
             continue;
         };
-        if view.installed.as_ref() == view.head.as_ref() {
+        if eligibility::identities_match(view.installed.as_ref(), view.head.as_ref()) {
             if is_verbose(user_flags) {
                 writeln!(
                     session.out,
@@ -1015,6 +1022,7 @@ fn apply_many(
         plan_index: 0,
         out,
     };
+    validate_tokens(names)?;
     if is_verbose(user_flags) {
         let doing = match brew_verb {
             "upgrade" => "upgrading installed formulae and casks",
@@ -1466,7 +1474,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         dep: &str,
         status: UpstreamStatus,
     ) -> Result<(), Error> {
-        self.refused = true;
+        self.hold_target_for_dep();
         let why = match status {
             UpstreamStatus::TooNew => {
                 format!("{dep} is too new (born inside the soak window)")
@@ -1493,13 +1501,21 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         target_token: &str,
         held: &HeldDep,
     ) -> Result<(), Error> {
-        self.refused = true;
+        self.hold_target_for_dep();
         writeln!(
             self.out,
             "cannot install {target}: dependency {}: {}\nuse `brew {} {target_token}` to bypass brewsoak.",
             held.dep, held.reason, self.brew_verb
         )?;
         Ok(())
+    }
+
+    /// The target was counted as upgraded when it was announced; a dependency
+    /// refusal holds it instead, so take that count back.
+    fn hold_target_for_dep(&mut self) {
+        self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+        self.counts.held += 1;
+        self.refused = true;
     }
 
     /// brew could not load a tap package from its staged copy.
@@ -1765,8 +1781,13 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         {
             return Ok(Some((o, tok.name)));
         }
-        let exists =
-            |o: &str, kind| cutoff_blob_exists(self.git, self.snaps, self.cache, o, dep, kind);
+        // At cutoff or HEAD: a dep born inside the window still resolves to
+        // its origin, so the walk refuses the target instead of leaving the
+        // name for brew to install unsoaked from HEAD.
+        let exists = |o: &str, kind| -> Result<bool, Error> {
+            let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, o, dep, kind)?;
+            Ok(blobs.cutoff.is_some() || blobs.head.is_some())
+        };
         if !origin::is_core_or_cask(dependent_origin)
             && !self.snaps.held_taps.contains_key(dependent_origin)
             && exists(dependent_origin, PkgKind::Formula)?
@@ -2902,6 +2923,10 @@ mod tests {
                 && text.contains("acme/tools could not be refreshed"),
             "{text}"
         );
+        assert!(
+            text.contains("upgraded 0, already soaked 0, held 1"),
+            "a held dependency holds the target, it does not upgrade it: {text}"
+        );
     }
 
     #[test]
@@ -3060,6 +3085,103 @@ mod tests {
                 .iter()
                 .all(|a| a.first().map(String::as_str) != Some("install"))
         );
+    }
+
+    /// A tap target with one bare dep `helper`; `setup` stages the git side.
+    fn bare_dep_refusal(setup: impl FnOnce(&InMemoryGit)) -> (String, RunResult, MockBrew) {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            tap.path()
+                .join("taps/hashicorp/tap/Formula/terraform.rb")
+                .to_string_lossy()
+                .into_owned(),
+            vec!["helper".to_string()],
+        );
+        let brew = MockBrew {
+            deps,
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        setup(&git);
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            tempfile::tempdir().unwrap().path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        (String::from_utf8(out).unwrap(), r, brew)
+    }
+
+    fn assert_dep_too_new_refusal(text: &str, r: &RunResult, brew: &MockBrew) {
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains("cannot install terraform: dependency helper is too new"),
+            "{text}"
+        );
+        assert!(
+            lock_runs(brew)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("install")),
+            "nothing may be installed: {:?}",
+            lock_runs(brew)
+        );
+        assert!(
+            text.contains("upgraded 0, already soaked 0, held 1"),
+            "a dep refusal holds the target, it does not upgrade it: {text}"
+        );
+    }
+
+    #[test]
+    fn same_tap_bare_dep_only_at_tap_head_refuses_target_as_too_new() {
+        let (text, r, brew) = bare_dep_refusal(|git| {
+            git.insert_blob(
+                "taphead",
+                "Formula/helper.rb",
+                formula_rb("helper", "0.1.0", "h1"),
+            );
+            git.insert_tree("taphead", &["Formula/terraform.rb", "Formula/helper.rb"]);
+        });
+        assert_dep_too_new_refusal(&text, &r, &brew);
+    }
+
+    #[test]
+    fn bare_dep_only_at_core_head_refuses_target_as_too_new() {
+        let (text, r, brew) = bare_dep_refusal(|git| {
+            git.insert_blob(
+                "headsha",
+                "Formula/h/helper.rb",
+                formula_rb("helper", "0.1.0", "h1"),
+            );
+        });
+        assert_dep_too_new_refusal(&text, &r, &brew);
     }
 
     #[test]
@@ -3946,6 +4068,145 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_cask_true_repair_with_version_only_receipt() {
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/a/app.rb", cask_rb("app", "1.0.0"));
+        git.insert_blob("caskhead", "Casks/a/app.rb", cask_rb("app", "1.1.0"));
+        let brew = MockBrew {
+            installed: vec![cask_pkg_from(
+                "app",
+                "homebrew/cask",
+                crate::brew::version_only_cask_receipt("app", "1.1.0"),
+            )],
+            ..MockBrew::new()
+        };
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["app".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.iter()
+                .any(|a| a == &["reinstall".to_string(), "app".to_string()]),
+            "installed == HEAD is a true repair: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn reinstall_true_repair_when_receipt_has_no_rebuild() {
+        let head = |rebuild: bool| {
+            let bottle = if rebuild {
+                "  bottle do\n    rebuild 1\n    sha256 cellar: :any, arm64_tahoe: \"bbb\"\n  end\n"
+            } else {
+                ""
+            };
+            format!(
+                "class Wget < Formula\n  url \"https://example.com/wget-1.2.0.tar.gz\"\n  sha256 \"newsha\"\n{bottle}end\n"
+            )
+        };
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        git.insert_blob("headsha", "Formula/w/wget.rb", head(true));
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", head(false))],
+            ..MockBrew::new()
+        };
+        let tap = tempfile::tempdir().unwrap();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["wget".to_string()],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.iter()
+                .any(|a| a == &["reinstall".to_string(), "wget".to_string()]),
+            "a receipt without rebuild still matches HEAD: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_explicit_token_is_rejected_before_any_brew_run() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let names = ["wget".to_string(), "a/b".to_string()];
+        let mut out = Vec::new();
+        let err = install(
+            &brew,
+            &git,
+            &core_snaps(),
+            tempfile::tempdir().unwrap().path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &names,
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::Usage(_)), "{err:?}");
+        assert!(
+            lock_runs(&brew).is_empty(),
+            "no side effects: {:?}",
+            lock_runs(&brew)
+        );
+        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
+    }
+
+    #[test]
+    fn bare_upgrade_total_leaves_auto_updates_casks_out() {
+        let (brew, git, snaps) = auto_updates_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            tempfile::tempdir().unwrap().path(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
+    }
+
+    #[test]
     fn reinstall_already_soaked() {
         let wget_mid = formula_rb("wget", "1.1.0", "midsha");
         let wget_new = formula_rb("wget", "1.2.0", "newsha");
@@ -4772,7 +5033,10 @@ mod tests {
             text.contains("==> Auto-updates (left to the app; name it to upgrade)\nalt-tab (7.38.1) < 11.8.0\n"),
             "{text}"
         );
-        assert!(text.contains("nothing outdated"), "{text}");
+        assert!(
+            !text.contains("nothing outdated"),
+            "a non-empty Auto-updates section is something outdated: {text}"
+        );
     }
 
     #[test]
