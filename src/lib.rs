@@ -8,6 +8,7 @@ pub mod git;
 pub mod github;
 pub mod hours;
 pub mod identity;
+pub mod inventory;
 pub mod nosoak;
 pub mod origin;
 pub mod paths;
