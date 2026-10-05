@@ -53,7 +53,7 @@ pub struct RealWorld {
 impl RealWorld {
     pub fn new() -> Self {
         Self {
-            git: git::ProcessGit,
+            git: git::ProcessGit::default(),
             github: github::UreqGithub {
                 base: "https://api.github.com".into(),
             },

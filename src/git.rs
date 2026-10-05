@@ -1,6 +1,9 @@
 use crate::Error;
-use std::path::Path;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::rc::Rc;
 
 pub const REF_CUTOFF: &str = "refs/brewsoak/cutoff";
 pub const REF_HEAD: &str = "refs/brewsoak/head";
@@ -35,9 +38,67 @@ pub trait GitStore {
     fn log_sha_before(&self, _dir: &Path, _until_unix: i64) -> Result<Option<String>, Error> {
         Ok(None)
     }
+    /// `git remote add <name> <url>`, or `set-url` when it exists.
+    fn set_remote(&self, _dir: &Path, name: &str, url: &str) -> Result<(), Error> {
+        Err(Error::Git {
+            action: format!("registering tap remote {name} ({url})"),
+            detail: "this git backend cannot add remotes".into(),
+        })
+    }
+    /// Full commit history of the remote's HEAD into `ref_name` (force), blobless
+    /// (`--filter=blob:none`); retried without the filter if the server rejects it.
+    fn fetch_history(&self, _dir: &Path, remote_name: &str, _ref_name: &str) -> Result<(), Error> {
+        Err(Error::Git {
+            action: format!("fetching history from {remote_name}"),
+            detail: "this git backend cannot fetch history".into(),
+        })
+    }
+    /// `(sha, committer_unix)` of the newest commit reachable from `rev` with
+    /// committer time <= `until_unix`; `None` when the history is younger.
+    fn rev_list_before(
+        &self,
+        _dir: &Path,
+        _rev: &str,
+        _until_unix: i64,
+    ) -> Result<Option<(String, i64)>, Error> {
+        Err(Error::Git {
+            action: "looking up the tap commit at or before the soak cutoff".into(),
+            detail: "this git backend cannot walk history".into(),
+        })
+    }
+    /// Force-set a pin ref to `sha`.
+    fn update_ref(&self, _dir: &Path, ref_name: &str, _sha: &str) -> Result<(), Error> {
+        Err(Error::Git {
+            action: format!("pinning {ref_name}"),
+            detail: "this git backend cannot update refs".into(),
+        })
+    }
+    /// `git ls-tree -r --name-only <sha>`; cached per (dir, sha) in ProcessGit.
+    fn ls_tree(&self, _dir: &Path, _sha: &str) -> Result<Vec<String>, Error> {
+        Err(Error::Git {
+            action: "listing a tap commit's files".into(),
+            detail: "this git backend cannot list trees".into(),
+        })
+    }
 }
 
-pub struct ProcessGit;
+type TreeCache = RefCell<HashMap<(PathBuf, String), Rc<Vec<String>>>>;
+
+#[derive(Default)]
+pub struct ProcessGit {
+    /// `ls-tree` output per (clone dir, commit). A commit's tree never changes.
+    trees: TreeCache,
+}
+
+/// Servers that do not support partial clone answer the filter with one of
+/// these; the caller retries without it.
+pub fn filter_rejected(stderr: &str) -> bool {
+    let s = stderr.to_ascii_lowercase();
+    s.contains("filter")
+        && (s.contains("not recognized")
+            || s.contains("not support")
+            || s.contains("invalid filter-spec"))
+}
 
 impl ProcessGit {
     fn git() -> Command {
@@ -231,19 +292,167 @@ impl GitStore for ProcessGit {
             Err(git_fail(action, &output))
         }
     }
-}
 
-#[cfg(test)]
-use std::cell::RefCell;
-#[cfg(test)]
-use std::collections::HashMap;
+    fn set_remote(&self, dir: &Path, name: &str, url: &str) -> Result<(), Error> {
+        let action = format!("registering tap remote {name} ({url})");
+        let dir = dir.to_string_lossy();
+        let add = run_git(
+            &action,
+            &["--git-dir", dir.as_ref(), "remote", "add", name, url],
+        )?;
+        if add.status.success() {
+            return Ok(());
+        }
+        if String::from_utf8_lossy(&add.stderr).contains("already exists") {
+            let set = run_git(
+                &action,
+                &["--git-dir", dir.as_ref(), "remote", "set-url", name, url],
+            )?;
+            if set.status.success() {
+                return Ok(());
+            }
+            return Err(git_fail(&action, &set));
+        }
+        Err(git_fail(&action, &add))
+    }
+
+    fn fetch_history(&self, dir: &Path, remote_name: &str, ref_name: &str) -> Result<(), Error> {
+        let action = format!("fetching history from {remote_name} to find the tap's soak cutoff");
+        let dir = dir.to_string_lossy();
+        let spec = format!("+HEAD:{ref_name}");
+        let with_filter = run_git(
+            &action,
+            &[
+                "--git-dir",
+                dir.as_ref(),
+                "fetch",
+                "--force",
+                "--filter=blob:none",
+                remote_name,
+                &spec,
+            ],
+        )?;
+        if with_filter.status.success() {
+            return Ok(());
+        }
+        if !filter_rejected(&String::from_utf8_lossy(&with_filter.stderr)) {
+            return Err(git_fail(&action, &with_filter));
+        }
+        let plain = run_git(
+            &action,
+            &[
+                "--git-dir",
+                dir.as_ref(),
+                "fetch",
+                "--force",
+                remote_name,
+                &spec,
+            ],
+        )?;
+        if plain.status.success() {
+            Ok(())
+        } else {
+            Err(git_fail(&action, &plain))
+        }
+    }
+
+    fn rev_list_before(
+        &self,
+        dir: &Path,
+        rev: &str,
+        until_unix: i64,
+    ) -> Result<Option<(String, i64)>, Error> {
+        let action = "looking up the tap commit at or before the soak cutoff";
+        let dir = dir.to_string_lossy();
+        let before = format!("--before={}", git_date_arg(until_unix));
+        // `log -1 --before` is the `rev-list -1 --before` walk with formatting
+        // and no `commit <sha>` header line to strip.
+        let output = run_git(
+            action,
+            &[
+                "--git-dir",
+                dir.as_ref(),
+                "log",
+                "-1",
+                &before,
+                "--format=%H %ct",
+                rev,
+            ],
+        )?;
+        if !output.status.success() {
+            return if missing_object(&output) {
+                Ok(None)
+            } else {
+                Err(git_fail(action, &output))
+            };
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut parts = text.split_whitespace();
+        match (
+            parts.next(),
+            parts.next().and_then(|t| t.parse::<i64>().ok()),
+        ) {
+            (Some(sha), Some(when)) => Ok(Some((sha.to_string(), when))),
+            _ => Ok(None),
+        }
+    }
+
+    fn update_ref(&self, dir: &Path, ref_name: &str, sha: &str) -> Result<(), Error> {
+        let action = format!("pinning {ref_name} to {sha}");
+        let dir = dir.to_string_lossy();
+        let output = run_git(
+            &action,
+            &["--git-dir", dir.as_ref(), "update-ref", ref_name, sha],
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(git_fail(&action, &output))
+        }
+    }
+
+    fn ls_tree(&self, dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
+        let key = (dir.to_path_buf(), sha.to_string());
+        if let Some(cached) = self.trees.borrow().get(&key) {
+            return Ok(cached.as_ref().clone());
+        }
+        let action = format!("listing the files of tap commit {sha}");
+        let dir_s = dir.to_string_lossy();
+        let output = run_git(
+            &action,
+            &[
+                "--git-dir",
+                dir_s.as_ref(),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                sha,
+            ],
+        )?;
+        if !output.status.success() {
+            return Err(git_fail(&action, &output));
+        }
+        let paths: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .collect();
+        self.trees.borrow_mut().insert(key, Rc::new(paths.clone()));
+        Ok(paths)
+    }
+}
 
 #[cfg(test)]
 #[derive(Default)]
 pub struct InMemoryGit {
     blobs: RefCell<HashMap<(String, String), Vec<u8>>>,
-    refs: RefCell<HashMap<String, String>>,
+    /// (dir, ref) -> sha. Tap clones each pin the same ref names.
+    refs: RefCell<HashMap<(String, String), String>>,
     fetched: RefCell<Vec<(String, String)>>,
+    /// remote url -> commits newest first (sha, committer unix)
+    commits: RefCell<HashMap<String, Vec<(String, i64)>>>,
+    trees: RefCell<HashMap<String, Vec<String>>>,
+    remotes: RefCell<HashMap<(String, String), String>>, // (dir, name) -> url
+    failing: RefCell<std::collections::HashSet<String>>,
 }
 
 #[cfg(test)]
@@ -261,6 +470,38 @@ impl InMemoryGit {
     pub fn fetched(&self) -> Vec<(String, String)> {
         self.fetched.borrow().clone()
     }
+
+    fn key(dir: &Path, name: &str) -> (String, String) {
+        (dir.to_string_lossy().into_owned(), name.to_string())
+    }
+
+    pub fn insert_commits(&self, remote_url: &str, newest_first: &[(&str, i64)]) {
+        self.commits.borrow_mut().insert(
+            remote_url.to_string(),
+            newest_first
+                .iter()
+                .map(|(s, t)| ((*s).to_string(), *t))
+                .collect(),
+        );
+    }
+
+    pub fn insert_tree(&self, sha: &str, paths: &[&str]) {
+        self.trees.borrow_mut().insert(
+            sha.to_string(),
+            paths.iter().map(|p| (*p).to_string()).collect(),
+        );
+    }
+
+    pub fn fail_remote(&self, remote_url: &str) {
+        self.failing.borrow_mut().insert(remote_url.to_string());
+    }
+
+    pub fn remote_url(&self, dir: &Path) -> Option<String> {
+        self.remotes
+            .borrow()
+            .get(&Self::key(dir, "origin"))
+            .cloned()
+    }
 }
 
 #[cfg(test)]
@@ -271,7 +512,7 @@ impl GitStore for InMemoryGit {
 
     fn fetch_depth1(
         &self,
-        _dir: &Path,
+        dir: &Path,
         _remote: &str,
         sha: &str,
         ref_name: &str,
@@ -281,7 +522,7 @@ impl GitStore for InMemoryGit {
             .push((sha.to_string(), ref_name.to_string()));
         self.refs
             .borrow_mut()
-            .insert(ref_name.to_string(), sha.to_string());
+            .insert(Self::key(dir, ref_name), sha.to_string());
         Ok(())
     }
 
@@ -293,12 +534,96 @@ impl GitStore for InMemoryGit {
             .cloned())
     }
 
-    fn rev_parse(&self, _dir: &Path, rev: &str) -> Result<Option<String>, Error> {
-        Ok(self.refs.borrow().get(rev).cloned())
+    fn rev_parse(&self, dir: &Path, rev: &str) -> Result<Option<String>, Error> {
+        Ok(self.refs.borrow().get(&Self::key(dir, rev)).cloned())
     }
 
     fn gc_prune(&self, _dir: &Path) -> Result<(), Error> {
         Ok(())
+    }
+
+    fn set_remote(&self, dir: &Path, name: &str, url: &str) -> Result<(), Error> {
+        self.remotes
+            .borrow_mut()
+            .insert(Self::key(dir, name), url.to_string());
+        Ok(())
+    }
+
+    fn fetch_history(&self, dir: &Path, remote_name: &str, ref_name: &str) -> Result<(), Error> {
+        let url = self
+            .remotes
+            .borrow()
+            .get(&Self::key(dir, remote_name))
+            .cloned();
+        let action = format!("fetching history from {remote_name} to find the tap's soak cutoff");
+        let Some(url) = url else {
+            return Err(Error::Git {
+                action,
+                detail: "no such remote".into(),
+            });
+        };
+        if self.failing.borrow().contains(&url) {
+            return Err(Error::Git {
+                action,
+                detail: format!("fatal: could not read from remote repository {url}"),
+            });
+        }
+        let head = self
+            .commits
+            .borrow()
+            .get(&url)
+            .and_then(|c| c.first().map(|(s, _)| s.clone()));
+        let Some(head) = head else {
+            return Err(Error::Git {
+                action,
+                detail: "remote has no commits".into(),
+            });
+        };
+        self.fetched
+            .borrow_mut()
+            .push((head.clone(), ref_name.to_string()));
+        self.refs
+            .borrow_mut()
+            .insert(Self::key(dir, ref_name), head);
+        Ok(())
+    }
+
+    fn rev_list_before(
+        &self,
+        dir: &Path,
+        rev: &str,
+        until_unix: i64,
+    ) -> Result<Option<(String, i64)>, Error> {
+        let start = self
+            .refs
+            .borrow()
+            .get(&Self::key(dir, rev))
+            .cloned()
+            .unwrap_or_else(|| rev.to_string());
+        let url = self
+            .remotes
+            .borrow()
+            .get(&Self::key(dir, "origin"))
+            .cloned();
+        let commits = url
+            .and_then(|u| self.commits.borrow().get(&u).cloned())
+            .unwrap_or_default();
+        let from = commits.iter().position(|(s, _)| *s == start).unwrap_or(0);
+        Ok(commits[from..]
+            .iter()
+            .find(|(_, t)| *t <= until_unix)
+            .cloned())
+    }
+
+    fn update_ref(&self, dir: &Path, ref_name: &str, sha: &str) -> Result<(), Error> {
+        self.refs
+            .borrow_mut()
+            .insert(Self::key(dir, ref_name), sha.to_string());
+        Ok(())
+    }
+
+    fn ls_tree(&self, _dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
+        Ok(self.trees.borrow().get(sha).cloned().unwrap_or_default())
     }
 }
 
@@ -437,7 +762,7 @@ mod tests {
         git_ok(&src, &["commit", "-m", "two"]);
         let newer = git_ok(&src, &["rev-parse", "HEAD"]);
 
-        let git = ProcessGit;
+        let git = ProcessGit::default();
         git.init_bare(&bare).expect("init bare");
         git.fetch_depth1(&bare, src.to_str().unwrap(), &newer, REF_CUTOFF)
             .expect("fetch newer");
@@ -467,7 +792,7 @@ mod tests {
         git_commit_at(&src, "two", COMMIT_UNIX + 60);
         let newer = git_ok(&src, &["rev-parse", "HEAD"]);
 
-        let git = ProcessGit;
+        let git = ProcessGit::default();
         git.init_bare(&bare).expect("init bare");
         git.fetch_depth1(&bare, src.to_str().unwrap(), &newer, REF_WINDOW)
             .expect("pin window to newer");
@@ -484,7 +809,7 @@ mod tests {
     fn process_git_fetch_error_explains_action_and_includes_git_output() {
         let tmp = tempfile::tempdir().unwrap();
         let bare = tmp.path().join("bare.git");
-        let git = ProcessGit;
+        let git = ProcessGit::default();
         git.init_bare(&bare).expect("init bare");
         let err = git
             .fetch_depth1(
@@ -506,5 +831,157 @@ mod tests {
                 || text.contains("fatal:"),
             "missing git output: {text}"
         );
+    }
+
+    #[test]
+    fn in_memory_fetch_history_pins_head_and_rev_list_before_finds_cutoff() {
+        let git = InMemoryGit::new();
+        let dir = Path::new("/cache/taps/hashicorp/tap.git");
+        git.insert_commits(
+            "https://github.com/hashicorp/homebrew-tap",
+            &[
+                ("h3", 1_700_000_000),
+                ("h2", 1_699_990_000),
+                ("h1", 1_699_900_000),
+            ],
+        );
+        git.set_remote(dir, "origin", "https://github.com/hashicorp/homebrew-tap")
+            .unwrap();
+        git.fetch_history(dir, "origin", REF_HEAD).unwrap();
+        assert_eq!(git.rev_parse(dir, REF_HEAD).unwrap(), Some("h3".into()));
+        assert_eq!(
+            git.rev_list_before(dir, REF_HEAD, 1_699_995_000).unwrap(),
+            Some(("h2".into(), 1_699_990_000))
+        );
+        assert_eq!(git.rev_list_before(dir, REF_HEAD, 1_000).unwrap(), None);
+        git.update_ref(dir, REF_CUTOFF, "h2").unwrap();
+        assert_eq!(git.rev_parse(dir, REF_CUTOFF).unwrap(), Some("h2".into()));
+    }
+
+    #[test]
+    fn in_memory_refs_are_per_dir() {
+        let git = InMemoryGit::new();
+        let a = Path::new("/cache/taps/a/tap.git");
+        let b = Path::new("/cache/taps/b/tap.git");
+        git.update_ref(a, REF_HEAD, "aaa").unwrap();
+        git.update_ref(b, REF_HEAD, "bbb").unwrap();
+        assert_eq!(git.rev_parse(a, REF_HEAD).unwrap(), Some("aaa".into()));
+        assert_eq!(git.rev_parse(b, REF_HEAD).unwrap(), Some("bbb".into()));
+    }
+
+    #[test]
+    fn in_memory_failing_remote_is_error_git() {
+        let git = InMemoryGit::new();
+        let dir = Path::new("/cache/taps/x/y.git");
+        git.fail_remote("https://example.com/x/homebrew-y");
+        git.set_remote(dir, "origin", "https://example.com/x/homebrew-y")
+            .unwrap();
+        let err = git.fetch_history(dir, "origin", REF_HEAD).unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+        assert!(err.to_string().contains("fetching history"), "{err}");
+    }
+
+    #[test]
+    fn in_memory_ls_tree_returns_inserted_paths() {
+        let git = InMemoryGit::new();
+        git.insert_tree("h2", &["Formula/terraform.rb", "README.md"]);
+        assert_eq!(
+            git.ls_tree(unused_dir(), "h2").unwrap(),
+            vec!["Formula/terraform.rb".to_string(), "README.md".to_string()]
+        );
+        assert!(git.ls_tree(unused_dir(), "nosuch").unwrap().is_empty());
+    }
+
+    #[test]
+    fn filter_rejected_recognizes_server_refusals() {
+        assert!(filter_rejected(
+            "fatal: filtering not recognized by server, ignoring"
+        ));
+        assert!(filter_rejected(
+            "warning: filtering not recognized by server"
+        ));
+        assert!(filter_rejected("fatal: invalid filter-spec 'blob:none'"));
+        assert!(filter_rejected(
+            "fatal: the remote end hung up unexpectedly\nerror: server does not support filter"
+        ));
+        assert!(!filter_rejected(
+            "fatal: could not read from remote repository"
+        ));
+    }
+
+    #[test]
+    fn process_git_fetch_history_then_cutoff_pin_and_ls_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let bare = tmp.path().join("tap.git");
+        std::fs::create_dir(&src).unwrap();
+        git_ok(&src, &["init", "-b", "main"]);
+        git_ok(&src, &["config", "user.email", "test@example.com"]);
+        git_ok(&src, &["config", "user.name", "Test"]);
+        std::fs::create_dir(src.join("Formula")).unwrap();
+        std::fs::write(src.join("Formula/foo.rb"), "one\n").unwrap();
+        git_ok(&src, &["add", "."]);
+        git_commit_at(&src, "one", COMMIT_UNIX);
+        let older = git_ok(&src, &["rev-parse", "HEAD"]);
+        std::fs::write(src.join("Formula/foo.rb"), "two\n").unwrap();
+        git_ok(&src, &["add", "."]);
+        git_commit_at(&src, "two", COMMIT_UNIX + 3600);
+        let newer = git_ok(&src, &["rev-parse", "HEAD"]);
+
+        let git = ProcessGit::default();
+        git.init_bare(&bare).expect("init");
+        git.set_remote(&bare, "origin", src.to_str().unwrap())
+            .expect("remote add");
+        git.set_remote(&bare, "origin", src.to_str().unwrap())
+            .expect("remote set-url is idempotent");
+        git.fetch_history(&bare, "origin", REF_HEAD)
+            .expect("fetch history");
+        assert_eq!(git.rev_parse(&bare, REF_HEAD).unwrap(), Some(newer.clone()));
+        let (sha, when) = git
+            .rev_list_before(&bare, REF_HEAD, COMMIT_UNIX + 60)
+            .unwrap()
+            .expect("older commit is before the cutoff");
+        assert_eq!(sha, older);
+        assert_eq!(when, COMMIT_UNIX);
+        assert_eq!(
+            git.rev_list_before(&bare, REF_HEAD, COMMIT_UNIX - 1)
+                .unwrap(),
+            None
+        );
+        git.update_ref(&bare, REF_CUTOFF, &older)
+            .expect("pin cutoff");
+        assert_eq!(
+            git.rev_parse(&bare, REF_CUTOFF).unwrap(),
+            Some(older.clone())
+        );
+        assert_eq!(
+            git.ls_tree(&bare, &older).unwrap(),
+            vec!["Formula/foo.rb".to_string()]
+        );
+        assert_eq!(
+            git.show(&bare, &older, "Formula/foo.rb")
+                .unwrap()
+                .as_deref(),
+            Some(b"one\n".as_slice())
+        );
+        // Force-pin: moving HEAD back to the older commit must not be rejected.
+        git_ok(&src, &["reset", "--hard", &older]);
+        git.fetch_history(&bare, "origin", REF_HEAD)
+            .expect("non-fast-forward head");
+        assert_eq!(git.rev_parse(&bare, REF_HEAD).unwrap(), Some(older));
+    }
+
+    #[test]
+    fn process_git_fetch_history_error_names_the_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("tap.git");
+        let git = ProcessGit::default();
+        git.init_bare(&bare).unwrap();
+        git.set_remote(&bare, "origin", "/no/such/brewsoak-tap")
+            .unwrap();
+        let err = git.fetch_history(&bare, "origin", REF_HEAD).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("fetching history"), "{text}");
+        assert!(text.contains("git failed"), "{text}");
     }
 }
