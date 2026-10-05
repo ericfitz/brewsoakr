@@ -1470,19 +1470,19 @@ mod tests {
             ],
             ..MockBrew::new()
         };
-        let snaps = Snapshots {
-            core: TapSnapshot {
+        let snaps = Snapshots::core_only(
+            TapSnapshot {
                 cutoff_sha: "cutoffsha".into(),
                 head_sha: "headsha".into(),
                 cutoff_time: None,
             },
-            cask: TapSnapshot {
+            TapSnapshot {
                 cutoff_sha: "caskcut".into(),
                 head_sha: "caskhead".into(),
                 cutoff_time: None,
             },
-            hours: SoakHours::new(24).expect("hours >= 1"),
-        };
+            SoakHours::new(24).expect("hours >= 1"),
+        );
         (brew, git, snaps)
     }
 
@@ -1575,19 +1575,19 @@ mod tests {
     }
 
     fn core_snaps() -> Snapshots {
-        Snapshots {
-            core: TapSnapshot {
+        Snapshots::core_only(
+            TapSnapshot {
                 cutoff_sha: "cutoffsha".into(),
                 head_sha: "headsha".into(),
                 cutoff_time: None,
             },
-            cask: TapSnapshot {
+            TapSnapshot {
                 cutoff_sha: "caskcut".into(),
                 head_sha: "caskhead".into(),
                 cutoff_time: None,
             },
-            hours: SoakHours::new(24).expect("hours >= 1"),
-        }
+            SoakHours::new(24).expect("hours >= 1"),
+        )
     }
 
     fn formula_pkg(name: &str, receipt_rb: String) -> InstalledPkg {
