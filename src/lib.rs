@@ -8,6 +8,7 @@ pub mod git;
 pub mod github;
 pub mod hours;
 pub mod identity;
+pub mod nosoak;
 pub mod paths;
 pub mod quiet;
 pub mod report;
