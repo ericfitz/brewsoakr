@@ -3801,24 +3801,30 @@ mod tests {
     }
 
     fn two_outdated_world(next_stdout: &str) -> (MockBrew, InMemoryGit) {
+        two_outdated_world_tagged("", next_stdout)
+    }
+
+    /// Like `two_outdated_world`, with every url version carrying `v` (a url
+    /// built from a `v1.1.0` tag), which brew drops from the keg name.
+    fn two_outdated_world_tagged(v: &str, next_stdout: &str) -> (MockBrew, InMemoryGit) {
         let git = InMemoryGit::new();
         for name in ["left", "right"] {
             let dir = &name[..1];
             git.insert_blob(
                 "cutoffsha",
                 &format!("Formula/{dir}/{name}.rb"),
-                formula_rb(name, "1.1.0", "midsha"),
+                formula_rb(name, &format!("{v}1.1.0"), "midsha"),
             );
             git.insert_blob(
                 "headsha",
                 &format!("Formula/{dir}/{name}.rb"),
-                formula_rb(name, "1.2.0", "newsha"),
+                formula_rb(name, &format!("{v}1.2.0"), "newsha"),
             );
         }
         let brew = MockBrew {
             installed: vec![
-                formula_pkg("left", formula_rb("left", "1.0.0", "oldsha")),
-                formula_pkg("right", formula_rb("right", "1.0.0", "oldsha")),
+                formula_pkg("left", formula_rb("left", &format!("{v}1.0.0"), "oldsha")),
+                formula_pkg("right", formula_rb("right", &format!("{v}1.0.0"), "oldsha")),
             ],
             next_stdout: next_stdout.as_bytes().to_vec(),
             ..MockBrew::new()
@@ -3827,6 +3833,10 @@ mod tests {
     }
 
     fn upgrade_both(brew: &MockBrew, git: &InMemoryGit) -> String {
+        upgrade_names(brew, git, &["left".to_string(), "right".to_string()])
+    }
+
+    fn upgrade_names(brew: &MockBrew, git: &InMemoryGit, names: &[String]) -> String {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let cfg = cfg24();
@@ -3839,7 +3849,7 @@ mod tests {
             tap.path(),
             &inv,
             &cfg,
-            &["left".to_string(), "right".to_string()],
+            names,
             &[],
             &mut out,
         )
@@ -3862,6 +3872,26 @@ mod tests {
         );
         assert!(text.contains("upgrading left 1.0.0 -> 1.1.0"), "{text}");
         assert!(!text.contains("upgrading right"), "{text}");
+    }
+
+    #[test]
+    fn dependency_upgraded_at_a_v_prefixed_cutoff_is_not_installed_again() {
+        // The url tag is `v1.1.0` but brew names the keg `1.1.0`.
+        let (brew, git) = two_outdated_world_tagged(
+            "v",
+            "\u{1f37a}  /opt/homebrew/Cellar/right/1.1.0: 5 files, 1MB\n",
+        );
+        let text = upgrade_names(&brew, &git, &[]);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(visible.len(), 1, "{visible:?}\n{text}");
+        assert!(
+            text.contains("[2/2] right 1.1.0: already upgraded as a dependency"),
+            "{text}"
+        );
+        assert!(
+            text.contains("[1/2] upgrading left 1.0.0 -> 1.1.0"),
+            "{text}"
+        );
     }
 
     #[test]

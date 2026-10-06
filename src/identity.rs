@@ -63,7 +63,7 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
         Some(v) => v,
         None => {
             if let Some(tag) = git_tag.as_deref() {
-                tag.strip_prefix('v').unwrap_or(tag).to_string()
+                drop_tag_v(tag).to_string()
             } else {
                 let url = first_quoted(rb, "url ").ok_or_else(|| {
                     Error::Other("formula missing version, git tag, and url".into())
@@ -381,7 +381,17 @@ fn version_from_url(url: &str) -> Option<String> {
     let path = url.split('?').next().unwrap_or(url);
     let segment = path.rsplit('/').next().filter(|s| !s.is_empty())?;
     let base = strip_alpha_extension(strip_archive_suffix(segment));
-    Some(version_from_basename(base))
+    let version = version_from_basename(base);
+    Some(drop_tag_v(&version).to_string())
+}
+
+/// Homebrew drops the `v` of a tag-style url (`v5.0.2.tar.gz`, `foo-v5.0.2`)
+/// from the version, so the keg is `5.0.2`. Only `v` before a digit counts.
+fn drop_tag_v(version: &str) -> &str {
+    match version.strip_prefix('v') {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+        _ => version,
+    }
 }
 
 /// Homebrew also downloads plain files — `.pem`, `.jar`, `.crate`, a bare
@@ -455,6 +465,24 @@ fn version_from_basename(base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_from_url_drops_the_tag_v_as_brew_does() {
+        for url in [
+            "https://github.com/x/simdjson/archive/refs/tags/v5.0.2.tar.gz",
+            "https://example.com/simdjson-v5.0.2.tar.gz",
+        ] {
+            assert_eq!(version_from_url(url).as_deref(), Some("5.0.2"), "{url}");
+        }
+        assert_eq!(
+            version_from_url("https://example.com/vim-9.1.tar.gz").as_deref(),
+            Some("9.1")
+        );
+        assert_eq!(
+            version_from_url("https://example.com/v.tar.gz").as_deref(),
+            Some("v")
+        );
+    }
 
     #[test]
     fn version_from_url_drops_a_non_archive_extension() {
