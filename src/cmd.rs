@@ -774,11 +774,6 @@ pub fn upgrade(
     user_flags: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
-    let targets: Vec<String> = if names.is_empty() {
-        inv.pkgs.iter().map(|p| p.name.clone()).collect()
-    } else {
-        names.to_vec()
-    };
     // A bare `brew soak upgrade` walks everything installed, so say up front
     // how many will actually change and count them off as they go.
     let plan_total = (names.is_empty()).then(|| plan_size(git, snaps, cache, inv));
@@ -793,7 +788,7 @@ pub fn upgrade(
         tap_root,
         inv,
         cfg,
-        &targets,
+        names,
         names.is_empty(),
         "upgrade",
         false,
@@ -1036,8 +1031,16 @@ fn apply_many(
             report::soak_banner(doing, snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
-    for name in names {
-        session.apply_one(name)?;
+    if bare_run {
+        // Walk the installed packages themselves: a formula and a cask can
+        // share a name, and a name alone finds only one of them.
+        for pkg in &inv.pkgs {
+            session.apply_pkg(pkg)?;
+        }
+    } else {
+        for name in names {
+            session.apply_one(name)?;
+        }
     }
     session.run_nosoak()?;
     session.write_tail()?;
@@ -1181,23 +1184,45 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         true
     }
 
-    fn nosoak_target(&self, r: Resolved) -> nosoak::Target {
+    fn nosoak_target(&self, r: Resolved, installed: Option<&Pkg>) -> nosoak::Target {
         nosoak::Target {
             switch_tap: r.receipt_tap.is_none()
                 && !origin::is_core_or_cask(&r.origin)
-                && self.inv.find_in(&r.origin, &r.name).is_some(),
+                && installed.is_some(),
             origin: r.origin,
             name: r.name,
         }
     }
 
     fn apply_one(&mut self, raw: &str) -> Result<(), Error> {
-        let mut r = resolve_token(raw, self.inv, self.cfg)?;
+        let r = resolve_token(raw, self.inv, self.cfg)?;
         if self.refuses_tap_switch(&r) {
             return Ok(());
         }
+        self.apply_resolved(r, None)
+    }
+
+    /// One installed package from a bare run, with its own origin and kind.
+    fn apply_pkg(&mut self, pkg: &Pkg) -> Result<(), Error> {
+        let r = Resolved {
+            origin: pkg.origin.clone(),
+            name: pkg.name.clone(),
+            class: pkg.class,
+            receipt_tap: pkg.receipt_tap.clone(),
+            tapped: origin::is_core_or_cask(&pkg.origin)
+                || self.inv.tap_class(&pkg.origin).is_some(),
+            named_origin: false,
+        };
+        self.apply_resolved(r, Some(pkg))
+    }
+
+    /// `known` is the installed package a bare run is walking; an explicit
+    /// token looks its package up by origin and name instead.
+    fn apply_resolved(&mut self, mut r: Resolved, known: Option<&Pkg>) -> Result<(), Error> {
         let name = r.name.clone();
-        let pinned = self.inv.find_in(&r.origin, &name).is_some_and(|p| p.pinned);
+        let inv = self.inv;
+        let installed = known.or_else(|| inv.find_in(&r.origin, &name));
+        let pinned = installed.is_some_and(|p| p.pinned);
         if pinned && self.brew_verb == "upgrade" && (self.bare_run || r.class != PkgClass::NoSoak) {
             self.counts.pinned += 1;
             if is_verbose(self.user_flags) {
@@ -1219,7 +1244,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         match r.class {
             PkgClass::NoSoak => {
-                let target = self.nosoak_target(r);
+                let target = self.nosoak_target(r, installed);
                 self.nosoak.push(target);
                 return Ok(());
             }
@@ -1247,18 +1272,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.refused = true;
             return Ok(());
         }
-        let kind = self.resolve_kind(&r.origin, &name)?;
+        let kind = match known {
+            Some(pkg) => pkg.kind,
+            None => self.resolve_kind(&r.origin, &name)?,
+        };
         settle_origin(&mut r, kind, self.inv, self.cfg);
         if r.class == PkgClass::NoSoak {
             // A fresh cask install under `NO_SOAK = ["homebrew/cask"]`.
-            let target = self.nosoak_target(r);
+            let target = self.nosoak_target(r, installed);
             self.nosoak.push(target);
             return Ok(());
         }
-        let receipt = self
-            .inv
-            .find_in(&r.origin, &name)
-            .map(|p| p.receipt_rb.as_str());
+        let receipt = installed.map(|p| p.receipt_rb.as_str());
         let Some(mut view) = resolve_view(
             self.git, self.snaps, self.cache, &r.origin, &name, kind, receipt,
         )?
@@ -1270,10 +1295,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if view.action == DesiredAction::RefuseYanked
             && view.cutoff.is_none()
             && origin::is_core_or_cask(&r.origin)
-            && self
-                .inv
-                .find_in(&r.origin, &name)
-                .is_some_and(|p| p.receipt_tap.is_none())
+            && installed.is_some_and(|p| p.receipt_tap.is_none())
         {
             // Staged from a tap, the origin record is gone, and the name
             // resolves nowhere in core or cask.
@@ -4926,6 +4948,98 @@ mod tests {
                 "vacuum\ninstalled: 0.30.6\ncutoff: 0.30.6\nhead: 0.30.6\norigin: homebrew/core\n"
             ),
             "bare name is the core formula: {text}"
+        );
+    }
+
+    /// Installed core formula `vacuum` and tap cask `daveshanley/vacuum/vacuum`,
+    /// both behind their cutoffs.
+    fn same_name_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/v/vacuum.rb",
+            formula_rb("vacuum", "0.30.6", "s"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/v/vacuum.rb",
+            formula_rb("vacuum", "0.30.6", "s"),
+        );
+        git.insert_blob("tapcut", "Casks/vacuum.rb", cask_rb("vacuum", "0.31.0"));
+        git.insert_blob("taphead", "Casks/vacuum.rb", cask_rb("vacuum", "0.31.0"));
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg_from(
+                    "vacuum",
+                    "homebrew/core",
+                    formula_rb("vacuum", "0.30.0", "old"),
+                ),
+                cask_pkg_from(
+                    "vacuum",
+                    "daveshanley/vacuum",
+                    crate::brew::version_only_cask_receipt("vacuum", "0.30.0"),
+                ),
+            ],
+            taps: vec![tapped(
+                "daveshanley/vacuum",
+                Some("https://github.com/daveshanley/homebrew-vacuum"),
+            )],
+            ..MockBrew::new()
+        };
+        let snaps = tap_snaps(&git, "daveshanley/vacuum", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Casks/vacuum.rb"]);
+        git.insert_tree("taphead", &["Casks/vacuum.rb"]);
+        (brew, git, snaps)
+    }
+
+    #[test]
+    fn upgrade_bare_evaluates_same_name_formula_and_tap_cask_once_each() {
+        let (brew, git, snaps) = same_name_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("upgrading vacuum 0.30.0 -> 0.30.6"),
+            "formula: {text}"
+        );
+        assert!(
+            text.contains("upgrading vacuum 0.30.0 -> 0.31.0"),
+            "cask: {text}"
+        );
+        assert_eq!(text.matches("upgrading vacuum").count(), 2, "{text}");
+        let runs = lock_runs(&brew);
+        let installs: Vec<&Vec<String>> = runs
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .collect();
+        assert_eq!(installs.len(), 2, "{runs:?}");
+        assert!(
+            installs.iter().any(|a| a.iter().any(|x| x == "--cask")
+                && a.iter().any(|x| x.ends_with("/Casks/vacuum.rb"))),
+            "cask staged from the tap's Casks/ path: {runs:?}"
+        );
+        assert!(
+            installs
+                .iter()
+                .any(|a| !a.iter().any(|x| x == "--cask")
+                    && a.iter().any(|x| x.ends_with("/vacuum.rb"))),
+            "formula staged: {runs:?}"
         );
     }
 
