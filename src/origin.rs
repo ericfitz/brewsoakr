@@ -88,10 +88,38 @@ impl OriginRecords {
     }
 }
 
+/// The tap a keg was staged from, read from the formula path its receipt
+/// recorded: `<cache>/staging/taps/<user>/<repo>/...`. Anything else (core
+/// staging directly under `<cache>/staging/`, a path elsewhere, `..`
+/// segments) names no tap.
+pub fn staged_tap(cache: &Path, receipt_path: &str) -> Option<String> {
+    use std::path::Component;
+    let path = Path::new(receipt_path);
+    if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+        return None;
+    }
+    // The cache dir may be spelled through a symlink in one place and not the
+    // other, so try it as given and resolved.
+    let resolved = std::fs::canonicalize(cache).ok();
+    let rest = [Some(cache), resolved.as_deref()]
+        .into_iter()
+        .flatten()
+        .find_map(|c| path.strip_prefix(c.join("staging").join("taps")).ok())?;
+    let mut parts = rest.components().map(|c| match c {
+        Component::Normal(p) => p.to_str(),
+        _ => None,
+    });
+    let (user, repo, _file) = (parts.next()??, parts.next()??, parts.next()??);
+    let tap = format!("{user}/{repo}").to_ascii_lowercase();
+    split_tap(&tap)?;
+    Some(tap)
+}
+
 /// Spec order: the receipt tap when non-empty and not the staging tap; else
-/// brewsoak's record; else `homebrew/core` / `homebrew/cask`.
+/// the tap a staged keg's receipt path names; else brewsoak's record; else `homebrew/core` / `homebrew/cask`.
 pub fn resolve_origin(
     receipt_tap: Option<&str>,
+    staged_from: Option<&str>,
     records: &OriginRecords,
     kind: PkgKind,
     name: &str,
@@ -100,6 +128,9 @@ pub fn resolve_origin(
         && !tap.is_empty()
         && !tap.eq_ignore_ascii_case(STAGING_TAP)
     {
+        return tap.to_ascii_lowercase();
+    }
+    if let Some(tap) = staged_from {
         return tap.to_ascii_lowercase();
     }
     records
@@ -165,22 +196,28 @@ mod tests {
         let mut r = OriginRecords::default();
         r.set(PkgKind::Formula, "terraform", "hashicorp/tap");
         assert_eq!(
-            resolve_origin(Some("Acme/Tools"), &r, PkgKind::Formula, "terraform"),
+            resolve_origin(Some("Acme/Tools"), None, &r, PkgKind::Formula, "terraform"),
             "acme/tools"
         );
         assert_eq!(
-            resolve_origin(None, &r, PkgKind::Formula, "terraform"),
+            resolve_origin(None, None, &r, PkgKind::Formula, "terraform"),
             "hashicorp/tap"
         );
         assert_eq!(
-            resolve_origin(Some(""), &r, PkgKind::Formula, "terraform"),
+            resolve_origin(Some(""), None, &r, PkgKind::Formula, "terraform"),
             "hashicorp/tap"
         );
         assert_eq!(
-            resolve_origin(Some(STAGING_TAP), &r, PkgKind::Formula, "terraform"),
+            resolve_origin(Some(STAGING_TAP), None, &r, PkgKind::Formula, "terraform"),
             "hashicorp/tap"
         );
-        assert_eq!(resolve_origin(None, &r, PkgKind::Formula, "wget"), CORE);
-        assert_eq!(resolve_origin(None, &r, PkgKind::Cask, "firefox"), CASK);
+        assert_eq!(
+            resolve_origin(None, None, &r, PkgKind::Formula, "wget"),
+            CORE
+        );
+        assert_eq!(
+            resolve_origin(None, None, &r, PkgKind::Cask, "firefox"),
+            CASK
+        );
     }
 }

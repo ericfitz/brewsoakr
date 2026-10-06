@@ -624,7 +624,8 @@ mod tests {
                 receipt_rb: "class X < Formula\n  url \"https://e.com/terraform-1.0.0.tar.gz\"\n  sha256 \"a\"\nend\n".into(),
                 pinned: false,
                 tap: Some("hashicorp/tap".into()),
-            }],
+ staged_path: None,
+}],
             taps: vec![
                 TapInfo {
                     name: "hashicorp/tap".into(),

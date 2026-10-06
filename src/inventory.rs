@@ -43,6 +43,18 @@ impl Inventory {
         origins: &OriginRecords,
         cfg: &Config,
     ) -> Self {
+        Self::build_in(installed, taps, origins, cfg, None)
+    }
+
+    /// `cache` is brewsoak's cache dir, where a staged formula's receipt path
+    /// names the tap it was staged from.
+    pub fn build_in(
+        installed: Vec<InstalledPkg>,
+        taps: &[TapInfo],
+        origins: &OriginRecords,
+        cfg: &Config,
+        cache: Option<&Path>,
+    ) -> Self {
         let mut inv = Inventory::default();
         for tap in taps {
             let name = tap.name.to_ascii_lowercase();
@@ -52,7 +64,16 @@ impl Inventory {
             }
         }
         for p in installed {
-            let origin = origin::resolve_origin(p.tap.as_deref(), origins, p.kind, &p.name);
+            let staged_from = cache
+                .zip(p.staged_path.as_deref())
+                .and_then(|(cache, path)| origin::staged_tap(cache, path));
+            let origin = origin::resolve_origin(
+                p.tap.as_deref(),
+                staged_from.as_deref(),
+                origins,
+                p.kind,
+                &p.name,
+            );
             let class = inv.class_for(&origin, &p.name, cfg);
             inv.pkgs.push(Pkg {
                 name: p.name,
@@ -71,7 +92,7 @@ impl Inventory {
         let installed = brew.installed_packages()?;
         let taps = brew.tap_info()?;
         let origins = OriginRecords::load(cache);
-        Ok(Self::build(installed, &taps, &origins, cfg))
+        Ok(Self::build_in(installed, &taps, &origins, cfg, Some(cache)))
     }
 
     /// Bare-name lookup. When a formula and a cask share a name, the
@@ -191,6 +212,7 @@ mod tests {
             receipt_rb: "rb".into(),
             pinned: false,
             tap: tap.map(str::to_string),
+            staged_path: None,
         }
     }
 
@@ -275,6 +297,66 @@ mod tests {
         assert_eq!(inv.tap_class("hashicorp/tap"), Some(TapClass::Soakable));
         assert_eq!(inv.tap_class("brewsoakr/soaked"), Some(TapClass::Staging));
         assert!(inv.any_no_soak());
+    }
+
+    fn staged(name: &str, path: &str) -> InstalledPkg {
+        InstalledPkg {
+            staged_path: Some(path.into()),
+            ..installed(name, PkgKind::Formula, None)
+        }
+    }
+
+    #[test]
+    fn staged_keg_origin_comes_from_its_receipt_path_ahead_of_origins_toml() {
+        let cache = Path::new("/Users/efitz/Library/Caches/brewsoak");
+        let mut origins = OriginRecords::default();
+        // A stale record must lose to the path.
+        origins.set(PkgKind::Formula, "terraform", "stale/tap");
+        let inv = Inventory::build_in(
+            vec![
+                staged(
+                    "cats",
+                    "/Users/efitz/Library/Caches/brewsoak/staging/taps/endava/tap/Formula/cats.rb",
+                ),
+                staged(
+                    "terraform",
+                    "/Users/efitz/Library/Caches/brewsoak/staging/taps/HashiCorp/tap/terraform.rb",
+                ),
+                // Same name as a core formula; sharded Formula/ directory.
+                staged(
+                    "cyclonedx-gomod",
+                    "/Users/efitz/Library/Caches/brewsoak/staging/taps/cyclonedx/cyclonedx/Formula/c/cyclonedx-gomod.rb",
+                ),
+                staged(
+                    "poppler",
+                    "/Users/efitz/Library/Caches/brewsoak/staging/Formula/poppler.rb",
+                ),
+                staged(
+                    "elsewhere",
+                    "/tmp/staging/taps/evil/tap/Formula/elsewhere.rb",
+                ),
+                staged(
+                    "dotdot",
+                    "/Users/efitz/Library/Caches/brewsoak/staging/taps/../taps/a/b/x.rb",
+                ),
+            ],
+            &taps(),
+            &origins,
+            &cfg("[]"),
+            Some(cache),
+        );
+        let origin = |n: &str| inv.find(n).unwrap().origin.clone();
+        assert_eq!(origin("cats"), "endava/tap");
+        assert_eq!(origin("terraform"), "hashicorp/tap");
+        assert_eq!(origin("cyclonedx-gomod"), "cyclonedx/cyclonedx");
+        assert_eq!(origin("poppler"), "homebrew/core");
+        assert_eq!(origin("elsewhere"), "homebrew/core");
+        assert_eq!(origin("dotdot"), "homebrew/core");
+        assert_eq!(
+            inv.find("cats").unwrap().receipt_tap,
+            None,
+            "receipt_tap still means brew installed it from a tap"
+        );
     }
 
     #[test]

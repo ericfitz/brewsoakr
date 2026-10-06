@@ -3772,6 +3772,7 @@ mod tests {
             receipt_rb,
             pinned: false,
             tap: None,
+            staged_path: None,
         }
     }
 
@@ -5280,6 +5281,7 @@ mod tests {
             receipt_rb,
             pinned: false,
             tap: Some(tap.into()),
+            staged_path: None,
         }
     }
 
