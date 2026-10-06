@@ -1178,7 +1178,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     /// True when brew already put this package at the version we wanted,
     /// as a dependency of something installed earlier in this session.
-    fn already_done(&self, name: &str, want: Option<&PkgIdentity>) -> bool {
+    /// Only formula Cellar versions enter `done`, so a cask is never done.
+    fn already_done(&self, name: &str, kind: PkgKind, want: Option<&PkgIdentity>) -> bool {
+        if kind == PkgKind::Cask {
+            return false;
+        }
         match (self.done.get(name), want) {
             (Some(have), Some(want)) => *have == report::cellar_version(want),
             _ => false,
@@ -1389,7 +1393,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::InstallCutoff => {
                 // brew may already have upgraded this as a dependency of an
                 // earlier package; running it again just prints a warning.
-                if self.already_done(&name, view.cutoff.as_ref()) {
+                if self.already_done(&name, kind, view.cutoff.as_ref()) {
                     self.announce_already_done(&name, &view)?;
                     return Ok(());
                 }
@@ -1502,7 +1506,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             .cutoff
             .as_deref()
             .and_then(|bytes| parse_pkg_bytes(kind, bytes).ok());
-        if self.already_done(dep, want.as_ref()) {
+        if self.already_done(dep, kind, want.as_ref()) {
             return Ok(true);
         }
         let blob = blobs.cutoff.as_deref().ok_or_else(|| {
@@ -5488,6 +5492,38 @@ mod tests {
                 .any(|a| !a.iter().any(|x| x == "--cask")
                     && a.iter().any(|x| x.ends_with("/vacuum.rb"))),
             "formula staged: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn a_formula_poured_earlier_does_not_mark_a_same_name_cask_done() {
+        let (mut brew, git, snaps) = same_name_world();
+        // brew pours formula `vacuum` at the cask's cutoff version.
+        brew.next_stdout = "\u{1f37a}  /opt/homebrew/Cellar/vacuum/0.31.0: 5 files, 1MB\n"
+            .as_bytes()
+            .to_vec();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(
+            lock_runs(&brew)
+                .iter()
+                .any(|a| a.iter().any(|x| x == "--cask")),
+            "the cask must still be installed"
         );
     }
 
