@@ -37,6 +37,12 @@ design review. They are not to be changed without the maintainer's approval.
   out of scope", narrowly: brewsoak runs `brew update` once per run, and only
   when a no-soak package is involved, so no-soak packages get the true
   latest.
+- **brewsoak never trusts a third-party tap on the user's behalf**
+  (decided 2026-10-05, after Homebrew 7.0.8 refused a staged
+  `hashicorp/tap/packer`). When brew refuses a staged copy because its tap is
+  untrusted, brewsoak holds the package, exits 1, and tells the user to run
+  `brew trust <tap>`. brewsoak keeps trusting its own `brewsoakr/soaked`
+  staging tap only.
 - **Accepted consequence:** `brew upgrade` also upgrades a no-soak package's
   outdated dependencies to brew's latest. No-soak therefore extends to its
   dependencies. This is documented, not prevented.
@@ -253,6 +259,11 @@ at HEAD with no `deprecate!`/`disable!`).
 - If brew cannot load a staged tap formula (e.g. `require_relative` to a
   file elsewhere in the tap), hold the package with a note:
   `<name>: cannot be installed from a staged copy; use brew, or add it to NO_SOAK`.
+- If brew refuses the staged copy because the tap is untrusted (Homebrew
+  7.0.8+: `Refusing to load formula <tap>/<name> from untrusted tap <tap>`),
+  hold the package with a note:
+  `<name>: brew does not trust tap <tap>; run brew trust <tap>, or add it to NO_SOAK`.
+  See the 2026-10-05 human decision on tap trust.
 
 ### No-soak packages
 
