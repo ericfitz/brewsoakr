@@ -70,6 +70,7 @@ impl NoSoakList {
 use crate::Error;
 use crate::brew::Brew;
 use crate::cmd::{max_status, merge_status};
+use crate::flags::{dropped_note, filter_for_verb};
 use crate::origin;
 use crate::quiet;
 use crate::resolve::PkgKind;
@@ -119,42 +120,6 @@ fn kind_groups<'a>(
         .into_iter()
         .filter(|(_, g)| !g.is_empty())
         .collect()
-}
-
-/// Options `brew reinstall` accepts. Anything else a user passed to
-/// `brewsoak upgrade` is dropped from the tap-switch run rather than making
-/// reinstall reject the whole command.
-fn reinstall_accepts(f: &str) -> bool {
-    const LONG: &[&str] = &[
-        "--debug",
-        "--force",
-        "--verbose",
-        "--quiet",
-        "--build-from-source",
-        "--force-bottle",
-        "--keep-tmp",
-        "--debug-symbols",
-        "--display-times",
-        "--skip-cask-deps",
-        "--binaries",
-        "--no-binaries",
-        "--require-sha",
-        "--quarantine",
-        "--no-quarantine",
-        "--adopt",
-        "--formula",
-        "--formulae",
-        "--cask",
-        "--casks",
-    ];
-    if LONG.contains(&f) {
-        return true;
-    }
-    // A cluster of short flags such as `-vd`.
-    f.len() > 1
-        && f.starts_with('-')
-        && !f.starts_with("--")
-        && f[1..].chars().all(|c| "dfvqs".contains(c))
 }
 
 fn is_dry_run(flags: &[String]) -> bool {
@@ -220,9 +185,15 @@ pub fn run_step(
     let split_kinds = targets.iter().any(|t| t.kind == Some(PkgKind::Formula))
         && targets.iter().any(|t| t.kind == Some(PkgKind::Cask));
 
+    let plain_flags = filter_for_verb(verb, &flags);
+    if !plain.is_empty()
+        && let Some(note) = dropped_note(verb, &plain_flags.dropped, "the no-soak run")
+    {
+        result.notes.push(note);
+    }
     for (kind_flag, group) in kind_groups(&plain, split_kinds) {
         let mut args = vec![verb.to_string()];
-        args.extend(flags.iter().cloned());
+        args.extend(plain_flags.kept.iter().cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(group.iter().map(|t| token_of(t)));
         writeln!(out, "no-soak: brew {}", args.join(" "))?;
@@ -247,6 +218,14 @@ pub fn run_step(
                 .join(", ")
         ));
     }
+    let switch_flags = filter_for_verb("reinstall", &flags);
+    if !dry_run
+        && !switch.is_empty()
+        && let Some(note) =
+            dropped_note("reinstall", &switch_flags.dropped, "the no-soak tap switch")
+    {
+        result.notes.push(note);
+    }
     let switch_groups = if dry_run {
         Vec::new()
     } else {
@@ -254,7 +233,7 @@ pub fn run_step(
     };
     for (kind_flag, switch) in switch_groups {
         let mut args = vec!["reinstall".to_string()];
-        args.extend(flags.iter().filter(|f| reinstall_accepts(f)).cloned());
+        args.extend(switch_flags.kept.iter().cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(switch.iter().map(|t| token_of(t)));
         writeln!(
@@ -509,6 +488,46 @@ mod tests {
             r.notes
         );
         assert!(r.switched.is_empty(), "{:?}", r.switched);
+    }
+
+    #[test]
+    fn switch_run_keeps_clusters_and_value_options_and_notes_what_it_dropped() {
+        let brew = MockBrew::new();
+        let flags = [
+            "-vyx",
+            "--appdir=/x",
+            "--language",
+            "en",
+            "--no-ask",
+            "--foo",
+        ]
+        .map(String::from);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &flags,
+            &switch_target("hashicorp/tap", "packer"),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            runs(&brew)[1],
+            vec![
+                "reinstall",
+                "-vy",
+                "--appdir=/x",
+                "--language",
+                "en",
+                "--no-ask",
+                "hashicorp/tap/packer"
+            ]
+        );
+        assert!(
+            r.notes.iter().any(|n| n
+                == "brew reinstall does not accept -x, --foo; dropped from the no-soak tap switch"),
+            "{:?}",
+            r.notes
+        );
     }
 
     #[test]

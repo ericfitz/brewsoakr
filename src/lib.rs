@@ -4,6 +4,7 @@ pub mod cmd;
 pub mod config;
 pub mod eligibility;
 pub mod error;
+pub mod flags;
 pub mod git;
 pub mod github;
 pub mod hours;
