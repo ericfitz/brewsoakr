@@ -98,11 +98,13 @@ pub fn evaluate_line(
             "up to date (soaked); installed {} matches cutoff; {did}",
             inst.unwrap_or("?")
         ),
-        DesiredAction::InstallCutoff => format!(
-            "installing cutoff {}; installed {} is behind soak; {did}",
-            cut.unwrap_or("?"),
-            inst.unwrap_or("not installed")
-        ),
+        DesiredAction::InstallCutoff => {
+            let state = match inst {
+                Some(v) => format!("installed {v} is behind soak"),
+                None => "not installed".to_string(),
+            };
+            format!("installing cutoff {}; {state}; {did}", cut.unwrap_or("?"))
+        }
         DesiredAction::LeaveAheadOfSoak => format!(
             "ahead of soak; installed {} matches HEAD {}; {did}",
             inst.unwrap_or("?"),
@@ -232,6 +234,28 @@ mod tests {
             DesiredAction::InstallCutoff,
         );
         assert_eq!(line, "wget  1.0.0  would upgrade to 1.1.0");
+    }
+
+    #[test]
+    fn evaluate_line_says_not_installed_instead_of_installed_not_installed() {
+        let cut = PkgIdentity::Formula(crate::identity::FormulaIdentity {
+            version: "1.16.1".into(),
+            revision: 0,
+            rebuild: None,
+            sha256: "bbb".into(),
+        });
+        let line = evaluate_line(
+            "packer",
+            DesiredAction::InstallCutoff,
+            None,
+            Some(&cut),
+            None,
+            "installing cutoff",
+        );
+        assert_eq!(
+            line,
+            "packer: installing cutoff 1.16.1; not installed; installing cutoff"
+        );
     }
 
     #[test]
