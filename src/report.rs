@@ -125,8 +125,13 @@ pub fn evaluate_line(
 }
 
 pub fn counts_line(c: &Counts) -> String {
+    let verb = if c.dry_run {
+        "would upgrade"
+    } else {
+        "upgraded"
+    };
     let mut line = format!(
-        "upgraded {}, already soaked {}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
+        "{verb} {}, already soaked {}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
         c.upgraded, c.soaked, c.held, c.ahead, c.pinned, c.skipped, c.no_soak
     );
     if c.auto_updates > 0 {
@@ -154,6 +159,8 @@ pub struct Counts {
     pub no_soak: usize,
     /// Self-updating casks a bare run left to the app (brew's `--greedy` skip).
     pub auto_updates: usize,
+    /// A dry run: nothing was upgraded, so `upgraded` reads "would upgrade".
+    pub dry_run: bool,
 }
 
 impl Counts {

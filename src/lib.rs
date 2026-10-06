@@ -138,7 +138,10 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         }
     }
     if inv.command.is_soaked() {
-        if let Some(warning) = config::apply_persist(cfg.persist, &world.config_path())? {
+        // A dry run changes nothing on the machine, the config file included.
+        if !flags::is_dry_run(&inv.brew_args)
+            && let Some(warning) = config::apply_persist(cfg.persist, &world.config_path())?
+        {
             eprintln!("brewsoak: warning: {warning}");
         }
         if cmd::is_verbose(&inv.brew_args) {
@@ -538,6 +541,17 @@ mod tests {
         }
         let text = std::fs::read_to_string(world.config_path()).expect("persisted config");
         assert_eq!(text, "SOAK_HOURS = 48\n");
+    }
+
+    #[test]
+    fn dry_run_does_not_persist_soak_hours() {
+        let world = TestWorld::new();
+        let _ = dispatch(&s(&["--soak-hours", "48", "upgrade", "--dry-run"]), &world)
+            .expect("dispatch");
+        assert!(
+            !world.config_path().exists(),
+            "a dry run must not rewrite the user's config"
+        );
     }
 
     #[test]

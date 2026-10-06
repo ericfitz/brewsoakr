@@ -2,6 +2,7 @@ use crate::Error;
 use crate::brew::Brew;
 use crate::config::Config;
 use crate::eligibility::{self, DesiredAction, UpstreamStatus};
+use crate::flags;
 use crate::git::GitStore;
 use crate::github::GithubApi;
 use crate::identity::{self, PkgIdentity};
@@ -786,7 +787,12 @@ pub fn upgrade(
     // how many will actually change and count them off as they go.
     let plan_total = (names.is_empty()).then(|| plan_size(git, snaps, cache, inv));
     if let Some(total) = plan_total {
-        writeln!(out, "upgrading {total} of {} packages", inv.pkgs.len())?;
+        let doing = if flags::is_dry_run(user_flags) {
+            "would upgrade"
+        } else {
+            "upgrading"
+        };
+        writeln!(out, "{doing} {total} of {} packages", inv.pkgs.len())?;
     }
     apply_many(
         brew,
@@ -926,7 +932,10 @@ pub fn reinstall(
         force_formula: false,
         refused: false,
         brew_status: None,
-        counts: Counts::default(),
+        counts: Counts {
+            dry_run: flags::is_dry_run(user_flags),
+            ..Counts::default()
+        },
         done: BTreeMap::new(),
         deferred: Vec::new(),
         nosoak: Vec::new(),
@@ -1046,7 +1055,10 @@ fn apply_many(
         force_formula,
         refused: false,
         brew_status: None,
-        counts: Counts::default(),
+        counts: Counts {
+            dry_run: flags::is_dry_run(user_flags),
+            ..Counts::default()
+        },
         done: BTreeMap::new(),
         deferred: Vec::new(),
         nosoak: Vec::new(),
@@ -1680,6 +1692,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     /// Tap packages are remembered by origin; core and cask need no record.
     fn record_origin(&mut self, origin_tap: &str, name: &str, kind: PkgKind) -> Result<(), Error> {
+        // A dry run installs nothing, so it proves nothing about origin.
+        if self.counts.dry_run {
+            return Ok(());
+        }
         let want = (!origin::is_core_or_cask(origin_tap)).then(|| origin_tap.to_ascii_lowercase());
         if self.origins.get(kind, name) == want.as_deref() {
             return Ok(());
@@ -1748,7 +1764,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.counts.no_soak += step.count;
         self.done.extend(step.installed);
         // The receipt now names the tap, so a staged-keg record is stale.
-        for t in &step.switched {
+        for t in step.switched.iter().filter(|_| !self.counts.dry_run) {
             let kind = t.kind.unwrap_or(PkgKind::Formula);
             if self.origins.get(kind, &t.name).is_some() {
                 self.origins.remove(kind, &t.name);
@@ -2653,6 +2669,95 @@ mod tests {
         assert_eq!(
             records.get(PkgKind::Formula, "terraform"),
             Some("hashicorp/tap")
+        );
+    }
+
+    #[test]
+    fn dry_run_tap_install_writes_no_origin_record_and_says_would_upgrade() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &["--dry-run".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!cache.path().join("origins.toml").exists());
+        assert!(text.contains("would upgrade 1,"), "{text}");
+        assert!(!text.contains("upgraded 1"), "{text}");
+    }
+
+    #[test]
+    fn dry_run_core_install_keeps_a_stale_origin_record() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let mut records = OriginRecords::default();
+        records.set(PkgKind::Formula, "alpha", "old/tap");
+        records.save(cache.path()).unwrap();
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alpha".into()],
+            false,
+            false,
+            &["-n".to_string()],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "alpha"),
+            Some("old/tap")
         );
     }
 
@@ -6415,6 +6520,36 @@ mod tests {
         assert_eq!(
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "vault"),
             None
+        );
+    }
+
+    #[test]
+    fn dry_run_leaves_the_origin_record_alone() {
+        // The switch is skipped under a dry run, so nothing is "switched";
+        // and the plain run's state must not be touched either.
+        let (brew, cfg) = switch_world(vec![(0, Vec::new()), (0, Vec::new())]);
+        let cache = tempfile::tempdir().unwrap();
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "vault", "hashicorp/tap");
+        origins.save(cache.path()).unwrap();
+        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        upgrade(
+            &brew,
+            &git_empty(),
+            &core_snaps(),
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &["--dry-run".to_string()],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "vault"),
+            Some("hashicorp/tap")
         );
     }
 
