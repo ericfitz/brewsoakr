@@ -28,6 +28,7 @@ const CASK_VALUE_OPTIONS: &[&str] = &[
     "--internet-plugindir",
     "--audio-unit-plugindir",
     "--vst-plugindir",
+    "--vst3-plugindir",
     "--screen-saverdir",
     "--language",
 ];
@@ -42,6 +43,7 @@ const INSTALL: Table = Table {
         "--no-ask",
         "--yes",
         "--formula",
+        "--formulae",
         "--ignore-dependencies",
         "--only-dependencies",
         "--build-from-source",
@@ -59,11 +61,13 @@ const INSTALL: Table = Table {
         "--git",
         "--overwrite",
         "--cask",
+        "--casks",
         "--require-sha",
         "--adopt",
         "--skip-cask-deps",
         "--zap",
-        "--vst",
+        "--binaries",
+        "--no-binaries",
         "--quiet",
     ],
     value_long: &["--cc", "--bottle-arch"],
@@ -79,6 +83,7 @@ const REINSTALL: Table = Table {
         "--no-ask",
         "--yes",
         "--formula",
+        "--formulae",
         "--build-from-source",
         "--interactive",
         "--force-bottle",
@@ -86,11 +91,13 @@ const REINSTALL: Table = Table {
         "--debug-symbols",
         "--git",
         "--cask",
+        "--casks",
         "--require-sha",
         "--adopt",
         "--skip-cask-deps",
         "--zap",
-        "--vst",
+        "--binaries",
+        "--no-binaries",
         "--quiet",
     ],
     value_long: &[],
@@ -107,6 +114,7 @@ const UPGRADE: Table = Table {
         "--no-ask",
         "--yes",
         "--formula",
+        "--formulae",
         "--build-from-source",
         "--interactive",
         "--force-bottle",
@@ -115,16 +123,18 @@ const UPGRADE: Table = Table {
         "--debug-symbols",
         "--overwrite",
         "--cask",
+        "--casks",
         "--skip-cask-deps",
+        "--binaries",
+        "--no-binaries",
         "--no-quit",
         "--greedy",
         "--greedy-latest",
         "--greedy-auto-updates",
         "--require-sha",
-        "--vst",
         "--quiet",
     ],
-    value_long: &["--minimum-version"],
+    value_long: &["--minimum-version", "--min-version"],
     shorts: "dfvnysigq",
 };
 
@@ -291,6 +301,30 @@ mod tests {
     fn upgrade_keeps_greedy_and_g_means_greedy_there() {
         let got = filter_for_verb("upgrade", &f(&["--greedy", "-g", "--minimum-version=1"]));
         assert_eq!(got.dropped, Vec::<String>::new());
+    }
+
+    #[test]
+    fn lists_match_brew_help_for_aliases_and_vst3() {
+        for verb in ["install", "reinstall", "upgrade"] {
+            let got = filter_for_verb(
+                verb,
+                &f(&[
+                    "--casks",
+                    "--formulae",
+                    "--binaries",
+                    "--no-binaries",
+                    "--vst3-plugindir=/v",
+                ]),
+            );
+            assert!(got.dropped.is_empty(), "{verb}: {:?}", got.dropped);
+            // `--vst` is a regex artefact of `--vst3-plugindir`, not an option.
+            assert_eq!(filter_for_verb(verb, &f(&["--vst"])).dropped, f(&["--vst"]));
+        }
+        assert!(
+            filter_for_verb("upgrade", &f(&["--min-version=1"]))
+                .dropped
+                .is_empty()
+        );
     }
 
     #[test]
