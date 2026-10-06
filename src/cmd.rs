@@ -920,6 +920,7 @@ pub fn reinstall(
                     origin: r.origin,
                     name: r.name,
                     switch_tap: false,
+                    kind: None,
                 });
                 continue;
             }
@@ -1216,6 +1217,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             switch_tap: r.receipt_tap.is_none()
                 && !origin::is_core_or_cask(&r.origin)
                 && installed.is_some(),
+            kind: installed.map(|p| p.kind),
             origin: r.origin,
             name: r.name,
         }

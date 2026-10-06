@@ -72,6 +72,7 @@ use crate::brew::Brew;
 use crate::cmd::{max_status, merge_status};
 use crate::origin;
 use crate::quiet;
+use crate::resolve::PkgKind;
 use crate::tap::is_stripped_flag;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -83,6 +84,8 @@ pub struct Target {
     pub origin: String,
     pub name: String,
     pub switch_tap: bool,
+    /// Known for an installed package; `None` for a name not installed yet.
+    pub kind: Option<PkgKind>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -93,6 +96,27 @@ pub struct StepResult {
     pub count: usize,
     /// Cellar versions brew reported installing, for the staleness check.
     pub installed: BTreeMap<String, String>,
+}
+
+/// The targets as `(kind flag, group)` runs: one unflagged group, or when
+/// `split` a `--formula` group and a `--cask` group (kind unknown counts as
+/// formula, as brew resolves a bare token).
+fn kind_groups<'a>(
+    targets: &[&'a Target],
+    split: bool,
+) -> Vec<(Option<&'static str>, Vec<&'a Target>)> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    if !split {
+        return vec![(None, targets.to_vec())];
+    }
+    let (casks, formulae): (Vec<&Target>, Vec<&Target>) =
+        targets.iter().partition(|t| t.kind == Some(PkgKind::Cask));
+    [(Some("--formula"), formulae), (Some("--cask"), casks)]
+        .into_iter()
+        .filter(|(_, g)| !g.is_empty())
+        .collect()
 }
 
 pub fn brew_token(origin_tap: &str, name: &str) -> String {
@@ -144,10 +168,18 @@ pub fn run_step(
         .iter()
         .partition(|t| t.switch_tap && verb == "upgrade");
 
-    if !plain.is_empty() {
+    // A formula and a cask can share a name, and a full token cannot tell
+    // them apart (`brew upgrade vacuum` takes the formula). brew honours
+    // `--formula` and `--cask` on upgrade, install, and reinstall, so when
+    // both kinds are present each runs in its own flagged group.
+    let split_kinds = targets.iter().any(|t| t.kind == Some(PkgKind::Formula))
+        && targets.iter().any(|t| t.kind == Some(PkgKind::Cask));
+
+    for (kind_flag, group) in kind_groups(&plain, split_kinds) {
         let mut args = vec![verb.to_string()];
         args.extend(flags.iter().cloned());
-        args.extend(plain.iter().map(|t| token_of(t)));
+        args.extend(kind_flag.map(str::to_string));
+        args.extend(group.iter().map(|t| token_of(t)));
         writeln!(out, "no-soak: brew {}", args.join(" "))?;
         let output = brew.run_visible(&args)?;
         result
@@ -156,9 +188,10 @@ pub fn run_step(
         merge_status(&mut result.status, output);
     }
 
-    if !switch.is_empty() {
+    for (kind_flag, switch) in kind_groups(&switch, split_kinds) {
         let mut args = vec!["install".to_string()];
         args.extend(flags.iter().cloned());
+        args.extend(kind_flag.map(str::to_string));
         args.extend(switch.iter().map(|t| token_of(t)));
         writeln!(
             out,
@@ -252,6 +285,7 @@ mod tests {
             origin: origin.into(),
             name: name.into(),
             switch_tap: false,
+            kind: None,
         }
     }
 
@@ -344,6 +378,7 @@ mod tests {
                 origin: "hashicorp/tap".into(),
                 name: "vault".into(),
                 switch_tap: true,
+                kind: None,
             },
         ];
         let r = run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
@@ -373,6 +408,7 @@ mod tests {
             origin: "hashicorp/tap".into(),
             name: "vault".into(),
             switch_tap: true,
+            kind: None,
         }];
         let r = run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
         assert_eq!(
@@ -388,6 +424,39 @@ mod tests {
         );
     }
 
+    fn typed(origin: &str, name: &str, kind: PkgKind) -> Target {
+        Target {
+            kind: Some(kind),
+            ..t(origin, name)
+        }
+    }
+
+    #[test]
+    fn same_name_formula_and_cask_run_in_separate_kind_groups() {
+        let brew = MockBrew::new();
+        let targets = [
+            typed("homebrew/core", "vacuum", PkgKind::Formula),
+            typed("homebrew/cask", "vacuum", PkgKind::Cask),
+        ];
+        run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
+        let got = runs(&brew);
+        assert_eq!(got.len(), 3, "one update, one run per kind: {got:?}");
+        assert_eq!(got[0], vec!["update"]);
+        assert_eq!(got[1], vec!["upgrade", "--formula", "vacuum"]);
+        assert_eq!(got[2], vec!["upgrade", "--cask", "vacuum"]);
+    }
+
+    #[test]
+    fn one_kind_keeps_the_single_unflagged_run() {
+        let brew = MockBrew::new();
+        let targets = [
+            typed("homebrew/core", "wget", PkgKind::Formula),
+            typed("homebrew/core", "curl", PkgKind::Formula),
+        ];
+        run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
+        assert_eq!(runs(&brew)[1], vec!["upgrade", "wget", "curl"]);
+    }
+
     #[test]
     fn switch_only_applies_to_upgrade() {
         let brew = MockBrew::new();
@@ -395,6 +464,7 @@ mod tests {
             origin: "hashicorp/tap".into(),
             name: "vault".into(),
             switch_tap: true,
+            kind: None,
         }];
         run_step(&brew, "reinstall", &[], &targets, &mut Vec::new()).unwrap();
         assert_eq!(runs(&brew)[1], vec!["reinstall", "hashicorp/tap/vault"]);
@@ -458,6 +528,7 @@ mod tests {
             origin: origin.into(),
             name: name.into(),
             switch_tap: true,
+            kind: None,
         }]
     }
 
