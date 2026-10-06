@@ -493,15 +493,7 @@ mod tests {
     #[test]
     fn switch_run_keeps_clusters_and_value_options_and_notes_what_it_dropped() {
         let brew = MockBrew::new();
-        let flags = [
-            "-vyx",
-            "--appdir=/x",
-            "--language",
-            "en",
-            "--no-ask",
-            "--foo",
-        ]
-        .map(String::from);
+        let flags = ["-vyx", "--appdir=/x", "--language=en", "--no-ask", "--foo"].map(String::from);
         let r = run_step(
             &brew,
             "upgrade",
@@ -516,8 +508,7 @@ mod tests {
                 "reinstall",
                 "-vy",
                 "--appdir=/x",
-                "--language",
-                "en",
+                "--language=en",
                 "--no-ask",
                 "hashicorp/tap/packer"
             ]

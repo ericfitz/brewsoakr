@@ -147,7 +147,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             raw,
         },
         "upgrade" => {
-            let (names, brew_args) = split_names_and_flags(before, after);
+            let (names, brew_args) = split_names_and_flags(before, after)?;
             Invocation {
                 soak_hours,
                 command: Command::Upgrade { names },
@@ -156,7 +156,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             }
         }
         "reinstall" => {
-            let (names, brew_args) = split_names_and_flags(before, after);
+            let (names, brew_args) = split_names_and_flags(before, after)?;
             Invocation {
                 soak_hours,
                 command: Command::Reinstall { names },
@@ -165,7 +165,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             }
         }
         "info" => {
-            let (names, brew_args) = split_names_and_flags(before, after);
+            let (names, brew_args) = split_names_and_flags(before, after)?;
             Invocation {
                 soak_hours,
                 command: Command::Info { names },
@@ -174,7 +174,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             }
         }
         "install" => {
-            let (names, brew_args, force_cask, force_formula) = split_install_args(before, after);
+            let (names, brew_args, force_cask, force_formula) = split_install_args(before, after)?;
             Invocation {
                 soak_hours,
                 command: Command::Install {
@@ -243,17 +243,29 @@ fn chain_args(before: &[String], after: &[String]) -> Vec<String> {
     [before, after].concat()
 }
 
-fn split_names_and_flags(before: &[String], after: &[String]) -> (Vec<String>, Vec<String>) {
+/// Words after the subcommand: package names, and brew flags. A value option
+/// given as `--opt value` becomes `--opt=value`, so its value is never taken
+/// for a package name and a later `brew` cannot read a package as its value.
+fn split_names_and_flags(
+    before: &[String],
+    after: &[String],
+) -> Result<(Vec<String>, Vec<String>), Error> {
     let mut brew_args = before.to_vec();
     let mut names = Vec::new();
-    for arg in after {
-        if arg.starts_with('-') {
+    let mut iter = after.iter();
+    while let Some(arg) = iter.next() {
+        if arg.starts_with("--") && !arg.contains('=') && crate::flags::takes_value(arg) {
+            let value = iter
+                .next()
+                .ok_or_else(|| Error::Usage(format!("{arg} needs a value")))?;
+            brew_args.push(format!("{arg}={value}"));
+        } else if arg.starts_with('-') {
             brew_args.push(arg.clone());
         } else {
             names.push(arg.clone());
         }
     }
-    (names, brew_args)
+    Ok((names, brew_args))
 }
 
 pub fn command_help(topic: &str) -> Option<&'static str> {
@@ -354,11 +366,11 @@ Shows origin tap and effective soak hours; no-soak packages are marked.
 fn split_install_args(
     before: &[String],
     after: &[String],
-) -> (Vec<String>, Vec<String>, bool, bool) {
-    let (names, brew_args) = split_names_and_flags(before, after);
+) -> Result<(Vec<String>, Vec<String>, bool, bool), Error> {
+    let (names, brew_args) = split_names_and_flags(before, after)?;
     let force_cask = brew_args.iter().any(|a| a == "--cask");
     let force_formula = brew_args.iter().any(|a| a == "--formula");
-    (names, brew_args, force_cask, force_formula)
+    Ok((names, brew_args, force_cask, force_formula))
 }
 
 #[cfg(test)]
@@ -394,6 +406,27 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn spaced_value_option_joins_its_value_and_leaves_names_alone() {
+        let inv = parse_argv(&s(&["upgrade", "--language", "en", "hashicorp/tap/packer"])).unwrap();
+        match inv.command {
+            Command::Upgrade { names } => assert_eq!(names, s(&["hashicorp/tap/packer"])),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(inv.brew_args, s(&["--language=en"]));
+        // What the tap switch then hands brew reinstall.
+        let kept = crate::flags::filter_for_verb("reinstall", &inv.brew_args).kept;
+        assert_eq!(kept, s(&["--language=en"]));
+    }
+
+    #[test]
+    fn value_option_without_a_value_is_usage() {
+        assert!(matches!(
+            parse_argv(&s(&["upgrade", "--appdir"])),
+            Err(Error::Usage(m)) if m.contains("--appdir")
+        ));
     }
 
     #[test]

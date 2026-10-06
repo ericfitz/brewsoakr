@@ -155,7 +155,7 @@ pub struct Filtered {
 }
 
 /// Split `flags` into what `brew <verb>` accepts and what it would reject.
-/// A value option given as `--name value` keeps or drops its value with it. A
+/// Value options arrive as `--name=value` (the CLI joins `--name value`). A
 /// verb with no table keeps everything.
 pub fn filter_for_verb(verb: &str, flags: &[String]) -> Filtered {
     let mut out = Filtered::default();
@@ -174,23 +174,10 @@ pub fn filter_for_verb(verb: &str, flags: &[String]) -> Filtered {
             };
             let takes_value = is_value_option_of(t, &name);
             let known = takes_value || (!has_value && t.bool_long.contains(&name.as_str()));
-            // `--name value`: the next word is this option's value.
-            let spaced = !has_value
-                && i < flags.len()
-                && !flags[i].starts_with('-')
-                && (takes_value || is_value_option(&name));
             if known {
                 out.kept.push(f.clone());
-                if spaced && takes_value {
-                    out.kept.push(flags[i].clone());
-                    i += 1;
-                }
             } else {
                 out.dropped.push(f.clone());
-                if spaced {
-                    out.dropped.push(flags[i].clone());
-                    i += 1;
-                }
             }
         } else if f.len() > 1 && f.starts_with('-') {
             let (ok, bad): (String, String) = f[1..].chars().partition(|c| t.shorts.contains(*c));
@@ -206,8 +193,8 @@ pub fn filter_for_verb(verb: &str, flags: &[String]) -> Filtered {
     out
 }
 
-/// Value options of any verb, so a dropped `--cc gcc` takes `gcc` with it.
-fn is_value_option(name: &str) -> bool {
+/// Whether `--name` takes a value in any of the verbs (`--appdir`, `--cc`).
+pub fn takes_value(name: &str) -> bool {
     [&INSTALL, &REINSTALL, &UPGRADE]
         .iter()
         .any(|t| is_value_option_of(t, name))
@@ -250,7 +237,7 @@ mod tests {
     }
 
     #[test]
-    fn value_options_keep_their_value_in_both_forms() {
+    fn value_options_keep_their_value() {
         let got = filter_for_verb(
             "reinstall",
             &f(&[
@@ -269,10 +256,10 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_value_option_takes_its_value_along() {
-        let got = filter_for_verb("reinstall", &f(&["--cc", "gcc", "-v"]));
+    fn a_value_option_the_verb_lacks_is_dropped() {
+        let got = filter_for_verb("reinstall", &f(&["--cc=gcc", "-v"]));
         assert_eq!(got.kept, f(&["-v"]));
-        assert_eq!(got.dropped, f(&["--cc", "gcc"]));
+        assert_eq!(got.dropped, f(&["--cc=gcc"]));
     }
 
     #[test]
