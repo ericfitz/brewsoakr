@@ -995,7 +995,8 @@ pub fn reinstall(
             let token = nosoak::brew_token(&r.origin, &r.name);
             writeln!(session.out, "reinstalling {}", r.name)?;
             let mut args = vec!["reinstall".to_string()];
-            args.extend(user_flags.iter().cloned());
+            args.extend(crate::flags::filter_for_verb("reinstall", user_flags).kept);
+            session.note_dropped_flags("reinstall", "repair reinstalls");
             args.push(token);
             if session.record_run(&args)? {
                 session.counts.upgraded += 1;
@@ -1132,6 +1133,16 @@ struct ApplySession<'a, B, G, W> {
 impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn defer(&mut self, msg: String) {
         self.deferred.push(msg);
+    }
+
+    /// Say once which user flags `brew <verb>` would reject and we dropped.
+    fn note_dropped_flags(&mut self, verb: &str, context: &str) {
+        let dropped = crate::flags::filter_for_verb(verb, self.user_flags).dropped;
+        if let Some(note) = crate::flags::dropped_note(verb, &dropped, context)
+            && !self.deferred.contains(&note)
+        {
+            self.defer(note);
+        }
     }
 
     /// `[3/26] upgrading node 26.7.0 -> 26.8.1`, so each package announces
@@ -1497,6 +1508,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
 
         let args = tap::brew_install_args(&pkg, &path, self.user_flags);
+        self.note_dropped_flags("install", "staged installs");
         match self.record_staged_install(origin_tap, name, kind, &args)? {
             StagedRun::Ran { failed } => {
                 // Counted as upgraded when it was announced; brew failed.
@@ -3886,6 +3898,15 @@ mod tests {
     }
 
     fn upgrade_names(brew: &MockBrew, git: &InMemoryGit, names: &[String]) -> String {
+        upgrade_names_flags(brew, git, names, &[])
+    }
+
+    fn upgrade_names_flags(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        names: &[String],
+        flags: &[String],
+    ) -> String {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let cfg = cfg24();
@@ -3899,7 +3920,7 @@ mod tests {
             &inv,
             &cfg,
             names,
-            &[],
+            flags,
             &mut out,
         )
         .expect("upgrade");
@@ -3959,6 +3980,27 @@ mod tests {
         upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
         assert_eq!(visible.len(), 2, "{visible:?}");
+    }
+
+    #[test]
+    fn staged_install_drops_flags_brew_install_rejects_and_says_so_once() {
+        let (brew, git) = two_outdated_world("");
+        let flags = ["--greedy", "--ignore-pinned", "--verbose"].map(String::from);
+        let text = upgrade_names_flags(&brew, &git, &[], &flags);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(visible.len(), 2, "{visible:?}");
+        for args in &visible {
+            assert!(
+                !args
+                    .iter()
+                    .any(|a| a == "--greedy" || a == "--ignore-pinned"),
+                "{args:?}"
+            );
+            assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
+        }
+        let note =
+            "brew install does not accept --greedy, --ignore-pinned; dropped from staged installs";
+        assert_eq!(text.matches(note).count(), 1, "{text}");
     }
 
     #[test]

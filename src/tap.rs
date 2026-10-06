@@ -44,12 +44,13 @@ pub fn brew_install_args(pkg: &PkgRef, path: &Path, user_flags: &[String]) -> Ve
         PkgKind::Formula => "--formula".into(),
         PkgKind::Cask => "--cask".into(),
     });
-    for flag in user_flags {
-        if is_stripped_flag(flag) {
-            continue;
-        }
-        args.push(flag.clone());
-    }
+    // brew install rejects upgrade-only flags such as `--greedy`.
+    let wanted: Vec<String> = user_flags
+        .iter()
+        .filter(|f| !is_stripped_flag(f))
+        .cloned()
+        .collect();
+    args.extend(crate::flags::filter_for_verb("install", &wanted).kept);
     args.push(path.to_string_lossy().into_owned());
     args
 }
@@ -130,6 +131,31 @@ mod tests {
             "{args:?}"
         );
         assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
+    }
+
+    #[test]
+    fn brew_install_args_drops_flags_install_rejects() {
+        let path = Path::new("/tmp/staging/Formula/wget.rb");
+        let flags = [
+            "--greedy",
+            "--greedy-latest",
+            "--greedy-auto-updates",
+            "--ignore-pinned",
+            "-vg",
+            "--verbose",
+        ]
+        .map(String::from);
+        let args = brew_install_args(&formula("wget"), path, &flags);
+        assert_eq!(
+            args,
+            vec![
+                "install",
+                "--formula",
+                "-vg",
+                "--verbose",
+                "/tmp/staging/Formula/wget.rb"
+            ]
+        );
     }
 
     #[test]
