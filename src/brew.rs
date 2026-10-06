@@ -64,6 +64,8 @@ pub struct ProcessBrew {
     pub bin: PathBuf,
     skip_tap_trust: Cell<bool>,
     raw: Cell<bool>,
+    /// `brew --cellar`, asked once: it never changes during a run.
+    cellar: std::cell::OnceCell<Option<PathBuf>>,
     sink: Mutex<Sink>,
 }
 
@@ -105,6 +107,7 @@ impl ProcessBrew {
             bin,
             skip_tap_trust: Cell::new(false),
             raw: Cell::new(false),
+            cellar: std::cell::OnceCell::new(),
             sink: Mutex::new(Sink::default()),
         }
     }
@@ -202,7 +205,7 @@ impl Brew for ProcessBrew {
     }
 
     fn keg_receipt(&self, name: &str, version: &str) -> Option<String> {
-        let cellar = self.brew_dir("--cellar")?;
+        let cellar = self.cellar()?;
         read_formula_receipt(&cellar, name, Some(version))
     }
 
@@ -212,7 +215,7 @@ impl Brew for ProcessBrew {
             return Err(brew_fail(&output));
         }
         let json = String::from_utf8_lossy(&output.stdout);
-        let cellar = self.brew_dir("--cellar");
+        let cellar = self.cellar();
         let caskroom = self.brew_dir("--caskroom");
         parse_installed_json(
             &json,
@@ -307,6 +310,12 @@ fn brewsoak_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'
 }
 
 impl ProcessBrew {
+    fn cellar(&self) -> Option<PathBuf> {
+        self.cellar
+            .get_or_init(|| self.brew_dir("--cellar"))
+            .clone()
+    }
+
     fn brew_dir(&self, flag: &str) -> Option<PathBuf> {
         let output = self.run(&[flag.into()]).ok()?;
         if !output.status.success() {
@@ -1482,6 +1491,37 @@ mod tests {
                 .iter()
                 .any(|(k, v)| *k == "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" && *v == Some("1"))
         );
+    }
+
+    #[test]
+    fn keg_receipt_asks_brew_for_the_cellar_once() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let cellar = tmp.path().join("Cellar");
+        let brew_dir = cellar.join("wget").join("1.0").join(".brew");
+        std::fs::create_dir_all(&brew_dir).expect("mkdir");
+        std::fs::write(brew_dir.join("wget.rb"), "rb").expect("rb");
+        let count = tmp.path().join("count");
+        let script = tmp.path().join("brew");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho x >> {}\necho {}\n",
+                count.display(),
+                cellar.display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let brew = ProcessBrew::new(script);
+        for _ in 0..3 {
+            assert_eq!(brew.keg_receipt("wget", "1.0").as_deref(), Some("rb"));
+        }
+        let calls = std::fs::read_to_string(count)
+            .expect("count")
+            .lines()
+            .count();
+        assert_eq!(calls, 1, "brew --cellar was spawned {calls} times");
     }
 
     #[test]
