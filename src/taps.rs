@@ -134,6 +134,9 @@ mod tests {
     fn untrusted_tap_reads_the_tap_from_brews_refusal() {
         let msg = "Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap HashiCorp/tap.\nRun `brew trust hashicorp/tap` to trust it.";
         assert_eq!(untrusted_tap(msg).as_deref(), Some("hashicorp/tap"));
+        let cask =
+            "Error: Refusing to load cask hashicorp/tap/packer from untrusted tap hashicorp/tap.";
+        assert_eq!(untrusted_tap(cask).as_deref(), Some("hashicorp/tap"));
         assert_eq!(untrusted_tap("Error: No bottle available for foo"), None);
         assert_eq!(untrusted_tap("Error: cannot load such file -- x"), None);
     }
