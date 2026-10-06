@@ -54,6 +54,22 @@ design review. They are not to be changed without the maintainer's approval.
   `<cache>/staging/taps/<user>/<repo>/`, that tap is the origin, ahead of
   `origins.toml`. This recovers kegs whose record was never written (bug 3);
   `origins.toml` stays as the fallback.
+- **Rulings confirmed by the maintainer (2026-10-06):**
+  - A bare `upgrade`/`outdated` leaves `auto_updates` casks to the app, as
+    `brew upgrade` does without `--greedy`; naming one upgrades it. `--greedy`
+    support is tracked in issue #3.
+  - An installed cask is compared to its cutoff by version alone when its
+    receipt carries no sha or url (the Caskroom keeps no cask source). The
+    blind spot (same version, new artifact) is accepted; brew shares it.
+  - `brewsoak reinstall X` whose installed copy matches HEAD runs a plain
+    `brew reinstall <user/repo/X>` (true repair), which may move a staged keg
+    to its real tap; the stale `origins.toml` record is then removed. Otherwise
+    it reinstalls the soaked cutoff from the staged copy, or holds.
+  - User flags a brew verb does not accept are dropped with a note naming
+    them, not rejected. `--dry-run` is refused where brew cannot honour it,
+    and a value option without its value is a usage error.
+  - A dry run still runs the one no-soak `brew update`, so the preview is
+    not computed against stale taps.
 - **Accepted consequence:** `brew upgrade` also upgrades a no-soak package's
   outdated dependencies to brew's latest. No-soak therefore extends to its
   dependencies. This is documented, not prevented.
