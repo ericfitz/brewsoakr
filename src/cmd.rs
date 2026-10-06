@@ -1007,8 +1007,14 @@ pub fn reinstall(
             args.extend(crate::flags::filter_for_verb("reinstall", user_flags).kept);
             session.note_dropped_flags("reinstall", "repair reinstalls");
             args.push(token);
-            if session.record_run(&args)? {
+            let (ok, installed_now) = session.record_run(&args)?;
+            if ok {
                 session.counts.upgraded += 1;
+            }
+            // Brew reinstalled from its own tap, so the keg's receipt now
+            // names the tap and any staged-install record is stale.
+            if installed_now {
+                session.forget_origin(pkg.kind, &r.name)?;
             }
             continue;
         }
@@ -1780,14 +1786,27 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
-    /// Runs brew and returns whether it succeeded.
-    fn record_run(&mut self, args: &[String]) -> Result<bool, Error> {
+    /// Runs brew; returns whether it succeeded, and whether it really
+    /// installed something (not brew's "already installed" no-op answer).
+    fn record_run(&mut self, args: &[String]) -> Result<(bool, bool), Error> {
         let output = self.brew.run_visible(args)?;
         self.done
             .extend(quiet::installed_from_output(&output.stdout));
         let ok = !brew_failed(&output);
+        let installed_now = output.status.success() && !already_installed_message(&output);
         merge_status(&mut self.brew_status, output);
-        Ok(ok)
+        Ok((ok, installed_now))
+    }
+
+    /// Drops a package's origin record whatever tap it names. For when brew
+    /// itself moved the keg, so the record no longer describes it.
+    fn forget_origin(&mut self, kind: PkgKind, name: &str) -> Result<(), Error> {
+        // A dry run installs nothing, so it proves nothing about origin.
+        if self.counts.dry_run || self.origins.get(kind, name).is_none() {
+            return Ok(());
+        }
+        self.origins.remove(kind, name);
+        self.origins.save(self.cache)
     }
 }
 
@@ -6700,6 +6719,86 @@ mod tests {
                 "hashicorp/tap/terraform".to_string()
             ]]
         );
+    }
+
+    fn repair_world(next_status: i32, next_stdout: &[u8]) -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        let rb = formula_rb("terraform", "1.2.0", "newsha");
+        git.insert_blob("tapcut", "Formula/terraform.rb", rb.clone());
+        git.insert_blob("taphead", "Formula/terraform.rb", rb.clone());
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from("terraform", "hashicorp/tap", rb)],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            next_status,
+            next_stdout: next_stdout.to_vec(),
+            ..MockBrew::new()
+        };
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        (brew, git, snaps)
+    }
+
+    /// Runs `reinstall terraform` over a cache holding `record`; returns the
+    /// record afterwards.
+    fn repair_record_after(
+        next_status: i32,
+        next_stdout: &[u8],
+        record: Option<&str>,
+    ) -> Option<String> {
+        let (brew, git, snaps) = repair_world(next_status, next_stdout);
+        let cache = tempfile::tempdir().unwrap();
+        let mut origins = OriginRecords::default();
+        if let Some(tap) = record {
+            origins.set(PkgKind::Formula, "terraform", tap);
+            origins.save(cache.path()).unwrap();
+        }
+        let cfg = cfg24();
+        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        reinstall(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["terraform".into()],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        OriginRecords::load(cache.path())
+            .get(PkgKind::Formula, "terraform")
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn repair_reinstall_removes_the_stale_origin_record() {
+        let after = repair_record_after(
+            0,
+            b"\xf0\x9f\x8d\xba  /opt/homebrew/Cellar/terraform/1.2.0\n",
+            Some("hashicorp/tap"),
+        );
+        assert_eq!(after, None);
+    }
+
+    #[test]
+    fn failed_repair_reinstall_keeps_the_origin_record() {
+        let after = repair_record_after(
+            1,
+            b"Error: terraform: download failed\n",
+            Some("hashicorp/tap"),
+        );
+        assert_eq!(after.as_deref(), Some("hashicorp/tap"));
+    }
+
+    #[test]
+    fn repair_reinstall_without_a_record_is_a_quiet_no_op() {
+        let after = repair_record_after(0, b"", None);
+        assert_eq!(after, None);
     }
 
     #[test]
