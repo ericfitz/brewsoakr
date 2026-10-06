@@ -799,13 +799,38 @@ pub fn upgrade(
     )
 }
 
+/// Why a bare run does not evaluate an installed package, in the order the
+/// run checks. `plan_size` and the bare loop both read this, so the `[i/N]`
+/// total cannot drift from what the loop announces.
+#[derive(Debug, PartialEq, Eq)]
+enum BareSkip<'a> {
+    Pinned,
+    /// No-soak or unsoakable: brew's, or a note.
+    NotSoaked,
+    /// Its tap could not be refreshed this run; carries git's error.
+    HeldTap(&'a str),
+}
+
+fn bare_skip<'a>(pkg: &Pkg, snaps: &'a Snapshots) -> Option<BareSkip<'a>> {
+    if pkg.pinned {
+        Some(BareSkip::Pinned)
+    } else if pkg.class != PkgClass::Soaked {
+        Some(BareSkip::NotSoaked)
+    } else {
+        snaps
+            .held_taps
+            .get(&pkg.origin)
+            .map(|err| BareSkip::HeldTap(err))
+    }
+}
+
 /// How many installed packages the soak window says to change. Resolution is
 /// cheap (cached blobs) and errors just mean "no total to show".
 fn plan_size(git: &impl GitStore, snaps: &Snapshots, cache: &Path, inv: &Inventory) -> usize {
     // Keep this in step with `apply_resolved`: every package counted here
     // must reach `announce` there, and none other.
     snapshotted_pkgs(inv, snaps)
-        .filter(|pkg| !pkg.pinned && !snaps.held_taps.contains_key(&pkg.origin))
+        .filter(|pkg| bare_skip(pkg, snaps).is_none())
         .filter(|pkg| {
             matches!(
                 resolve_view(
@@ -1251,7 +1276,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let name = r.name.clone();
         let inv = self.inv;
         let installed = known.or_else(|| inv.find_in(&r.origin, &name));
-        let pinned = installed.is_some_and(|p| p.pinned);
+        let snaps = self.snaps;
+        let skip = known.and_then(|p| bare_skip(p, snaps));
+        let pinned = match known {
+            Some(_) => skip == Some(BareSkip::Pinned),
+            None => installed.is_some_and(|p| p.pinned),
+        };
         if pinned && self.brew_verb == "upgrade" && (self.bare_run || r.class != PkgClass::NoSoak) {
             self.counts.pinned += 1;
             if is_verbose(self.user_flags) {
@@ -1294,7 +1324,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
             PkgClass::Soaked => {}
         }
-        if let Some(err) = self.snaps.held_taps.get(&r.origin) {
+        let held_err = match (known, skip) {
+            (Some(_), Some(BareSkip::HeldTap(err))) => Some(err),
+            (Some(_), _) => None,
+            (None, _) => snaps.held_taps.get(&r.origin).map(String::as_str),
+        };
+        if let Some(err) = held_err {
             let note = held_tap_note(&name, &r.origin, err);
             self.defer(note);
             self.counts.held += 1;
