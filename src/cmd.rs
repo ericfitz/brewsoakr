@@ -1726,6 +1726,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         )?;
         self.counts.no_soak += step.count;
         self.done.extend(step.installed);
+        // The receipt now names the tap, so a staged-keg record is stale.
+        for t in &step.switched {
+            let kind = t.kind.unwrap_or(PkgKind::Formula);
+            if self.origins.get(kind, &t.name).is_some() {
+                self.origins.remove(kind, &t.name);
+                self.origins.save(self.cache)?;
+            }
+        }
         for note in step.notes {
             self.defer(note);
         }
@@ -6222,7 +6230,7 @@ mod tests {
     }
 
     #[test]
-    fn no_soak_staged_keg_switches_tap_with_install() {
+    fn no_soak_staged_keg_switches_tap_with_reinstall() {
         let brew = MockBrew {
             installed: vec![InstalledPkg {
                 tap: None,
@@ -6254,7 +6262,86 @@ mod tests {
         )
         .unwrap();
         let runs = lock_runs(&brew);
-        assert_eq!(runs[1], vec!["install", "hashicorp/tap/vault"], "{runs:?}");
+        assert_eq!(
+            runs[1],
+            vec!["reinstall", "hashicorp/tap/vault"],
+            "{runs:?}"
+        );
+    }
+
+    fn switch_world(next: Vec<(i32, Vec<u8>)>) -> (MockBrew, Config) {
+        let brew = MockBrew {
+            installed: vec![InstalledPkg {
+                tap: None,
+                ..formula_pkg("vault", formula_rb("vault", "1.0.0", "oldsha"))
+            }],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            next_outputs: std::sync::Mutex::new(next.into()),
+            ..MockBrew::new()
+        };
+        (brew, cfg_with("NO_SOAK = [\"hashicorp/tap\"]\n"))
+    }
+
+    fn switch_upgrade(brew: &MockBrew, cfg: &Config, cache: &Path) -> String {
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "vault", "hashicorp/tap");
+        origins.save(cache).unwrap();
+        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            brew,
+            &git_empty(),
+            &core_snaps(),
+            cache,
+            tap.path(),
+            &inv,
+            cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn successful_tap_switch_removes_the_stale_origin_record() {
+        let (brew, cfg) = switch_world(vec![
+            (0, Vec::new()),
+            (
+                0,
+                b"\xf0\x9f\x8d\xba  /opt/homebrew/Cellar/vault/1.2.0: 5 files, 1MB\n".to_vec(),
+            ),
+        ]);
+        let cache = tempfile::tempdir().unwrap();
+        switch_upgrade(&brew, &cfg, cache.path());
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "vault"),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_tap_switch_keeps_the_origin_record() {
+        let (brew, cfg) = switch_world(vec![
+            (0, Vec::new()),
+            (
+                0,
+                b"Warning: hashicorp/tap/vault 1.2.0 is already installed and up-to-date.\n"
+                    .to_vec(),
+            ),
+        ]);
+        let cache = tempfile::tempdir().unwrap();
+        let text = switch_upgrade(&brew, &cfg, cache.path());
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "vault"),
+            Some("hashicorp/tap")
+        );
+        assert!(text.contains("did not replace the staged keg"), "{text}");
     }
 
     #[test]

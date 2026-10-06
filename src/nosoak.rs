@@ -96,6 +96,8 @@ pub struct StepResult {
     pub count: usize,
     /// Cellar versions brew reported installing, for the staleness check.
     pub installed: BTreeMap<String, String>,
+    /// Tap-switch targets brew replaced; their staged-keg origin record is stale.
+    pub switched: Vec<Target>,
 }
 
 /// The targets as `(kind flag, group)` runs: one unflagged group, or when
@@ -119,6 +121,14 @@ fn kind_groups<'a>(
         .collect()
 }
 
+/// `brew upgrade` options that `brew reinstall` rejects.
+fn is_upgrade_only_flag(f: &str) -> bool {
+    matches!(
+        f,
+        "--greedy" | "--greedy-latest" | "--greedy-auto-updates" | "--ignore-pinned"
+    )
+}
+
 pub fn brew_token(origin_tap: &str, name: &str) -> String {
     if origin::is_core_or_cask(origin_tap) {
         name.to_string()
@@ -128,7 +138,7 @@ pub fn brew_token(origin_tap: &str, name: &str) -> String {
 }
 
 /// Spec "No-soak packages": one `brew update`, then one `brew <verb>` with
-/// full tokens; tap-switch targets go through `brew install` on `upgrade`.
+/// full tokens; tap-switch targets go through `brew reinstall` on `upgrade`.
 pub fn run_step(
     brew: &impl Brew,
     verb: &str,
@@ -188,9 +198,11 @@ pub fn run_step(
         merge_status(&mut result.status, output);
     }
 
+    // brew install says "already installed" and leaves a staged keg alone;
+    // reinstall replaces it, and the receipt then carries the real tap.
     for (kind_flag, switch) in kind_groups(&switch, split_kinds) {
-        let mut args = vec!["install".to_string()];
-        args.extend(flags.iter().cloned());
+        let mut args = vec!["reinstall".to_string()];
+        args.extend(flags.iter().filter(|f| !is_upgrade_only_flag(f)).cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(switch.iter().map(|t| token_of(t)));
         writeln!(
@@ -205,19 +217,37 @@ pub fn run_step(
         let installed = quiet::cellar_installed_from_output(&output.stdout);
         let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
         let mut code = output.status.code().unwrap_or(1);
+        let mut failed = Vec::new();
         for t in &switch {
             let name = t.name.to_ascii_lowercase();
             let said_installed = text
                 .lines()
                 .any(|l| crate::cmd::already_installed_line(l) && l.contains(&name));
             if code != 0 || said_installed {
+                let cask = if t.kind == Some(PkgKind::Cask) {
+                    " --cask"
+                } else {
+                    ""
+                };
                 result.notes.push(format!(
-                    "{}: brew did not replace the staged keg; run brew reinstall {}",
+                    "{}: brew did not replace the staged keg; run brew uninstall{cask} {} then brew install{cask} {}",
+                    t.name,
                     t.name,
                     token_of(t)
                 ));
                 code = code.max(1);
+                failed.push(*t);
             }
+        }
+        // When the run failed as a whole, which kegs it replaced is unknown;
+        // their records stay and the next run tries again.
+        if code == 0 {
+            result.switched.extend(
+                switch
+                    .iter()
+                    .filter(|t| !failed.contains(t))
+                    .map(|t| (*t).clone()),
+            );
         }
         result.installed.extend(installed);
         max_status(&mut result.status, code);
@@ -360,7 +390,7 @@ mod tests {
     }
 
     #[test]
-    fn tap_switch_targets_use_install_in_a_separate_run() {
+    fn tap_switch_targets_use_reinstall_in_a_separate_run() {
         let brew = MockBrew {
             next_outputs: std::sync::Mutex::new(VecDeque::from(vec![
                 (0, Vec::new()),
@@ -385,7 +415,8 @@ mod tests {
         let got = runs(&brew);
         assert_eq!(got.len(), 3, "{got:?}");
         assert_eq!(got[1], vec!["upgrade", "wget"]);
-        assert_eq!(got[2], vec!["install", "hashicorp/tap/vault"]);
+        assert_eq!(got[2], vec!["reinstall", "hashicorp/tap/vault"]);
+        assert_eq!(r.switched, vec![targets[1].clone()]);
         assert_eq!(r.status, Some(0));
         assert_eq!(r.installed.get("vault").map(String::as_str), Some("1.2.0"));
         assert!(r.notes.is_empty(), "{:?}", r.notes);
@@ -418,9 +449,38 @@ mod tests {
         );
         assert!(
             r.notes.iter().any(|n| n.contains("did not replace")
-                && n.contains("brew reinstall hashicorp/tap/vault")),
+                && n.contains("brew uninstall vault")
+                && n.contains("brew install hashicorp/tap/vault")
+                && !n.contains("run brew reinstall")),
             "{:?}",
             r.notes
+        );
+        assert!(r.switched.is_empty(), "{:?}", r.switched);
+    }
+
+    #[test]
+    fn switch_message_names_reinstall_and_flags_reinstall_rejects_are_dropped() {
+        let brew = MockBrew::new();
+        let mut out = Vec::new();
+        let flags = ["--greedy".to_string(), "--verbose".to_string()];
+        run_step(
+            &brew,
+            "upgrade",
+            &flags,
+            &switch_target("hashicorp/tap", "packer"),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "no-soak: brew reinstall --verbose hashicorp/tap/packer (moving staged kegs to their tap)"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            runs(&brew)[1],
+            vec!["reinstall", "--verbose", "hashicorp/tap/packer"]
         );
     }
 
@@ -553,6 +613,7 @@ mod tests {
             &switch_target("hashicorp/tap", "vault"),
         );
         assert_eq!(r.status, Some(1));
+        assert!(r.switched.is_empty());
         assert!(
             r.notes.iter().any(|n| n.contains("did not replace")),
             "{:?}",
@@ -578,7 +639,7 @@ mod tests {
             stale
                 .notes
                 .iter()
-                .any(|n| n.contains("brew reinstall acme/tap/foo")),
+                .any(|n| n.contains("brew install acme/tap/foo")),
             "{:?}",
             stale.notes
         );

@@ -295,9 +295,12 @@ For mutating commands (`upgrade`, `install`, `reinstall`):
    updated).
 4. Tap switch: when a no-soak package's installed receipt has an empty tap
    (it was staged by brewsoak) and its origin is a third-party tap, use
-   `brew install <user/repo/name>` instead of `upgrade`, so it lands on its
-   real tap. The plan includes a real-brew check that this replaces the keg
-   cleanly.
+   `brew reinstall <user/repo/name>` instead of `upgrade`, so it lands on its
+   real tap. `brew install` was tried first and answers "already installed"
+   without replacing the keg; `reinstall` does replace it, and the receipt's
+   `source.tap` becomes the tap. After a successful switch the package's
+   `origins.toml` record is removed. If brew does not replace the keg, the
+   run exits 1 with a note telling the user to uninstall and install it.
 5. `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` stays set. This is the one
    deliberate difference from a hand-run `brew upgrade`: soaked dependents of
    a no-soak package are not upgraded by it.
@@ -342,7 +345,7 @@ Unit tests with the existing fakes (`MockBrew`, `InMemoryGit`,
 - Flows: soaked tap install stages under the tap directory and writes
   `origins.toml`; no-soak runs `brew update` exactly once and only when
   needed, then one `brew upgrade` with full tokens; tap-switch uses
-  `install`; dep closure crosses taps; explicit unsoakable is refused.
+  `reinstall`; dep closure crosses taps; explicit unsoakable is refused.
 - Golden: an `upgrade` summary with `no-soak N` and the new notes.
 
 Manual verification against real brew (plan steps):
