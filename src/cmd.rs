@@ -1420,8 +1420,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let walked = match self.collect_cutoff_deps(origin_tap, name, kind) {
             Ok(w) => w,
             // brew could not even read the staged tap file's dependencies.
-            Err(Error::Brew { .. }) if !origin::is_core_or_cask(origin_tap) => {
-                self.hold_target_staged_copy(name);
+            Err(Error::Brew { message, .. }) if !origin::is_core_or_cask(origin_tap) => {
+                match taps::untrusted_tap(&message) {
+                    Some(tap) => self.hold_target_untrusted(name, &tap),
+                    None => self.hold_target_staged_copy(name),
+                }
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -3152,6 +3155,95 @@ mod tests {
                 .unwrap()
                 .contains("cannot be installed from a staged copy")
         );
+        assert!(
+            lock_runs(&brew.0)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("install"))
+        );
+    }
+
+    #[test]
+    fn deps_untrusted_tap_refusal_holds_with_trust_note() {
+        struct FailDepsBrew(MockBrew);
+        impl Brew for FailDepsBrew {
+            fn brew_bin(&self) -> &Path {
+                self.0.brew_bin()
+            }
+            fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
+                self.0.run(a)
+            }
+            fn run_visible(&self, a: &[String]) -> Result<std::process::Output, Error> {
+                self.0.run_visible(a)
+            }
+            fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
+                self.0.installed_packages()
+            }
+            fn tap_new_soaked(&self) -> Result<(), Error> {
+                self.0.tap_new_soaked()
+            }
+            fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
+                self.0.tap_info()
+            }
+            fn outdated_names(&self) -> Result<Vec<String>, Error> {
+                self.0.outdated_names()
+            }
+            fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+                Err(Error::Brew {
+                    status: 1,
+                    message: format!(
+                        "Error: terraform: Refusing to load formula hashicorp/tap/terraform from untrusted tap hashicorp/tap. ({token})"
+                    ),
+                })
+            }
+        }
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = FailDepsBrew(MockBrew {
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        });
+        let cfg = cfg24();
+        let inv = inv_from(&brew.0, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "terraform: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("staged copy"), "{text}");
         assert!(
             lock_runs(&brew.0)
                 .iter()
