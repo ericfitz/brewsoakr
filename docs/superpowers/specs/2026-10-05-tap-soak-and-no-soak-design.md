@@ -49,6 +49,11 @@ design review. They are not to be changed without the maintainer's approval.
   formula of the same name, so the origin record was never consulted.
   brewsoak reads `source.tap` from the keg's `INSTALL_RECEIPT.json` instead;
   null falls back to `origins.toml`, then core. Casks keep `brew info`.
+- **A staged formula's origin can be read from its receipt path**
+  (decided 2026-10-05). When `source.tap` is null and `source.path` is under
+  `<cache>/staging/taps/<user>/<repo>/`, that tap is the origin, ahead of
+  `origins.toml`. This recovers kegs whose record was never written (bug 3);
+  `origins.toml` stays as the fallback.
 - **Accepted consequence:** `brew upgrade` also upgrades a no-soak package's
   outdated dependencies to brew's latest. No-soak therefore extends to its
   dependencies. This is documented, not prevented.
@@ -137,7 +142,9 @@ A package's origin is the tap it belongs to:
 
 1. The tap the installed package came from, if non-empty and not
    brewsoak's staging tap. For a formula this is `source.tap` in the keg's
-   own `INSTALL_RECEIPT.json` (null after a staged install). The top-level
+   own `INSTALL_RECEIPT.json` (null after a staged install). When it is
+   null and the receipt's `source.path` lies under brewsoak's own
+   `<cache>/staging/taps/<user>/<repo>/`, the origin is `<user>/<repo>`. The top-level
    `tap` in `brew info --json=v2 --installed` is the tap brew resolves the
    name to now, not the keg's receipt, so it is not used for formulae. For a
    cask it is `tap` in `brew info --json=v2 --installed`.
