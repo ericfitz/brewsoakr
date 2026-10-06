@@ -295,6 +295,7 @@ fn apply_brewsoak_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
 fn brewsoak_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'static str>)> {
     let mut pairs = vec![
         ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
+        ("HOMEBREW_NO_COLOR", Some("1")),
         ("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", Some("1")),
         ("HOMEBREW_DEVELOPER", Some("1")),
         ("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", None),
@@ -1480,6 +1481,16 @@ mod tests {
             pairs
                 .iter()
                 .any(|(k, v)| *k == "HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK" && *v == Some("1"))
+        );
+    }
+
+    #[test]
+    fn brewsoak_brew_env_turns_brew_colour_off() {
+        let pairs = brewsoak_brew_env_pairs(false);
+        assert!(
+            pairs
+                .iter()
+                .any(|(k, v)| *k == "HOMEBREW_NO_COLOR" && *v == Some("1"))
         );
     }
 

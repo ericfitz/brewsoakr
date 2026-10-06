@@ -3,7 +3,7 @@
 ## Installing soaked formulae
 
 - Install from a staged `.rb` path under the brewsoak cache, not `brewsoakr/soaked/<name>`.
-- Homebrew rejects path installs unless `HOMEBREW_DEVELOPER=1` is set and `HOMEBREW_FORBID_PACKAGES_FROM_PATHS` is unset. Set those on every brewsoak `brew` child. Also set `HOMEBREW_NO_AUTO_UPDATE=1` and `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1`.
+- Homebrew rejects path installs unless `HOMEBREW_DEVELOPER=1` is set and `HOMEBREW_FORBID_PACKAGES_FROM_PATHS` is unset. Set those on every brewsoak `brew` child. Also set `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` and `HOMEBREW_NO_COLOR=1` (brew colours some `==>` lines even into a pipe; the summarizer's ANSI strip is only a fallback).
 - Never pass `--ignore-dependencies`. Homebrew treats it as an unsupported developer option and warns even in developer mode. Install the cutoff dep closure first, then install the target and let brew treat already-installed deps as satisfied.
 - Cellar receipts omit `bottle`/`rebuild`. Do not treat a missing rebuild as 0 when comparing installed vs cutoff.
 - `-v`/`--verbose` prints the soak window, cutoffs, and a line for every package evaluated. Bare `-v` is brewsoak help, not `brew -v`.
