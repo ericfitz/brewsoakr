@@ -802,8 +802,10 @@ pub fn upgrade(
 /// How many installed packages the soak window says to change. Resolution is
 /// cheap (cached blobs) and errors just mean "no total to show".
 fn plan_size(git: &impl GitStore, snaps: &Snapshots, cache: &Path, inv: &Inventory) -> usize {
+    // Keep this in step with `apply_resolved`: every package counted here
+    // must reach `announce` there, and none other.
     snapshotted_pkgs(inv, snaps)
-        .filter(|pkg| !pkg.pinned)
+        .filter(|pkg| !pkg.pinned && !snaps.held_taps.contains_key(&pkg.origin))
         .filter(|pkg| {
             matches!(
                 resolve_view(
@@ -1124,6 +1126,26 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
+    /// The package was planned (it is in the `[i/N]` total) but brew already
+    /// upgraded it as a dependency, so it still takes its numbered line.
+    fn announce_already_done(&mut self, name: &str, view: &ResolvedView) -> Result<(), Error> {
+        self.plan_index += 1;
+        let Some(total) = self.plan_total else {
+            return Ok(());
+        };
+        let to = view
+            .cutoff
+            .as_ref()
+            .map(report::identity_version)
+            .unwrap_or("?");
+        writeln!(
+            self.out,
+            "[{}/{total}] {name} {to}: already upgraded as a dependency",
+            self.plan_index
+        )?;
+        Ok(())
+    }
+
     /// Everything worth saying once the packages are done: the counts, the
     /// byte delta, held/skipped packages, caveats, and where the raw brew log
     /// went for anyone who wants the detail we filtered out.
@@ -1367,7 +1389,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 // brew may already have upgraded this as a dependency of an
                 // earlier package; running it again just prints a warning.
                 if self.already_done(&name, view.cutoff.as_ref()) {
-                    self.plan_index += 1;
+                    self.announce_already_done(&name, &view)?;
                     return Ok(());
                 }
                 self.announce(&name, &view)?;
@@ -5041,6 +5063,103 @@ mod tests {
                     && a.iter().any(|x| x.ends_with("/vacuum.rb"))),
             "formula staged: {runs:?}"
         );
+    }
+
+    #[test]
+    fn upgrade_bare_header_total_equals_announced_steps() {
+        let git = InMemoryGit::new();
+        for name in ["left", "right"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "cutoffsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+        }
+        let auto = format!("{}  auto_updates true\n", cask_rb("alt-tab", "11.8.0"));
+        git.insert_blob("caskcut", "Casks/a/alt-tab.rb", auto.clone());
+        git.insert_blob("caskhead", "Casks/a/alt-tab.rb", auto);
+        let (vbrew, vgit, snaps) = same_name_world();
+        for (sha, path, body) in [
+            (
+                "cutoffsha",
+                "Formula/v/vacuum.rb",
+                formula_rb("vacuum", "0.30.6", "s"),
+            ),
+            (
+                "headsha",
+                "Formula/v/vacuum.rb",
+                formula_rb("vacuum", "0.30.6", "s"),
+            ),
+            ("tapcut", "Casks/vacuum.rb", cask_rb("vacuum", "0.31.0")),
+            ("taphead", "Casks/vacuum.rb", cask_rb("vacuum", "0.31.0")),
+        ] {
+            git.insert_blob(sha, path, body);
+        }
+        drop(vgit);
+        git.insert_tree("tapcut", &["Casks/vacuum.rb"]);
+        git.insert_tree("taphead", &["Casks/vacuum.rb"]);
+        let mut installed = vec![
+            formula_pkg("left", formula_rb("left", "1.0.0", "oldsha")),
+            formula_pkg("right", formula_rb("right", "1.0.0", "oldsha")),
+            cask_pkg_from(
+                "alt-tab",
+                "homebrew/cask",
+                crate::brew::version_only_cask_receipt("alt-tab", "7.38.1"),
+            ),
+        ];
+        installed.extend(vbrew.installed.clone());
+        // brew pours `right` while installing `left`: it is already at cutoff
+        // when its turn comes.
+        let brew = MockBrew {
+            installed,
+            taps: vbrew.taps.clone(),
+            next_stdout: "\u{1f37a}  /opt/homebrew/Cellar/right/1.1.0: 5 files, 1MB\n"
+                .as_bytes()
+                .to_vec(),
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let header = text
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("upgrading ")?
+                    .split(' ')
+                    .next()?
+                    .parse::<usize>()
+                    .ok()
+            })
+            .expect("header");
+        let announced = text
+            .lines()
+            .filter(|l| l.starts_with('[') && l.contains(&format!("/{header}] ")))
+            .count();
+        assert_eq!(header, 4, "{text}");
+        assert_eq!(announced, header, "{text}");
+        assert!(!text.contains("alt-tab 7.38.1 ->"), "{text}");
     }
 
     /// Installed `alt-tab` 7.38.1 (self-updating app) behind a cask cutoff
