@@ -121,12 +121,47 @@ fn kind_groups<'a>(
         .collect()
 }
 
-/// `brew upgrade` options that `brew reinstall` rejects.
-fn is_upgrade_only_flag(f: &str) -> bool {
-    matches!(
-        f,
-        "--greedy" | "--greedy-latest" | "--greedy-auto-updates" | "--ignore-pinned"
-    )
+/// Options `brew reinstall` accepts. Anything else a user passed to
+/// `brewsoak upgrade` is dropped from the tap-switch run rather than making
+/// reinstall reject the whole command.
+fn reinstall_accepts(f: &str) -> bool {
+    const LONG: &[&str] = &[
+        "--debug",
+        "--force",
+        "--verbose",
+        "--quiet",
+        "--build-from-source",
+        "--force-bottle",
+        "--keep-tmp",
+        "--debug-symbols",
+        "--display-times",
+        "--skip-cask-deps",
+        "--binaries",
+        "--no-binaries",
+        "--require-sha",
+        "--quarantine",
+        "--no-quarantine",
+        "--adopt",
+        "--formula",
+        "--formulae",
+        "--cask",
+        "--casks",
+    ];
+    if LONG.contains(&f) {
+        return true;
+    }
+    // A cluster of short flags such as `-vd`.
+    f.len() > 1
+        && f.starts_with('-')
+        && !f.starts_with("--")
+        && f[1..].chars().all(|c| "dfvqs".contains(c))
+}
+
+fn is_dry_run(flags: &[String]) -> bool {
+    flags.iter().any(|f| {
+        f == "--dry-run"
+            || (f.len() > 1 && f.starts_with('-') && !f.starts_with("--") && f[1..].contains('n'))
+    })
 }
 
 pub fn brew_token(origin_tap: &str, name: &str) -> String {
@@ -200,9 +235,26 @@ pub fn run_step(
 
     // brew install says "already installed" and leaves a staged keg alone;
     // reinstall replaces it, and the receipt then carries the real tap.
-    for (kind_flag, switch) in kind_groups(&switch, split_kinds) {
+    // reinstall has no dry run, so a dry run must not reach it.
+    let dry_run = is_dry_run(&flags);
+    if dry_run && !switch.is_empty() {
+        result.notes.push(format!(
+            "no-soak: skipped moving staged kegs to their tap for a dry run: {}",
+            switch
+                .iter()
+                .map(|t| token_of(t))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    let switch_groups = if dry_run {
+        Vec::new()
+    } else {
+        kind_groups(&switch, split_kinds)
+    };
+    for (kind_flag, switch) in switch_groups {
         let mut args = vec!["reinstall".to_string()];
-        args.extend(flags.iter().filter(|f| !is_upgrade_only_flag(f)).cloned());
+        args.extend(flags.iter().filter(|f| reinstall_accepts(f)).cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(switch.iter().map(|t| token_of(t)));
         writeln!(
@@ -230,7 +282,7 @@ pub fn run_step(
                     ""
                 };
                 result.notes.push(format!(
-                    "{}: brew did not replace the staged keg; run brew uninstall{cask} {} then brew install{cask} {}",
+                    "{}: brew did not replace the staged keg; run brew uninstall{cask} {} then brew install{cask} {} (--ignore-dependencies will not help)",
                     t.name,
                     t.name,
                     token_of(t)
@@ -451,6 +503,7 @@ mod tests {
             r.notes.iter().any(|n| n.contains("did not replace")
                 && n.contains("brew uninstall vault")
                 && n.contains("brew install hashicorp/tap/vault")
+                && n.contains("--ignore-dependencies will not help")
                 && !n.contains("run brew reinstall")),
             "{:?}",
             r.notes
@@ -459,10 +512,42 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_skips_the_switch_with_a_note_and_never_claims_a_failure() {
+        for flag in ["--dry-run", "-n"] {
+            let brew = MockBrew::new();
+            let r = run_step(
+                &brew,
+                "upgrade",
+                &[flag.to_string()],
+                &switch_target("hashicorp/tap", "packer"),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let got = runs(&brew);
+            assert_eq!(got, vec![vec!["update".to_string()]], "{flag}: {got:?}");
+            assert_eq!(r.status, None, "{flag}");
+            assert!(
+                r.notes.iter().any(|n| n.contains("dry run")
+                    && n.contains("hashicorp/tap/packer")
+                    && !n.contains("did not replace")),
+                "{flag}: {:?}",
+                r.notes
+            );
+        }
+    }
+
+    #[test]
     fn switch_message_names_reinstall_and_flags_reinstall_rejects_are_dropped() {
         let brew = MockBrew::new();
         let mut out = Vec::new();
-        let flags = ["--greedy".to_string(), "--verbose".to_string()];
+        let flags = [
+            "--greedy".to_string(),
+            "--fetch-HEAD".to_string(),
+            "--overwrite".to_string(),
+            "--no-quit".to_string(),
+            "--some-future-flag".to_string(),
+            "--verbose".to_string(),
+        ];
         run_step(
             &brew,
             "upgrade",
