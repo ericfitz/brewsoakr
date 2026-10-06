@@ -176,7 +176,7 @@ pub fn run_step(
             let name = t.name.to_ascii_lowercase();
             let said_installed = text
                 .lines()
-                .any(|l| l.contains("already installed") && l.contains(&name));
+                .any(|l| crate::cmd::already_installed_line(l) && l.contains(&name));
             if code != 0 || said_installed {
                 result.notes.push(format!(
                     "{}: brew did not replace the staged keg; run brew reinstall {}",

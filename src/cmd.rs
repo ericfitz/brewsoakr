@@ -1683,7 +1683,15 @@ fn already_installed_message(output: &std::process::Output) -> bool {
     let stderr = String::from_utf8_lossy(&output.stderr);
     format!("{stdout}\n{stderr}")
         .to_ascii_lowercase()
-        .contains("already installed")
+        .lines()
+        .any(already_installed_line)
+}
+
+/// brew's no-op answer for one (lowercased) output line. `x 1.0 is already
+/// installed but outdated (so it will be upgraded).` precedes a real upgrade,
+/// so it is not one.
+pub(crate) fn already_installed_line(line: &str) -> bool {
+    line.contains("already installed") && !line.contains("already installed but outdated")
 }
 
 /// Where `dir`'s staged `.rb` files live for this origin; tap names are
@@ -4804,6 +4812,84 @@ mod tests {
             !run_has_token(&lock_runs(&brew), "hashicorp/tap/terraform"),
             "soaked tap packages are never brew tokens"
         );
+    }
+
+    #[test]
+    fn staged_tap_upgrade_records_origin_despite_outdated_notice() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "hashicorp/tap",
+                formula_rb("terraform", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            // What brew prints on every upgrade of an outdated keg.
+            next_stdout: b"Warning: terraform 1.0.0 is already installed but outdated (so it will be upgraded).\n"
+                .to_vec(),
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
+            Some("hashicorp/tap")
+        );
+    }
+
+    #[test]
+    fn already_installed_message_tells_a_no_op_from_an_upgrade() {
+        let said = |text: &str| {
+            already_installed_message(&std::process::Output {
+                status: std::process::ExitStatus::default(),
+                stdout: text.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        };
+        assert!(said(
+            "Warning: foo 1.0 is already installed and up-to-date.\n"
+        ));
+        assert!(said(
+            "Warning: ericfitz/tap/agentbus 1.13.0 already installed\n"
+        ));
+        assert!(said("Warning: Cask 'x' is already installed.\n"));
+        assert!(said("Error: fresh 1.1.0 is already installed\n"));
+        assert!(!said(
+            "cats 13.8.0 is already installed but outdated (so it will be upgraded).\n"
+        ));
+        // A real no-op for another package still counts.
+        assert!(said(
+            "cats 13.8.0 is already installed but outdated (so it will be upgraded).\nWarning: foo 1.0 is already installed and up-to-date.\n"
+        ));
     }
 
     fn cask_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
