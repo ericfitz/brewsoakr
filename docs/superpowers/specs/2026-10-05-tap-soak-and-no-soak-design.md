@@ -43,6 +43,12 @@ design review. They are not to be changed without the maintainer's approval.
   untrusted, brewsoak holds the package, exits 1, and tells the user to run
   `brew trust <tap>`. brewsoak keeps trusting its own `brewsoakr/soaked`
   staging tap only.
+- **A formula's origin comes from its keg receipt, not `brew info`**
+  (decided 2026-10-05, bug 6). `brew info`'s top-level `tap` reported
+  `homebrew/core` for a staged `cyclonedx/cyclonedx` keg because core has a
+  formula of the same name, so the origin record was never consulted.
+  brewsoak reads `source.tap` from the keg's `INSTALL_RECEIPT.json` instead;
+  null falls back to `origins.toml`, then core. Casks keep `brew info`.
 - **Accepted consequence:** `brew upgrade` also upgrades a no-soak package's
   outdated dependencies to brew's latest. No-soak therefore extends to its
   dependencies. This is documented, not prevented.
@@ -129,9 +135,12 @@ apply). Individual bad keys or entries fall back as above.
 
 A package's origin is the tap it belongs to:
 
-1. The tap `brew` reports for the installed package (`tap` in
-   `brew info --json=v2 --installed`), if non-empty and not brewsoak's
-   staging tap.
+1. The tap the installed package came from, if non-empty and not
+   brewsoak's staging tap. For a formula this is `source.tap` in the keg's
+   own `INSTALL_RECEIPT.json` (null after a staged install). The top-level
+   `tap` in `brew info --json=v2 --installed` is the tap brew resolves the
+   name to now, not the keg's receipt, so it is not used for formulae. For a
+   cask it is `tap` in `brew info --json=v2 --installed`.
 2. Else brewsoak's origin record, `<cache>/origins.toml`.
 3. Else `homebrew/core` for formulae, `homebrew/cask` for casks (v1
    behavior).
