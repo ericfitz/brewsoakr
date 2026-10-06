@@ -963,8 +963,9 @@ pub fn reinstall(
             let mut args = vec!["reinstall".to_string()];
             args.extend(user_flags.iter().cloned());
             args.push(token);
-            session.record_run(&args)?;
-            session.counts.upgraded += 1;
+            if session.record_run(&args)? {
+                session.counts.upgraded += 1;
+            }
             continue;
         }
         session.apply_one(raw)?;
@@ -1435,8 +1436,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
 
         let args = tap::brew_install_args(&pkg, &path, self.user_flags);
-        if !self.record_staged_install(origin_tap, name, kind, &args)? {
-            self.hold_target_staged_copy(name);
+        match self.record_staged_install(origin_tap, name, kind, &args)? {
+            StagedRun::Ran { failed } => {
+                // Counted as upgraded when it was announced; brew failed.
+                if failed {
+                    self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                }
+            }
+            StagedRun::LoadFailure => self.hold_target_staged_copy(name),
+            StagedRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
         }
         Ok(())
     }
@@ -1505,8 +1513,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let args = tap::brew_install_args(&pkg, &path, &[]);
         // A dep that brew cannot load is held by name; the target is still
         // attempted and brew reports the missing dependency.
-        if !self.record_staged_install(dep_origin, dep, kind, &args)? {
-            self.hold_staged_copy(dep);
+        match self.record_staged_install(dep_origin, dep, kind, &args)? {
+            StagedRun::Ran { .. } => {}
+            StagedRun::LoadFailure => self.hold_staged_copy(dep),
+            StagedRun::Untrusted(tap) => self.hold_untrusted(dep, &tap),
         }
         Ok(true)
     }
@@ -1578,6 +1588,23 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.hold_staged_copy(name);
     }
 
+    /// brew refuses to load a package from a tap the user has not trusted.
+    /// Trusting a third-party tap is the user's decision, never brewsoak's.
+    fn hold_untrusted(&mut self, name: &str, tap: &str) {
+        self.defer(format!(
+            "{name}: brew does not trust tap {tap}; run brew trust {tap}, or add it to NO_SOAK"
+        ));
+        self.counts.held += 1;
+        self.refused = true;
+    }
+
+    /// The target was counted as upgraded when it was announced; it is held
+    /// instead, so take that count back.
+    fn hold_target_untrusted(&mut self, name: &str, tap: &str) {
+        self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+        self.hold_untrusted(name, tap);
+    }
+
     /// Tap packages are remembered by origin; core and cask need no record.
     fn record_origin(&mut self, origin_tap: &str, name: &str, kind: PkgKind) -> Result<(), Error> {
         let want = (!origin::is_core_or_cask(origin_tap)).then(|| origin_tap.to_ascii_lowercase());
@@ -1592,33 +1619,36 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     }
 
     /// Runs one staged install and records where the keg came from.
-    /// Returns false, with brew's status left out of the run, when brew could
-    /// not load a tap package's staged copy; the caller holds it.
+    /// A tap package brew could not load or would not trust is reported
+    /// without brew's status, so the caller holds it instead.
     fn record_staged_install(
         &mut self,
         origin_tap: &str,
         name: &str,
         kind: PkgKind,
         args: &[String],
-    ) -> Result<bool, Error> {
+    ) -> Result<StagedRun, Error> {
         let output = self.brew.run_visible(args)?;
         let text = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success()
-            && !origin::is_core_or_cask(origin_tap)
-            && taps::staged_load_failure(&text)
-        {
-            return Ok(false);
+        if !output.status.success() && !origin::is_core_or_cask(origin_tap) {
+            if let Some(tap) = taps::untrusted_tap(&text) {
+                return Ok(StagedRun::Untrusted(tap));
+            }
+            if taps::staged_load_failure(&text) {
+                return Ok(StagedRun::LoadFailure);
+            }
         }
         self.done
             .extend(quiet::installed_from_output(&output.stdout));
         // Only a real install proves the keg came from this origin; brew's
         // "already installed" answer says nothing about where the keg came from.
         let installed_now = output.status.success() && !already_installed_message(&output);
+        let failed = brew_failed(&output);
         merge_status(&mut self.brew_status, output);
         if installed_now {
             self.record_origin(origin_tap, name, kind)?;
         }
-        Ok(true)
+        Ok(StagedRun::Ran { failed })
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1653,12 +1683,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
-    fn record_run(&mut self, args: &[String]) -> Result<(), Error> {
+    /// Runs brew and returns whether it succeeded.
+    fn record_run(&mut self, args: &[String]) -> Result<bool, Error> {
         let output = self.brew.run_visible(args)?;
         self.done
             .extend(quiet::installed_from_output(&output.stdout));
+        let ok = !brew_failed(&output);
         merge_status(&mut self.brew_status, output);
-        Ok(())
+        Ok(ok)
     }
 }
 
@@ -1668,6 +1700,21 @@ pub(crate) fn merge_status(slot: &mut Option<i32>, output: std::process::Output)
         code = 0;
     }
     max_status(slot, code);
+}
+
+/// brew exited non-zero and not with its "already installed" no-op answer.
+fn brew_failed(output: &std::process::Output) -> bool {
+    !output.status.success() && !already_installed_message(output)
+}
+
+/// What one staged `brew install` came to.
+enum StagedRun {
+    /// brew ran; `failed` when it exited non-zero for a reason of its own.
+    Ran { failed: bool },
+    /// brew could not load the tap package's staged copy.
+    LoadFailure,
+    /// brew does not trust this tap (lowercase `user/repo`).
+    Untrusted(String),
 }
 
 pub(crate) fn max_status(slot: &mut Option<i32>, code: i32) {
@@ -2823,6 +2870,207 @@ mod tests {
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
             None
         );
+    }
+
+    const PACKER_REFUSAL: &[u8] = b"Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap hashicorp/tap.\nRun `brew trust --formula hashicorp/tap/packer` or `brew trust hashicorp/tap` to trust it.\n";
+
+    fn packer_world() -> (InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/packer.rb",
+            formula_rb("packer", "1.16.1", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/packer.rb",
+            formula_rb("packer", "1.17.0", "newsha"),
+        );
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Formula/packer.rb"]);
+        git.insert_tree("taphead", &["Formula/packer.rb"]);
+        (git, snaps)
+    }
+
+    fn install_packer(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        snaps: &Snapshots,
+    ) -> (RunResult, String) {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            brew,
+            git,
+            snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/packer".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    fn hashicorp_tap() -> Vec<TapInfo> {
+        vec![tapped(
+            "hashicorp/tap",
+            Some("https://github.com/hashicorp/homebrew-tap"),
+        )]
+    }
+
+    #[test]
+    fn untrusted_tap_refusal_holds_the_target_and_never_runs_brew_trust() {
+        let (git, snaps) = packer_world();
+        let brew = MockBrew {
+            taps: hashicorp_tap(),
+            next_status: 1,
+            next_stdout: PACKER_REFUSAL.to_vec(),
+            ..MockBrew::new()
+        };
+        let (r, text) = install_packer(&brew, &git, &snaps);
+        assert!(r.refused);
+        assert_eq!(r.brew_status, None, "a trust hold is not a brew failure");
+        assert!(
+            text.contains(
+                "packer: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("upgraded 0,") && text.contains("held 1"),
+            "{text}"
+        );
+        let all: Vec<Vec<String>> = lock_runs(&brew)
+            .into_iter()
+            .chain(brew.visible_runs.lock().unwrap().clone())
+            .collect();
+        assert!(
+            !all.iter().any(|a| a.iter().any(|x| x == "trust")),
+            "brewsoak must never trust a third-party tap: {all:?}"
+        );
+    }
+
+    #[test]
+    fn untrusted_tap_refusal_on_a_dep_holds_the_dep() {
+        let (git, snaps) = packer_world();
+        git.insert_blob(
+            "tapcut",
+            "Formula/widget.rb",
+            formula_rb("widget", "1.0.0", "w"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/widget.rb",
+            formula_rb("widget", "1.0.0", "w"),
+        );
+        git.insert_tree("tapcut", &["Formula/packer.rb", "Formula/widget.rb"]);
+        git.insert_tree("taphead", &["Formula/packer.rb", "Formula/widget.rb"]);
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            tap.path()
+                .join("taps/hashicorp/tap/Formula/packer.rb")
+                .to_string_lossy()
+                .into_owned(),
+            vec!["hashicorp/tap/widget".to_string()],
+        );
+        let widget_refusal = String::from_utf8_lossy(PACKER_REFUSAL).replace("packer", "widget");
+        let brew = MockBrew {
+            deps,
+            taps: hashicorp_tap(),
+            next_outputs: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                (1, widget_refusal.into_bytes()),
+                (1, PACKER_REFUSAL.to_vec()),
+            ])),
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/packer".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused);
+        assert_eq!(r.brew_status, None);
+        for name in ["widget", "packer"] {
+            assert!(
+                text.contains(&format!(
+                    "{name}: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
+                )),
+                "{text}"
+            );
+        }
+        assert!(text.contains("upgraded 0,"), "{text}");
+    }
+
+    #[test]
+    fn failed_brew_run_is_not_counted_as_upgraded() {
+        let (git, snaps) = packer_world();
+        let brew = MockBrew {
+            taps: hashicorp_tap(),
+            next_status: 1,
+            next_stdout: b"Error: packer: download failed\n".to_vec(),
+            ..MockBrew::new()
+        };
+        let (r, text) = install_packer(&brew, &git, &snaps);
+        assert_eq!(r.brew_status, Some(1), "{text}");
+        assert!(text.contains("upgraded 0,"), "{text}");
+        assert!(!text.contains("held 1"), "a failure is not a hold: {text}");
+    }
+
+    #[test]
+    fn failed_reinstall_repair_is_not_counted_as_upgraded() {
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new.clone());
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_new)],
+            next_status: 1,
+            next_stdout: b"Error: wget: download failed\n".to_vec(),
+            ..MockBrew::new()
+        };
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let result = call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["wget".to_string()],
+            &mut out,
+        )
+        .expect("reinstall");
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(result.brew_status, Some(1), "{text}");
+        assert!(text.contains("upgraded 0,"), "{text}");
     }
 
     #[test]
