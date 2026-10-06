@@ -196,14 +196,22 @@ impl Brew for ProcessBrew {
         let json = String::from_utf8_lossy(&output.stdout);
         let cellar = self.brew_dir("--cellar");
         let caskroom = self.brew_dir("--caskroom");
-        parse_installed_json(&json, |name, kind, version| match kind {
-            PkgKind::Formula => cellar
-                .as_deref()
-                .and_then(|dir| read_formula_receipt(dir, name, version)),
-            PkgKind::Cask => caskroom
-                .as_deref()
-                .and_then(|dir| read_cask_receipt(dir, name, version)),
-        })
+        parse_installed_json(
+            &json,
+            |name, kind, version| match kind {
+                PkgKind::Formula => cellar
+                    .as_deref()
+                    .and_then(|dir| read_formula_receipt(dir, name, version)),
+                PkgKind::Cask => caskroom
+                    .as_deref()
+                    .and_then(|dir| read_cask_receipt(dir, name, version)),
+            },
+            |name, version| {
+                cellar
+                    .as_deref()
+                    .and_then(|dir| read_formula_receipt_tap(dir, name, version))
+            },
+        )
     }
 
     fn tap_new_soaked(&self) -> Result<(), Error> {
@@ -514,6 +522,24 @@ fn read_formula_receipt(cellar: &Path, name: &str, version: Option<&str>) -> Opt
     std::fs::read_to_string(rb).ok()
 }
 
+/// The tap a formula keg's own `INSTALL_RECEIPT.json` records
+/// (`source.tap`), not where brew resolves the name today: a keg staged by
+/// brewsoak has `null`, and `brew info` may still say `homebrew/core` for it
+/// when core has a same-name formula.
+fn read_formula_receipt_tap(cellar: &Path, name: &str, version: Option<&str>) -> Option<String> {
+    let text = std::fs::read_to_string(
+        cellar
+            .join(name)
+            .join(version?)
+            .join("INSTALL_RECEIPT.json"),
+    )
+    .ok()?;
+    let source = find_json_key(&text, "source")?.trim_start();
+    let end = skip_delimited(source.as_bytes(), 0, b'{', b'}')?;
+    json_string_value(source.get(..end)?, "tap")
+        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP))
+}
+
 fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Option<String> {
     let metadata = caskroom.join(name).join(".metadata");
     let target = format!("{name}.rb");
@@ -567,19 +593,20 @@ fn walk_metadata_for_file(dir: &Path, target: &str) -> Option<String> {
     None
 }
 
+/// `formula_tap(name, version)` is the tap in that formula keg's own receipt;
+/// brew info's top-level `tap` is only trusted for casks.
 fn parse_installed_json(
     v: &str,
     mut read_receipt: impl FnMut(&str, PkgKind, Option<&str>) -> Option<String>,
+    mut formula_tap: impl FnMut(&str, Option<&str>) -> Option<String>,
 ) -> Result<Vec<InstalledPkg>, Error> {
     let mut out = Vec::new();
     for obj in json_objects_in_array(v, "formulae")? {
         let Some(name) = json_string_value(obj, "name").filter(|n| !n.is_empty()) else {
             continue;
         };
-        let tap = json_string_value(obj, "tap");
-        let tap =
-            tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
         let version = installed_version(obj);
+        let tap = formula_tap(&name, version.as_deref());
         if let Some(receipt_rb) = read_receipt(&name, PkgKind::Formula, version.as_deref()) {
             out.push(InstalledPkg {
                 name,
@@ -896,10 +923,14 @@ mod tests {
           ],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |name, kind, version| {
-            assert_eq!((name, kind), ("ca-certificates", PkgKind::Formula));
-            Some(format!("keg {}", version.expect("version")))
-        })
+        let got = parse_installed_json(
+            json,
+            |name, kind, version| {
+                assert_eq!((name, kind), ("ca-certificates", PkgKind::Formula));
+                Some(format!("keg {}", version.expect("version")))
+            },
+            |_, _| Some("homebrew/core".into()),
+        )
         .expect("parse fixture");
         assert_eq!(
             got,
@@ -925,9 +956,11 @@ mod tests {
           ],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |_name, _kind, version| {
-            Some(format!("keg {}", version.expect("version")))
-        })
+        let got = parse_installed_json(
+            json,
+            |_name, _kind, version| Some(format!("keg {}", version.expect("version"))),
+            |_, _| Some("homebrew/core".into()),
+        )
         .expect("parse fixture");
         assert_eq!(
             got,
@@ -964,12 +997,20 @@ mod tests {
             }
           ]
         }"#;
-        let got = parse_installed_json(json, |name, kind, _version| match (name, kind) {
-            ("wget", PkgKind::Formula) => Some("class Wget; end".into()),
-            ("firefox", PkgKind::Cask) => Some("cask \"firefox\"".into()),
-            ("foo", PkgKind::Formula) => Some("class Foo; end".into()),
-            (other, _) => panic!("unexpected receipt read for {other}"),
-        })
+        let got = parse_installed_json(
+            json,
+            |name, kind, _version| match (name, kind) {
+                ("wget", PkgKind::Formula) => Some("class Wget; end".into()),
+                ("firefox", PkgKind::Cask) => Some("cask \"firefox\"".into()),
+                ("foo", PkgKind::Formula) => Some("class Foo; end".into()),
+                (other, _) => panic!("unexpected receipt read for {other}"),
+            },
+            |name, _| match name {
+                "wget" => Some("homebrew/core".into()),
+                "foo" => Some("acme/tools".into()),
+                other => panic!("unexpected tap read for {other}"),
+            },
+        )
         .expect("parse fixture");
         assert_eq!(
             got,
@@ -1006,7 +1047,8 @@ mod tests {
           ],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |_, _, _| Some("rb".into())).expect("parse");
+        let got =
+            parse_installed_json(json, |_, _, _| Some("rb".into()), |_, _| None).expect("parse");
         assert_eq!(got.len(), 3);
         assert!(got.iter().all(|p| p.tap.is_none()), "{got:?}");
     }
@@ -1017,11 +1059,15 @@ mod tests {
           "formulae": [{"name": "ca-certificates", "tap": ""}],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |name, kind, _version| {
-            assert_eq!(name, "ca-certificates");
-            assert_eq!(kind, PkgKind::Formula);
-            Some("class CaCertificates; end".into())
-        })
+        let got = parse_installed_json(
+            json,
+            |name, kind, _version| {
+                assert_eq!(name, "ca-certificates");
+                assert_eq!(kind, PkgKind::Formula);
+                Some("class CaCertificates; end".into())
+            },
+            |_, _| None,
+        )
         .expect("parse empty tap");
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].name, "ca-certificates");
@@ -1045,12 +1091,19 @@ mod tests {
             {"token": "flighty", "tap": "homebrew/cask", "installed": "2.0"}
           ]
         }"#;
-        let got = parse_installed_json(json, |name, kind, _version| match (name, kind) {
-            ("vacuum", PkgKind::Formula) => Some("class Vacuum; end".into()),
-            ("flighty", PkgKind::Cask) => Some("cask \"flighty\"".into()),
-            (_, PkgKind::Cask) => None,
-            (other, _) => panic!("unexpected receipt read for {other}"),
-        })
+        let got = parse_installed_json(
+            json,
+            |name, kind, _version| match (name, kind) {
+                ("vacuum", PkgKind::Formula) => Some("class Vacuum; end".into()),
+                ("flighty", PkgKind::Cask) => Some("cask \"flighty\"".into()),
+                (_, PkgKind::Cask) => None,
+                (other, _) => panic!("unexpected receipt read for {other}"),
+            },
+            |name, _| match name {
+                "vacuum" => Some("homebrew/core".into()),
+                other => panic!("unexpected tap read for {other}"),
+            },
+        )
         .expect("parse fixture");
         let summary: Vec<(&str, PkgKind, Option<&str>)> = got
             .iter()
@@ -1103,10 +1156,14 @@ mod tests {
           ]
         }"#;
         let mut versions = Vec::new();
-        parse_installed_json(json, |name, kind, version| {
-            versions.push((name.to_string(), kind, version.map(str::to_string)));
-            Some("rb".into())
-        })
+        parse_installed_json(
+            json,
+            |name, kind, version| {
+                versions.push((name.to_string(), kind, version.map(str::to_string)));
+                Some("rb".into())
+            },
+            |_, _| None,
+        )
         .expect("parse");
         assert_eq!(
             versions,
@@ -1158,10 +1215,14 @@ mod tests {
           ],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |name, kind, version| {
-            assert_eq!(kind, PkgKind::Formula);
-            read_formula_receipt(&cellar, name, version)
-        })
+        let got = parse_installed_json(
+            json,
+            |name, kind, version| {
+                assert_eq!(kind, PkgKind::Formula);
+                read_formula_receipt(&cellar, name, version)
+            },
+            |_, _| Some("homebrew/core".into()),
+        )
         .expect("parse");
         assert_eq!(
             got,
@@ -1172,6 +1233,82 @@ mod tests {
                 Some("homebrew/core")
             )]
         );
+    }
+
+    fn write_receipt(cellar: &Path, name: &str, version: &str, body: &str) {
+        let keg = cellar.join(name).join(version);
+        std::fs::create_dir_all(&keg).expect("keg");
+        std::fs::write(keg.join("INSTALL_RECEIPT.json"), body).expect("receipt");
+    }
+
+    #[test]
+    fn receipt_tap_reads_source_tap_of_the_named_keg() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_receipt(
+            cellar,
+            "packer",
+            "1.0.0",
+            r#"{"source":{"tap":"homebrew/core","spec":"stable"}}"#,
+        );
+        write_receipt(
+            cellar,
+            "packer",
+            "1.1.0",
+            r#"{"used_options":[],"source":{"tap":"hashicorp/tap","path":"/x","spec":"stable"}}"#,
+        );
+        assert_eq!(
+            read_formula_receipt_tap(cellar, "packer", Some("1.1.0")).as_deref(),
+            Some("hashicorp/tap")
+        );
+    }
+
+    #[test]
+    fn receipt_tap_is_none_when_null_missing_or_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_receipt(
+            cellar,
+            "cyclonedx-gomod",
+            "1.12.0",
+            r#"{"source":{"tap":null,"path":"/s/Formula/cyclonedx-gomod.rb"}}"#,
+        );
+        write_receipt(
+            cellar,
+            "staged",
+            "1",
+            r#"{"source":{"tap":"brewsoakr/soaked"}}"#,
+        );
+        write_receipt(cellar, "garbled", "1", "not json");
+        assert_eq!(
+            read_formula_receipt_tap(cellar, "cyclonedx-gomod", Some("1.12.0")),
+            None
+        );
+        assert_eq!(read_formula_receipt_tap(cellar, "staged", Some("1")), None);
+        assert_eq!(read_formula_receipt_tap(cellar, "garbled", Some("1")), None);
+        assert_eq!(read_formula_receipt_tap(cellar, "absent", Some("1")), None);
+        assert_eq!(read_formula_receipt_tap(cellar, "garbled", None), None);
+    }
+
+    #[test]
+    fn parse_installed_json_takes_a_formulas_tap_from_its_receipt_not_brew_info() {
+        let json = r#"{
+          "formulae": [
+            {"name": "cyclonedx-gomod", "tap": "homebrew/core", "installed": [{"version": "1.12.0"}]},
+            {"name": "packer", "tap": "hashicorp/tap", "installed": [{"version": "1.0"}]}
+          ],
+          "casks": [{"token": "vacuum", "tap": "daveshanley/vacuum", "installed": "1"}]
+        }"#;
+        let got = parse_installed_json(
+            json,
+            |_, _, _| Some("rb".into()),
+            |name, _| (name == "packer").then(|| "hashicorp/tap".to_string()),
+        )
+        .expect("parse");
+        let tap = |n: &str| got.iter().find(|p| p.name == n).unwrap().tap.clone();
+        assert_eq!(tap("cyclonedx-gomod"), None, "staged keg: receipt null");
+        assert_eq!(tap("packer").as_deref(), Some("hashicorp/tap"));
+        assert_eq!(tap("vacuum").as_deref(), Some("daveshanley/vacuum"));
     }
 
     #[test]
@@ -1193,8 +1330,12 @@ mod tests {
           ],
           "casks": []
         }"#;
-        let got = parse_installed_json(json, |name, _kind, _version| Some(name.to_string()))
-            .expect("parse");
+        let got = parse_installed_json(
+            json,
+            |name, _kind, _version| Some(name.to_string()),
+            |_, _| None,
+        )
+        .expect("parse");
         assert!(got.iter().find(|p| p.name == "wget").expect("wget").pinned);
         assert!(!got.iter().find(|p| p.name == "curl").expect("curl").pinned);
     }
