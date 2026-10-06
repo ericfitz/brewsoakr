@@ -204,6 +204,14 @@ fn is_value_option_of(t: &Table, name: &str) -> bool {
     t.value_long.contains(&name) || CASK_VALUE_OPTIONS.contains(&name)
 }
 
+/// `--dry-run`, or `-n` alone or inside a short cluster (`-vn`).
+pub fn is_dry_run(flags: &[String]) -> bool {
+    flags.iter().any(|f| {
+        f == "--dry-run"
+            || (f.len() > 1 && f.starts_with('-') && !f.starts_with("--") && f[1..].contains('n'))
+    })
+}
+
 /// `brew reinstall does not accept --foo, -x; dropped from the tap switch`.
 pub fn dropped_note(verb: &str, dropped: &[String], context: &str) -> Option<String> {
     (!dropped.is_empty()).then(|| {

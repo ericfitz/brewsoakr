@@ -157,6 +157,13 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
         }
         "reinstall" => {
             let (names, brew_args) = split_names_and_flags(before, after)?;
+            // brew reinstall has no dry run, and dropping the flag would run
+            // the reinstall for real.
+            if crate::flags::is_dry_run(&brew_args) {
+                return Err(Error::Usage(
+                    "brew reinstall has no dry run (--dry-run / -n); not reinstalling".into(),
+                ));
+            }
             Invocation {
                 soak_hours,
                 command: Command::Reinstall { names },
@@ -427,6 +434,17 @@ mod tests {
             parse_argv(&s(&["upgrade", "--appdir"])),
             Err(Error::Usage(m)) if m.contains("--appdir")
         ));
+    }
+
+    #[test]
+    fn reinstall_refuses_a_dry_run_it_cannot_honour() {
+        for flag in ["--dry-run", "-n", "-vn"] {
+            match parse_argv(&s(&["reinstall", flag, "wget"])) {
+                Err(Error::Usage(m)) => assert!(m.contains("no dry run"), "{flag}: {m}"),
+                other => panic!("{flag}: {other:?}"),
+            }
+        }
+        assert!(parse_argv(&s(&["reinstall", "-v", "wget"])).is_ok());
     }
 
     #[test]

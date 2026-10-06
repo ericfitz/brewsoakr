@@ -70,7 +70,7 @@ impl NoSoakList {
 use crate::Error;
 use crate::brew::Brew;
 use crate::cmd::{max_status, merge_status};
-use crate::flags::{dropped_note, filter_for_verb};
+use crate::flags::{dropped_note, filter_for_verb, is_dry_run};
 use crate::origin;
 use crate::quiet;
 use crate::resolve::PkgKind;
@@ -120,13 +120,6 @@ fn kind_groups<'a>(
         .into_iter()
         .filter(|(_, g)| !g.is_empty())
         .collect()
-}
-
-fn is_dry_run(flags: &[String]) -> bool {
-    flags.iter().any(|f| {
-        f == "--dry-run"
-            || (f.len() > 1 && f.starts_with('-') && !f.starts_with("--") && f[1..].contains('n'))
-    })
 }
 
 pub fn brew_token(origin_tap: &str, name: &str) -> String {
