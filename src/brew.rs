@@ -52,6 +52,12 @@ pub trait Brew {
     fn session_report(&self) -> SessionReport {
         SessionReport::default()
     }
+    /// The formula `.rb` brew stored in keg `<cellar>/<name>/<version>/.brew/`,
+    /// or `None` when it cannot be read. This is what the keg really is, as
+    /// opposed to what its directory name suggests.
+    fn keg_receipt(&self, _name: &str, _version: &str) -> Option<String> {
+        None
+    }
 }
 
 pub struct ProcessBrew {
@@ -118,6 +124,8 @@ pub struct MockBrew {
     pub next_outputs: Mutex<VecDeque<(i32, Vec<u8>)>>,
     /// What `outdated_names` reports.
     pub outdated: Vec<String>,
+    /// What `keg_receipt` reports, keyed by `(name, cellar version)`.
+    pub kegs: BTreeMap<(String, String), String>,
 }
 
 impl Default for MockBrew {
@@ -133,6 +141,7 @@ impl Default for MockBrew {
             next_stderr: Vec::new(),
             next_outputs: Mutex::new(VecDeque::new()),
             outdated: Vec::new(),
+            kegs: BTreeMap::new(),
         }
     }
 }
@@ -190,6 +199,11 @@ impl Brew for ProcessBrew {
             freed_bytes: sink.filter.freed_bytes(),
             log_path: sink.log_path.clone(),
         }
+    }
+
+    fn keg_receipt(&self, name: &str, version: &str) -> Option<String> {
+        let cellar = self.brew_dir("--cellar")?;
+        read_formula_receipt(&cellar, name, Some(version))
     }
 
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -455,6 +469,12 @@ impl Brew for MockBrew {
 
     fn outdated_names(&self) -> Result<Vec<String>, Error> {
         Ok(self.outdated.clone())
+    }
+
+    fn keg_receipt(&self, name: &str, version: &str) -> Option<String> {
+        self.kegs
+            .get(&(name.to_string(), version.to_string()))
+            .cloned()
     }
 
     fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {

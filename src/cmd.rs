@@ -1210,16 +1210,25 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         write_session_tail(&report, self.out)
     }
 
-    /// True when brew already put this package at the version we wanted,
-    /// as a dependency of something installed earlier in this session.
-    /// Only formula Cellar versions enter `done`, so a cask is never done.
+    /// True when brew already put this package at the artifact we wanted, as
+    /// a dependency of something installed earlier in this session. The keg
+    /// directory name is no evidence: brew's version heuristics differ from
+    /// ours (`go1.27.1` is keg `1.27.1`), and brew may have resolved a dep at
+    /// a version other than the cutoff. So the keg's own formula is read and
+    /// compared by artifact; an unreadable keg is not done. Casks never are.
     fn already_done(&self, name: &str, kind: PkgKind, want: Option<&PkgIdentity>) -> bool {
         if kind == PkgKind::Cask {
             return false;
         }
-        match (self.done.get(name), want) {
-            (Some(have), Some(want)) => *have == report::identity_version(want),
-            _ => false,
+        let (Some(version), Some(want)) = (self.done.get(name), want) else {
+            return false;
+        };
+        let Some(rb) = self.brew.keg_receipt(name, version) else {
+            return false;
+        };
+        match crate::identity::parse_formula(&rb) {
+            Ok(have) => PkgIdentity::Formula(have).same_artifact(want),
+            Err(_) => false,
         }
     }
 }
@@ -3817,32 +3826,56 @@ mod tests {
     }
 
     fn two_outdated_world(next_stdout: &str) -> (MockBrew, InMemoryGit) {
-        two_outdated_world_tagged("", next_stdout)
+        two_outdated_world_with(formula_rb, next_stdout)
     }
 
-    /// Like `two_outdated_world`, with every url version carrying `v` (a url
-    /// built from a `v1.1.0` tag), which brew drops from the keg name.
-    fn two_outdated_world_tagged(v: &str, next_stdout: &str) -> (MockBrew, InMemoryGit) {
+    /// A formula whose url version is `go<ver>` (keg `<ver>`), as brew's
+    /// version heuristics name it; identity.rs cannot reproduce those.
+    fn go_style_rb(name: &str, ver: &str, sha: &str) -> String {
+        format!(
+            "class X < Formula\n  url \"https://example.com/{name}/go{ver}.src.tar.gz\"\n  sha256 \"{sha}\"\nend\n"
+        )
+    }
+
+    /// `left` and `right` installed at 1.0.0, soak cutoff 1.1.0, HEAD 1.2.0.
+    /// The mock Cellar holds a keg receipt for `right` at the cutoff version
+    /// (what brew would have written), at HEAD, and at an unrelated 1.0.9.
+    fn two_outdated_world_with(
+        rb: fn(&str, &str, &str) -> String,
+        next_stdout: &str,
+    ) -> (MockBrew, InMemoryGit) {
         let git = InMemoryGit::new();
         for name in ["left", "right"] {
             let dir = &name[..1];
             git.insert_blob(
                 "cutoffsha",
                 &format!("Formula/{dir}/{name}.rb"),
-                formula_rb(name, &format!("{v}1.1.0"), "midsha"),
+                rb(name, "1.1.0", "midsha"),
             );
             git.insert_blob(
                 "headsha",
                 &format!("Formula/{dir}/{name}.rb"),
-                formula_rb(name, &format!("{v}1.2.0"), "newsha"),
+                rb(name, "1.2.0", "newsha"),
+            );
+        }
+        let mut kegs = BTreeMap::new();
+        for (ver, rb_ver, sha) in [
+            ("1.1.0", "1.1.0", "midsha"),
+            ("1.2.0", "1.2.0", "newsha"),
+            ("1.0.9", "1.0.9", "othersha"),
+        ] {
+            kegs.insert(
+                ("right".to_string(), ver.to_string()),
+                rb("right", rb_ver, sha),
             );
         }
         let brew = MockBrew {
             installed: vec![
-                formula_pkg("left", formula_rb("left", &format!("{v}1.0.0"), "oldsha")),
-                formula_pkg("right", formula_rb("right", &format!("{v}1.0.0"), "oldsha")),
+                formula_pkg("left", rb("left", "1.0.0", "oldsha")),
+                formula_pkg("right", rb("right", "1.0.0", "oldsha")),
             ],
             next_stdout: next_stdout.as_bytes().to_vec(),
+            kegs,
             ..MockBrew::new()
         };
         (brew, git)
@@ -3891,23 +3924,41 @@ mod tests {
     }
 
     #[test]
-    fn dependency_upgraded_at_a_v_prefixed_cutoff_is_not_installed_again() {
-        // The url tag is `v1.1.0` but brew names the keg `1.1.0`.
-        let (brew, git) = two_outdated_world_tagged(
-            "v",
+    fn go_style_dependency_poured_at_the_cutoff_counts_as_done() {
+        // Identity version `go1.1.0`, keg `1.1.0`: compared by the keg's own
+        // receipt, not by version strings.
+        let (brew, git) = two_outdated_world_with(
+            go_style_rb,
             "\u{1f37a}  /opt/homebrew/Cellar/right/1.1.0: 5 files, 1MB\n",
         );
         let text = upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
         assert_eq!(visible.len(), 1, "{visible:?}\n{text}");
         assert!(
-            text.contains("[2/2] right 1.1.0: already upgraded as a dependency"),
+            text.contains("[2/2] right go1.1.0: already upgraded as a dependency"),
             "{text}"
         );
-        assert!(
-            text.contains("[1/2] upgrading left 1.0.0 -> 1.1.0"),
-            "{text}"
+    }
+
+    #[test]
+    fn dependency_poured_at_head_instead_of_the_cutoff_is_still_installed() {
+        let (brew, git) = two_outdated_world_with(
+            go_style_rb,
+            "\u{1f37a}  /opt/homebrew/Cellar/right/1.2.0: 5 files, 1MB\n",
         );
+        upgrade_names(&brew, &git, &[]);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(visible.len(), 2, "{visible:?}");
+    }
+
+    #[test]
+    fn unreadable_keg_receipt_is_not_done() {
+        let (mut brew, git) =
+            two_outdated_world("\u{1f37a}  /opt/homebrew/Cellar/right/1.1.0: 5 files, 1MB\n");
+        brew.kegs.clear();
+        upgrade_names(&brew, &git, &[]);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(visible.len(), 2, "{visible:?}");
     }
 
     #[test]
