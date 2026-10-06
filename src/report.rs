@@ -36,17 +36,10 @@ pub fn soak_banner(doing: &str, hours: u32, core: &TapSnapshot, cask: &TapSnapsh
     )
 }
 
-pub fn identity_version(id: &PkgIdentity) -> &str {
-    match id {
-        PkgIdentity::Formula(f) => f.version.as_str(),
-        PkgIdentity::Cask(c) => c.version.as_str(),
-    }
-}
-
-/// The version as it appears in the Cellar path: `1.0.0`, or `1.0.0_2` when
-/// the formula carries a revision. Lets a session compare what it wanted
-/// against what brew reported installing.
-pub fn cellar_version(id: &PkgIdentity) -> String {
+/// The version as brew names it, in messages and in the Cellar path: `1.0.0`,
+/// or `1.0.0_2` when the formula carries a revision. Showing the revision
+/// keeps a revision-only upgrade from reading `1.0.0 -> 1.0.0`.
+pub fn identity_version(id: &PkgIdentity) -> String {
     match id {
         PkgIdentity::Formula(f) if f.revision > 0 => format!("{}_{}", f.version, f.revision),
         PkgIdentity::Formula(f) => f.version.clone(),
@@ -72,10 +65,12 @@ pub fn compact_info_line(
     cutoff: Option<&PkgIdentity>,
     action: DesiredAction,
 ) -> String {
-    let inst = installed.map(identity_version).unwrap_or("-");
+    let inst = installed
+        .map(identity_version)
+        .unwrap_or_else(|| "-".into());
     match action {
         DesiredAction::InstallCutoff => {
-            let cut = cutoff.map(identity_version).unwrap_or("?");
+            let cut = cutoff.map(identity_version).unwrap_or_else(|| "?".into());
             format!("{name}  {inst}  would upgrade to {cut}")
         }
         _ => format!("{name}  {inst}  {}", human_action(action)),
@@ -93,6 +88,7 @@ pub fn evaluate_line(
     let inst = installed.map(identity_version);
     let cut = cutoff.map(identity_version);
     let hd = head.map(identity_version);
+    let (inst, cut, hd) = (inst.as_deref(), cut.as_deref(), hd.as_deref());
     let why = match action {
         DesiredAction::NoOpAlreadySoaked => format!(
             "up to date (soaked); installed {} matches cutoff; {did}",
@@ -256,6 +252,44 @@ mod tests {
             line,
             "packer: installing cutoff 1.16.1; not installed; installing cutoff"
         );
+    }
+
+    fn formula_id(version: &str, revision: u32) -> PkgIdentity {
+        PkgIdentity::Formula(crate::identity::FormulaIdentity {
+            version: version.into(),
+            revision,
+            rebuild: None,
+            sha256: "s".into(),
+        })
+    }
+
+    #[test]
+    fn evaluate_line_shows_the_revision_when_only_the_revision_differs() {
+        let inst = formula_id("26.10.0", 1);
+        let cut = formula_id("26.10.0", 2);
+        let line = evaluate_line(
+            "node",
+            DesiredAction::InstallCutoff,
+            Some(&inst),
+            Some(&cut),
+            None,
+            "installing cutoff",
+        );
+        assert_eq!(
+            line,
+            "node: installing cutoff 26.10.0_2; installed 26.10.0_1 is behind soak; installing cutoff"
+        );
+    }
+
+    #[test]
+    fn compact_line_shows_the_revision() {
+        let line = compact_info_line(
+            "node",
+            Some(&formula_id("26.10.0", 1)),
+            Some(&formula_id("26.10.0", 2)),
+            DesiredAction::InstallCutoff,
+        );
+        assert_eq!(line, "node  26.10.0_1  would upgrade to 26.10.0_2");
     }
 
     #[test]

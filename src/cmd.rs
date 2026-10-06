@@ -525,12 +525,12 @@ pub fn outdated(
                     .installed
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("unknown");
+                    .unwrap_or_else(|| "unknown".into());
                 let cutoff_ver = view
                     .cutoff
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("none");
+                    .unwrap_or_else(|| "none".into());
                 upgrades.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
             }
             DesiredAction::RefuseTooNew
@@ -546,12 +546,12 @@ pub fn outdated(
                     .installed
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("unknown");
+                    .unwrap_or_else(|| "unknown".into());
                 let cutoff_ver = view
                     .cutoff
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("none");
+                    .unwrap_or_else(|| "none".into());
                 auto_updates.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
             }
             DesiredAction::NoOpAlreadySoaked => soaked += 1,
@@ -644,12 +644,20 @@ pub fn info(
                 let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
                     writeln!(out, "{raw}")?;
-                    writeln!(out, "installed: {}", inst.unwrap_or("not installed"))?;
+                    writeln!(
+                        out,
+                        "installed: {}",
+                        inst.as_deref().unwrap_or("not installed")
+                    )?;
                     writeln!(out, "origin: {}", r.origin)?;
                     writeln!(out, "soak: no-soak (brew decides)")?;
                     writeln!(out, "action: no-soak")?;
                 } else {
-                    writeln!(out, "{raw}  {}  no-soak (brew)", inst.unwrap_or("-"))?;
+                    writeln!(
+                        out,
+                        "{raw}  {}  no-soak (brew)",
+                        inst.as_deref().unwrap_or("-")
+                    )?;
                 }
                 continue;
             }
@@ -718,7 +726,7 @@ pub fn info(
                 view.installed
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("not installed")
+                    .unwrap_or_else(|| "not installed".into())
             )?;
             writeln!(
                 out,
@@ -726,7 +734,7 @@ pub fn info(
                 view.cutoff
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("none")
+                    .unwrap_or_else(|| "none".into())
             )?;
             writeln!(
                 out,
@@ -734,7 +742,7 @@ pub fn info(
                 view.head
                     .as_ref()
                     .map(report::identity_version)
-                    .unwrap_or("none")
+                    .unwrap_or_else(|| "none".into())
             )?;
             writeln!(out, "origin: {}", r.origin)?;
             writeln!(out, "soak hours: {}", cfg.effective_hours(&r.origin).get())?;
@@ -1138,7 +1146,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             .cutoff
             .as_ref()
             .map(report::identity_version)
-            .unwrap_or("?");
+            .unwrap_or_else(|| "?".into());
         let doing = match self.brew_verb {
             "install" => "installing",
             "reinstall" => "reinstalling",
@@ -1164,7 +1172,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             .cutoff
             .as_ref()
             .map(report::identity_version)
-            .unwrap_or("?");
+            .unwrap_or_else(|| "?".into());
         writeln!(
             self.out,
             "[{}/{total}] {name} {to}: already upgraded as a dependency",
@@ -1210,7 +1218,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             return false;
         }
         match (self.done.get(name), want) {
-            (Some(have), Some(want)) => *have == report::cellar_version(want),
+            (Some(have), Some(want)) => *have == report::identity_version(want),
             _ => false,
         }
     }
@@ -3890,6 +3898,27 @@ mod tests {
         );
         assert!(
             text.contains("[1/2] upgrading left 1.0.0 -> 1.1.0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn revision_only_upgrade_announces_both_revisions() {
+        let rb = |rev: u32, sha: &str| {
+            format!(
+                "class X < Formula\n  url \"https://example.com/node-26.10.0.tar.gz\"\n  sha256 \"{sha}\"\n  revision {rev}\nend\n"
+            )
+        };
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/n/node.rb", rb(2, "midsha"));
+        git.insert_blob("headsha", "Formula/n/node.rb", rb(2, "midsha"));
+        let brew = MockBrew {
+            installed: vec![formula_pkg("node", rb(1, "oldsha"))],
+            ..MockBrew::new()
+        };
+        let text = upgrade_names(&brew, &git, &["node".to_string()]);
+        assert!(
+            text.contains("upgrading node 26.10.0_1 -> 26.10.0_2"),
             "{text}"
         );
     }
