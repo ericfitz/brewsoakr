@@ -21,6 +21,28 @@ struct Caveat {
     lines: Vec<String>,
 }
 
+/// `text` without ANSI SGR colour sequences (`ESC [ ... m`).
+fn strip_ansi(text: &str) -> String {
+    if !text.contains('\u{1b}') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for d in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&d) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Sections brew emits with `==> `. Used to tell a real section header from a
 /// package sub-header inside a caveats block (`==> node`).
 const SECTION_WORDS: [&str; 9] = [
@@ -38,6 +60,8 @@ const SECTION_WORDS: [&str; 9] = [
 #[derive(Debug, Default)]
 pub struct Filter {
     state: Option<State>,
+    /// The last line shown in this brew run, for dropping an immediate repeat.
+    last_shown: Option<String>,
     /// Package most recently seen installing; names an unlabeled caveats block.
     last_pkg: Option<String>,
     /// Set right after `==> Upgrading x`, when the next indented line is the
@@ -61,6 +85,7 @@ impl Filter {
     pub fn start_run(&mut self) {
         self.state = Some(State::Normal);
         self.expect_version_line = false;
+        self.last_shown = None;
     }
 
     /// Cellar versions of packages brew installed, including transitive deps.
@@ -76,9 +101,23 @@ impl Filter {
         self.freed_bytes
     }
 
-    /// One raw brew line in, at most one line to show the user out.
+    /// One raw brew line in, at most one line to show the user out. ANSI
+    /// colour is dropped before matching, so brew's coloured `==>` marker is
+    /// treated like the plain one, and a line identical to the one shown just
+    /// before it is not shown again (brew prints some lines twice). The log
+    /// keeps every raw byte; this is only the terminal view.
     pub fn line(&mut self, raw: &str) -> Option<String> {
-        let t = raw.trim_end_matches(['\r', '\n']);
+        let out = self.filter_line(raw)?;
+        if self.last_shown.as_deref() == Some(out.as_str()) {
+            return None;
+        }
+        self.last_shown = Some(out.clone());
+        Some(out)
+    }
+
+    fn filter_line(&mut self, raw: &str) -> Option<String> {
+        let plain = strip_ansi(raw.trim_end_matches(['\r', '\n']));
+        let t = plain.as_str();
         match self.state.unwrap_or(State::Normal) {
             State::Caveats => self.caveat_line(t),
             State::Cleanup => self.cleanup_line(t),
@@ -542,6 +581,39 @@ To install completions, run:
     fn unknown_lines_pass_through_without_arrows() {
         let (out, _) = run("==> Something brand new\nplain line");
         assert_eq!(out, vec!["Something brand new", "plain line"]);
+    }
+
+    #[test]
+    fn ansi_wrapped_marker_is_stripped_like_a_plain_one() {
+        let plain = run("==> Verifying checksum for 'x.tar.gz'").0;
+        let coloured =
+            run("\u{1b}[34m==>\u{1b}[0m \u{1b}[1mVerifying checksum for 'x.tar.gz'\u{1b}[0m").0;
+        assert_eq!(plain, vec!["Verifying checksum for 'x.tar.gz'"]);
+        assert_eq!(coloured, plain);
+    }
+
+    #[test]
+    fn ansi_wrapped_section_words_are_still_recognised() {
+        let (out, _) = run("\u{1b}[34m==>\u{1b}[0m \u{1b}[1mDownloading https://x\u{1b}[0m");
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn a_line_identical_to_the_one_just_shown_is_not_shown_again() {
+        let (out, _) = run("==> Verifying checksum for 'x'\n\
+             \u{1b}[34m==>\u{1b}[0m \u{1b}[1mVerifying checksum for 'x'\u{1b}[0m\n\
+             plain\nplain\nother");
+        assert_eq!(out, vec!["Verifying checksum for 'x'", "plain", "other"]);
+    }
+
+    #[test]
+    fn a_new_run_may_repeat_the_previous_runs_last_line() {
+        let mut f = Filter::new();
+        f.start_run();
+        assert!(f.line("same").is_some());
+        assert!(f.line("same").is_none());
+        f.start_run();
+        assert!(f.line("same").is_some());
     }
 
     #[test]
