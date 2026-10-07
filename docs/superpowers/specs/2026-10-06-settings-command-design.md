@@ -43,6 +43,7 @@ design review. They are not to be changed without the maintainer's approval.
 | `settings no-soak remove TOKEN...` | Remove each matching entry from `NO_SOAK`. |
 | `settings tap-hours USER/REPO N` | Set that tap's `soak_hours`, creating its `[[TAP]]` entry if missing. |
 | `settings tap-hours USER/REPO --clear` | Remove that tap's `soak_hours`; remove the whole entry if only `name` remains. |
+| `settings repair` | Fix what the reader notes or warns about (see the section below). |
 
 `N` is an integer ≥ 1 (`SoakHours::new`). `homebrew/core` and `homebrew/cask`
 are valid `USER/REPO` values.
@@ -173,3 +174,21 @@ On any I/O error the temp file is removed and the error is returned as
 
 README "Configuration" gains a `brewsoak settings` section, and the sentence
 "`[[TAP]]` and `NO_SOAK` are file-only" is updated. `--help` lists `settings`.
+
+## `settings repair` (issue #5, maintainer decisions 2026-10-06)
+
+These are human decisions made by the maintainer; do not change them without
+the maintainer's approval.
+
+- **Scope.** Invalid and non-string `NO_SOAK` entries are removed. A lone
+  valid `NO_SOAK` string is converted to a one-element array. A `NO_SOAK`
+  written inside a `[[TAP]]` table has its valid entries merged into the
+  top-level list (created above the first `[[TAP]]` if missing) and the
+  misplaced key is removed. Invalid `[[TAP]]` entries are removed, a bad
+  `soak_hours` is removed (the entry too if only `name` is left), and for
+  duplicate `[[TAP]]` names the last one is kept. Valid entries keep their
+  text, order, comments, and layout.
+- **Refusals.** A `NO_SOAK` that is not an array and not a valid string, and
+  a `TAP` that is not an array of tables, are refused and nothing is written.
+- **No-op.** Nothing to repair prints `nothing to repair`, writes nothing,
+  and makes no backup.

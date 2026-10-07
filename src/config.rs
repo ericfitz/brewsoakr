@@ -167,18 +167,20 @@ fn parse_taps(v: &toml::Value, out: &mut ParsedFile) {
                 .and_then(toml::Value::as_str)
                 .unwrap_or("(unnamed)");
             out.warnings.push(format!(
-                "config: NO_SOAK inside [[TAP]] {label} is ignored; move it above the first [[TAP]] table"
+                "config: NO_SOAK inside [[TAP]] {label} is ignored; move it above the first [[TAP]] table; run brewsoak settings repair"
             ));
         }
         let Some(name) = entry.get("name").and_then(toml::Value::as_str) else {
-            out.notes
-                .push("config: [[TAP]] entry is missing name; skipped".into());
+            out.notes.push(
+                "config: [[TAP]] entry is missing name; skipped; run brewsoak settings repair"
+                    .into(),
+            );
             continue;
         };
         let lower = name.trim().to_ascii_lowercase();
         if lower.split('/').count() != 2 || lower.split('/').any(str::is_empty) {
             out.notes.push(format!(
-                "config: [[TAP]] name {name:?} is not user/repo; skipped"
+                "config: [[TAP]] name {name:?} is not user/repo; skipped; run brewsoak settings repair"
             ));
             continue;
         }
@@ -192,7 +194,7 @@ fn parse_taps(v: &toml::Value, out: &mut ParsedFile) {
                 Some(h) => Some(h),
                 None => {
                     out.notes.push(format!(
-                        "config: [[TAP]] {lower} soak_hours {h} is not an integer >= 1; using SOAK_HOURS"
+                        "config: [[TAP]] {lower} soak_hours {h} is not an integer >= 1; using SOAK_HOURS; run brewsoak settings repair"
                     ));
                     None
                 }
@@ -200,7 +202,7 @@ fn parse_taps(v: &toml::Value, out: &mut ParsedFile) {
         };
         if let Some(pos) = out.taps.iter().position(|t| t.name == lower) {
             out.notes.push(format!(
-                "config: duplicate [[TAP]] {lower}; last entry wins"
+                "config: duplicate [[TAP]] {lower}; last entry wins; run brewsoak settings repair"
             ));
             out.taps.remove(pos);
         }
@@ -215,19 +217,33 @@ fn parse_no_soak(v: &toml::Value, out: &mut ParsedFile) {
     let Some(raw) = v.get("NO_SOAK") else {
         return;
     };
-    let strings: Option<Vec<&str>> = raw
-        .as_array()
-        .and_then(|a| a.iter().map(toml::Value::as_str).collect());
+    let Some(array) = raw.as_array() else {
+        let hint = if raw.as_str().is_some_and(|s| nosoak::parse_entry(s).is_ok()) {
+            "; run brewsoak settings repair"
+        } else {
+            ""
+        };
+        out.notes.push(format!(
+            "config: NO_SOAK is not an array of strings; ignored{hint}"
+        ));
+        return;
+    };
+    let strings: Option<Vec<&str>> = array.iter().map(toml::Value::as_str).collect();
     let Some(strings) = strings else {
-        out.notes
-            .push("config: NO_SOAK is not an array of strings; ignored".into());
+        out.notes.push(
+            "config: NO_SOAK contains non-string entries; ignored; run brewsoak settings repair"
+                .into(),
+        );
         return;
     };
     let mut entries = Vec::new();
     for s in strings {
         match nosoak::parse_entry(s) {
             Ok(e) => entries.push(e),
-            Err(reason) => out.notes.push(format!("config: {reason}")),
+            Err(reason) => out.notes.push(format!(
+                "config: {}; run brewsoak settings repair",
+                reason.trim_end_matches("; skipped")
+            )),
         }
     }
     out.no_soak = NoSoakList::new(entries);
@@ -924,7 +940,62 @@ name = "cyclonedx/cyclonedx"
         let p = parse_file("NO_SOAK = [\"wget\", \"a/b/c/d\", \"\"]\n");
         assert!(p.no_soak.matches("homebrew/core", "wget"));
         assert!(!p.no_soak.matches("a/b", "c"));
-        assert_eq!(p.notes.len(), 2, "{:?}", p.notes);
+        assert_eq!(
+            p.notes,
+            [
+                "config: NO_SOAK entry \"a/b/c/d\" has more than two slashes; run brewsoak settings repair",
+                "config: NO_SOAK entry is empty; run brewsoak settings repair",
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_no_soak_string_points_at_repair_only_when_repair_can_fix_it() {
+        let p = parse_file("NO_SOAK = \"wget\"\n");
+        assert_eq!(
+            p.notes,
+            ["config: NO_SOAK is not an array of strings; ignored; run brewsoak settings repair"]
+        );
+        for bad in ["NO_SOAK = \"a//b\"\n", "NO_SOAK = 3\n"] {
+            let p = parse_file(bad);
+            assert_eq!(
+                p.notes,
+                ["config: NO_SOAK is not an array of strings; ignored"]
+            );
+        }
+    }
+
+    #[test]
+    fn tap_problems_point_at_repair() {
+        let p = parse_file(
+            "[[TAP]]\nsoak_hours = 1\n\n[[TAP]]\nname = \"x\"\n\n[[TAP]]\nname = \"a/b\"\nsoak_hours = 0\nNO_SOAK = [\"w\"]\n\n[[TAP]]\nname = \"a/b\"\n",
+        );
+        assert_eq!(p.notes.len(), 4, "{:?}", p.notes);
+        assert!(
+            p.notes
+                .iter()
+                .chain(&p.warnings)
+                .all(|n| n.ends_with("; run brewsoak settings repair")),
+            "{:?} {:?}",
+            p.notes,
+            p.warnings
+        );
+        assert_eq!(p.warnings.len(), 1);
+    }
+
+    #[test]
+    fn no_soak_with_non_strings_is_ignored_and_points_at_repair() {
+        let p = parse_file("NO_SOAK = [\"wget\", 3]\n");
+        assert!(p.no_soak.is_empty());
+        assert_eq!(
+            p.notes,
+            ["config: NO_SOAK contains non-string entries; ignored; run brewsoak settings repair"]
+        );
+        let p = parse_file("NO_SOAK = \"wget\"\n");
+        assert_eq!(
+            p.notes,
+            ["config: NO_SOAK is not an array of strings; ignored; run brewsoak settings repair"]
+        );
     }
 
     #[test]

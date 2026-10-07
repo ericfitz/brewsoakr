@@ -179,13 +179,19 @@ fn separate_taps(doc: &mut DocumentMut, had_values: bool) {
     }
 }
 
+/// `parse_entry`'s reasons end `; skipped`, which describes the reader, not
+/// an edit.
+fn trim_skipped(reason: &str) -> String {
+    reason.trim_end_matches("; skipped").to_string()
+}
+
 /// Every token through `nosoak::parse_entry`, the config reader's parser.
 /// All bad tokens go in one usage error; the result is lowercased.
 fn validate_tokens(tokens: &[String]) -> Result<Vec<String>, Error> {
     let bad: Vec<String> = tokens
         .iter()
         .filter_map(|t| nosoak::parse_entry(t).err())
-        .map(|reason| reason.trim_end_matches("; skipped").to_string())
+        .map(|reason| trim_skipped(&reason))
         .collect();
     if !bad.is_empty() {
         return Err(Error::Usage(format!(
@@ -199,18 +205,64 @@ fn validate_tokens(tokens: &[String]) -> Result<Vec<String>, Error> {
         .collect())
 }
 
-/// `Ok(None)`: no top-level key. `Err`: the key exists but is not an array
-/// of strings, which the reader ignores and this editor will not clobber.
-fn no_soak_array(doc: &mut DocumentMut) -> Result<Option<&mut Array>, Error> {
+/// `Ok(None)`: no top-level key. `Err`: the key exists but is not an array,
+/// which the reader ignores and no editor will clobber.
+fn no_soak_any_array(doc: &mut DocumentMut) -> Result<Option<&mut Array>, Error> {
     let Some(item) = doc.get_mut("NO_SOAK") else {
         return Ok(None);
     };
+    let lone = lone_valid_string(item);
     match item.as_array_mut() {
-        Some(arr) if arr.iter().all(|v| v.as_str().is_some()) => Ok(Some(arr)),
-        _ => Err(Error::Refusal(
-            "config: NO_SOAK is not an array of strings; fix it by hand".into(),
+        Some(arr) => Ok(Some(arr)),
+        None if lone => Err(Error::Refusal(
+            "config: NO_SOAK is not an array; run brewsoak settings repair".into(),
+        )),
+        None => Err(Error::Refusal(
+            "config: NO_SOAK is not an array; fix it by hand".into(),
         )),
     }
+}
+
+/// Like `no_soak_any_array`, but an array with a non-string element is
+/// refused too: add and remove leave it for `settings repair`.
+fn no_soak_array(doc: &mut DocumentMut) -> Result<Option<&mut Array>, Error> {
+    match no_soak_any_array(doc)? {
+        Some(arr) if arr.iter().any(|v| v.as_str().is_none()) => Err(Error::Refusal(
+            "config: NO_SOAK contains non-string entries; run brewsoak settings repair".into(),
+        )),
+        other => Ok(other),
+    }
+}
+
+/// Drop every element `gone` matches. The first element's prefix and the
+/// last one's suffix hold the array's padding (`[ "a"`, `"b"\n]`); hand them
+/// to whichever element becomes first or last. Returns how many went.
+fn retain_keeping_padding(arr: &mut Array, gone: impl Fn(&Value) -> bool) -> usize {
+    let first_gone = arr.get(0).filter(|v| gone(v)).map(|v| prefix_of(v.decor()));
+    let last_gone = arr.iter().last().filter(|v| gone(v)).map(|v| {
+        v.decor()
+            .suffix()
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    });
+    let before = arr.len();
+    arr.retain(|v| !gone(v));
+    let removed = before - arr.len();
+    if removed == 0 {
+        return 0;
+    }
+    if let Some(prefix) = first_gone
+        && let Some(first) = arr.get_mut(0)
+    {
+        first.decor_mut().set_prefix(prefix);
+    }
+    if let Some(suffix) = last_gone
+        && let Some(last) = arr.len().checked_sub(1).and_then(|i| arr.get_mut(i))
+    {
+        last.decor_mut().set_suffix(suffix);
+    }
+    removed
 }
 
 fn no_soak_contains(arr: &Array, token: &str) -> bool {
@@ -279,40 +331,404 @@ pub fn no_soak_remove(doc: &mut DocumentMut, tokens: &[String]) -> Result<Edit, 
             v.as_str()
                 .is_some_and(|s| s.trim().eq_ignore_ascii_case(&token))
         };
-        // The first element's prefix and the last one's suffix hold the
-        // array's padding (`[ "a"`, `"b"\n]`); hand them to whichever
-        // element becomes first or last.
-        let first_gone = arr
-            .get(0)
-            .filter(|v| matches(v))
-            .map(|v| prefix_of(v.decor()));
-        let last_gone = arr.iter().last().filter(|v| matches(v)).map(|v| {
-            v.decor()
-                .suffix()
-                .and_then(|s| s.as_str())
-                .unwrap_or("")
-                .to_string()
-        });
-        let before = arr.len();
-        arr.retain(|v| !matches(v));
-        if arr.len() == before {
+        if retain_keeping_padding(arr, matches) == 0 {
             edit.messages.push(format!("not in NO_SOAK: {token}"));
             continue;
         }
         edit.changed = true;
         edit.messages.push(format!("removed from NO_SOAK: {token}"));
-        if let Some(prefix) = first_gone
-            && let Some(first) = arr.get_mut(0)
-        {
-            first.decor_mut().set_prefix(prefix);
-        }
-        if let Some(suffix) = last_gone
-            && let Some(last) = arr.len().checked_sub(1).and_then(|i| arr.get_mut(i))
-        {
-            last.decor_mut().set_suffix(suffix);
-        }
     }
     Ok(edit)
+}
+
+/// The element as the file spells it, without its padding or comments.
+fn as_written(v: &Value) -> String {
+    let mut bare = v.clone();
+    *bare.decor_mut() = toml_edit::Decor::default();
+    bare.to_string()
+}
+
+fn decor_text(s: Option<&toml_edit::RawString>) -> String {
+    s.and_then(|s| s.as_str()).unwrap_or("").to_string()
+}
+
+fn is_multiline(arr: &Array) -> bool {
+    arr.trailing().as_str().is_some_and(|s| s.contains('\n'))
+        || arr.iter().any(|v| {
+            decor_text(v.decor().prefix()).contains('\n')
+                || decor_text(v.decor().suffix()).contains('\n')
+        })
+}
+
+/// Split at the first newline: the text on the previous element's line,
+/// and everything from the newline on.
+fn split_line(s: &str) -> (&str, &str) {
+    s.find('\n').map_or((s, ""), |i| s.split_at(i))
+}
+
+/// `retain_keeping_padding` for an array written one entry per line. A
+/// comment after an element's comma is stored in the next element's prefix
+/// (the last one's in the array's trailing text), so dropping an element
+/// must leave its predecessor's comment behind and drop its own.
+fn remove_keeping_lines(arr: &mut Array, gone: impl Fn(&Value) -> bool) {
+    let mut i = 0;
+    while i < arr.len() {
+        if !arr.get(i).is_some_and(&gone) {
+            i += 1;
+            continue;
+        }
+        let prefix = decor_text(arr.get(i).and_then(|v| v.decor().prefix()));
+        let (head, _) = split_line(&prefix);
+        if i + 1 < arr.len() {
+            let next = decor_text(arr.get(i + 1).and_then(|v| v.decor().prefix()));
+            let new = if prefix.contains('\n') && next.contains('\n') {
+                format!("{head}{}", split_line(&next).1)
+            } else if i == 0 {
+                prefix.clone()
+            } else {
+                next
+            };
+            if let Some(v) = arr.get_mut(i + 1) {
+                v.decor_mut().set_prefix(new);
+            }
+        } else if arr.trailing_comma() {
+            let trailing = decor_text(Some(arr.trailing()));
+            if prefix.contains('\n') && trailing.contains('\n') {
+                arr.set_trailing(format!("{head}{}", split_line(&trailing).1));
+            }
+        } else if i > 0 {
+            let suffix = decor_text(arr.get(i).and_then(|v| v.decor().suffix()));
+            let new = if prefix.contains('\n') && suffix.contains('\n') {
+                format!("{head}{}", split_line(&suffix).1)
+            } else {
+                suffix
+            };
+            if let Some(v) = arr.get_mut(i - 1) {
+                v.decor_mut().set_suffix(new);
+            }
+        }
+        arr.remove(i);
+    }
+    if arr.is_empty() {
+        arr.set_trailing_comma(false);
+    }
+}
+
+/// Why the reader drops this element, or `None` when it keeps it.
+fn invalid_reason(v: &Value) -> Option<String> {
+    match v.as_str() {
+        None => Some("not a string".into()),
+        Some(s) => nosoak::parse_entry(s).err().map(|r| trim_skipped(&r)),
+    }
+}
+
+const REPAIR_NOTHING: &str = "nothing to repair";
+
+/// A top-level `NO_SOAK` that is a lone string the reader would accept as an
+/// entry: `repair` wraps it in an array.
+fn lone_valid_string(item: &Item) -> bool {
+    item.as_str()
+        .is_some_and(|s| nosoak::parse_entry(s).is_ok())
+}
+
+/// Step A: wrap a lone valid string in an array, keeping it as written.
+fn repair_convert_lone_string(doc: &mut DocumentMut, messages: &mut Vec<String>) {
+    let Some(item) = doc.get_mut("NO_SOAK") else {
+        return;
+    };
+    if !lone_valid_string(item) {
+        return;
+    }
+    let Some(old) = item.as_value() else {
+        return;
+    };
+    let decor = old.decor().clone();
+    let mut entry = old.clone();
+    *entry.decor_mut() = toml_edit::Decor::default();
+    messages.push(format!(
+        "converted NO_SOAK to an array: {}",
+        as_written(&entry)
+    ));
+    let mut arr = Array::new();
+    arr.push_formatted(entry);
+    let mut new = Value::Array(arr);
+    *new.decor_mut() = decor;
+    *item = Item::Value(new);
+}
+
+/// Step B: drop the elements of the top-level array the reader rejects.
+fn repair_top_array(doc: &mut DocumentMut, messages: &mut Vec<String>) {
+    let Some(arr) = doc.get_mut("NO_SOAK").and_then(Item::as_array_mut) else {
+        return;
+    };
+    let before = messages.len();
+    messages.extend(arr.iter().filter_map(|v| {
+        invalid_reason(v)
+            .map(|reason| format!("removed from NO_SOAK: {} ({reason})", as_written(v)))
+    }));
+    if messages.len() == before {
+        return;
+    }
+    if is_multiline(arr) {
+        remove_keeping_lines(arr, |v| invalid_reason(v).is_some());
+    } else {
+        retain_keeping_padding(arr, |v| invalid_reason(v).is_some());
+    }
+}
+
+/// One element of a `NO_SOAK` found inside a `[[TAP]]` table.
+enum Misplaced {
+    Valid(String),
+    Invalid { written: String, reason: String },
+}
+
+fn misplaced_pieces(item: &Item) -> Vec<Misplaced> {
+    let piece = |v: &Value| match invalid_reason(v) {
+        Some(reason) => Misplaced::Invalid {
+            written: as_written(v),
+            reason,
+        },
+        None => Misplaced::Valid(v.as_str().unwrap_or_default().to_string()),
+    };
+    match item {
+        Item::Value(Value::Array(arr)) => arr.iter().map(piece).collect(),
+        Item::Value(v) => vec![piece(v)],
+        other => vec![Misplaced::Invalid {
+            written: other.type_name().to_string(),
+            reason: "not a string".into(),
+        }],
+    }
+}
+
+fn tap_label(table: &Table) -> String {
+    table
+        .get("name")
+        .and_then(Item::as_str)
+        .unwrap_or("(unnamed)")
+        .to_string()
+}
+
+/// Remove `key` from the `[[TAP]]` table at `i`. A comment above it goes to
+/// the next key, else to the next `[[TAP]]`, else to the end of the file.
+fn remove_tap_key(doc: &mut DocumentMut, i: usize, key: &str) {
+    let tables = doc
+        .get_mut("TAP")
+        .and_then(Item::as_array_of_tables_mut)
+        .expect("TAP was checked");
+    let table = tables.get_mut(i).expect("index in range");
+    let Some(idx) = table.iter().position(|(k, _)| k == key) else {
+        return;
+    };
+    let why = table
+        .key(key)
+        .map(|k| prefix_of(k.leaf_decor()))
+        .unwrap_or_default();
+    table.remove(key);
+    if why.is_empty() {
+        return;
+    }
+    let carried = table.iter_mut().nth(idx).is_some_and(|(mut next, item)| {
+        item.is_value() && {
+            let old = prefix_of(next.leaf_decor());
+            next.leaf_decor_mut().set_prefix(format!("{why}{old}"));
+            true
+        }
+    });
+    if !carried {
+        carry_to_tap(doc, i + 1, &why);
+    }
+}
+
+/// Remove the `[[TAP]]` table at `i`; its comments go to the next table.
+fn remove_tap_table(doc: &mut DocumentMut, i: usize) {
+    let tables = doc
+        .get_mut("TAP")
+        .and_then(Item::as_array_of_tables_mut)
+        .expect("TAP was checked");
+    let removed = prefix_of(tables.get(i).expect("index in range").decor());
+    tables.remove(i);
+    if tables.is_empty() {
+        doc.as_table_mut().remove("TAP");
+    }
+    carry_to_tap(doc, i, &removed);
+}
+
+/// Step C: move the valid entries of a `NO_SOAK` written inside a `[[TAP]]`
+/// table to the top-level list and delete the misplaced key.
+fn repair_misplaced_no_soak(doc: &mut DocumentMut, messages: &mut Vec<String>) {
+    let had_values = root_has_values(doc);
+    let mut created = false;
+    let count = doc
+        .get("TAP")
+        .and_then(Item::as_array_of_tables)
+        .map_or(0, ArrayOfTables::len);
+    for i in 0..count {
+        let found = doc
+            .get("TAP")
+            .and_then(Item::as_array_of_tables)
+            .and_then(|t| t.get(i))
+            .and_then(|t| {
+                t.get("NO_SOAK")
+                    .map(|item| (tap_label(t), misplaced_pieces(item)))
+            });
+        let Some((label, pieces)) = found else {
+            continue;
+        };
+        if pieces.is_empty() {
+            messages.push(format!("removed empty NO_SOAK from [[TAP]] {label}"));
+        }
+        for piece in pieces {
+            match piece {
+                Misplaced::Invalid { written, reason } => messages.push(format!(
+                    "removed from [[TAP]] {label} NO_SOAK: {written} ({reason})"
+                )),
+                Misplaced::Valid(entry) => {
+                    if doc.get("NO_SOAK").is_none() {
+                        doc["NO_SOAK"] = value(Array::new());
+                        created = true;
+                    }
+                    let arr = doc
+                        .get_mut("NO_SOAK")
+                        .and_then(Item::as_array_mut)
+                        .expect("top-level NO_SOAK is an array here");
+                    if no_soak_contains(arr, entry.trim()) {
+                        messages.push(format!("already in NO_SOAK: {entry}"));
+                    } else {
+                        push_entry(arr, &entry);
+                        messages.push(format!("moved to NO_SOAK from [[TAP]] {label}: {entry}"));
+                    }
+                }
+            }
+        }
+        remove_tap_key(doc, i, "NO_SOAK");
+    }
+    if created {
+        separate_taps(doc, had_values);
+    }
+}
+
+/// The reader's name rule: a string of exactly two non-empty segments.
+/// `Err` carries the reader's reason, without `; skipped`.
+fn reader_tap_name(table: &Table) -> Result<String, String> {
+    let Some(name) = table.get("name").and_then(Item::as_str) else {
+        return Err("[[TAP]] entry is missing name".into());
+    };
+    let lower = name.trim().to_ascii_lowercase();
+    if lower.split('/').count() != 2 || lower.split('/').any(str::is_empty) {
+        return Err(format!("[[TAP]] name {name:?} is not user/repo"));
+    }
+    Ok(lower)
+}
+
+fn tap_len(doc: &DocumentMut) -> usize {
+    doc.get("TAP")
+        .and_then(Item::as_array_of_tables)
+        .map_or(0, ArrayOfTables::len)
+}
+
+fn tap_table(doc: &DocumentMut, i: usize) -> &Table {
+    doc.get("TAP")
+        .and_then(Item::as_array_of_tables)
+        .and_then(|t| t.get(i))
+        .expect("index in range")
+}
+
+/// Step D: drop `[[TAP]]` entries and keys the reader rejects, and earlier
+/// duplicates (the reader lets the last one win).
+fn repair_taps(doc: &mut DocumentMut, messages: &mut Vec<String>) {
+    // Bad or missing names: the whole table goes.
+    let mut i = 0;
+    while i < tap_len(doc) {
+        match reader_tap_name(tap_table(doc, i)) {
+            Ok(_) => i += 1,
+            Err(reason) => {
+                messages.push(format!("removed [[TAP]] entry: {reason}"));
+                remove_tap_table(doc, i);
+            }
+        }
+    }
+    // Duplicates are judged as the reader does, before bad soak_hours is
+    // dropped, so the entry that wins does not change.
+    let mut i = 0;
+    while i < tap_len(doc) {
+        let me = reader_tap_name(tap_table(doc, i)).expect("names were checked");
+        let later = (i + 1..tap_len(doc))
+            .any(|j| reader_tap_name(tap_table(doc, j)).is_ok_and(|other| other == me));
+        if later {
+            messages.push(format!(
+                "removed duplicate [[TAP]] {me} (the last one is kept)"
+            ));
+            remove_tap_table(doc, i);
+        } else {
+            i += 1;
+        }
+    }
+    let mut i = 0;
+    while i < tap_len(doc) {
+        let table = tap_table(doc, i);
+        let bad = table.get("soak_hours").filter(|item| {
+            item.as_integer()
+                .and_then(|n| u32::try_from(n).ok())
+                .and_then(SoakHours::new)
+                .is_none()
+        });
+        let Some(bad) = bad else {
+            i += 1;
+            continue;
+        };
+        let written = bad
+            .as_value()
+            .map_or_else(|| bad.type_name().to_string(), as_written);
+        let name = reader_tap_name(table).expect("names were checked");
+        messages.push(format!(
+            "removed [[TAP]] {name} soak_hours {written}: not an integer >= 1"
+        ));
+        remove_tap_key(doc, i, "soak_hours");
+        let table = tap_table(doc, i);
+        if table.len() == 1 && table.contains_key("name") {
+            remove_tap_table(doc, i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// Make the file's `NO_SOAK` and `[[TAP]]` entries what the reader accepts,
+/// so it stops noting or warning about them. In order: a lone valid string
+/// becomes a one-element array; invalid elements leave the top-level array;
+/// entries of a misplaced `NO_SOAK` inside `[[TAP]]` move to the top-level
+/// list; invalid `[[TAP]]` entries, bad `soak_hours` and earlier duplicates
+/// go. Valid entries keep their text, order, comments and layout. A value
+/// that cannot be repaired is refused before anything is touched.
+pub fn no_soak_repair(doc: &mut DocumentMut) -> Result<Edit, Error> {
+    if let Some(item) = doc.get("NO_SOAK")
+        && !item.is_array()
+        && !lone_valid_string(item)
+    {
+        return Err(Error::Refusal(
+            "config: NO_SOAK is not an array of strings and cannot be repaired; fix it by hand"
+                .into(),
+        ));
+    }
+    tap_tables(doc)?;
+    let before = doc.to_string();
+    let mut messages = Vec::new();
+    repair_convert_lone_string(doc, &mut messages);
+    repair_top_array(doc, &mut messages);
+    repair_misplaced_no_soak(doc, &mut messages);
+    repair_taps(doc, &mut messages);
+    // The document, not the message list, says whether anything changed, so
+    // a step that edits without reporting is still written (and visible).
+    if doc.to_string() == before {
+        return Ok(Edit::unchanged(REPAIR_NOTHING));
+    }
+    if messages.is_empty() {
+        messages.push("repaired the file".into());
+    }
+    Ok(Edit {
+        changed: true,
+        messages,
+    })
 }
 
 /// Same rule as the `[[TAP]]` reader: exactly two non-empty segments.
@@ -324,11 +740,14 @@ pub fn normalize_tap(raw: &str) -> Result<String, Error> {
     Ok(lower)
 }
 
-/// `Ok(None)`: no `TAP` key. `Err`: it exists but is not `[[TAP]]` tables.
+/// `Ok(None)`: no `TAP` key, or an empty `TAP = []`. `Err`: it exists but is not `[[TAP]]` tables.
 fn tap_tables(doc: &mut DocumentMut) -> Result<Option<&mut ArrayOfTables>, Error> {
     let Some(item) = doc.get_mut("TAP") else {
         return Ok(None);
     };
+    if item.as_array().is_some_and(Array::is_empty) {
+        return Ok(None);
+    }
     item.as_array_of_tables_mut().map(Some).ok_or_else(|| {
         Error::Refusal("config: TAP is not an array of tables; fix it by hand".into())
     })
@@ -830,6 +1249,422 @@ mod tests {
                 }
                 assert_eq!(d.to_string(), contents);
             }
+        }
+    }
+
+    fn repair(contents: &str) -> (DocumentMut, Result<Edit, Error>) {
+        let mut d = doc(contents);
+        let r = no_soak_repair(&mut d);
+        (d, r)
+    }
+
+    #[test]
+    fn repair_removes_invalid_strings_and_keeps_valid_ones_as_written() {
+        let (d, r) =
+            repair("NO_SOAK = [\"WGet\", \"a//b\", \" Ericfitz/Tap \", \"a/b/c/d\", \"\"]\n");
+        let edit = r.unwrap();
+        assert!(edit.changed);
+        assert_eq!(
+            edit.messages,
+            [
+                "removed from NO_SOAK: \"a//b\" (NO_SOAK entry \"a//b\" has an empty path segment)",
+                "removed from NO_SOAK: \"a/b/c/d\" (NO_SOAK entry \"a/b/c/d\" has more than two slashes)",
+                "removed from NO_SOAK: \"\" (NO_SOAK entry is empty)",
+            ]
+        );
+        assert_eq!(d.to_string(), "NO_SOAK = [\"WGet\", \" Ericfitz/Tap \"]\n");
+    }
+
+    #[test]
+    fn repair_removes_non_string_elements() {
+        let (d, r) = repair("NO_SOAK = [\"wget\", 3, true, [1], { a = 1 }]\n");
+        let edit = r.unwrap();
+        assert!(edit.changed);
+        assert_eq!(
+            edit.messages,
+            [
+                "removed from NO_SOAK: 3 (not a string)",
+                "removed from NO_SOAK: true (not a string)",
+                "removed from NO_SOAK: [1] (not a string)",
+                "removed from NO_SOAK: { a = 1 } (not a string)",
+            ]
+        );
+        assert_eq!(d.to_string(), "NO_SOAK = [\"wget\"]\n");
+    }
+
+    #[test]
+    fn repair_with_nothing_to_do_is_unchanged() {
+        for contents in [
+            "",
+            "SOAK_HOURS = 6\n",
+            "NO_SOAK = []\n",
+            "NO_SOAK = [\"wget\", \"A/B\"]\n",
+        ] {
+            let (d, r) = repair(contents);
+            assert_eq!(
+                r.unwrap(),
+                Edit::unchanged("nothing to repair"),
+                "{contents:?}"
+            );
+            assert_eq!(d.to_string(), contents);
+        }
+    }
+
+    #[test]
+    fn repair_keeps_comments() {
+        let (d, r) = repair(
+            "# why\nNO_SOAK = [\n  \"wget\", # keep\n  \"a//b\", # gone\n  \"curl\", # also keep\n] # tail\n",
+        );
+        assert!(r.unwrap().changed);
+        assert_eq!(
+            d.to_string(),
+            "# why\nNO_SOAK = [\n  \"wget\", # keep\n  \"curl\", # also keep\n] # tail\n"
+        );
+    }
+
+    #[test]
+    fn repair_keeps_the_comments_of_surviving_elements_at_every_position() {
+        let cases = [
+            (
+                "[ # open\n  \"\", # gone\n  \"a\", # c1\n  # lead b\n  \"b\", # c2\n  # end\n]",
+                "[ # open\n  \"a\", # c1\n  # lead b\n  \"b\", # c2\n  # end\n]",
+            ),
+            (
+                "[\n  \"a\", # c1\n  \"b//c\", # gone\n]",
+                "[\n  \"a\", # c1\n]",
+            ),
+            (
+                "[\n  \"a\", # c1\n  \"b//c\" # gone\n]",
+                "[\n  \"a\" # c1\n]",
+            ),
+            (
+                "[\n  \"a\", # c1\n  \"\", # gone1\n  \"b//c\", # gone2\n  \"d\", # c4\n]",
+                "[\n  \"a\", # c1\n  \"d\", # c4\n]",
+            ),
+        ];
+        for (arr, want) in cases {
+            let (d, r) = repair(&format!("NO_SOAK = {arr}\n"));
+            assert!(r.unwrap().changed, "{arr}");
+            assert_eq!(d.to_string(), format!("NO_SOAK = {want}\n"), "{arr}");
+        }
+    }
+
+    #[test]
+    fn repair_keeps_array_layout() {
+        let cases = [
+            ("[ \"\", \"wget\", \"a//b\" ]", "[ \"wget\" ]"),
+            (
+                "[ \"\", \"a\", \"x/\", \"b\", \"c//d\" ]",
+                "[ \"a\", \"b\" ]",
+            ),
+            ("[\"\",\"a\"]", "[\"a\"]"),
+            ("[\"a\",\"\"]", "[\"a\"]"),
+            ("[ \"\", \"a//b\" ]", "[]"),
+            (
+                "[\n  \"\",\n  \"a\",\n  \"b//c\",\n  \"d\",\n  \"e/f/g/h\",\n]",
+                "[\n  \"a\",\n  \"d\",\n]",
+            ),
+            (
+                "[\n  \"\",\n  \"a\",\n  \"b//c\",\n  \"d\",\n  \"e/f/g/h\"\n]",
+                "[\n  \"a\",\n  \"d\"\n]",
+            ),
+            ("[\n  \"a\",\n  3,\n]", "[\n  \"a\",\n]"),
+        ];
+        for (arr, want) in cases {
+            let (d, r) = repair(&format!("NO_SOAK = {arr}\n"));
+            assert!(r.unwrap().changed, "{arr}");
+            assert_eq!(d.to_string(), format!("NO_SOAK = {want}\n"), "{arr}");
+        }
+    }
+
+    #[test]
+    fn repair_converts_a_lone_valid_string_to_an_array() {
+        let (d, r) = repair("# c\nNO_SOAK = \"WGet\" # why\n");
+        let edit = r.unwrap();
+        assert_eq!(edit.messages, ["converted NO_SOAK to an array: \"WGet\""]);
+        assert_eq!(d.to_string(), "# c\nNO_SOAK = [\"WGet\"] # why\n");
+    }
+
+    #[test]
+    fn repair_refuses_what_it_cannot_convert_and_changes_nothing() {
+        for contents in [
+            "NO_SOAK = \"a//b\"\n",
+            "NO_SOAK = \"\"\n",
+            "NO_SOAK = 3\n",
+            "NO_SOAK = true\n",
+            "NO_SOAK = { a = 1 }\n",
+            "[NO_SOAK]\na = 1\n",
+        ] {
+            let (d, r) = repair(contents);
+            match r {
+                Err(Error::Refusal(m)) => assert_eq!(
+                    m,
+                    "config: NO_SOAK is not an array of strings and cannot be repaired; fix it by hand"
+                ),
+                other => panic!("{contents:?}: {other:?}"),
+            }
+            assert_eq!(d.to_string(), contents);
+        }
+        let contents = "NO_SOAK = [\"a//b\"]\nTAP = 5\n";
+        let (d, r) = repair(contents);
+        match r {
+            Err(Error::Refusal(m)) => assert!(m.contains("TAP is not an array of tables"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(d.to_string(), contents, "refused before any edit");
+    }
+
+    #[test]
+    fn repair_moves_a_misplaced_no_soak_and_dedupes() {
+        let (d, r) = repair(
+            "NO_SOAK = [\"Wget\"]\n\n[[TAP]]\nname = \"a/b\"\n# misplaced\nNO_SOAK = [\"wget\", \"Curl\", \"x//y\", 3, \"curl\"]\nsoak_hours = 5\n\n[[TAP]]\nname = \"c/d\"\nNO_SOAK = \"jq\"\n\n[[TAP]]\nNO_SOAK = 7\n",
+        );
+        let edit = r.unwrap();
+        assert_eq!(
+            edit.messages,
+            [
+                "already in NO_SOAK: wget",
+                "moved to NO_SOAK from [[TAP]] a/b: Curl",
+                "removed from [[TAP]] a/b NO_SOAK: \"x//y\" (NO_SOAK entry \"x//y\" has an empty path segment)",
+                "removed from [[TAP]] a/b NO_SOAK: 3 (not a string)",
+                "already in NO_SOAK: curl",
+                "moved to NO_SOAK from [[TAP]] c/d: jq",
+                "removed from [[TAP]] (unnamed) NO_SOAK: 7 (not a string)",
+                "removed [[TAP]] entry: [[TAP]] entry is missing name",
+            ]
+        );
+        assert_eq!(
+            d.to_string(),
+            "NO_SOAK = [\"Wget\", \"Curl\", \"jq\"]\n\n[[TAP]]\nname = \"a/b\"\n# misplaced\nsoak_hours = 5\n\n[[TAP]]\nname = \"c/d\"\n"
+        );
+    }
+
+    #[test]
+    fn repair_creates_the_top_level_no_soak_above_the_first_tap() {
+        let (d, r) = repair("[[TAP]]\nname = \"a/b\"\nNO_SOAK = [\"wget\"]\n");
+        assert!(r.unwrap().changed);
+        assert_eq!(
+            d.to_string(),
+            "NO_SOAK = [\"wget\"]\n\n[[TAP]]\nname = \"a/b\"\n"
+        );
+        let (d, r) = repair("SOAK_HOURS = 2\n\n[[TAP]]\nname = \"a/b\"\nNO_SOAK = [\"wget\"]\n");
+        assert!(r.unwrap().changed);
+        assert_eq!(
+            d.to_string(),
+            "SOAK_HOURS = 2\nNO_SOAK = [\"wget\"]\n\n[[TAP]]\nname = \"a/b\"\n"
+        );
+    }
+
+    #[test]
+    fn repair_with_only_invalid_misplaced_entries_creates_nothing() {
+        let (d, r) = repair("[[TAP]]\nname = \"a/b\"\nNO_SOAK = [\"\"]\n");
+        assert!(r.unwrap().changed);
+        assert_eq!(d.to_string(), "[[TAP]]\nname = \"a/b\"\n");
+    }
+
+    #[test]
+    fn repair_salvages_a_misplaced_no_soak_from_a_table_it_removes() {
+        let (d, r) = repair("[[TAP]]\nname = \"bad\"\nNO_SOAK = [\"wget\"]\n");
+        let edit = r.unwrap();
+        assert_eq!(
+            edit.messages,
+            [
+                "moved to NO_SOAK from [[TAP]] bad: wget",
+                "removed [[TAP]] entry: [[TAP]] name \"bad\" is not user/repo",
+            ]
+        );
+        assert_eq!(d.to_string(), "NO_SOAK = [\"wget\"]\n");
+    }
+
+    #[test]
+    fn repair_removes_taps_with_a_missing_or_bad_name() {
+        let (d, r) = repair(
+            "# one\n[[TAP]]\nsoak_hours = 5\n\n[[TAP]]\nname = 3\n\n[[TAP]]\nname = \"a/b/c\"\n\n# keep\n[[TAP]]\nname = \"ok/tap\"\n",
+        );
+        let edit = r.unwrap();
+        assert_eq!(
+            edit.messages,
+            [
+                "removed [[TAP]] entry: [[TAP]] entry is missing name",
+                "removed [[TAP]] entry: [[TAP]] entry is missing name",
+                "removed [[TAP]] entry: [[TAP]] name \"a/b/c\" is not user/repo",
+            ]
+        );
+        let text = d.to_string();
+        assert!(
+            text.ends_with("# keep\n[[TAP]]\nname = \"ok/tap\"\n"),
+            "{text:?}"
+        );
+        assert!(text.contains("# one"), "{text:?}");
+        assert!(
+            !text.contains("soak_hours") && !text.contains("a/b/c"),
+            "{text:?}"
+        );
+    }
+
+    #[test]
+    fn repair_drops_a_bad_soak_hours_and_a_table_left_with_only_a_name() {
+        let (d, r) = repair(
+            "[[TAP]]\nname = \"a/b\"\nsoak_hours = 0\n\n[[TAP]]\nname = \"C/D\"\n# why\nsoak_hours = \"x\"\nextra = 1\n\n[[TAP]]\nname = \"e/f\"\nsoak_hours = 9\n",
+        );
+        let edit = r.unwrap();
+        assert_eq!(
+            edit.messages,
+            [
+                "removed [[TAP]] a/b soak_hours 0: not an integer >= 1",
+                "removed [[TAP]] c/d soak_hours \"x\": not an integer >= 1",
+            ]
+        );
+        assert_eq!(
+            d.to_string(),
+            "\n[[TAP]]\nname = \"C/D\"\n# why\nextra = 1\n\n[[TAP]]\nname = \"e/f\"\nsoak_hours = 9\n"
+        );
+    }
+
+    #[test]
+    fn repair_reports_an_empty_misplaced_no_soak_it_removes() {
+        for (contents, want) in [
+            (
+                "[[TAP]]\nname = \"a/b\"\nNO_SOAK = []\n",
+                "[[TAP]]\nname = \"a/b\"\n",
+            ),
+            (
+                "[[TAP]]\nname = \"a/b\"\nsoak_hours = 0\nNO_SOAK = []\n",
+                "",
+            ),
+        ] {
+            let (d, r) = repair(contents);
+            let edit = r.unwrap();
+            assert!(edit.changed, "{contents:?}");
+            assert_eq!(
+                edit.messages[0], "removed empty NO_SOAK from [[TAP]] a/b",
+                "{contents:?}"
+            );
+            assert_eq!(d.to_string(), want);
+        }
+    }
+
+    #[test]
+    fn repair_names_the_type_of_a_table_valued_soak_hours() {
+        let (d, r) = repair("[[TAP]]\nname = \"a/b\"\n[TAP.soak_hours]\nx = 1\n");
+        let edit = r.unwrap();
+        assert_eq!(
+            edit.messages,
+            ["removed [[TAP]] a/b soak_hours table: not an integer >= 1"]
+        );
+        assert!(edit.messages.iter().all(|m| !m.contains('\n')));
+        assert_eq!(d.to_string(), "");
+    }
+
+    #[test]
+    fn an_empty_tap_array_means_no_taps() {
+        let (d, r) = repair("TAP = []\n");
+        assert_eq!(r.unwrap(), Edit::unchanged("nothing to repair"));
+        assert_eq!(d.to_string(), "TAP = []\n");
+        let mut d = doc("TAP = []\n");
+        let edit = tap_hours_clear(&mut d, "a/b").unwrap();
+        assert!(!edit.changed);
+        let edit = tap_hours_set(&mut d, "a/b", SoakHours::new(5).unwrap()).unwrap();
+        assert!(edit.changed);
+        assert!(config::parse_file(&d.to_string()).notes.is_empty(), "{d}");
+        let mut d = doc("TAP = [{ name = \"a/b\" }]\n");
+        assert!(matches!(
+            tap_hours_clear(&mut d, "a/b"),
+            Err(Error::Refusal(_))
+        ));
+    }
+
+    #[test]
+    fn add_and_remove_on_a_lone_valid_string_point_at_repair() {
+        for op in [no_soak_add, no_soak_remove] {
+            let contents = "NO_SOAK = \"wget\"\n";
+            let mut d = doc(contents);
+            match op(&mut d, &s(&["curl"])) {
+                Err(Error::Refusal(m)) => {
+                    assert_eq!(
+                        m,
+                        "config: NO_SOAK is not an array; run brewsoak settings repair"
+                    );
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(d.to_string(), contents);
+            for contents in ["NO_SOAK = \"a//b\"\n", "NO_SOAK = 3\n"] {
+                let mut d = doc(contents);
+                match op(&mut d, &s(&["curl"])) {
+                    Err(Error::Refusal(m)) => assert!(m.ends_with("fix it by hand"), "{m}"),
+                    other => panic!("{other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn repair_keeps_the_last_duplicate_tap() {
+        let (d, r) = repair(
+            "[[TAP]]\nname = \"a/b\"\nsoak_hours = 5\n\n[[TAP]]\nname = \"c/d\"\n\n[[TAP]]\nname = \" A/B \"\nsoak_hours = 7\n",
+        );
+        let edit = r.unwrap();
+        assert_eq!(
+            edit.messages,
+            ["removed duplicate [[TAP]] a/b (the last one is kept)"]
+        );
+        assert_eq!(
+            d.to_string(),
+            "\n[[TAP]]\nname = \"c/d\"\n\n[[TAP]]\nname = \" A/B \"\nsoak_hours = 7\n"
+        );
+        // The winner keeps its own state even when its soak_hours is bad:
+        // the reader would already have used SOAK_HOURS for it.
+        let (d, r) = repair(
+            "[[TAP]]\nname = \"a/b\"\nsoak_hours = 5\n\n[[TAP]]\nname = \"a/b\"\nsoak_hours = 0\nx = 1\n",
+        );
+        assert_eq!(r.unwrap().messages.len(), 2);
+        assert_eq!(d.to_string(), "\n[[TAP]]\nname = \"a/b\"\nx = 1\n");
+    }
+
+    #[test]
+    fn repair_of_a_messy_file_leaves_nothing_for_the_reader_to_report() {
+        let messy = "# top\nNO_SOAK = \"Wget\"\nSOAK_HOURS = 12\n\n[[TAP]]\nname = \"a/b\"\nNO_SOAK = [\"curl\", \"\", 4]\nsoak_hours = 0\n\n[[TAP]]\nname = \"nope\"\n\n[[TAP]]\nsoak_hours = 2\n\n[[TAP]]\nname = \"A/B\"\nsoak_hours = 3\n\n[[TAP]]\nname = \"c/d\"\nsoak_hours = \"x\"\n";
+        assert!(!config::parse_file(messy).notes.is_empty());
+        let (mut d, r) = repair(messy);
+        assert!(r.unwrap().changed);
+        let parsed = config::parse_file(&d.to_string());
+        assert!(parsed.notes.is_empty(), "{:?}\n{d}", parsed.notes);
+        assert!(parsed.warnings.is_empty(), "{:?}\n{d}", parsed.warnings);
+        assert!(parsed.no_soak.matches("homebrew/core", "wget"));
+        assert!(parsed.no_soak.matches("homebrew/core", "curl"));
+        assert_eq!(parsed.soak_hours, SoakHours::new(12));
+        let once = d.to_string();
+        assert_eq!(
+            no_soak_repair(&mut d).unwrap(),
+            Edit::unchanged("nothing to repair")
+        );
+        assert_eq!(d.to_string(), once, "second run");
+    }
+
+    #[test]
+    fn repair_twice_is_a_no_op() {
+        let (mut d, r) = repair("NO_SOAK = [\"wget\", \"\", 3]\n");
+        assert!(r.unwrap().changed);
+        let once = d.to_string();
+        let edit = no_soak_repair(&mut d).unwrap();
+        assert_eq!(edit, Edit::unchanged("nothing to repair"));
+        assert_eq!(d.to_string(), once);
+    }
+
+    #[test]
+    fn add_and_remove_on_a_mixed_array_point_at_repair() {
+        for op in [no_soak_add, no_soak_remove] {
+            let contents = "NO_SOAK = [\"a\", 2]\n";
+            let mut d = doc(contents);
+            match op(&mut d, &s(&["curl"])) {
+                Err(Error::Refusal(m)) => assert_eq!(
+                    m,
+                    "config: NO_SOAK contains non-string entries; run brewsoak settings repair"
+                ),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(d.to_string(), contents);
         }
     }
 

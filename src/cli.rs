@@ -65,6 +65,7 @@ pub enum SettingsEdit {
     /// Raw tokens; `settings::no_soak_add` validates and lowercases them.
     NoSoakAdd(Vec<String>),
     NoSoakRemove(Vec<String>),
+    NoSoakRepair,
     /// `tap` is normalized `user/repo`; `hours` `None` is `--clear`.
     TapHours {
         tap: String,
@@ -95,6 +96,7 @@ Settings (edit ~/.config/brewsoak/config.toml; never runs brew):
   settings soak-hours N|--clear           set or remove SOAK_HOURS
   settings no-soak add|remove TOKEN...    edit the NO_SOAK list
   settings tap-hours USER/REPO N|--clear  set or remove a tap's soak_hours
+  settings repair                         fix invalid NO_SOAK and [[TAP]] entries
 
 Options:
   --soak-hours <N>   soak window in hours (default 24; also BREWSOAK_SOAK_HOURS)
@@ -386,6 +388,15 @@ fn parse_settings(args: &[String]) -> Result<SettingsCmd, Error> {
                 }
             }
         }
+        "repair" => {
+            if !rest.is_empty() {
+                return Err(Error::Usage(format!(
+                    "settings repair takes no arguments, got: {}; {hint}",
+                    rest.join(" ")
+                )));
+            }
+            SettingsEdit::NoSoakRepair
+        }
         "tap-hours" => {
             let [tap, arg] = rest else {
                 return Err(Error::Usage(format!(
@@ -399,7 +410,7 @@ fn parse_settings(args: &[String]) -> Result<SettingsCmd, Error> {
         }
         other => {
             return Err(Error::Usage(format!(
-                "unknown settings verb {other:?}; expected show, soak-hours, no-soak, or tap-hours; {hint}"
+                "unknown settings verb {other:?}; expected show, soak-hours, no-soak, repair, or tap-hours; {hint}"
             )));
         }
     };
@@ -532,6 +543,7 @@ Usage: brewsoak settings [show]
        brewsoak settings soak-hours N|--clear
        brewsoak settings no-soak add|remove TOKEN...
        brewsoak settings tap-hours USER/REPO N|--clear
+       brewsoak settings repair
 
 Show or edit ~/.config/brewsoak/config.toml. Edits keep comments, key order,
 and unknown keys. Before each write the previous file is kept as
@@ -549,6 +561,13 @@ config.toml.<UTC time>.bak next to it; the 2 newest backups are kept.
                         set that tap's soak_hours, adding its [[TAP]] entry
   tap-hours USER/REPO --clear
                         remove soak_hours; an entry left with only name goes
+  repair                make the file what brewsoak reads: wrap a lone
+                        NO_SOAK string in an array, drop invalid NO_SOAK
+                        entries, move a NO_SOAK written inside [[TAP]] up to
+                        the top-level list, drop invalid or duplicate [[TAP]]
+                        entries and bad soak_hours. Valid entries keep their
+                        text, order, and comments. An unfixable value is
+                        refused; nothing to fix writes nothing.
 
 TOKEN is wget, user/repo, or user/repo/name. N is an integer >= 1.
 homebrew/core and homebrew/cask are valid USER/REPO values.
@@ -888,6 +907,18 @@ mod tests {
     }
 
     #[test]
+    fn settings_repair_parses_and_takes_no_arguments() {
+        assert_eq!(
+            settings(&["settings", "repair"]),
+            SettingsCmd::Edit(SettingsEdit::NoSoakRepair)
+        );
+        match parse_argv(&s(&["settings", "repair", "x", "y"])) {
+            Err(Error::Usage(m)) => assert!(m.contains("x y"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn settings_tap_hours_normalizes_the_tap() {
         assert_eq!(
             settings(&["settings", "tap-hours", "HashiCorp/tap", "72"]),
@@ -925,6 +956,7 @@ mod tests {
             "no-soak add",
             "no-soak remove",
             "tap-hours",
+            "repair",
             "--clear",
             ".bak",
         ] {
@@ -952,6 +984,8 @@ mod tests {
             s(&["settings", "tap-hours", "a/b/c", "5"]),
             s(&["settings", "tap-hours", "a/b", "0"]),
             s(&["settings", "tap-hours", "a/b", "5", "x"]),
+            s(&["settings", "repair", "x"]),
+            s(&["settings", "repair", "--clear"]),
             s(&["settings", "bogus"]),
             s(&["settings", "-v"]),
             s(&["-v", "settings"]),

@@ -94,7 +94,7 @@ names in both.
 | `hashicorp/tap/terraform` | that one package from that tap |
 
 Matching is case-insensitive. Invalid entries are skipped and reported under
-`-v`. A `NO_SOAK` key inside a `[[TAP]]` table is ignored, with a warning on
+`-v`; `brewsoak settings repair` removes them. A `NO_SOAK` key inside a `[[TAP]]` table is ignored, with a warning on
 stderr every run.
 
 `--soak-hours N` edits only the `SOAK_HOURS` key; `[[TAP]]`, `NO_SOAK`, and
@@ -109,6 +109,7 @@ brewsoak settings [show]
 brewsoak settings soak-hours N|--clear
 brewsoak settings no-soak add|remove TOKEN...
 brewsoak settings tap-hours USER/REPO N|--clear
+brewsoak settings repair
 ```
 
 `show` prints the effective soak hours and their source (`BREWSOAK_SOAK_HOURS`,
@@ -120,10 +121,24 @@ the first `[[TAP]]`; a new `[[TAP]]` is appended after the last one.
 `soak-hours 24` removes `SOAK_HOURS` (24 is the default). `no-soak` tokens
 are validated like the file's entries, compared case-insensitively, and
 written lowercased; adding a present token or removing an absent one is
-reported and is not an error. `no-soak remove` validates its tokens like `add`, so an invalid entry
-already in the file must be removed by hand. `tap-hours USER/REPO --clear` removes the
+reported and is not an error. `no-soak add` and `remove` refuse a `NO_SOAK`
+list that holds a non-string entry; `repair` fixes it. `tap-hours USER/REPO --clear` removes the
 entry when only `name` would remain. When nothing is left in the file, the
 file is removed.
+
+`repair` makes the file what brewsoak reads, so `show` and `-v` stop noting
+problems. A lone `NO_SOAK = "wget"` becomes `["wget"]`. Elements of `NO_SOAK`
+that are not valid entries (or not strings) are removed. A `NO_SOAK` written
+inside a `[[TAP]]` table has its valid entries appended to the top-level list
+(created above the first `[[TAP]]` if missing), and the misplaced key is
+deleted. `[[TAP]]` entries with a missing or bad `name` are removed, as is a
+`soak_hours` that is not an integer >= 1 (the entry goes too if only `name`
+is left) and every earlier duplicate (the last one wins, as when reading).
+Valid entries keep their text, order, comments, and layout. Every removal is
+printed. A `NO_SOAK` that is neither an array nor a valid entry string (an
+invalid string, a number, a table), or a `TAP` that is not an array of
+tables, is refused and nothing is written. With nothing to fix it prints
+`nothing to repair` and writes nothing.
 
 Every write goes to a temp file first, the previous `config.toml` is kept as
 `config.toml.<YYYYMMDDTHHMMSSZ>.bak` next to it (the 2 newest backups are

@@ -404,8 +404,11 @@ fn edit_settings(
 ) -> Result<(), Error> {
     // The reader's warnings (a NO_SOAK inside [[TAP]]) fire on edits too;
     // dispatch skipped its own warning loop for settings.
-    for warning in &config::parse_file(&doc.to_string()).warnings {
-        eprintln!("brewsoak: warning: {warning}");
+    // Repair reports what it fixes, warnings included.
+    if !matches!(cmd, cli::SettingsEdit::NoSoakRepair) {
+        for warning in &config::parse_file(&doc.to_string()).warnings {
+            eprintln!("brewsoak: warning: {warning}");
+        }
     }
     let edit = match cmd {
         cli::SettingsEdit::SoakHours(hours) => {
@@ -421,6 +424,7 @@ fn edit_settings(
         }
         cli::SettingsEdit::NoSoakAdd(tokens) => settings::no_soak_add(&mut doc, tokens)?,
         cli::SettingsEdit::NoSoakRemove(tokens) => settings::no_soak_remove(&mut doc, tokens)?,
+        cli::SettingsEdit::NoSoakRepair => settings::no_soak_repair(&mut doc)?,
         cli::SettingsEdit::TapHours {
             tap,
             hours: Some(h),
@@ -813,6 +817,7 @@ mod tests {
             s(&["settings", "no-soak", "remove", "nope"]),
             s(&["settings", "tap-hours", "a/b", "5"]),
             s(&["settings", "tap-hours", "a/b", "--clear"]),
+            s(&["settings", "repair"]),
             s(&["settings", "soak-hours", "--clear"]),
         ] {
             let world = TestWorld::new();
@@ -951,6 +956,75 @@ mod tests {
             ["config.toml"],
             "no backup, no temp file"
         );
+    }
+
+    #[test]
+    fn settings_repair_writes_once_with_a_backup_then_nothing() {
+        let world = TestWorld::new();
+        let path = world.config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# mine\nNO_SOAK = [\"wget\", \"a//b\", 3]\n").unwrap();
+        let repair = s(&["settings", "repair"]);
+        dispatch(&repair, &world).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# mine\nNO_SOAK = [\"wget\"]\n"
+        );
+        let names = config_dir_names(&world);
+        assert_eq!(names.len(), 2, "{names:?}");
+        let backup = names.iter().find(|n| n.ends_with(".bak")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(path.parent().unwrap().join(backup)).unwrap(),
+            "# mine\nNO_SOAK = [\"wget\", \"a//b\", 3]\n"
+        );
+        dispatch(&repair, &world).unwrap();
+        assert_eq!(config_dir_names(&world), names, "second run writes nothing");
+        let mut out = Vec::new();
+        run_settings(
+            &cli::SettingsCmd::Edit(cli::SettingsEdit::NoSoakRepair),
+            &path,
+            None,
+            now(),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), "nothing to repair\n");
+    }
+
+    #[test]
+    fn settings_repair_does_not_print_the_readers_warnings() {
+        // Covered by edit_settings skipping them; the file is still fixed.
+        let world = TestWorld::new();
+        let path = world.config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[[TAP]]\nname = \"a/b\"\nNO_SOAK = []\n").unwrap();
+        dispatch(&s(&["settings", "repair"]), &world).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[[TAP]]\nname = \"a/b\"\n"
+        );
+        dispatch(&s(&["settings", "repair"]), &world).unwrap();
+        assert_eq!(
+            config_dir_names(&world).len(),
+            2,
+            "second run writes nothing"
+        );
+    }
+
+    #[test]
+    fn settings_repair_refuses_invalid_toml_and_a_non_array() {
+        let world = TestWorld::new();
+        let path = world.config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for contents in ["[[[", "NO_SOAK = 3\n"] {
+            std::fs::write(&path, contents).unwrap();
+            match dispatch(&s(&["settings", "repair"]), &world) {
+                Err(Error::Refusal(_)) => {}
+                other => panic!("{contents:?}: {other:?}"),
+            }
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(config_dir_names(&world), ["config.toml"]);
+        }
     }
 
     #[test]
