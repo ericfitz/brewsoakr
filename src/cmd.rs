@@ -3294,9 +3294,6 @@ mod tests {
             fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
                 self.0.installed_packages()
             }
-            fn tap_new_soaked(&self) -> Result<(), Error> {
-                self.0.tap_new_soaked()
-            }
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()
             }
@@ -3379,9 +3376,6 @@ mod tests {
             }
             fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
                 self.0.installed_packages()
-            }
-            fn tap_new_soaked(&self) -> Result<(), Error> {
-                self.0.tap_new_soaked()
             }
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()

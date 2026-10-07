@@ -2,7 +2,7 @@
 
 ## Installing soaked formulae
 
-- Install from a staged `.rb` path under the brewsoak cache, not `brewsoakr/soaked/<name>`.
+- Install from a staged `.rb` path under the brewsoak cache. brewsoak has no tap of its own; `brewsoakr/soaked` survives only as `origin::STAGING_TAP` so pre-1.0 receipts and `tap-info` entries classify as staged, never as an origin (issue #4).
 - Homebrew rejects path installs unless `HOMEBREW_DEVELOPER=1` is set and `HOMEBREW_FORBID_PACKAGES_FROM_PATHS` is unset. Set those on every brewsoak `brew` child. Also set `HOMEBREW_NO_AUTO_UPDATE=1`, `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1` and `HOMEBREW_NO_COLOR=1` (brew colours some `==>` lines even into a pipe; the summarizer's ANSI strip is only a fallback).
 - Never pass `--ignore-dependencies`. Homebrew treats it as an unsupported developer option and warns even in developer mode. Install the cutoff dep closure first, then install the target and let brew treat already-installed deps as satisfied.
 - Cellar receipts omit `bottle`/`rebuild`. Do not treat a missing rebuild as 0 when comparing installed vs cutoff.
@@ -16,7 +16,7 @@
 - Tap packages are staged under `<cache>/staging/taps/<user>/<repo>/{Formula,Casks}/<name>.rb`; core and cask stay directly under `<cache>/staging/`. Never let a tap formula land in the core staging root.
 - Tap history lives in `<cache>/taps/<user>/<repo>.git`: a bare clone with a named `origin` remote, fetched `--filter=blob:none` (retry without the filter if the server rejects it). Never fetch into, or move the checkout of, anything under `$(brew --repository)/Library/Taps`. No GitHub API calls for taps.
 - `NO_SOAK` packages are never staged. They go to brew as full tokens (`user/repo/name` for tap packages) in one `brew update` + one `brew upgrade|install|reinstall` after all soaked work. A no-soak package whose keg was staged by brewsoak is moved to its real tap with `brew install user/repo/name`.
-- `brew tap-info --json --installed` reports `remote: null` for API-mode `homebrew/core` and `homebrew/cask` and for the staging tap; classify those by name before applying the "no HTTPS remote = unsoakable" rule.
+- `brew tap-info --json --installed` reports `remote: null` for API-mode `homebrew/core` and `homebrew/cask` and for a leftover `brewsoakr/soaked` tap; classify those by name before applying the "no HTTPS remote = unsoakable" rule.
 - A tap whose fetch fails holds only that tap's packages (`Error::Git` note). Core or cask fetch failure still aborts the run.
 - Config: top-level keys (`SOAK_HOURS`, `NO_SOAK`) must precede the first `[[TAP]]` table in every example; a `NO_SOAK` inside `[[TAP]]` is ignored with a stderr warning.
 

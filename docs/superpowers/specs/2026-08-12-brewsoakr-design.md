@@ -16,7 +16,7 @@ A Rust CLI wrapper around Homebrew that only installs core formulae and casks wh
 - Installed newer than the soaked candidate: **leave it**. Do not downgrade. A soaked `reinstall`/`install` that would refresh a too-new artifact is a refusal.
 - History is two snapshots per tap: tree at T−soak (cutoff) and tree at HEAD. No intermediate blobs. Git history older than the cutoff is pruned.
 - Eligible artifact is the cutoff `.rb`. Survival is “name still resolves at HEAD and HEAD file has no `deprecate!` / `disable!`”.
-- `brew` is the only installer. brewsoak writes cutoff files into a local tap and invokes `brew`.
+- `brew` is the only installer. brewsoak writes cutoff files into a local tap and invokes `brew`. *Superseded 2026-08-13 (path installs; recorded 2026-10-06, issue #4): cutoff files are staged under `<cache>/staging/` and installed by path; brewsoak has no tap of its own.*
 
 ## Naming and configuration
 
@@ -175,6 +175,8 @@ Otherwise treat as a soaked install of the cutoff artifact. If that would not re
 `services`, `tap`, `doctor`, `cleanup`, unknown subcommands, etc. → `exec brew` with the original args (strip only `--soak-hours` and its value if present).
 
 ## Invoking brew
+
+*Superseded 2026-08-13 (path installs; recorded 2026-10-06, issue #4). brewsoak creates no tap. In place of steps 1-4 below it stages the cutoff `.rb` under `<cache>/staging/` (`Formula/<name>.rb` or `Casks/<name>.rb`; tap packages under `staging/taps/<user>/<repo>/`), asks `brew deps --1 --formula|--cask <path>` for dependencies, and installs each dep and the target with `brew install --formula|--cask [user flags] <path>`. Step 5 still applies. The original text is kept as the design record.*
 
 1. On first use: `brew tap-new brewsoak/soaked --no-git`.
 2. Write each needed cutoff blob to the tap (`Formula/<name>.rb` or `Casks/<name>.rb`).

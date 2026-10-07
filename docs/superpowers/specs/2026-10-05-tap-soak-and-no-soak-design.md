@@ -42,7 +42,11 @@ design review. They are not to be changed without the maintainer's approval.
   `hashicorp/tap/packer`). When brew refuses a staged copy because its tap is
   untrusted, brewsoak holds the package, exits 1, and tells the user to run
   `brew trust <tap>`. brewsoak keeps trusting its own `brewsoakr/soaked`
-  staging tap only.
+  staging tap only. *Amended 2026-10-06 (issue #4): brewsoak runs
+  `brew trust` for no tap at all. The staging tap was superseded by path
+  installs from `<cache>/staging/` before 1.0.0 and its `tap-new`/`trust`
+  code is removed; the name is recognized only so a receipt or `tap-info`
+  entry left by a pre-release build is classified as staged.*
 - **A formula's origin comes from its keg receipt, not `brew info`**
   (decided 2026-10-05, bug 6). `brew info`'s top-level `tap` reported
   `homebrew/core` for a staged `cyclonedx/cyclonedx` keg because core has a
@@ -70,6 +74,12 @@ design review. They are not to be changed without the maintainer's approval.
     and a value option without its value is a usage error.
   - A dry run still runs the one no-soak `brew update`, so the preview is
     not computed against stale taps.
+  - brewsoak has no staging tap (issue #4). `brewsoakr/soaked` was
+    superseded by path installs before 1.0.0; the `brew tap-new` and
+    `brew trust brewsoakr/soaked` code is removed, so brewsoak never runs
+    `brew trust`. `origin::STAGING_TAP` and `TapClass::Staging` stay so a
+    pre-release keg's receipt or tap entry is treated as staged, never as an
+    origin.
 - **Accepted consequence:** `brew upgrade` also upgrades a no-soak package's
   outdated dependencies to brew's latest. No-soak therefore extends to its
   dependencies. This is documented, not prevented.
@@ -156,8 +166,8 @@ apply). Individual bad keys or entries fall back as above.
 
 A package's origin is the tap it belongs to:
 
-1. The tap the installed package came from, if non-empty and not
-   brewsoak's staging tap. For a formula this is `source.tap` in the keg's
+1. The tap the installed package came from, if non-empty and not the
+   leftover `brewsoakr/soaked` tap. For a formula this is `source.tap` in the keg's
    own `INSTALL_RECEIPT.json` (null after a staged install). When it is
    null and the receipt's `source.path` lies under brewsoak's own
    `<cache>/staging/taps/<user>/<repo>/`, the origin is `<user>/<repo>`. The top-level
@@ -189,7 +199,7 @@ From `brew tap-info --json --installed`:
 | Tap | Treatment |
 |---|---|
 | `homebrew/core`, `homebrew/cask` | Existing v1 snapshots |
-| brewsoak's staging tap | Ignored |
+| `brewsoakr/soaked` (a leftover pre-1.0 staging tap) | Ignored |
 | Remote missing (`null`) or not `https://` | Unsoakable |
 | Everything else | Soakable |
 

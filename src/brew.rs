@@ -36,12 +36,11 @@ pub struct SessionReport {
 
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
-    /// Capturing run for JSON, deps, `--repository`, tap-new, and trust.
+    /// Capturing run for JSON (`info`, `outdated`, `tap-info`), `deps`, `--cellar` and `--caskroom`.
     fn run(&self, args: &[String]) -> Result<Output, Error>;
     /// Live stdout/stderr for install/upgrade/reinstall and brew passthrough.
     fn run_visible(&self, args: &[String]) -> Result<Output, Error>;
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error>;
-    fn tap_new_soaked(&self) -> Result<(), Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error>;
@@ -62,7 +61,6 @@ pub trait Brew {
 
 pub struct ProcessBrew {
     pub bin: PathBuf,
-    skip_tap_trust: Cell<bool>,
     raw: Cell<bool>,
     /// `brew --cellar`, asked once: it never changes during a run.
     cellar: std::cell::OnceCell<Option<PathBuf>>,
@@ -105,7 +103,6 @@ impl ProcessBrew {
     pub fn new(bin: PathBuf) -> Self {
         Self {
             bin,
-            skip_tap_trust: Cell::new(false),
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
             sink: Mutex::new(Sink::default()),
@@ -236,18 +233,6 @@ impl Brew for ProcessBrew {
         )
     }
 
-    fn tap_new_soaked(&self) -> Result<(), Error> {
-        let output = self.run(&[
-            "tap-new".into(),
-            "brewsoakr/soaked".into(),
-            "--no-git".into(),
-        ])?;
-        if !(output.status.success() || tap_already_exists(&output)) {
-            return Err(brew_fail(&output));
-        }
-        self.trust_soaked_tap()
-    }
-
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
         let output = self.run(&["tap-info".into(), "--json".into(), "--installed".into()])?;
         if !output.status.success() {
@@ -282,8 +267,8 @@ impl Brew for ProcessBrew {
 /// Unset FORBID so a user-level forbid cannot block us.
 /// `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` stops brew from upgrading
 /// dependents of a cutoff install to HEAD.
-fn apply_brewsoak_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
-    for (key, value) in brewsoak_brew_env_pairs(skip_tap_trust) {
+fn apply_brewsoak_brew_env(cmd: &mut Command) {
+    for (key, value) in brewsoak_brew_env_pairs() {
         match value {
             Some(v) => {
                 cmd.env(key, v);
@@ -295,18 +280,14 @@ fn apply_brewsoak_brew_env(cmd: &mut Command, skip_tap_trust: bool) {
     }
 }
 
-fn brewsoak_brew_env_pairs(skip_tap_trust: bool) -> Vec<(&'static str, Option<&'static str>)> {
-    let mut pairs = vec![
+fn brewsoak_brew_env_pairs() -> Vec<(&'static str, Option<&'static str>)> {
+    vec![
         ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
         ("HOMEBREW_NO_COLOR", Some("1")),
         ("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", Some("1")),
         ("HOMEBREW_DEVELOPER", Some("1")),
         ("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", None),
-    ];
-    if skip_tap_trust {
-        pairs.push(("HOMEBREW_NO_REQUIRE_TAP_TRUST", Some("1")));
-    }
-    pairs
+    ]
 }
 
 impl ProcessBrew {
@@ -333,7 +314,7 @@ impl ProcessBrew {
     fn spawn_brew(&self, args: &[String], visible: bool) -> Result<Output, Error> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args);
-        apply_brewsoak_brew_env(&mut cmd, self.skip_tap_trust.get());
+        apply_brewsoak_brew_env(&mut cmd);
         if !visible {
             return match cmd.output() {
                 Ok(output) => Ok(output),
@@ -370,20 +351,6 @@ impl ProcessBrew {
             stdout: captured,
             stderr: Vec::new(),
         })
-    }
-
-    fn trust_soaked_tap(&self) -> Result<(), Error> {
-        let output = self.run(&["trust".into(), "brewsoakr/soaked".into()])?;
-        if output.status.success() {
-            return Ok(());
-        }
-        if trust_command_unavailable(&output) {
-            // Homebrew < 6 has no `brew trust`. Disable the Homebrew 6 check
-            // for later brew deps/install of brewsoakr/soaked/*.
-            self.skip_tap_trust.set(true);
-            return Ok(());
-        }
-        Err(brew_fail(&output))
     }
 }
 
@@ -422,15 +389,6 @@ fn forward_run(src: impl Read, sink: &mut Sink, args: &[String], raw: bool) -> V
     captured
 }
 
-fn trust_command_unavailable(output: &Output) -> bool {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    text.contains("unknown command")
-        || text.contains("unknown subcommand")
-        || text.contains("invalid command")
-}
-
 impl Brew for MockBrew {
     fn brew_bin(&self) -> &Path {
         Path::new("brew")
@@ -461,16 +419,6 @@ impl Brew for MockBrew {
 
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
         Ok(self.installed.clone())
-    }
-
-    fn tap_new_soaked(&self) -> Result<(), Error> {
-        let _ = self.run(&[
-            "tap-new".into(),
-            "brewsoakr/soaked".into(),
-            "--no-git".into(),
-        ])?;
-        let _ = self.run(&["trust".into(), "brewsoakr/soaked".into()])?;
-        Ok(())
     }
 
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
@@ -532,10 +480,6 @@ fn brew_fail(output: &Output) -> Error {
         stderr.to_string()
     };
     Error::Brew { status, message }
-}
-
-fn tap_already_exists(output: &Output) -> bool {
-    String::from_utf8_lossy(&output.stderr).contains("already exists")
 }
 
 fn parse_deps_stdout(stdout: &[u8]) -> Vec<String> {
@@ -1470,7 +1414,7 @@ mod tests {
 
     #[test]
     fn brewsoak_brew_env_enables_path_installs() {
-        let pairs = brewsoak_brew_env_pairs(false);
+        let pairs = brewsoak_brew_env_pairs();
         assert!(
             pairs
                 .iter()
@@ -1526,11 +1470,25 @@ mod tests {
 
     #[test]
     fn brewsoak_brew_env_turns_brew_colour_off() {
-        let pairs = brewsoak_brew_env_pairs(false);
+        let pairs = brewsoak_brew_env_pairs();
         assert!(
             pairs
                 .iter()
                 .any(|(k, v)| *k == "HOMEBREW_NO_COLOR" && *v == Some("1"))
+        );
+    }
+
+    #[test]
+    fn brewsoak_brew_env_never_disables_tap_trust() {
+        // brewsoak never trusts a tap on the user's behalf (2026-10-05 human
+        // decision), so it must not switch Homebrew's tap-trust check off
+        // either. The removed brewsoakr/soaked fallback used to set this.
+        let pairs = brewsoak_brew_env_pairs();
+        assert!(
+            !pairs
+                .iter()
+                .any(|(k, _)| *k == "HOMEBREW_NO_REQUIRE_TAP_TRUST"),
+            "{pairs:?}"
         );
     }
 
@@ -1592,18 +1550,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).contains("hello-visible"),
             "{:?}",
             String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    #[test]
-    fn mock_tap_new_soaked_records_trust() {
-        let brew = MockBrew::new();
-        brew.tap_new_soaked().expect("tap");
-        let runs = brew.runs.lock().expect("runs");
-        assert!(
-            runs.iter()
-                .any(|args| args == &["trust".to_string(), "brewsoakr/soaked".into()]),
-            "expected brew trust brewsoakr/soaked: {runs:?}"
         );
     }
 
