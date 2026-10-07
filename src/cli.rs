@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::{Error, SoakHours};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Invocation {
@@ -28,6 +28,7 @@ pub enum Command {
         names: Vec<String>,
     },
     Version,
+    Settings(SettingsCmd),
     Help {
         topic: Option<String>,
     },
@@ -50,6 +51,27 @@ impl Command {
     }
 }
 
+/// `brewsoak settings`: show, or one edit of the config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsCmd {
+    Show,
+    Edit(SettingsEdit),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SettingsEdit {
+    /// `None` is `--clear`. 24 is passed through; the editor removes the key.
+    SoakHours(Option<SoakHours>),
+    /// Raw tokens; `settings::no_soak_add` validates and lowercases them.
+    NoSoakAdd(Vec<String>),
+    NoSoakRemove(Vec<String>),
+    /// `tap` is normalized `user/repo`; `hours` `None` is `--clear`.
+    TapHours {
+        tap: String,
+        hours: Option<SoakHours>,
+    },
+}
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub fn version_line() -> String {
@@ -68,19 +90,26 @@ Soaked commands:
 Other brew commands are passed through unchanged. Packages and taps listed
 under NO_SOAK in ~/.config/brewsoak/config.toml skip soaking and go to brew.
 
+Settings (edit ~/.config/brewsoak/config.toml; never runs brew):
+  settings [show]                         print the effective config
+  settings soak-hours N|--clear           set or remove SOAK_HOURS
+  settings no-soak add|remove TOKEN...    edit the NO_SOAK list
+  settings tap-hours USER/REPO N|--clear  set or remove a tap's soak_hours
+
 Options:
   --soak-hours <N>   soak window in hours (default 24; also BREWSOAK_SOAK_HOURS)
   -v, --verbose      show soak window, cutoff, and every package evaluated
       --raw          print brew's output unfiltered (also in $TMPDIR log)
   -V, --version      print brewsoak version and exit
   -h, --help         show this help
-  help <command>     soak-aware help for a soaked command; else brew help
+  help <command>     brewsoak help for a soaked command or settings; else brew help
 
 Examples:
   brewsoak update
   brewsoak outdated
   brewsoak upgrade
   brewsoak info wget
+  brewsoak settings no-soak add wget
   brewsoak --version
 "
 }
@@ -126,6 +155,38 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
         return Ok(Invocation {
             soak_hours,
             command: Command::Help { topic },
+            brew_args: Vec::new(),
+            raw,
+        });
+    }
+    if subcommand == "settings" {
+        // Config edits are not a flag: `--soak-hours` is for soaked commands.
+        if soak_hours.is_some() {
+            return Err(Error::Usage(
+                "--soak-hours cannot be combined with settings; use: brewsoak settings soak-hours N"
+                    .into(),
+            ));
+        }
+        if sub_idx != 0 {
+            return Err(Error::Usage(format!(
+                "settings takes no options before it, got: {}",
+                remaining[..sub_idx].join(" ")
+            )));
+        }
+        let rest = &remaining[sub_idx + 1..];
+        if rest.iter().any(|a| a == "--help" || a == "-h") {
+            return Ok(Invocation {
+                soak_hours: None,
+                command: Command::Help {
+                    topic: Some("settings".into()),
+                },
+                brew_args: Vec::new(),
+                raw,
+            });
+        }
+        return Ok(Invocation {
+            soak_hours: None,
+            command: Command::Settings(parse_settings(rest)?),
             brew_args: Vec::new(),
             raw,
         });
@@ -275,6 +336,91 @@ fn split_names_and_flags(
     Ok((names, brew_args))
 }
 
+/// Strict: every verb takes a fixed shape, and anything else is usage.
+fn parse_settings(args: &[String]) -> Result<SettingsCmd, Error> {
+    let hint = "see: brewsoak help settings";
+    let Some((verb, rest)) = args.split_first() else {
+        return Ok(SettingsCmd::Show);
+    };
+    let edit = match verb.as_str() {
+        "show" => {
+            if !rest.is_empty() {
+                return Err(Error::Usage(format!(
+                    "settings show takes no arguments, got: {}; {hint}",
+                    rest.join(" ")
+                )));
+            }
+            return Ok(SettingsCmd::Show);
+        }
+        "soak-hours" => {
+            let [arg] = rest else {
+                return Err(Error::Usage(format!(
+                    "settings soak-hours takes exactly one argument: N or --clear; {hint}"
+                )));
+            };
+            SettingsEdit::SoakHours(parse_hours_or_clear(arg, "soak-hours")?)
+        }
+        "no-soak" => {
+            let Some((op, tokens)) = rest.split_first() else {
+                return Err(Error::Usage(format!(
+                    "settings no-soak needs add or remove and at least one token; {hint}"
+                )));
+            };
+            if tokens.is_empty() {
+                return Err(Error::Usage(format!(
+                    "settings no-soak {op} needs at least one token; {hint}"
+                )));
+            }
+            if let Some(flag) = tokens.iter().find(|t| t.starts_with('-')) {
+                return Err(Error::Usage(format!(
+                    "settings no-soak {op} takes tokens, not options, got {flag:?}; {hint}"
+                )));
+            }
+            match op.as_str() {
+                "add" => SettingsEdit::NoSoakAdd(tokens.to_vec()),
+                "remove" => SettingsEdit::NoSoakRemove(tokens.to_vec()),
+                other => {
+                    return Err(Error::Usage(format!(
+                        "unknown settings no-soak verb {other:?}; expected add or remove; {hint}"
+                    )));
+                }
+            }
+        }
+        "tap-hours" => {
+            let [tap, arg] = rest else {
+                return Err(Error::Usage(format!(
+                    "settings tap-hours takes exactly two arguments: USER/REPO and N or --clear; {hint}"
+                )));
+            };
+            SettingsEdit::TapHours {
+                tap: crate::settings::normalize_tap(tap)?,
+                hours: parse_hours_or_clear(arg, "tap-hours")?,
+            }
+        }
+        other => {
+            return Err(Error::Usage(format!(
+                "unknown settings verb {other:?}; expected show, soak-hours, no-soak, or tap-hours; {hint}"
+            )));
+        }
+    };
+    Ok(SettingsCmd::Edit(edit))
+}
+
+fn parse_hours_or_clear(arg: &str, verb: &str) -> Result<Option<SoakHours>, Error> {
+    if arg == "--clear" {
+        return Ok(None);
+    }
+    arg.parse::<u32>()
+        .ok()
+        .and_then(SoakHours::new)
+        .map(Some)
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "settings {verb} needs an integer >= 1 or --clear, got {arg:?}"
+            ))
+        })
+}
+
 pub fn command_help(topic: &str) -> Option<&'static str> {
     Some(match topic {
         "update" => {
@@ -364,6 +510,37 @@ user/repo/name tokens are soaked (or no-soak) like any other package.
 Shows origin tap and effective soak hours; no-soak packages are marked.
 
   -v, --verbose   long form for every package plus soak window
+"
+        }
+        "settings" => {
+            "\
+Usage: brewsoak settings [show]
+       brewsoak settings soak-hours N|--clear
+       brewsoak settings no-soak add|remove TOKEN...
+       brewsoak settings tap-hours USER/REPO N|--clear
+
+Show or edit ~/.config/brewsoak/config.toml. Edits keep comments, key order,
+and unknown keys. Before each write the previous file is kept as
+config.toml.<UTC time>.bak next to it; the 2 newest backups are kept.
+
+  show                  effective soak hours and their source, NO_SOAK as
+                        written, every [[TAP]] with its effective hours, and
+                        every parse note and warning
+  soak-hours N          set SOAK_HOURS (24, the default, removes the key)
+  soak-hours --clear    remove SOAK_HOURS
+  no-soak add TOKEN...  append tokens not already listed (case-insensitive)
+  no-soak remove TOKEN...
+                        remove matching tokens; an absent token is reported
+  tap-hours USER/REPO N
+                        set that tap's soak_hours, adding its [[TAP]] entry
+  tap-hours USER/REPO --clear
+                        remove soak_hours; an entry left with only name goes
+
+TOKEN is wget, user/repo, or user/repo/name. N is an integer >= 1.
+homebrew/core and homebrew/cask are valid USER/REPO values.
+BREWSOAK_SOAK_HOURS overrides SOAK_HOURS in the file; soak-hours warns when
+it is set. --soak-hours is not accepted with settings. A file that is not
+valid TOML is refused, not rewritten.
 "
         }
         _ => return None,
@@ -625,6 +802,159 @@ mod tests {
                 assert!(msg.contains("--version"));
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    fn settings(args: &[&str]) -> SettingsCmd {
+        let i = parse_argv(&s(args)).unwrap_or_else(|e| panic!("{args:?}: {e}"));
+        assert!(i.brew_args.is_empty(), "{args:?}: {:?}", i.brew_args);
+        assert_eq!(i.soak_hours, None, "{args:?}");
+        match i.command {
+            Command::Settings(cmd) => cmd,
+            other => panic!("{args:?}: {other:?}"),
+        }
+    }
+
+    fn hours(n: u32) -> Option<SoakHours> {
+        Some(SoakHours::new(n).unwrap())
+    }
+
+    #[test]
+    fn settings_bare_and_show() {
+        assert_eq!(settings(&["settings"]), SettingsCmd::Show);
+        assert_eq!(settings(&["settings", "show"]), SettingsCmd::Show);
+        let i = parse_argv(&s(&["settings", "--raw", "show"])).unwrap();
+        assert!(i.raw, "--raw is accepted and ignored");
+        assert_eq!(i.command, Command::Settings(SettingsCmd::Show));
+        assert!(!Command::Settings(SettingsCmd::Show).is_soaked());
+    }
+
+    #[test]
+    fn settings_soak_hours_value_and_clear() {
+        assert_eq!(
+            settings(&["settings", "soak-hours", "48"]),
+            SettingsCmd::Edit(SettingsEdit::SoakHours(hours(48)))
+        );
+        assert_eq!(
+            settings(&["settings", "soak-hours", "24"]),
+            SettingsCmd::Edit(SettingsEdit::SoakHours(hours(24))),
+            "24 is the editor's business (it removes the key)"
+        );
+        assert_eq!(
+            settings(&["settings", "soak-hours", "--clear"]),
+            SettingsCmd::Edit(SettingsEdit::SoakHours(None))
+        );
+    }
+
+    #[test]
+    fn settings_no_soak_add_and_remove_keep_tokens_verbatim() {
+        assert_eq!(
+            settings(&[
+                "settings",
+                "no-soak",
+                "add",
+                "WGet",
+                "hashicorp/tap/terraform"
+            ]),
+            SettingsCmd::Edit(SettingsEdit::NoSoakAdd(s(&[
+                "WGet",
+                "hashicorp/tap/terraform"
+            ])))
+        );
+        assert_eq!(
+            settings(&["settings", "no-soak", "remove", "wget"]),
+            SettingsCmd::Edit(SettingsEdit::NoSoakRemove(s(&["wget"])))
+        );
+    }
+
+    #[test]
+    fn settings_tap_hours_normalizes_the_tap() {
+        assert_eq!(
+            settings(&["settings", "tap-hours", "HashiCorp/tap", "72"]),
+            SettingsCmd::Edit(SettingsEdit::TapHours {
+                tap: "hashicorp/tap".into(),
+                hours: hours(72)
+            })
+        );
+        assert_eq!(
+            settings(&["settings", "tap-hours", "homebrew/core", "--clear"]),
+            SettingsCmd::Edit(SettingsEdit::TapHours {
+                tap: "homebrew/core".into(),
+                hours: None
+            })
+        );
+    }
+
+    #[test]
+    fn settings_help_forms() {
+        for args in [
+            s(&["settings", "--help"]),
+            s(&["settings", "-h"]),
+            s(&["settings", "no-soak", "-h"]),
+            s(&["help", "settings"]),
+        ] {
+            match parse_argv(&args).unwrap().command {
+                Command::Help { topic: Some(t) } => assert_eq!(t, "settings", "{args:?}"),
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        let text = command_help("settings").unwrap();
+        for word in [
+            "show",
+            "soak-hours",
+            "no-soak add",
+            "no-soak remove",
+            "tap-hours",
+            "--clear",
+            ".bak",
+        ] {
+            assert!(text.contains(word), "{word}: {text}");
+        }
+        assert!(help_text().contains("settings"), "{}", help_text());
+    }
+
+    #[test]
+    fn settings_usage_matrix() {
+        for args in [
+            s(&["settings", "show", "x"]),
+            s(&["settings", "soak-hours"]),
+            s(&["settings", "soak-hours", "0"]),
+            s(&["settings", "soak-hours", "abc"]),
+            s(&["settings", "soak-hours", "48", "x"]),
+            s(&["settings", "soak-hours", "--clear", "x"]),
+            s(&["settings", "no-soak"]),
+            s(&["settings", "no-soak", "add"]),
+            s(&["settings", "no-soak", "frob", "x"]),
+            s(&["settings", "no-soak", "add", "--flag"]),
+            s(&["settings", "tap-hours"]),
+            s(&["settings", "tap-hours", "a/b"]),
+            s(&["settings", "tap-hours", "bad", "5"]),
+            s(&["settings", "tap-hours", "a/b/c", "5"]),
+            s(&["settings", "tap-hours", "a/b", "0"]),
+            s(&["settings", "tap-hours", "a/b", "5", "x"]),
+            s(&["settings", "bogus"]),
+            s(&["settings", "-v"]),
+            s(&["-v", "settings"]),
+            s(&["--verbose", "settings", "show"]),
+        ] {
+            match parse_argv(&args) {
+                Err(Error::Usage(_)) => {}
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn settings_rejects_soak_hours_flag_in_every_position() {
+        for args in [
+            s(&["--soak-hours", "1", "settings", "show"]),
+            s(&["settings", "--soak-hours=1"]),
+            s(&["settings", "soak-hours", "48", "--soak-hours", "1"]),
+        ] {
+            match parse_argv(&args) {
+                Err(Error::Usage(m)) => assert!(m.contains("settings soak-hours"), "{args:?}: {m}"),
+                other => panic!("{args:?}: {other:?}"),
+            }
         }
     }
 }

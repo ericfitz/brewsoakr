@@ -1,6 +1,11 @@
 use crate::nosoak::{self, NoSoakList};
+use crate::settings;
 use crate::{Error, SoakHours};
-use std::path::Path;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+use toml_edit::DocumentMut;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TapEntry {
@@ -232,21 +237,240 @@ pub fn read_file(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
-/// Key-level edit of `SOAK_HOURS`. Returns a warning instead of touching a
-/// file that is not valid TOML. Comments are not preserved.
-pub fn apply_persist(action: PersistAction, path: &Path) -> Result<Option<String>, Error> {
+/// `None` when the file does not exist; any other I/O error is returned.
+pub fn read_existing(path: &Path) -> Result<Option<String>, Error> {
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Backups kept after every write; older `.bak` files are deleted.
+const BACKUPS_KEPT: usize = 2;
+
+/// A temp file this much older than now is a failed run's leftover.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// `20231114T221320Z`: UTC, sortable, safe in a file name.
+pub(crate) fn backup_stamp(now: OffsetDateTime) -> String {
+    let format =
+        time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
+            .expect("static format description");
+    now.to_offset(time::UtcOffset::UTC)
+        .format(&format)
+        .expect("a UTC datetime formats")
+}
+
+/// `config.toml.20231114T221320Z-2.bak` -> `("20231114T221320Z", 2)`; the
+/// bare name is suffix 1. The stamp must be exactly `YYYYMMDDTHHMMSSZ`;
+/// anything else (`config.toml.old.bak`) is not a backup of `name`.
+pub(crate) fn backup_key(name: &str, file: &str) -> Option<(String, u32)> {
+    let middle = file
+        .strip_prefix(name)?
+        .strip_prefix('.')?
+        .strip_suffix(".bak")?;
+    let (stamp, n) = match middle.split_once('-') {
+        None => (middle, 1),
+        Some((stamp, n)) => (stamp, n.parse().ok()?),
+    };
+    let b = stamp.as_bytes();
+    let shaped = b.len() == 16
+        && b[..8].iter().all(u8::is_ascii_digit)
+        && b[8] == b'T'
+        && b[9..15].iter().all(u8::is_ascii_digit)
+        && b[15] == b'Z';
+    shaped.then(|| (stamp.to_string(), n))
+}
+
+fn backup_name(name: &str, stamp: &str, n: u32) -> String {
+    if n == 1 {
+        format!("{name}.{stamp}.bak")
+    } else {
+        format!("{name}.{stamp}-{n}.bak")
+    }
+}
+
+/// Spec "config::write_atomic". Readers see the old file or the new one,
+/// never none: the body goes to a temp file, the current file is hard-linked
+/// to a `.bak`, and the temp file is renamed over it.
+///
+/// There is no lock. Two overlapping runs each rename atomically and the
+/// last one wins; both succeed. The stale-temp sweep at the end removes only
+/// temp files more than ten minutes old, so it never deletes the other
+/// run's in-flight temp file.
+pub fn write_atomic(path: &Path, new_body: &str, now: OffsetDateTime) -> Result<(), Error> {
+    let current = read_existing(path)?;
+    if current.as_deref().unwrap_or("") == new_body {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "config: {} has no parent directory",
+                path.display()
+            ))
+        })?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| Error::Other(format!("config: {} has no file name", path.display())))?;
+    std::fs::create_dir_all(dir)?;
+    let tmp_prefix = format!(".{name}.tmp-");
+    let tmp = dir.join(format!("{tmp_prefix}{}", std::process::id()));
+    let result = write_temp(&tmp, new_body)
+        .map_err(Error::from)
+        .and_then(|()| replace_with_temp(path, &tmp, dir, name, new_body, current.is_some(), now));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
+    prune_backups(dir, name)?;
+    remove_stale_temps(dir, &tmp_prefix, &tmp)
+}
+
+/// Mode 0600 and fsync. `create` + `truncate` (not `create_new`) so a
+/// leftover from an earlier run with the same pid does not block the write;
+/// `set_permissions` because `mode()` applies only when the file is created.
+fn write_temp(tmp: &Path, body: &str) -> std::io::Result<()> {
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    file.write_all(body.as_bytes())?;
+    file.sync_all()
+}
+
+/// Steps 4 and 5: back up the current file, then rename the temp file over
+/// it, or remove both when the new body is only whitespace.
+fn replace_with_temp(
+    path: &Path,
+    tmp: &Path,
+    dir: &Path,
+    name: &str,
+    new_body: &str,
+    exists: bool,
+    now: OffsetDateTime,
+) -> Result<(), Error> {
+    if exists {
+        make_backup(path, dir, name, now)?;
+    }
+    if new_body.trim().is_empty() {
+        std::fs::remove_file(tmp)?;
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    } else {
+        std::fs::rename(tmp, path).map_err(Error::from)
+    }
+}
+
+/// Hard link to `<name>.<stamp>.bak`, or `-N` with N one above the highest
+/// suffix already used for this second, so the newest backup always sorts
+/// last and pruning never deletes it. A link onto an existing name fails
+/// atomically, so two runs in the same second cannot share a backup: on
+/// `AlreadyExists` the next suffix is tried. Copy when linking is not
+/// possible.
+fn make_backup(path: &Path, dir: &Path, name: &str, now: OffsetDateTime) -> Result<(), Error> {
+    let stamp = backup_stamp(now);
+    let mut highest = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if let Some(file) = entry.file_name().to_str()
+            && let Some((s, n)) = backup_key(name, file)
+            && s == stamp
+        {
+            highest = highest.max(n);
+        }
+    }
+    for n in (highest + 1)..=999 {
+        let backup = dir.join(backup_name(name, &stamp, n));
+        match std::fs::hard_link(path, &backup) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => {
+                std::fs::copy(path, &backup)?;
+                return Ok(());
+            }
+        }
+    }
+    Err(Error::Other(format!(
+        "config: more than 999 backups of {name} in one second; not writing"
+    )))
+}
+
+/// Step 6: keep the newest `BACKUPS_KEPT` by `(stamp, suffix)`.
+fn prune_backups(dir: &Path, name: &str) -> Result<(), Error> {
+    let mut backups: Vec<((String, u32), PathBuf)> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file = entry.file_name();
+        let Some(file) = file.to_str() else { continue };
+        if let Some(key) = backup_key(name, file) {
+            backups.push((key, entry.path()));
+        }
+    }
+    backups.sort();
+    let excess = backups.len().saturating_sub(BACKUPS_KEPT);
+    for (_, old) in backups.into_iter().take(excess) {
+        std::fs::remove_file(old)?;
+    }
+    Ok(())
+}
+
+/// Step 7: `.config.toml.tmp-*` left by earlier failed runs. Only files
+/// older than `STALE_TEMP_AGE` go; a younger one may belong to a run that is
+/// still writing. Our own temp file is already renamed or removed; skip it
+/// anyway. A file that vanishes mid-sweep (another run finished) is fine.
+fn remove_stale_temps(dir: &Path, prefix: &str, own: &Path) -> Result<(), Error> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let is_temp = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|f| f.starts_with(prefix));
+        if !is_temp || entry.path() == own {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok());
+        if age.is_some_and(|a| a > STALE_TEMP_AGE) {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Key-level edit of `SOAK_HOURS` through the settings editor, so comments
+/// and unknown keys survive, written with `write_atomic`. Returns a warning
+/// instead of touching a file that is not valid TOML.
+pub fn apply_persist(
+    action: PersistAction,
+    path: &Path,
+    now: OffsetDateTime,
+) -> Result<Option<String>, Error> {
     if action == PersistAction::None {
         return Ok(None);
     }
-    let existing = match std::fs::read_to_string(path) {
-        Ok(s) => Some(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(e.into()),
-    };
-    let mut table = match existing.as_deref() {
-        None => toml::Table::new(),
-        Some(s) => match toml::from_str::<toml::Table>(s) {
-            Ok(t) => t,
+    let existing = read_existing(path)?;
+    let mut doc = match existing.as_deref() {
+        None => DocumentMut::new(),
+        Some(s) => match s.parse::<DocumentMut>() {
+            Ok(doc) => doc,
             Err(_) => {
                 return Ok(Some(format!(
                     "{} is not valid TOML; --soak-hours was not persisted (it still applies to this run)",
@@ -255,30 +479,14 @@ pub fn apply_persist(action: PersistAction, path: &Path) -> Result<Option<String
             }
         },
     };
-    match action {
+    let edit = match action {
         PersistAction::None => return Ok(None),
-        PersistAction::Write(hours) => {
-            table.insert(
-                "SOAK_HOURS".into(),
-                toml::Value::Integer(i64::from(hours.get())),
-            );
-        }
-        PersistAction::Delete => {
-            table.remove("SOAK_HOURS");
-        }
+        PersistAction::Write(hours) => settings::set_soak_hours(&mut doc, hours),
+        PersistAction::Delete => settings::clear_soak_hours(&mut doc),
+    };
+    if edit.changed {
+        write_atomic(path, &doc.to_string(), now)?;
     }
-    if table.is_empty() {
-        return match std::fs::remove_file(path) {
-            Ok(()) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        };
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let body = toml::to_string(&table).map_err(|e| Error::Other(format!("config: {e}")))?;
-    std::fs::write(path, body)?;
     Ok(None)
 }
 
@@ -342,18 +550,259 @@ mod tests {
         }
     }
 
+    // `OffsetDateTime`, `Path` and `PermissionsExt` come in through
+    // `use super::*`.
+    fn at(secs: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000 + secs).expect("fixed now")
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn age_file(path: &Path, secs: u64) {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(secs);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_stamp_is_utc_compact_iso() {
+        assert_eq!(backup_stamp(at(0)), "20231114T221320Z");
+    }
+
+    #[test]
+    fn backup_key_orders_same_second_suffixes_after_the_bare_name() {
+        let k = |f| backup_key("config.toml", f);
+        assert_eq!(
+            k("config.toml.20231114T221320Z.bak"),
+            Some(("20231114T221320Z".into(), 1))
+        );
+        assert_eq!(
+            k("config.toml.20231114T221320Z-2.bak"),
+            Some(("20231114T221320Z".into(), 2))
+        );
+        assert!(k("config.toml.20231114T221320Z-2.bak") > k("config.toml.20231114T221320Z.bak"));
+        assert!(k("config.toml.20231114T221320Z-10.bak") > k("config.toml.20231114T221320Z-2.bak"));
+        assert!(k("config.toml.20231114T221321Z.bak") > k("config.toml.20231114T221320Z-10.bak"));
+        assert_eq!(k("config.toml"), None);
+        assert_eq!(k(".config.toml.tmp-1"), None);
+        assert_eq!(k("config.toml.20231114T221320Z-x.bak"), None);
+        assert_eq!(k("other.toml.20231114T221320Z.bak"), None);
+    }
+
+    #[test]
+    fn unchanged_body_makes_no_write_and_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_atomic(&path, "a\n", at(0)).unwrap();
+        assert_eq!(
+            names(dir.path()),
+            ["config.toml"],
+            "first write of a new file has nothing to back up"
+        );
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_atomic(&path, "a\n", at(1)).unwrap();
+        assert_eq!(names(dir.path()), ["config.toml"]);
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), mtime);
+        write_atomic(&path, "b\n", at(2)).unwrap();
+        assert_eq!(
+            names(dir.path()),
+            ["config.toml", "config.toml.20231114T221322Z.bak"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.20231114T221322Z.bak")).unwrap(),
+            "a\n"
+        );
+        write_atomic(&path, "b\n", at(3)).unwrap();
+        assert_eq!(
+            names(dir.path()).len(),
+            2,
+            "second identical edit: no backup"
+        );
+    }
+
+    #[test]
+    fn backups_keep_the_two_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for (i, body) in ["a\n", "b\n", "c\n", "d\n"].iter().enumerate() {
+            write_atomic(&path, body, at(i as i64)).unwrap();
+        }
+        assert_eq!(
+            names(dir.path()),
+            [
+                "config.toml",
+                "config.toml.20231114T221322Z.bak",
+                "config.toml.20231114T221323Z.bak"
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.20231114T221322Z.bak")).unwrap(),
+            "b\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("config.toml.20231114T221323Z.bak")).unwrap(),
+            "c\n"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "d\n");
+    }
+
+    #[test]
+    fn same_second_backups_get_suffixes_and_prune_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let bodies = ["a\n", "b\n", "c\n", "d\n", "e\n", "f\n", "g\n", "h\n"];
+        write_atomic(&path, bodies[0], at(0)).unwrap();
+        for (i, body) in bodies.iter().enumerate().skip(1) {
+            write_atomic(&path, body, at(0)).unwrap();
+            let mut backups: Vec<((String, u32), String)> = names(dir.path())
+                .into_iter()
+                .filter_map(|f| backup_key("config.toml", &f).map(|k| (k, f)))
+                .collect();
+            backups.sort();
+            assert_eq!(backups.len(), i.min(2), "write {i}: {backups:?}");
+            let newest = &backups.last().unwrap().1;
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(newest)).unwrap(),
+                bodies[i - 1],
+                "write {i}: newest backup {newest} holds the previous body"
+            );
+        }
+    }
+
+    #[test]
+    fn files_that_only_look_like_backups_are_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for junk in ["config.toml.old.bak", "config.toml.2026.bak"] {
+            std::fs::write(dir.path().join(junk), "junk").unwrap();
+        }
+        for (i, body) in ["a\n", "b\n", "c\n", "d\n"].iter().enumerate() {
+            write_atomic(&path, body, at(i as i64)).unwrap();
+        }
+        assert_eq!(
+            names(dir.path()),
+            [
+                "config.toml",
+                "config.toml.20231114T221322Z.bak",
+                "config.toml.20231114T221323Z.bak",
+                "config.toml.2026.bak",
+                "config.toml.old.bak"
+            ]
+        );
+        assert_eq!(backup_key("config.toml", "config.toml.old.bak"), None);
+        assert_eq!(backup_key("config.toml", "config.toml.2026.bak"), None);
+    }
+
+    #[test]
+    fn empty_body_removes_the_file_and_keeps_a_backup() {
+        for empty in ["", "  \n"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            write_atomic(&path, "a\n", at(0)).unwrap();
+            write_atomic(&path, empty, at(1)).unwrap();
+            assert!(!path.exists(), "{empty:?}");
+            assert_eq!(
+                names(dir.path()),
+                ["config.toml.20231114T221321Z.bak"],
+                "{empty:?}"
+            );
+            write_atomic(&path, "", at(2)).unwrap();
+            assert_eq!(names(dir.path()).len(), 1, "empty onto missing is a no-op");
+        }
+    }
+
+    #[test]
+    fn comment_only_body_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_atomic(&path, "# keep\n", at(0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# keep\n");
+    }
+
+    #[test]
+    fn missing_directory_is_created_and_mode_is_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x/y/config.toml");
+        write_atomic(&path, "a\n", at(0)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn stale_temp_files_are_removed_and_fresh_ones_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let stale = dir.path().join(".config.toml.tmp-1");
+        let fresh = dir.path().join(".config.toml.tmp-2");
+        std::fs::write(&stale, "junk").unwrap();
+        std::fs::write(&fresh, "live").unwrap();
+        age_file(&stale, 11 * 60);
+        write_atomic(&path, "a\n", at(0)).unwrap();
+        assert_eq!(names(dir.path()), [".config.toml.tmp-2", "config.toml"]);
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "live");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+    }
+
+    #[test]
+    fn leftover_temp_with_our_own_pid_does_not_block_the_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let own = dir
+            .path()
+            .join(format!(".config.toml.tmp-{}", std::process::id()));
+        std::fs::write(&own, "junk").unwrap();
+        write_atomic(&path, "a\n", at(0)).unwrap();
+        assert_eq!(names(dir.path()), ["config.toml"]);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\n");
+    }
+
+    #[test]
+    fn read_existing_distinguishes_missing_from_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert_eq!(read_existing(&path).unwrap(), None);
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(read_existing(&path).unwrap(), Some(String::new()));
+    }
+
     #[test]
     fn apply_write_and_delete() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        apply_persist(PersistAction::Write(SoakHours::new(48).unwrap()), &path).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap().trim(),
-            "SOAK_HOURS = 48"
-        );
-        apply_persist(PersistAction::Delete, &path).unwrap();
+        apply_persist(
+            PersistAction::Write(SoakHours::new(48).unwrap()),
+            &path,
+            at(0),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "SOAK_HOURS = 48\n");
+        apply_persist(PersistAction::Delete, &path, at(1)).unwrap();
         assert!(!path.exists());
-        apply_persist(PersistAction::Delete, &path).unwrap(); // missing is ok
+        assert_eq!(
+            names(dir.path()),
+            ["config.toml.20231114T221321Z.bak"],
+            "the delete left a backup"
+        );
+        apply_persist(PersistAction::Delete, &path, at(2)).unwrap(); // missing is ok
+        assert_eq!(
+            names(dir.path()).len(),
+            1,
+            "nothing to do: no write, no backup"
+        );
     }
 
     const FULL: &str = r#"
@@ -494,17 +943,49 @@ name = "cyclonedx/cyclonedx"
         assert_eq!(p, ParsedFile::default());
     }
 
+    const COMMENTED: &str = "# keep me\nSOAK_HOURS = 6 # why\nNO_SOAK = [\"wget\"]\n";
+
     #[test]
-    fn persist_write_keeps_other_keys() {
+    fn persist_write_keeps_other_keys_and_comments() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, FULL).unwrap();
-        let warn = apply_persist(PersistAction::Write(SoakHours::new(12).unwrap()), &path).unwrap();
+        let warn = apply_persist(
+            PersistAction::Write(SoakHours::new(12).unwrap()),
+            &path,
+            at(0),
+        )
+        .unwrap();
         assert_eq!(warn, None);
         let p = parse_file(&std::fs::read_to_string(&path).unwrap());
         assert_eq!(p.soak_hours.map(|h| h.get()), Some(12));
         assert_eq!(p.taps.len(), 2);
         assert!(p.no_soak.matches("ericfitz/tap", "x"));
+        std::fs::write(&path, COMMENTED).unwrap();
+        apply_persist(
+            PersistAction::Write(SoakHours::new(12).unwrap()),
+            &path,
+            at(1),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# keep me\nSOAK_HOURS = 12 # why\nNO_SOAK = [\"wget\"]\n"
+        );
+    }
+
+    #[test]
+    fn persist_same_value_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, COMMENTED).unwrap();
+        apply_persist(
+            PersistAction::Write(SoakHours::new(6).unwrap()),
+            &path,
+            at(0),
+        )
+        .unwrap();
+        assert_eq!(names(dir.path()), ["config.toml"], "no backup for a no-op");
     }
 
     #[test]
@@ -512,13 +993,20 @@ name = "cyclonedx/cyclonedx"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, FULL).unwrap();
-        apply_persist(PersistAction::Delete, &path).unwrap();
+        apply_persist(PersistAction::Delete, &path, at(0)).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("SOAK_HOURS"), "{text}");
         assert!(text.contains("NO_SOAK"), "{text}");
         std::fs::write(&path, "SOAK_HOURS = 48\n").unwrap();
-        apply_persist(PersistAction::Delete, &path).unwrap();
+        apply_persist(PersistAction::Delete, &path, at(1)).unwrap();
         assert!(!path.exists(), "file with no keys left must be deleted");
+        std::fs::write(&path, "# only a comment\nSOAK_HOURS = 48\n").unwrap();
+        apply_persist(PersistAction::Delete, &path, at(2)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# only a comment\n",
+            "a file holding just comments is kept"
+        );
     }
 
     #[test]
@@ -526,11 +1014,21 @@ name = "cyclonedx/cyclonedx"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "[[[").unwrap();
-        let warn = apply_persist(PersistAction::Write(SoakHours::new(12).unwrap()), &path).unwrap();
+        let warn = apply_persist(
+            PersistAction::Write(SoakHours::new(12).unwrap()),
+            &path,
+            at(0),
+        )
+        .unwrap();
         assert!(warn.is_some_and(|w| w.contains("not valid TOML")));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[[[");
-        let warn = apply_persist(PersistAction::Delete, &path).unwrap();
+        let warn = apply_persist(PersistAction::Delete, &path, at(1)).unwrap();
         assert!(warn.is_some());
         assert!(path.exists());
+        assert_eq!(
+            names(dir.path()),
+            ["config.toml"],
+            "no backup of a file we did not write"
+        );
     }
 }

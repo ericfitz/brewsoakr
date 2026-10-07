@@ -81,8 +81,9 @@ name = "cyclonedx/cyclonedx"     # no soak_hours: uses SOAK_HOURS
 
 Effective soak hours for a package: a `NO_SOAK` match means no soak at all;
 else the origin tap's `[[TAP]]` `soak_hours`; else `SOAK_HOURS`. `[[TAP]]` and
-`NO_SOAK` are file-only (no flag, no environment variable). `homebrew/core`
-and `homebrew/cask` are valid tap names in both.
+`NO_SOAK` have no flag and no environment variable: edit the file, or use
+`brewsoak settings` below. `homebrew/core` and `homebrew/cask` are valid tap
+names in both.
 
 `NO_SOAK` entries:
 
@@ -96,8 +97,45 @@ Matching is case-insensitive. Invalid entries are skipped and reported under
 `-v`. A `NO_SOAK` key inside a `[[TAP]]` table is ignored, with a warning on
 stderr every run.
 
-`--soak-hours N` edits only the `SOAK_HOURS` key; `[[TAP]]` and `NO_SOAK` are
-kept. A config file that is not valid TOML is left alone with a warning.
+`--soak-hours N` edits only the `SOAK_HOURS` key; `[[TAP]]`, `NO_SOAK`, and
+comments are kept, and the previous file is backed up as described under
+`brewsoak settings`. A config file that is not valid TOML is left alone with
+a warning.
+
+### `brewsoak settings`
+
+```text
+brewsoak settings [show]
+brewsoak settings soak-hours N|--clear
+brewsoak settings no-soak add|remove TOKEN...
+brewsoak settings tap-hours USER/REPO N|--clear
+```
+
+`show` prints the effective soak hours and their source (`BREWSOAK_SOAK_HOURS`,
+the file, or the default 24), `NO_SOAK` as written, every `[[TAP]]` with its
+effective hours, and every parse note and warning. It never writes.
+
+Edits keep comments, key order, and unknown keys. New top-level keys go above
+the first `[[TAP]]`; a new `[[TAP]]` is appended after the last one.
+`soak-hours 24` removes `SOAK_HOURS` (24 is the default). `no-soak` tokens
+are validated like the file's entries, compared case-insensitively, and
+written lowercased; adding a present token or removing an absent one is
+reported and is not an error. `no-soak remove` validates its tokens like `add`, so an invalid entry
+already in the file must be removed by hand. `tap-hours USER/REPO --clear` removes the
+entry when only `name` would remain. When nothing is left in the file, the
+file is removed.
+
+Every write goes to a temp file first, the previous `config.toml` is kept as
+`config.toml.<YYYYMMDDTHHMMSSZ>.bak` next to it (the 2 newest backups are
+kept), and the temp file is renamed into place, so another `brewsoak` never sees a
+missing or partial file. An unchanged edit writes nothing. A file that is not
+valid TOML is refused, with the parse error, and left untouched.
+
+`settings soak-hours` warns on stderr when `BREWSOAK_SOAK_HOURS` is set,
+because the environment overrides the file; the edit is still written.
+
+`settings` never runs `brew` or `git` and does not check whether a tap is
+installed. `--soak-hours` is not accepted with `settings`.
 
 ### Third-party taps
 

@@ -16,6 +16,7 @@ pub mod paths;
 pub mod quiet;
 pub mod report;
 pub mod resolve;
+pub mod settings;
 pub mod snapshot;
 pub mod tap;
 pub mod taps;
@@ -24,7 +25,10 @@ pub use error::Error;
 pub use hours::SoakHours;
 
 use crate::brew::Brew;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use time::OffsetDateTime;
+use toml_edit::DocumentMut;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Dispatch {
@@ -126,6 +130,20 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
     paths::warn_duplicate_install();
     let inv = cli::parse_argv(args)?;
     world.brew().set_raw(inv.raw);
+    if let cli::Command::Settings(cmd) = &inv.command {
+        // Before config resolution, brew, git, or snapshots: settings reads
+        // and writes the file and nothing else, and refuses invalid TOML
+        // where resolve_config would silently default it.
+        let env = world.env_soak();
+        run_settings(
+            cmd,
+            &world.config_path(),
+            env.as_deref(),
+            world.now(),
+            &mut std::io::stdout(),
+        )?;
+        return Ok(Dispatch::Exit(0));
+    }
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
     let cfg = config::resolve_config(inv.soak_hours, env.as_deref(), file.as_deref())?;
@@ -140,7 +158,8 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
     if inv.command.is_soaked() {
         // A dry run changes nothing on the machine, the config file included.
         if !flags::is_dry_run(&inv.brew_args)
-            && let Some(warning) = config::apply_persist(cfg.persist, &world.config_path())?
+            && let Some(warning) =
+                config::apply_persist(cfg.persist, &world.config_path(), world.now())?
         {
             eprintln!("brewsoak: warning: {warning}");
         }
@@ -171,6 +190,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 ))
             }
         }
+        cli::Command::Settings(_) => unreachable!("settings returns before config resolution"),
         cli::Command::Passthrough { args } => {
             Ok(Dispatch::Exec(world.brew().brew_bin().to_path_buf(), args))
         }
@@ -342,6 +362,87 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             ))
         }
     }
+}
+
+/// Spec "brewsoak settings". Reads the file once, applies one edit, and
+/// writes the whole document back only when the edit changed it.
+pub fn run_settings(
+    cmd: &cli::SettingsCmd,
+    path: &Path,
+    env: Option<&str>,
+    now: OffsetDateTime,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let existing = config::read_existing(path)?;
+    let doc = match existing.as_deref() {
+        None => None,
+        Some(text) => Some(text.parse::<DocumentMut>().map_err(|e| {
+            Error::Refusal(format!(
+                "{} is not valid TOML; fix it by hand before using settings:\n{e}",
+                path.display()
+            ))
+        })?),
+    };
+    match cmd {
+        cli::SettingsCmd::Show => {
+            write!(out, "{}", settings::render_show(path, env, doc.as_ref()))?;
+            Ok(())
+        }
+        cli::SettingsCmd::Edit(edit) => {
+            edit_settings(edit, doc.unwrap_or_default(), path, env, now, out)
+        }
+    }
+}
+
+fn edit_settings(
+    cmd: &cli::SettingsEdit,
+    mut doc: DocumentMut,
+    path: &Path,
+    env: Option<&str>,
+    now: OffsetDateTime,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    // The reader's warnings (a NO_SOAK inside [[TAP]]) fire on edits too;
+    // dispatch skipped its own warning loop for settings.
+    for warning in &config::parse_file(&doc.to_string()).warnings {
+        eprintln!("brewsoak: warning: {warning}");
+    }
+    let edit = match cmd {
+        cli::SettingsEdit::SoakHours(hours) => {
+            if let Some(raw) = env {
+                eprintln!(
+                    "brewsoak: warning: BREWSOAK_SOAK_HOURS={raw} is set and overrides SOAK_HOURS in the file"
+                );
+            }
+            match hours {
+                Some(h) => settings::set_soak_hours(&mut doc, *h),
+                None => settings::clear_soak_hours(&mut doc),
+            }
+        }
+        cli::SettingsEdit::NoSoakAdd(tokens) => settings::no_soak_add(&mut doc, tokens)?,
+        cli::SettingsEdit::NoSoakRemove(tokens) => settings::no_soak_remove(&mut doc, tokens)?,
+        cli::SettingsEdit::TapHours {
+            tap,
+            hours: Some(h),
+        } => settings::tap_hours_set(&mut doc, tap, *h)?,
+        cli::SettingsEdit::TapHours { tap, hours: None } => {
+            settings::tap_hours_clear(&mut doc, tap)?
+        }
+    };
+    for message in &edit.messages {
+        writeln!(out, "{message}")?;
+    }
+    if !edit.changed {
+        return Ok(());
+    }
+    let body = doc.to_string();
+    config::write_atomic(path, &body, now)?;
+    if body.trim().is_empty() {
+        writeln!(out, "removed {} (nothing left)", path.display())?;
+    } else {
+        writeln!(out, "wrote {}", path.display())?;
+    }
+    Ok(())
 }
 
 fn soaked_exit(result: Result<cmd::RunResult, Error>) -> Result<Dispatch, Error> {
@@ -670,6 +771,278 @@ mod tests {
         assert!(
             !state.contains("ericfitz/tap"),
             "no installed soaked package: not refreshed\n{state}"
+        );
+    }
+
+    fn assert_nothing_external_ran(world: &TestWorld, what: &str) {
+        assert!(
+            world.brew.runs.lock().unwrap().is_empty(),
+            "{what}: brew ran"
+        );
+        assert!(
+            world.brew.visible_runs.lock().unwrap().is_empty(),
+            "{what}: brew ran visibly"
+        );
+        assert!(!world.github.refreshed.get(), "{what}: github was queried");
+        assert!(
+            !world.cache_path().exists(),
+            "{what}: settings must not create the cache"
+        );
+    }
+
+    fn config_dir_names(world: &TestWorld) -> Vec<String> {
+        let dir = world.config_path();
+        let dir = dir.parent().unwrap();
+        let mut v: Vec<String> = match std::fs::read_dir(dir) {
+            Ok(entries) => entries
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn settings_never_runs_brew_git_or_snapshots() {
+        for args in [
+            s(&["settings"]),
+            s(&["settings", "show"]),
+            s(&["settings", "soak-hours", "48"]),
+            s(&["settings", "no-soak", "add", "wget"]),
+            s(&["settings", "no-soak", "remove", "nope"]),
+            s(&["settings", "tap-hours", "a/b", "5"]),
+            s(&["settings", "tap-hours", "a/b", "--clear"]),
+            s(&["settings", "soak-hours", "--clear"]),
+        ] {
+            let world = TestWorld::new();
+            match dispatch(&args, &world) {
+                Ok(Dispatch::Exit(0)) => {}
+                other => panic!("{args:?}: {other:?}"),
+            }
+            assert_nothing_external_ran(&world, &args.join(" "));
+        }
+    }
+
+    #[test]
+    fn settings_with_soak_hours_flag_is_usage_and_writes_nothing() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["--soak-hours", "1", "settings", "show"]), &world) {
+            Err(Error::Usage(m)) => assert!(m.contains("settings soak-hours"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!world.config_path().exists());
+    }
+
+    #[test]
+    fn settings_edits_round_trip_and_show_reports_them() {
+        let world = TestWorld::new();
+        let path = world.config_path();
+        let mut out = Vec::new();
+        run_settings(
+            &cli::SettingsCmd::Edit(cli::SettingsEdit::NoSoakAdd(s(&["WGet", "ericfitz/tap"]))),
+            &path,
+            None,
+            now(),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "added to NO_SOAK: wget\nadded to NO_SOAK: ericfitz/tap\nwrote {}\n",
+                path.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "NO_SOAK = [\"wget\", \"ericfitz/tap\"]\n"
+        );
+        let mut out = Vec::new();
+        run_settings(
+            &cli::SettingsCmd::Edit(cli::SettingsEdit::TapHours {
+                tap: "hashicorp/tap".into(),
+                hours: Some(SoakHours::new(72).unwrap()),
+            }),
+            &path,
+            None,
+            now(),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "NO_SOAK = [\"wget\", \"ericfitz/tap\"]\n\n[[TAP]]\nname = \"hashicorp/tap\"\nsoak_hours = 72\n"
+        );
+        let mut out = Vec::new();
+        run_settings(&cli::SettingsCmd::Show, &path, Some("36"), now(), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("soak hours: 36 (BREWSOAK_SOAK_HOURS)\n"),
+            "{text}"
+        );
+        assert!(text.contains("  wget\n  ericfitz/tap\n"), "{text}");
+        assert!(text.contains("  hashicorp/tap: 72 (own)\n"), "{text}");
+        let mut out = Vec::new();
+        run_settings(
+            &cli::SettingsCmd::Edit(cli::SettingsEdit::NoSoakRemove(s(&["wget", "nope"]))),
+            &path,
+            None,
+            now(),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.starts_with("removed from NO_SOAK: wget\nnot in NO_SOAK: nope\n"),
+            "{text}"
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .starts_with("NO_SOAK = [\"ericfitz/tap\"]\n"),
+            "comment-free edit keeps the rest"
+        );
+    }
+
+    #[test]
+    fn settings_show_without_a_file_prints_the_defaults() {
+        let world = TestWorld::new();
+        let mut out = Vec::new();
+        run_settings(
+            &cli::SettingsCmd::Show,
+            &world.config_path(),
+            None,
+            now(),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("(no config file)\n"), "{text}");
+        assert!(text.contains("soak hours: 24 (default)\n"), "{text}");
+        assert!(!world.config_path().exists(), "show never writes");
+    }
+
+    #[test]
+    fn settings_refuses_invalid_toml_and_leaves_it_alone() {
+        let world = TestWorld::new();
+        let path = world.config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[[[").unwrap();
+        for cmd in [
+            cli::SettingsCmd::Show,
+            cli::SettingsCmd::Edit(cli::SettingsEdit::NoSoakAdd(s(&["wget"]))),
+            cli::SettingsCmd::Edit(cli::SettingsEdit::SoakHours(None)),
+        ] {
+            let mut out = Vec::new();
+            match run_settings(&cmd, &path, None, now(), &mut out) {
+                Err(Error::Refusal(m)) => {
+                    assert!(m.contains(&path.display().to_string()), "{cmd:?}: {m}");
+                    assert!(m.contains("TOML parse error"), "{cmd:?}: {m}");
+                }
+                other => panic!("{cmd:?}: {other:?}"),
+            }
+            assert!(out.is_empty(), "{cmd:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[[[");
+        assert_eq!(
+            config_dir_names(&world),
+            ["config.toml"],
+            "no backup, no temp file"
+        );
+    }
+
+    #[test]
+    fn settings_second_identical_edit_writes_nothing() {
+        let world = TestWorld::new();
+        let add = s(&["settings", "no-soak", "add", "wget"]);
+        dispatch(&add, &world).unwrap();
+        assert_eq!(config_dir_names(&world), ["config.toml"]);
+        dispatch(&add, &world).unwrap();
+        assert_eq!(
+            config_dir_names(&world),
+            ["config.toml"],
+            "no-op edit: no write, no backup"
+        );
+        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        assert_eq!(
+            config_dir_names(&world).len(),
+            2,
+            "a real edit leaves one backup"
+        );
+        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        assert_eq!(
+            config_dir_names(&world).len(),
+            2,
+            "repeating it adds nothing"
+        );
+        let text = std::fs::read_to_string(world.config_path()).unwrap();
+        assert_eq!(text, "NO_SOAK = [\"wget\"]\nSOAK_HOURS = 48\n");
+    }
+
+    #[test]
+    fn settings_invalid_token_is_usage_and_writes_nothing() {
+        let world = TestWorld::new();
+        match dispatch(&s(&["settings", "no-soak", "add", "a/b/c/d"]), &world) {
+            Err(Error::Usage(m)) => assert!(m.contains("a/b/c/d"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(!world.config_path().exists());
+    }
+
+    #[test]
+    fn settings_clear_last_key_removes_the_file() {
+        let world = TestWorld::new();
+        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        assert!(world.config_path().exists());
+        let mut out = Vec::new();
+        run_settings(
+            &cli::SettingsCmd::Edit(cli::SettingsEdit::SoakHours(None)),
+            &world.config_path(),
+            None,
+            now(),
+            &mut out,
+        )
+        .unwrap();
+        assert!(!world.config_path().exists(), "nothing left: file removed");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(&format!(
+                "removed {} (nothing left)",
+                world.config_path().display()
+            )),
+            "{text}"
+        );
+        assert_eq!(config_dir_names(&world).len(), 1, "the backup remains");
+    }
+
+    #[test]
+    fn soak_hours_persistence_keeps_comments() {
+        let world = TestWorld::new();
+        std::fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
+        std::fs::write(world.config_path(), "# keep me\nSOAK_HOURS = 6 # why\n").unwrap();
+        match dispatch(&s(&["--soak-hours", "48", "outdated"]), &world).expect("outdated") {
+            Dispatch::Exit(0) => {}
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(world.config_path()).unwrap(),
+            "# keep me\nSOAK_HOURS = 48 # why\n"
+        );
+    }
+
+    #[test]
+    fn settings_soak_hours_still_writes_when_env_is_set() {
+        let world = TestWorld {
+            env_soak: Some("36".into()),
+            ..TestWorld::new()
+        };
+        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(world.config_path()).unwrap(),
+            "SOAK_HOURS = 48\n",
+            "the warning (stderr) does not stop the edit"
         );
     }
 }

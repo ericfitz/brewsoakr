@@ -13,6 +13,7 @@ categories = ["command-line-utilities"]
 serde = { version = "1", features = ["derive"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "0.8"
+toml_edit = "0.22"
 ureq = "2"
 
 [dev-dependencies]

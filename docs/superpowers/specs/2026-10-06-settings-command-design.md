@@ -117,14 +117,15 @@ not touched. `settings show` prints the same refusal.
 3. Write `new_body` to `.config.toml.tmp-<pid>` in the same directory with mode
    0600, and fsync it.
 4. If `config.toml` exists, hard-link it to `config.toml.<YYYYMMDDTHHMMSSZ>.bak`
-   (UTC). If that name exists, use `...Z-2.bak`, `...Z-3.bak`, and so on. If
+   (UTC). If backups for that second exist, use the next suffix above the highest one (`...Z-2.bak`, `...Z-3.bak`, and so on). If
    hard-linking fails, copy instead.
 5. Rename the temp file over `config.toml`. When `new_body` is empty or only whitespace (a file holding just comments is kept), remove
    `config.toml` instead of renaming (the backup from step 4 is kept), and
    remove the temp file.
 6. Delete all but the 2 newest `config.toml.*.bak` files (newest by name,
    which sorts by timestamp then suffix).
-7. Remove any stale `.config.toml.tmp-*` files left by earlier failed runs.
+7. Remove any `.config.toml.tmp-*` files older than 10 minutes left by earlier
+   failed runs.
 
 On any I/O error the temp file is removed and the error is returned as
 `Error::Io`.
@@ -136,8 +137,9 @@ On any I/O error the temp file is removed and the error is returned as
   is atomic; the last writer wins and both leave backups. Readers never see a
   missing or partial file.
 - **Leftovers from a failed run**: a stray `.config.toml.tmp-*` is not read by
-  anything and is removed by the next write. A stray extra `.bak` is pruned by
-  the next write.
+  anything and is removed by the next write once it is older than 10 minutes
+  (a fresher one may belong to a concurrent run). A stray extra `.bak` is
+  pruned by the next write.
 
 ## Components
 
