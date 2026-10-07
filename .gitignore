@@ -6,3 +6,4 @@
 *.pdb
 /dist
 /HANDOFF.md
+.local/
