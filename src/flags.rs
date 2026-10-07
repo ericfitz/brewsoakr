@@ -206,10 +206,68 @@ fn is_value_option_of(t: &Table, name: &str) -> bool {
 
 /// `--dry-run`, or `-n` alone or inside a short cluster (`-vn`).
 pub fn is_dry_run(flags: &[String]) -> bool {
-    flags.iter().any(|f| {
-        f == "--dry-run"
-            || (f.len() > 1 && f.starts_with('-') && !f.starts_with("--") && f[1..].contains('n'))
-    })
+    flags
+        .iter()
+        .any(|f| f == "--dry-run" || (is_short_cluster(f) && f[1..].contains('n')))
+}
+
+/// Which self-updating casks a bare `upgrade`/`outdated` may touch. brew's
+/// `--greedy` covers both kinds; the two long forms cover one each.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Greedy {
+    /// `--greedy` / `--greedy-auto-updates`: casks with `auto_updates true`.
+    pub auto_updates: bool,
+    /// `--greedy` / `--greedy-latest`: casks with `version :latest`.
+    pub latest: bool,
+}
+
+/// Read the greedy flags brew's `upgrade` and `outdated` take. `-g`, alone
+/// or in a short cluster (`-vg`), is `--greedy` on those verbs (brew's own
+/// short; on `install` and `reinstall` the same letter is `--git`). Callers
+/// gate on the verb: `upgrade` and `outdated` read it directly, and
+/// `apply_resolved` reads it for every verb but only acts on it for a bare
+/// run (`bare_run`).
+pub fn greedy_mode(flags: &[String]) -> Greedy {
+    let mut mode = Greedy::default();
+    for f in flags {
+        match f.as_str() {
+            "--greedy" => {
+                mode.auto_updates = true;
+                mode.latest = true;
+            }
+            "--greedy-auto-updates" => mode.auto_updates = true,
+            "--greedy-latest" => mode.latest = true,
+            s if is_short_cluster(s) && s[1..].contains('g') => {
+                mode.auto_updates = true;
+                mode.latest = true;
+            }
+            _ => {}
+        }
+    }
+    mode
+}
+
+/// `flags` without the greedy flags brewsoak consumed on an upgrade run:
+/// the three long forms, and `g` removed from short clusters (a cluster
+/// that was only `-g` disappears). What is left is what `brew install
+/// <file>.rb` may see; the `install` table filter still applies after.
+pub fn without_greedy(flags: &[String]) -> Vec<String> {
+    flags
+        .iter()
+        .filter_map(|f| match f.as_str() {
+            "--greedy" | "--greedy-auto-updates" | "--greedy-latest" => None,
+            s if is_short_cluster(s) => {
+                let kept: String = s[1..].chars().filter(|c| *c != 'g').collect();
+                (!kept.is_empty()).then(|| format!("-{kept}"))
+            }
+            _ => Some(f.clone()),
+        })
+        .collect()
+}
+
+/// `-v`, `-vn`: a single dash followed by one or more letters.
+pub(crate) fn is_short_cluster(s: &str) -> bool {
+    s.len() > 1 && s.starts_with('-') && !s.starts_with("--")
 }
 
 /// `brew reinstall does not accept --foo, -x; dropped from the tap switch`.
@@ -335,5 +393,76 @@ mod tests {
             Some("brew reinstall does not accept --foo; dropped from the tap switch")
         );
         assert_eq!(dropped_note("reinstall", &[], "x"), None);
+    }
+
+    #[test]
+    fn greedy_mode_reads_each_flag_with_brew_meaning() {
+        assert_eq!(greedy_mode(&[]), Greedy::default());
+        assert_eq!(
+            greedy_mode(&f(&["--greedy"])),
+            Greedy {
+                auto_updates: true,
+                latest: true
+            }
+        );
+        assert_eq!(
+            greedy_mode(&f(&["--greedy-auto-updates"])),
+            Greedy {
+                auto_updates: true,
+                latest: false
+            }
+        );
+        assert_eq!(
+            greedy_mode(&f(&["--greedy-latest"])),
+            Greedy {
+                auto_updates: false,
+                latest: true
+            }
+        );
+        assert_eq!(
+            greedy_mode(&f(&["--greedy-latest", "--greedy-auto-updates"])),
+            Greedy {
+                auto_updates: true,
+                latest: true
+            }
+        );
+    }
+
+    #[test]
+    fn greedy_mode_reads_g_in_a_cluster() {
+        let both = Greedy {
+            auto_updates: true,
+            latest: true,
+        };
+        assert_eq!(greedy_mode(&f(&["-g"])), both);
+        assert_eq!(greedy_mode(&f(&["-vg"])), both);
+        assert_eq!(greedy_mode(&f(&["-v"])), Greedy::default());
+    }
+
+    #[test]
+    fn greedy_mode_ignores_lookalikes() {
+        // `filter_for_verb` drops a boolean flag given a value; so do we.
+        assert_eq!(greedy_mode(&f(&["--greedy=yes"])), Greedy::default());
+        assert_eq!(greedy_mode(&f(&["--greedy-foo"])), Greedy::default());
+        assert_eq!(greedy_mode(&f(&["--g"])), Greedy::default());
+        assert_eq!(greedy_mode(&f(&["greedy"])), Greedy::default());
+    }
+
+    #[test]
+    fn without_greedy_strips_the_flags_and_the_letter() {
+        let got = without_greedy(&f(&[
+            "--greedy",
+            "--verbose",
+            "--greedy-latest",
+            "-vg",
+            "-g",
+            "--greedy-auto-updates",
+            "--greedy=yes",
+        ]));
+        assert_eq!(got, f(&["--verbose", "-v", "--greedy=yes"]));
+        assert_eq!(
+            without_greedy(&f(&["-v", "--force"])),
+            f(&["-v", "--force"])
+        );
     }
 }

@@ -47,6 +47,12 @@ impl PkgIdentity {
             _ => false,
         }
     }
+
+    /// A cask whose definition says `version :latest`: the artifact behind
+    /// it changes without the cask changing, so its contents cannot be soaked.
+    pub fn is_latest_cask(&self) -> bool {
+        matches!(self, Self::Cask(c) if c.version == ":latest")
+    }
 }
 
 fn both_or_skip(a: &Option<String>, b: &Option<String>) -> bool {
@@ -837,5 +843,37 @@ end
     fn comment_disable_does_not_match() {
         let rb = "# disable! maybe\nclass X < Formula\nend\n";
         assert!(!is_deprecated_or_disabled(rb, "2026-08-13"));
+    }
+
+    #[test]
+    fn is_latest_cask_reads_only_the_cutoff_side() {
+        let latest = PkgIdentity::Cask(
+            parse_cask("cask \"nightly\" do\n  version :latest\n  sha256 :no_check\nend\n")
+                .unwrap(),
+        );
+        let numbered = PkgIdentity::Cask(
+            parse_cask("cask \"nightly\" do\n  version \"2.0\"\n  sha256 \"abc\"\nend\n").unwrap(),
+        );
+        let formula = PkgIdentity::Formula(FormulaIdentity {
+            version: ":latest".into(),
+            revision: 0,
+            rebuild: None,
+            sha256: "s".into(),
+        });
+        assert!(latest.is_latest_cask());
+        assert!(
+            !numbered.is_latest_cask(),
+            "a cutoff that moved to a number soaks"
+        );
+        assert!(!formula.is_latest_cask(), "only casks have :latest");
+        // brew's version-only receipt for an installed :latest cask.
+        let receipt = PkgIdentity::Cask(
+            parse_cask(&crate::brew::version_only_cask_receipt("nightly", "latest")).unwrap(),
+        );
+        assert!(receipt.is_latest_cask());
+        assert!(
+            receipt.same_artifact(&latest),
+            "same definition: already soaked"
+        );
     }
 }

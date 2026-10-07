@@ -158,7 +158,8 @@ fn classify_installed(
         else {
             continue;
         };
-        view.action = bare_action(&view);
+        // `brew update` has no greedy mode; the summary reads like a bare run.
+        view.action = bare_action(&view, flags::Greedy::default());
         out.push((
             pkg.name.clone(),
             view.action,
@@ -421,6 +422,7 @@ pub fn outdated(
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
     let verbose = is_verbose(extra_args);
+    let greedy = flags::greedy_mode(extra_args);
     if verbose {
         writeln!(
             out,
@@ -502,7 +504,7 @@ pub fn outdated(
             }
             continue;
         };
-        view.action = bare_action(&view);
+        view.action = bare_action(&view, greedy);
         for warn in &view.warnings {
             writeln!(out, "warning: {warn}")?;
         }
@@ -519,6 +521,9 @@ pub fn outdated(
                     "classified for outdated",
                 )
             )?;
+            if latest_left(&view, greedy) {
+                writeln!(out, "{}", latest_note(&pkg.name))?;
+            }
         }
         match view.action {
             DesiredAction::InstallCutoff => {
@@ -785,7 +790,8 @@ pub fn upgrade(
 ) -> Result<RunResult, Error> {
     // A bare `brew soak upgrade` walks everything installed, so say up front
     // how many will actually change and count them off as they go.
-    let plan_total = (names.is_empty()).then(|| plan_size(git, snaps, cache, inv));
+    let plan_total = (names.is_empty())
+        .then(|| plan_size(git, snaps, cache, inv, flags::greedy_mode(user_flags)));
     if let Some(total) = plan_total {
         let doing = if flags::is_dry_run(user_flags) {
             "would upgrade"
@@ -840,9 +846,19 @@ fn bare_skip<'a>(pkg: &Pkg, snaps: &'a Snapshots) -> Option<BareSkip<'a>> {
 
 /// How many installed packages the soak window says to change. Resolution is
 /// cheap (cached blobs) and errors just mean "no total to show".
-fn plan_size(git: &impl GitStore, snaps: &Snapshots, cache: &Path, inv: &Inventory) -> usize {
-    // Keep this in step with `apply_resolved`: every package counted here
-    // must reach `announce` there, and none other.
+fn plan_size(
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    inv: &Inventory,
+    greedy: flags::Greedy,
+) -> usize {
+    // Keep this in step with `apply_resolved` and the `outdated` report:
+    // every package counted here must reach `announce` there and land under
+    // "Outdated (will upgrade)", and none other. All three go through
+    // `bare_action` with the same greedy mode; the test
+    // `plan_size_upgrade_and_outdated_agree_under_every_greedy_mode` pins that
+    // under all four modes.
     snapshotted_pkgs(inv, snaps)
         .filter(|pkg| bare_skip(pkg, snaps).is_none())
         .filter(|pkg| {
@@ -856,7 +872,7 @@ fn plan_size(git: &impl GitStore, snaps: &Snapshots, cache: &Path, inv: &Invento
                     pkg.kind,
                     Some(&pkg.receipt_rb)
                 ),
-                Ok(Some(view)) if bare_action(&view) == DesiredAction::InstallCutoff
+                Ok(Some(view)) if bare_action(&view, greedy) == DesiredAction::InstallCutoff
             )
         })
         .count()
@@ -1005,7 +1021,7 @@ pub fn reinstall(
             writeln!(session.out, "reinstalling {}", r.name)?;
             let mut args = vec!["reinstall".to_string()];
             args.extend(crate::flags::filter_for_verb("reinstall", user_flags).kept);
-            session.note_dropped_flags("reinstall", "repair reinstalls");
+            session.note_dropped_flags("reinstall", user_flags, "repair reinstalls");
             args.push(token);
             let (ok, installed_now) = session.record_run(&args)?;
             if ok {
@@ -1153,13 +1169,25 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.deferred.push(msg);
     }
 
-    /// Say once which user flags `brew <verb>` would reject and we dropped.
-    fn note_dropped_flags(&mut self, verb: &str, context: &str) {
-        let dropped = crate::flags::filter_for_verb(verb, self.user_flags).dropped;
+    /// Say once which of `flags` `brew <verb>` would reject and we dropped.
+    fn note_dropped_flags(&mut self, verb: &str, flags: &[String], context: &str) {
+        let dropped = crate::flags::filter_for_verb(verb, flags).dropped;
         if let Some(note) = crate::flags::dropped_note(verb, &dropped, context)
             && !self.deferred.contains(&note)
         {
             self.defer(note);
+        }
+    }
+
+    /// What a staged `brew install` may see. On an upgrade the greedy flags
+    /// are brewsoak's (read by `bare_action`), so they are neither forwarded
+    /// nor reported as dropped; `-g` would otherwise reach brew install as
+    /// `--git`. The install table filter still applies in `brew_install_args`.
+    fn staged_install_flags(&self) -> Vec<String> {
+        if self.brew_verb == "upgrade" {
+            crate::flags::without_greedy(self.user_flags)
+        } else {
+            self.user_flags.to_vec()
         }
     }
 
@@ -1419,11 +1447,16 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         for warn in view.warnings.clone() {
             self.defer(format!("warning: {warn}"));
         }
+        let greedy = flags::greedy_mode(self.user_flags);
         if self.bare_run {
-            view.action = bare_action(&view);
+            view.action = bare_action(&view, greedy);
         }
+        let leaves_latest = self.bare_run && latest_left(&view, greedy);
         let did = match view.action {
             DesiredAction::InstallCutoff => "installing cutoff",
+            DesiredAction::NoOpAlreadySoaked if leaves_latest => {
+                "left unchanged; its contents cannot be soaked"
+            }
             DesiredAction::NoOpAlreadySoaked => "left unchanged",
             DesiredAction::LeaveAheadOfSoak => "left unchanged",
             DesiredAction::LeaveAutoUpdates => "left to the app",
@@ -1451,6 +1484,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
                     writeln!(self.out, "{name} is already installed")?;
+                }
+                if leaves_latest {
+                    // brew would reinstall it under --greedy; say why we did not.
+                    self.defer(latest_note(&name));
                 }
             }
             // Silent, as brew is: the app updates itself. `-v` shows the line.
@@ -1525,8 +1562,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
 
-        let args = tap::brew_install_args(&pkg, &path, self.user_flags);
-        self.note_dropped_flags("install", "staged installs");
+        let install_flags = self.staged_install_flags();
+        let args = tap::brew_install_args(&pkg, &path, &install_flags);
+        self.note_dropped_flags("install", &install_flags, "staged installs");
         match self.record_staged_install(origin_tap, name, kind, &args)? {
             StagedRun::Ran { failed } => {
                 // Counted as upgraded when it was announced; brew failed.
@@ -1838,7 +1876,9 @@ pub(crate) fn max_status(slot: &mut Option<i32>, code: i32) {
 }
 
 pub fn is_verbose(flags: &[String]) -> bool {
-    flags.iter().any(|f| f == "-v" || f == "--verbose")
+    flags
+        .iter()
+        .any(|f| f == "--verbose" || (flags::is_short_cluster(f) && f[1..].contains('v')))
 }
 
 fn already_installed_message(output: &std::process::Output) -> bool {
@@ -2028,18 +2068,44 @@ struct ResolvedView {
     warnings: Vec<String>,
     /// The HEAD cask says `auto_updates true`.
     auto_updates: bool,
+    /// The cutoff cask says `version :latest`. Read from the cutoff, not
+    /// HEAD: the cutoff is what brewsoak would install, and a cask whose
+    /// cutoff moved from `:latest` to a number soaks like any other.
+    latest: bool,
 }
 
 /// What a bare `upgrade`/`outdated` does: an installed self-updating cask
 /// that is behind the cutoff is left to the app, as brew leaves it without
-/// `--greedy`. Everything else keeps its action.
-fn bare_action(view: &ResolvedView) -> DesiredAction {
-    if view.auto_updates && view.installed.is_some() && view.action == DesiredAction::InstallCutoff
+/// `--greedy` / `--greedy-auto-updates`. Everything else keeps its action.
+/// `greedy.latest` changes no action: a `:latest` cask is reinstalled only
+/// when its cutoff definition differs from the installed one, which
+/// `desired_action` already decides; see `latest_left` for the note.
+fn bare_action(view: &ResolvedView, greedy: flags::Greedy) -> DesiredAction {
+    if view.auto_updates
+        && !greedy.auto_updates
+        && view.installed.is_some()
+        && view.action == DesiredAction::InstallCutoff
     {
         DesiredAction::LeaveAutoUpdates
     } else {
         view.action
     }
+}
+
+/// Under `--greedy` / `--greedy-latest`, brew reinstalls every `:latest`
+/// cask. brewsoak leaves one whose cutoff definition matches the installed
+/// one and says why. Evaluate after `bare_action` has settled the action.
+fn latest_left(view: &ResolvedView, greedy: flags::Greedy) -> bool {
+    greedy.latest
+        && view.latest
+        && view.installed.is_some()
+        && view.action == DesiredAction::NoOpAlreadySoaked
+}
+
+fn latest_note(name: &str) -> String {
+    format!(
+        "{name}: version :latest left unchanged; the contents of a :latest cask cannot be soaked"
+    )
 }
 
 fn resolve_view(
@@ -2090,6 +2156,7 @@ fn resolve_view(
         None => Vec::new(),
     };
     let auto_updates = kind == PkgKind::Cask && head_rb.is_some_and(identity::cask_auto_updates);
+    let latest = cutoff.as_ref().is_some_and(PkgIdentity::is_latest_cask);
     Ok(Some(ResolvedView {
         installed,
         cutoff,
@@ -2098,6 +2165,7 @@ fn resolve_view(
         cutoff_blob: blobs.cutoff,
         warnings,
         auto_updates,
+        latest,
     }))
 }
 
@@ -4116,9 +4184,10 @@ mod tests {
             );
             assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
         }
-        let note =
-            "brew install does not accept --greedy, --ignore-pinned; dropped from staged installs";
+        // `--greedy` is brewsoak's on an upgrade, so it is not "dropped".
+        let note = "brew install does not accept --ignore-pinned; dropped from staged installs";
         assert_eq!(text.matches(note).count(), 1, "{text}");
+        assert!(!text.contains("does not accept --greedy"), "{text}");
     }
 
     #[test]
@@ -5957,6 +6026,588 @@ mod tests {
             ..MockBrew::new()
         };
         (brew, git, core_snaps())
+    }
+
+    /// A hand-built view for the pure functions. `latest` makes the cutoff
+    /// `version :latest`; the installed side is always a numbered version.
+    fn greedy_view(action: DesiredAction, auto_updates: bool, latest: bool) -> ResolvedView {
+        let id = |v: &str| {
+            PkgIdentity::Cask(
+                crate::identity::parse_cask(&format!("cask \"x\" do\n  version {v}\nend\n"))
+                    .unwrap(),
+            )
+        };
+        ResolvedView {
+            installed: Some(id("\"1.0\"")),
+            cutoff: Some(id(if latest { ":latest" } else { "\"2.0\"" })),
+            head: None,
+            action,
+            cutoff_blob: None,
+            warnings: Vec::new(),
+            auto_updates,
+            latest,
+        }
+    }
+
+    fn greedy(argv: &[&str]) -> flags::Greedy {
+        flags::greedy_mode(&argv.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    /// A `version :latest` cask with `sha256 :no_check`; `url` is the only
+    /// thing that can differ between two of them.
+    fn latest_cask_rb(name: &str, url: &str, auto_updates: bool) -> String {
+        let auto = if auto_updates {
+            "  auto_updates true\n"
+        } else {
+            ""
+        };
+        format!(
+            "cask \"{name}\" do\n  version :latest\n  sha256 :no_check\n  url \"{url}\"\n{auto}end\n"
+        )
+    }
+
+    /// Five installed packages, one per greedy row: `wget` (formula behind
+    /// cutoff), `alt-tab` (self-updating, behind cutoff), `nightly`
+    /// (`:latest`, version-only receipt, cutoff matches), `moved` (`:latest`,
+    /// full receipt, cutoff url moved) and `self-latest` (`:latest` and
+    /// self-updating, cutoff url moved).
+    ///
+    /// Expected plan sizes: bare 2 (wget, moved); `--greedy-latest` 2;
+    /// `--greedy-auto-updates` 4 (+ alt-tab, self-latest); `--greedy` 4.
+    fn greedy_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.2.0", "newsha"),
+        );
+        let casks = [
+            (
+                "alt-tab",
+                format!("{}  auto_updates true\n", cask_rb("alt-tab", "11.8.0")),
+            ),
+            (
+                "nightly",
+                latest_cask_rb("nightly", "https://example.com/nightly.dmg", false),
+            ),
+            (
+                "moved",
+                latest_cask_rb("moved", "https://example.com/moved-new.dmg", false),
+            ),
+            (
+                "self-latest",
+                latest_cask_rb("self-latest", "https://example.com/self-new.dmg", true),
+            ),
+        ];
+        for (name, rb) in &casks {
+            let path = format!("Casks/{}/{name}.rb", &name[..1]);
+            git.insert_blob("caskcut", &path, rb.clone());
+            git.insert_blob("caskhead", &path, rb.clone());
+        }
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha")),
+                cask_pkg_from(
+                    "alt-tab",
+                    "homebrew/cask",
+                    crate::brew::version_only_cask_receipt("alt-tab", "7.38.1"),
+                ),
+                cask_pkg_from(
+                    "nightly",
+                    "homebrew/cask",
+                    crate::brew::version_only_cask_receipt("nightly", "latest"),
+                ),
+                cask_pkg_from(
+                    "moved",
+                    "homebrew/cask",
+                    latest_cask_rb("moved", "https://example.com/moved-old.dmg", false),
+                ),
+                cask_pkg_from(
+                    "self-latest",
+                    "homebrew/cask",
+                    latest_cask_rb("self-latest", "https://example.com/self-old.dmg", true),
+                ),
+            ],
+            ..MockBrew::new()
+        };
+        (brew, git, core_snaps())
+    }
+
+    /// Bare `upgrade` over `greedy_world` with `flags`; returns the output.
+    fn greedy_upgrade(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        snaps: &Snapshots,
+        argv: &[&str],
+    ) -> String {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let flags: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let mut out = Vec::new();
+        upgrade(
+            brew,
+            git,
+            snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &flags,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn bare_upgrade_of_greedy_world_is_unchanged() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["-v"]);
+        assert!(text.contains("upgrading 2 of 5 packages"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "wget"), "{text}");
+        assert!(
+            run_is_soaked_install(&runs, "moved"),
+            "a changed :latest definition reinstalls: {text}"
+        );
+        assert!(!run_is_soaked_install(&runs, "alt-tab"), "{text}");
+        assert!(!run_is_soaked_install(&runs, "self-latest"), "{text}");
+        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(
+            !text.contains("cannot be soaked"),
+            "bare run says nothing about :latest: {text}"
+        );
+        assert!(text.contains("auto-updates 2"), "{text}");
+    }
+
+    #[test]
+    fn greedy_upgrades_self_updating_casks_and_notes_latest_casks() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy", "-v"]);
+        assert!(text.contains("upgrading 4 of 5 packages"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "alt-tab"), "{text}");
+        assert!(run_is_soaked_install(&runs, "self-latest"), "{text}");
+        assert!(run_is_soaked_install(&runs, "moved"), "{text}");
+        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(
+            text.contains("alt-tab: installing cutoff 11.8.0; installed 7.38.1 is behind soak; installing cutoff"),
+            "{text}"
+        );
+        assert!(
+            text.contains("nightly: up to date (soaked); installed :latest matches cutoff; left unchanged; its contents cannot be soaked"),
+            "{text}"
+        );
+        assert!(text.contains("notes:\n"), "{text}");
+        assert!(
+            text.contains(&format!("\n  {}\n", latest_note("nightly"))),
+            "the note is a line of the notes block: {text}"
+        );
+        assert!(
+            !text.contains("auto-updates"),
+            "no cask was left to the app: {text}"
+        );
+        assert!(text.contains("upgraded 4, already soaked 1,"), "{text}");
+        for args in &runs {
+            assert!(
+                !args.iter().any(|a| a.starts_with("--greedy")),
+                "brew install never sees the greedy flags: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn greedy_auto_updates_upgrades_self_updating_casks_only() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy-auto-updates"]);
+        assert!(text.contains("upgrading 4 of 5 packages"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "alt-tab"), "{text}");
+        assert!(run_is_soaked_install(&runs, "self-latest"), "{text}");
+        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(!text.contains("cannot be soaked"), "{text}");
+    }
+
+    #[test]
+    fn greedy_latest_leaves_self_updating_casks_and_notes_latest() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy-latest", "-v"]);
+        assert!(text.contains("upgrading 2 of 5 packages"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(!run_is_soaked_install(&runs, "alt-tab"), "{text}");
+        assert!(
+            !run_is_soaked_install(&runs, "self-latest"),
+            "both :latest and self-updating: the auto-updates leave stands: {text}"
+        );
+        assert!(run_is_soaked_install(&runs, "moved"), "{text}");
+        assert!(
+            text.contains("self-latest: auto-updates; installed :latest is left to the app"),
+            "{text}"
+        );
+        assert!(text.contains(&latest_note("nightly")), "{text}");
+        assert!(text.contains("auto-updates 2"), "{text}");
+    }
+
+    #[test]
+    fn short_g_is_greedy_on_upgrade_and_never_reaches_brew_install() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["-vg"]);
+        assert!(
+            text.contains("alt-tab: installing cutoff"),
+            "-vg is brewsoak-verbose: {text}"
+        );
+        assert!(text.contains("upgrading 4 of 5 packages"), "{text}");
+        let installs: Vec<Vec<String>> = lock_runs(&brew)
+            .into_iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .collect();
+        assert_eq!(installs.len(), 4, "{text}");
+        for args in &installs {
+            assert!(
+                !args.iter().any(|a| a == "-g" || a == "-vg" || a == "--git"),
+                "`g` is --git to brew install: {args:?}"
+            );
+            assert!(
+                args.iter().any(|a| a == "-v"),
+                "the rest of the cluster stays: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_upgrade_ignores_greedy_and_prints_no_latest_note() {
+        let (brew, git, snaps) = greedy_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["nightly".into(), "alt-tab".into()],
+            &["--greedy".into()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let runs = lock_runs(&brew);
+        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(
+            run_is_soaked_install(&runs, "alt-tab"),
+            "named: upgraded regardless of greedy: {text}"
+        );
+        assert!(!text.contains("cannot be soaked"), "{text}");
+        assert!(!text.contains("does not accept --greedy"), "{text}");
+    }
+
+    /// Bare `outdated` over `greedy_world` with `argv`; returns the output.
+    fn greedy_outdated(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        snaps: &Snapshots,
+        argv: &[&str],
+    ) -> String {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let flags: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+        let mut out = Vec::new();
+        outdated(
+            brew,
+            git,
+            snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &flags,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// Lines under `header` up to the next `==> ` header, `(none)` excluded.
+    fn section_lines(text: &str, header: &str) -> Vec<String> {
+        text.lines()
+            .skip_while(|l| *l != header)
+            .skip(1)
+            .take_while(|l| !l.starts_with("==> "))
+            .filter(|l| *l != "(none)")
+            .map(str::to_string)
+            .collect()
+    }
+
+    const OUTDATED_HEADER: &str = "==> Outdated (will upgrade)";
+    const AUTO_UPDATES_HEADER: &str = "==> Auto-updates (left to the app; name it to upgrade)";
+
+    #[test]
+    fn outdated_greedy_lists_self_updating_casks_as_outdated() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_outdated(&brew, &git, &snaps, &["--greedy"]);
+        let upgrades = section_lines(&text, OUTDATED_HEADER);
+        assert!(
+            upgrades.contains(&"alt-tab (7.38.1) < 11.8.0".to_string()),
+            "{text}"
+        );
+        assert!(
+            upgrades.contains(&"self-latest (:latest) < :latest".to_string()),
+            "{text}"
+        );
+        assert!(
+            upgrades.contains(&"moved (:latest) < :latest".to_string()),
+            "{text}"
+        );
+        assert!(
+            upgrades.contains(&"wget (1.0.0) < 1.1.0".to_string()),
+            "{text}"
+        );
+        assert_eq!(upgrades.len(), 4, "{text}");
+        assert!(
+            section_lines(&text, AUTO_UPDATES_HEADER).is_empty(),
+            "{text}"
+        );
+        assert!(
+            !text.contains("cannot be soaked"),
+            "the note needs -v: {text}"
+        );
+    }
+
+    #[test]
+    fn outdated_greedy_latest_notes_latest_casks_with_verbose() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_outdated(&brew, &git, &snaps, &["--greedy-latest", "-v"]);
+        assert!(text.contains(&latest_note("nightly")), "{text}");
+        assert_eq!(
+            text.matches("cannot be soaked").count(),
+            1,
+            "only nightly: {text}"
+        );
+        let auto = section_lines(&text, AUTO_UPDATES_HEADER);
+        assert_eq!(
+            auto.len(),
+            2,
+            "alt-tab and self-latest stay left to the app: {text}"
+        );
+        assert_eq!(section_lines(&text, OUTDATED_HEADER).len(), 2, "{text}");
+    }
+
+    #[test]
+    fn outdated_greedy_auto_updates_lists_self_updating_and_skips_the_note() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_outdated(&brew, &git, &snaps, &["--greedy-auto-updates", "-v"]);
+        assert_eq!(section_lines(&text, OUTDATED_HEADER).len(), 4, "{text}");
+        assert!(
+            section_lines(&text, AUTO_UPDATES_HEADER).is_empty(),
+            "{text}"
+        );
+        assert!(!text.contains("cannot be soaked"), "{text}");
+    }
+
+    #[test]
+    fn outdated_short_g_is_greedy() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_outdated(&brew, &git, &snaps, &["-g"]);
+        assert_eq!(section_lines(&text, OUTDATED_HEADER).len(), 4, "{text}");
+        let text = greedy_outdated(&brew, &git, &snaps, &["-gv"]);
+        assert_eq!(section_lines(&text, OUTDATED_HEADER).len(), 4, "{text}");
+        assert!(
+            text.contains("classified for outdated"),
+            "-gv is verbose: {text}"
+        );
+        let text = greedy_outdated(&brew, &git, &snaps, &["-v", "--greedy-latest"]);
+        assert!(text.contains(&latest_note("nightly")), "{text}");
+    }
+
+    #[test]
+    fn bare_greedy_latest_upgrade_prints_the_latest_note_in_notes() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy-latest"]);
+        let notes = text
+            .split("notes:\n")
+            .nth(1)
+            .unwrap_or_else(|| panic!("no notes: block: {text}"));
+        assert!(notes.contains("nightly"), "{text}");
+        assert!(notes.contains("cannot be soaked"), "{text}");
+    }
+
+    /// Pins the claim in `plan_size`'s comment: the pre-run total, the
+    /// `[i/N]` announcements and the `outdated` report agree in every mode.
+    #[test]
+    fn plan_size_upgrade_and_outdated_agree_under_every_greedy_mode() {
+        for (argv, want) in [
+            (&[][..], 2usize),
+            (&["--greedy-latest"][..], 2),
+            (&["--greedy-auto-updates"][..], 4),
+            (&["--greedy"][..], 4),
+        ] {
+            let (brew, git, snaps) = greedy_world();
+            let cfg = cfg24();
+            let inv = inv_from(&brew, &cfg);
+            let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            let size = plan_size(
+                &git,
+                &snaps,
+                unused_cache(),
+                &inv,
+                flags::greedy_mode(&owned),
+            );
+            assert_eq!(size, want, "plan_size {argv:?}");
+
+            let text = greedy_upgrade(&brew, &git, &snaps, argv);
+            assert!(
+                text.contains(&format!("upgrading {want} of 5 packages")),
+                "{argv:?}: {text}"
+            );
+            let announced = text
+                .lines()
+                .filter(|l| l.starts_with('[') && l.contains(&format!("/{want}] ")))
+                .count();
+            assert_eq!(announced, want, "announced {argv:?}: {text}");
+
+            let text = greedy_outdated(&brew, &git, &snaps, argv);
+            assert_eq!(
+                section_lines(&text, OUTDATED_HEADER).len(),
+                want,
+                "outdated {argv:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_action_leaves_self_updating_cask_unless_greedy_auto_updates() {
+        let view = greedy_view(DesiredAction::InstallCutoff, true, false);
+        assert_eq!(
+            bare_action(&view, greedy(&[])),
+            DesiredAction::LeaveAutoUpdates
+        );
+        assert_eq!(
+            bare_action(&view, greedy(&["--greedy-latest"])),
+            DesiredAction::LeaveAutoUpdates
+        );
+        assert_eq!(
+            bare_action(&view, greedy(&["--greedy-auto-updates"])),
+            DesiredAction::InstallCutoff
+        );
+        assert_eq!(
+            bare_action(&view, greedy(&["--greedy"])),
+            DesiredAction::InstallCutoff
+        );
+    }
+
+    #[test]
+    fn bare_action_only_changes_a_self_updating_install() {
+        for argv in [
+            &[][..],
+            &["--greedy"][..],
+            &["--greedy-latest"][..],
+            &["--greedy-auto-updates"][..],
+        ] {
+            let plain = greedy_view(DesiredAction::InstallCutoff, false, false);
+            assert_eq!(
+                bare_action(&plain, greedy(argv)),
+                DesiredAction::InstallCutoff,
+                "{argv:?}"
+            );
+            let soaked = greedy_view(DesiredAction::NoOpAlreadySoaked, true, false);
+            assert_eq!(
+                bare_action(&soaked, greedy(argv)),
+                DesiredAction::NoOpAlreadySoaked,
+                "{argv:?}"
+            );
+            let ahead = greedy_view(DesiredAction::LeaveAheadOfSoak, true, false);
+            assert_eq!(
+                bare_action(&ahead, greedy(argv)),
+                DesiredAction::LeaveAheadOfSoak,
+                "{argv:?}"
+            );
+            let mut fresh = greedy_view(DesiredAction::InstallCutoff, true, false);
+            fresh.installed = None;
+            assert_eq!(
+                bare_action(&fresh, greedy(argv)),
+                DesiredAction::InstallCutoff,
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_left_only_under_greedy_latest_with_a_matching_cutoff() {
+        let same = greedy_view(DesiredAction::NoOpAlreadySoaked, false, true);
+        assert!(
+            !latest_left(&same, greedy(&[])),
+            "bare run: silent, as today"
+        );
+        assert!(latest_left(&same, greedy(&["--greedy-latest"])));
+        assert!(latest_left(&same, greedy(&["--greedy"])));
+        assert!(!latest_left(&same, greedy(&["--greedy-auto-updates"])));
+        let moved = greedy_view(DesiredAction::InstallCutoff, false, true);
+        assert!(
+            !latest_left(&moved, greedy(&["--greedy"])),
+            "a changed definition reinstalls"
+        );
+        let numbered = greedy_view(DesiredAction::NoOpAlreadySoaked, false, false);
+        assert!(!latest_left(&numbered, greedy(&["--greedy"])));
+        let mut fresh = greedy_view(DesiredAction::NoOpAlreadySoaked, false, true);
+        fresh.installed = None;
+        assert!(!latest_left(&fresh, greedy(&["--greedy"])));
+        assert_eq!(
+            latest_note("nightly"),
+            "nightly: version :latest left unchanged; the contents of a :latest cask cannot be soaked"
+        );
+    }
+
+    #[test]
+    fn resolve_view_reads_latest_from_the_cutoff_cask() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "caskcut",
+            "Casks/n/nightly.rb",
+            "cask \"nightly\" do\n  version :latest\n  sha256 :no_check\n  url \"https://example.com/nightly.dmg\"\nend\n",
+        );
+        git.insert_blob("caskhead", "Casks/n/nightly.rb", cask_rb("nightly", "2.0"));
+        let receipt = crate::brew::version_only_cask_receipt("nightly", "latest");
+        let view = resolve_view(
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            "homebrew/cask",
+            "nightly",
+            PkgKind::Cask,
+            Some(&receipt),
+        )
+        .unwrap()
+        .expect("parseable");
+        assert!(view.latest, "cutoff is :latest");
+        assert_eq!(view.action, DesiredAction::NoOpAlreadySoaked);
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/n/nightly.rb", cask_rb("nightly", "2.0"));
+        git.insert_blob("caskhead", "Casks/n/nightly.rb", cask_rb("nightly", "2.0"));
+        let view = resolve_view(
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            "homebrew/cask",
+            "nightly",
+            PkgKind::Cask,
+            Some(&receipt),
+        )
+        .unwrap()
+        .expect("parseable");
+        assert!(!view.latest, "a cutoff that moved to a number is soakable");
+        assert_eq!(view.action, DesiredAction::InstallCutoff);
     }
 
     #[test]

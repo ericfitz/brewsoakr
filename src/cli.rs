@@ -455,6 +455,13 @@ with them.
 Taps without an HTTPS remote are not soakable and are noted, not upgraded.
 Casks that update themselves (auto_updates true) are left to the app on a
 bare upgrade, as brew leaves them without --greedy; name one to upgrade it.
+  -g, --greedy              also upgrade self-updating casks to their cutoff,
+                            and consider version :latest casks
+      --greedy-auto-updates self-updating casks only
+      --greedy-latest       version :latest casks only
+A version :latest cask is reinstalled only when its cutoff definition
+differs from the installed one; otherwise it is left with a note that the
+contents of a :latest cask cannot be soaked.
 
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
@@ -492,8 +499,15 @@ user/repo/name tokens are soaked (or no-soak) like any other package.
 Usage: brewsoak outdated
 
 List installed packages that upgrade would change, plus held,
-ahead-of-soak, and pinned sections.
+ahead-of-soak, auto-updates, and pinned sections.
 
+  -g, --greedy              list self-updating casks behind their cutoff
+                            under Outdated instead of Auto-updates, and
+                            consider version :latest casks
+      --greedy-auto-updates self-updating casks only
+      --greedy-latest       version :latest casks only
+  With --greedy or --greedy-latest, -v notes each :latest cask left
+  because its contents cannot be soaked.
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
                   written under $TMPDIR; its path is printed at the end)
@@ -647,6 +661,12 @@ mod tests {
                 .contains("passed through to brew")
         );
         assert!(command_help("update").unwrap().contains("brew update"));
+        for verb in ["upgrade", "outdated"] {
+            let text = command_help(verb).unwrap();
+            assert!(text.contains("--greedy-auto-updates"), "{verb}: {text}");
+            assert!(text.contains("--greedy-latest"), "{verb}: {text}");
+            assert!(text.contains("cannot be soaked"), "{verb}: {text}");
+        }
     }
 
     #[test]

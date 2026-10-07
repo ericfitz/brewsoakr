@@ -166,6 +166,9 @@ by that step.
 | `--help` / `-h` | brewsoak help. `help install` is soak-aware; `help services` is `brew help`. |
 
 Other flags (`--formula`, `--cask`, `--debug`, …) are forwarded to `brew`.
+`upgrade` and `outdated` honor brew's `--greedy` (`-g`),
+`--greedy-auto-updates` and `--greedy-latest` themselves (see below); the
+no-soak `brew upgrade` also receives them.
 
 `-v` / `--verbose` prints the soak window, cutoff SHAs and times, and a
 line for every package evaluated (what happened and why).
@@ -211,9 +214,16 @@ already soaked: 137 formulae and casks
 Casks that update themselves (`auto_updates true`) are left to the app on a
 bare `upgrade`, as `brew upgrade` leaves them without `--greedy`; they are
 counted as `auto-updates N` and `outdated` lists them under their own
-heading. Name one (`brewsoak upgrade alt-tab`) to upgrade it anyway. Since Homebrew 4
-an installed cask carries only a version (the Caskroom usually holds no cask
-source), so a cask is compared to its cutoff by version alone.
+heading. Name one (`brewsoak upgrade alt-tab`) to upgrade it anyway, or pass
+`--greedy` (or `--greedy-auto-updates`) to upgrade all of them to their
+soaked cutoff like any other cask. A `version :latest` cask is different:
+its contents change without the cask changing, so brewsoak reinstalls one
+under `--greedy` / `--greedy-latest` only when its cutoff definition differs
+from the installed one, and otherwise leaves it with a note that the
+contents of a `:latest` cask cannot be soaked (brew would reinstall it every
+time). Since Homebrew 4 an installed cask carries only a version (the
+Caskroom usually holds no cask source), so a cask is compared to its cutoff
+by version alone.
 
 An `upgrade` with work to do looks like:
 

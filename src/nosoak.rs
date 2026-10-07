@@ -211,7 +211,14 @@ pub fn run_step(
                 .join(", ")
         ));
     }
-    let switch_flags = filter_for_verb("reinstall", &flags);
+    // On upgrade `-g` is `--greedy`, but on reinstall the same letter is
+    // `--git`: the switch must not see it.
+    let switch_input = if verb == "upgrade" {
+        crate::flags::without_greedy(&flags)
+    } else {
+        flags.clone()
+    };
+    let switch_flags = filter_for_verb("reinstall", &switch_input);
     if !dry_run
         && !switch.is_empty()
         && let Some(note) =
@@ -570,6 +577,38 @@ mod tests {
             runs(&brew)[1],
             vec!["reinstall", "--verbose", "hashicorp/tap/packer"]
         );
+    }
+
+    #[test]
+    fn short_g_never_reaches_reinstall_but_plain_upgrade_keeps_greedy() {
+        for (flag, want) in [("-g", vec![]), ("-vg", vec!["-v"])] {
+            let brew = MockBrew::new();
+            run_step(
+                &brew,
+                "upgrade",
+                &[flag.to_string()],
+                &switch_target("hashicorp/tap", "packer"),
+                &mut Vec::new(),
+            )
+            .unwrap();
+            let got = runs(&brew);
+            let mut expect = vec!["reinstall".to_string()];
+            expect.extend(want.iter().map(|s| s.to_string()));
+            expect.push("hashicorp/tap/packer".into());
+            assert_eq!(got[1], expect, "`g` is --git to brew reinstall: {flag}");
+        }
+        for flag in ["-g", "--greedy"] {
+            let brew = MockBrew::new();
+            run_step(
+                &brew,
+                "upgrade",
+                &[flag.to_string()],
+                &[t("homebrew/cask", "foo")],
+                &mut Vec::new(),
+            )
+            .unwrap();
+            assert_eq!(runs(&brew)[1], vec!["upgrade", flag, "foo"]);
+        }
     }
 
     fn typed(origin: &str, name: &str, kind: PkgKind) -> Target {
