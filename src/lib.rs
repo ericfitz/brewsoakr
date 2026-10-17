@@ -1,3 +1,4 @@
+pub mod atomic;
 pub mod brew;
 pub mod cli;
 pub mod cmd;
@@ -10,6 +11,7 @@ pub mod github;
 pub mod hours;
 pub mod identity;
 pub mod inventory;
+pub mod lock;
 pub mod nosoak;
 pub mod origin;
 pub mod paths;
@@ -49,6 +51,10 @@ pub trait World {
     fn git(&self) -> &Self::Git;
     fn github(&self) -> &Self::Github;
     fn brew(&self) -> &Self::Brew;
+    /// How long a run waits for another run's cache lock.
+    fn lock_wait(&self) -> std::time::Duration {
+        lock::WAIT
+    }
 }
 
 pub struct RealWorld {
@@ -147,6 +153,27 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         )?;
         return Ok(Dispatch::Exit(0));
     }
+    // Everything below the settings branch that reads or writes the cache
+    // holds the run lock to the end of dispatch. `outdated` and `info` count:
+    // they refresh and write state.toml and the clones when the stored
+    // snapshot is missing or a tap is stale. Version, help and passthrough
+    // never touch the cache.
+    let _lock = match inv.command {
+        cli::Command::Update
+        | cli::Command::Outdated
+        | cli::Command::Info { .. }
+        | cli::Command::Upgrade { .. }
+        | cli::Command::Install { .. }
+        | cli::Command::Reinstall { .. } => Some(lock::acquire_waiting(
+            &world.cache_path(),
+            args,
+            world.lock_wait(),
+        )?),
+        cli::Command::Version
+        | cli::Command::Help { .. }
+        | cli::Command::Settings(_)
+        | cli::Command::Passthrough { .. } => None,
+    };
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
     let cfg = config::resolve_config(inv.soak_hours, env.as_deref(), file.as_deref())?;
@@ -598,6 +625,72 @@ mod tests {
         fn brew(&self) -> &MockBrew {
             &self.brew
         }
+        fn lock_wait(&self) -> std::time::Duration {
+            std::time::Duration::from_millis(150)
+        }
+    }
+
+    #[test]
+    fn cache_writing_commands_fail_while_another_run_holds_the_lock() {
+        for argv in [
+            s(&["update"]),
+            s(&["outdated"]),
+            s(&["info", "wget"]),
+            s(&["upgrade"]),
+            s(&["install", "wget"]),
+            s(&["reinstall", "wget"]),
+        ] {
+            let world = TestWorld::new();
+            let _held = lock::acquire_waiting(
+                &world.cache_path,
+                &s(&["upgrade", "jq"]),
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap();
+            let err = dispatch(&argv, &world).unwrap_err();
+            let text = err.to_string();
+            assert!(matches!(err, Error::Refusal(_)), "{argv:?}: {text}");
+            assert!(
+                text.contains(&format!("pid {}", std::process::id()))
+                    && text.contains("`brewsoak upgrade jq`"),
+                "{argv:?}: {text}"
+            );
+            assert!(!world.github.refreshed.get(), "{argv:?} did work");
+            assert!(!world.config_path.exists(), "{argv:?} wrote config");
+        }
+    }
+
+    #[test]
+    fn commands_that_never_touch_the_cache_ignore_the_lock() {
+        for argv in [
+            s(&["--version"]),
+            s(&["help"]),
+            s(&["settings"]),
+            s(&["settings", "show"]),
+            s(&["settings", "soak-hours", "48"]),
+            s(&["services", "list"]),
+        ] {
+            let world = TestWorld::new();
+            let _held = lock::acquire_waiting(
+                &world.cache_path,
+                &s(&["upgrade"]),
+                std::time::Duration::from_millis(50),
+            )
+            .unwrap();
+            dispatch(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn dispatch_releases_the_lock_when_it_returns() {
+        let world = TestWorld::new();
+        dispatch(&s(&["outdated"]), &world).unwrap();
+        let again = lock::acquire_waiting(
+            &world.cache_path,
+            &s(&["update"]),
+            std::time::Duration::from_millis(50),
+        );
+        assert!(again.is_ok(), "{again:?}");
     }
 
     #[test]

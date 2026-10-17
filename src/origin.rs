@@ -70,8 +70,7 @@ impl OriginRecords {
         for (k, v) in &self.map {
             body.push_str(&format!("{k:?} = {v:?}\n"));
         }
-        std::fs::write(Self::path(cache), body)?;
-        Ok(())
+        crate::atomic::write(&Self::path(cache), &body)
     }
 
     pub fn get(&self, kind: PkgKind, name: &str) -> Option<&str> {

@@ -36,3 +36,9 @@
   - `action`: what brewsoak was doing, in our words
   - `detail`: git's stderr (or why git could not start)
 - Do not leak a raw git message as the only user-visible text.
+
+## Cache state
+
+- Commands that touch the cache (`update`, `outdated`, `info`, `upgrade`, `install`, `reinstall`; not `settings`, which never touches the cache) hold the `<cache>/run.lock` flock via `lock::acquire_waiting` from `dispatch`.
+- Write `state.toml` and `origins.toml` only through `atomic::write` (temp + rename).
+- `gc_prune` runs only after `state.toml` is written.

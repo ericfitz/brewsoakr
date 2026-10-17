@@ -150,10 +150,12 @@ type Classified = (
 );
 
 /// Installed soaked packages whose origin has a snapshot in this run. A tap
-/// that failed to refresh (or has no state) contributes nothing.
+/// that failed to refresh (even if it keeps its last good table) or has no
+/// state contributes nothing.
 fn snapshotted_pkgs<'a>(inv: &'a Inventory, snaps: &'a Snapshots) -> impl Iterator<Item = &'a Pkg> {
     inv.pkgs.iter().filter(|p| {
         p.class == PkgClass::Soaked
+            && !snaps.held_taps.contains_key(&p.origin)
             && (origin::is_core_or_cask(&p.origin) || snaps.tap(&p.origin).is_some())
     })
 }
@@ -8319,6 +8321,32 @@ mod tests {
                 && text.contains("fatal: boom"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn snapshotted_pkgs_skips_a_held_tap_that_keeps_its_last_good_snapshot() {
+        let git = InMemoryGit::new();
+        let brew = MockBrew {
+            installed: vec![formula_pkg_from(
+                "terraform",
+                "hashicorp/tap",
+                formula_rb("terraform", "1.0.0", "oldsha"),
+            )],
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let inv = inv_from(&brew, &cfg24());
+        let mut snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        assert_eq!(snapshotted_pkgs(&inv, &snaps).count(), 1);
+        snaps.held_taps.insert(
+            "hashicorp/tap".into(),
+            "while fetching history from origin, git failed:\nfatal: boom".into(),
+        );
+        assert!(snaps.tap("hashicorp/tap").is_some(), "stale table is kept");
+        assert_eq!(snapshotted_pkgs(&inv, &snaps).count(), 0);
     }
 
     #[test]
