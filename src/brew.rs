@@ -96,6 +96,9 @@ pub struct ProcessBrew {
     cellar: std::cell::OnceCell<Option<PathBuf>>,
     /// `compare_versions` answers for this run, keyed by `(kind, a, b)`.
     orderings: Mutex<HashMap<(&'static str, String, String), Ordering>>,
+    /// Pairs whose batch failed, with the failure: a broken `brew ruby` costs
+    /// one spawn per run, not one per package.
+    ordering_failures: Mutex<HashMap<(&'static str, String, String), (i32, String)>>,
     /// `host_platform`, asked once: the host never changes during a run.
     host: std::cell::OnceCell<Option<HostPlatform>>,
     sink: Mutex<Sink>,
@@ -134,12 +137,36 @@ impl Sink {
 }
 
 impl ProcessBrew {
+    /// One `brew ruby` spawn for a batch; `count` answers or an error.
+    fn ask_orderings(&self, args: &[String], count: usize) -> Result<Vec<Ordering>, Error> {
+        let output = self.run(args)?;
+        if !output.status.success() {
+            return Err(brew_fail(&output));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        stdout
+            .lines()
+            .map(|l| match l.trim() {
+                "-1" => Some(Ordering::Less),
+                "0" => Some(Ordering::Equal),
+                "1" => Some(Ordering::Greater),
+                _ => None,
+            })
+            .collect::<Option<_>>()
+            .filter(|a: &Vec<Ordering>| a.len() == count)
+            .ok_or_else(|| Error::Brew {
+                status: 0,
+                message: format!("unparseable version comparison output: {}", stdout.trim()),
+            })
+    }
+
     pub fn new(bin: PathBuf) -> Self {
         Self {
             bin,
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
             orderings: Mutex::new(HashMap::new()),
+            ordering_failures: Mutex::new(HashMap::new()),
             host: std::cell::OnceCell::new(),
             sink: Mutex::new(Sink::default()),
         }
@@ -276,6 +303,18 @@ impl Brew for ProcessBrew {
                 }
             }
         }
+        {
+            let failures = self
+                .ordering_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((status, message)) = pairs.iter().find_map(|p| failures.get(&key(p))) {
+                return Err(Error::Brew {
+                    status: *status,
+                    message: message.clone(),
+                });
+            }
+        }
         if !asking.is_empty() {
             let mut args = vec![
                 "ruby".to_string(),
@@ -286,25 +325,23 @@ impl Brew for ProcessBrew {
             for (kind, a, b) in &asking {
                 args.extend([kind_tag(*kind).to_string(), a.clone(), b.clone()]);
             }
-            let output = self.run(&args)?;
-            if !output.status.success() {
-                return Err(brew_fail(&output));
-            }
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let answers: Vec<Ordering> = stdout
-                .lines()
-                .map(|l| match l.trim() {
-                    "-1" => Some(Ordering::Less),
-                    "0" => Some(Ordering::Equal),
-                    "1" => Some(Ordering::Greater),
-                    _ => None,
-                })
-                .collect::<Option<_>>()
-                .filter(|a: &Vec<Ordering>| a.len() == asking.len())
-                .ok_or_else(|| Error::Brew {
-                    status: 0,
-                    message: format!("unparseable version comparison output: {}", stdout.trim()),
-                })?;
+            let answers = match self.ask_orderings(&args, asking.len()) {
+                Ok(answers) => answers,
+                Err(e) => {
+                    let (status, message) = match &e {
+                        Error::Brew { status, message } => (*status, message.clone()),
+                        other => (1, other.to_string()),
+                    };
+                    let mut failures = self
+                        .ordering_failures
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for pair in &asking {
+                        failures.insert(key(pair), (status, message.clone()));
+                    }
+                    return Err(e);
+                }
+            };
             let mut memo = self.orderings.lock().unwrap_or_else(|e| e.into_inner());
             for (pair, answer) in asking.iter().zip(answers) {
                 memo.insert(key(pair), answer);
@@ -1650,6 +1687,20 @@ mod tests {
                 .ends_with("-- formula 3.6.5 3.5.9 cask 1.0 2.0"),
             "versions travel as argv, not Ruby source: {argv}"
         );
+    }
+
+    #[test]
+    fn compare_versions_failure_is_memoized_for_the_run() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "", 1);
+        let brew = ProcessBrew::new(script);
+        let pair = (PkgKind::Formula, "1.0".to_string(), "2.0".to_string());
+        assert!(brew.compare_versions(std::slice::from_ref(&pair)).is_err());
+        assert!(brew.compare_versions(std::slice::from_ref(&pair)).is_err());
+        let other = (PkgKind::Formula, "1.0".to_string(), "3.0".to_string());
+        assert!(brew.compare_versions(&[pair.clone(), other]).is_err());
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(argv.matches("ruby -e").count(), 1, "{argv}");
     }
 
     #[test]
