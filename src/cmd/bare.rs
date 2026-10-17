@@ -211,6 +211,21 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_announces_a_moved_latest_cask_as_a_changed_definition() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy", "-v"]);
+        assert!(
+            text.contains("reinstalling moved (latest definition changed)"),
+            "{text}"
+        );
+        assert!(!text.contains("upgrading moved"), "{text}");
+        assert!(
+            text.contains("moved: installed :latest definition differs from cutoff; reinstalling"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn greedy_upgrades_self_updating_casks_and_notes_latest_casks() {
         let (brew, git, snaps) = greedy_world();
         let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy", "-v"]);

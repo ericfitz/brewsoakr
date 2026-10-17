@@ -329,7 +329,13 @@ fn retain_keeping_padding(arr: &mut Array, gone: impl Fn(&Value) -> bool) -> usi
         v.decor_mut().set_prefix(prefixes_new[j].clone());
     }
     if kept.is_empty() {
-        arr.set_trailing("");
+        // Nothing left to carry the comment after `[`, so it stays in the
+        // array's own text: `[ # list\n]`.
+        arr.set_trailing(if open_trail.contains('#') {
+            open_trail.as_str()
+        } else {
+            ""
+        });
         arr.set_trailing_comma(false);
     } else if comma {
         arr.set_trailing(tail);
@@ -1369,6 +1375,28 @@ mod tests {
             let mut d = doc(input);
             no_soak_remove(&mut d, &s(&[token])).unwrap();
             assert_eq!(d.to_string(), want, "{input:?} - {token}");
+            assert!(
+                d.to_string().parse::<DocumentMut>().is_ok(),
+                "still valid TOML: {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_soak_remove_of_every_entry_keeps_the_open_bracket_comment() {
+        for (input, want) in [
+            (
+                "NO_SOAK = [ # list\n  \"a\",\n  \"b\",\n]\n",
+                "NO_SOAK = [ # list\n]\n",
+            ),
+            (
+                "NO_SOAK = [ # list\n  \"a\",\n  \"b\"\n]\n",
+                "NO_SOAK = [ # list\n]\n",
+            ),
+        ] {
+            let mut d = doc(input);
+            no_soak_remove(&mut d, &s(&["a", "b"])).unwrap();
+            assert_eq!(d.to_string(), want, "{input:?}");
             assert!(
                 d.to_string().parse::<DocumentMut>().is_ok(),
                 "still valid TOML: {want:?}"

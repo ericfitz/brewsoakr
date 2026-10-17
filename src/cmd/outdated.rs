@@ -19,7 +19,7 @@ use std::path::Path;
 /// installed one, so say that in brew's own `outdated --verbose` style
 /// (`Cask#outdated_info`: `token (latest) != latest`, without the colon).
 fn compare_line(name: &str, installed: &str, cmp: char, cutoff: &str) -> String {
-    if installed == ":latest" && cutoff == ":latest" {
+    if crate::report::latest_redefined(Some(installed), Some(cutoff)) {
         return format!("{name} (latest) != latest (definition changed)");
     }
     format!("{name} ({installed}) {cmp} {cutoff}")
@@ -448,6 +448,17 @@ mod tests {
         );
         assert!(!r.refused);
         assert!(brew.visible_runs.lock().expect("visible").is_empty());
+    }
+
+    #[test]
+    fn outdated_verbose_says_a_moved_latest_cask_changed_definition() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_outdated(&brew, &git, &snaps, &["--greedy", "-v"]);
+        assert!(
+            text.contains("moved: installed :latest definition differs from cutoff; reinstalling"),
+            "{text}"
+        );
+        assert!(!text.contains("moved: installing cutoff :latest"), "{text}");
     }
 
     #[test]

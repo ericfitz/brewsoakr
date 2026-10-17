@@ -47,6 +47,13 @@ pub fn identity_version(id: &PkgIdentity) -> String {
     }
 }
 
+/// A `:latest` cask has no version to order, so installed and cutoff both
+/// reading `:latest` while the action is to install means the cask definition
+/// (url or sha) changed, not that the installed one is "behind".
+pub fn latest_redefined(installed: Option<&str>, cutoff: Option<&str>) -> bool {
+    installed == Some(":latest") && cutoff == Some(":latest")
+}
+
 pub fn human_action(action: DesiredAction) -> &'static str {
     match action {
         DesiredAction::InstallCutoff => "would upgrade",
@@ -73,6 +80,9 @@ pub fn compact_info_line(
     match action {
         DesiredAction::InstallCutoff => {
             let cut = cutoff.map(identity_version).unwrap_or_else(|| "?".into());
+            if latest_redefined(Some(&inst), Some(&cut)) {
+                return format!("{name}  {inst}  definition changed; would reinstall");
+            }
             format!("{name}  {inst}  would upgrade to {cut}")
         }
         _ => format!("{name}  {inst}  {}", human_action(action)),
@@ -96,6 +106,9 @@ pub fn evaluate_line(
             "up to date (soaked); installed {} matches cutoff; {did}",
             inst.unwrap_or("?")
         ),
+        DesiredAction::InstallCutoff if latest_redefined(inst, cut) => {
+            format!("installed :latest definition differs from cutoff; reinstalling; {did}")
+        }
         DesiredAction::InstallCutoff => {
             let state = match inst {
                 Some(v) => format!("installed {v} is behind soak"),
@@ -305,6 +318,24 @@ mod tests {
             line,
             "node: installing cutoff 26.10.0_2; installed 26.10.0_1 is behind soak; installing cutoff"
         );
+    }
+
+    #[test]
+    fn compact_line_says_a_moved_latest_definition_changed() {
+        let latest = || {
+            PkgIdentity::Cask(crate::identity::CaskIdentity {
+                version: ":latest".into(),
+                sha256: Some(":no_check".into()),
+                url: Some("https://example.com/new.dmg".into()),
+            })
+        };
+        let line = compact_info_line(
+            "moved",
+            Some(&latest()),
+            Some(&latest()),
+            DesiredAction::InstallCutoff,
+        );
+        assert_eq!(line, "moved  :latest  definition changed; would reinstall");
     }
 
     #[test]

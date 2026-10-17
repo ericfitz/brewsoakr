@@ -7,6 +7,7 @@ use super::{RunResult, is_verbose};
 use crate::Error;
 use crate::brew::Brew;
 use crate::config::Config;
+use crate::eligibility::DesiredAction;
 use crate::git::GitStore;
 use crate::inventory::{Inventory, PkgClass};
 use crate::nosoak;
@@ -175,7 +176,22 @@ pub fn info(
             )?;
             writeln!(out, "origin: {}", r.origin)?;
             writeln!(out, "soak hours: {}", cfg.effective_hours(&r.origin).get())?;
-            writeln!(out, "action: {}", report::human_action(view.action))?;
+            let redefined = view.action == DesiredAction::InstallCutoff
+                && report::latest_redefined(
+                    view.installed
+                        .as_ref()
+                        .map(report::identity_version)
+                        .as_deref(),
+                    view.cutoff
+                        .as_ref()
+                        .map(report::identity_version)
+                        .as_deref(),
+                );
+            if redefined {
+                writeln!(out, "action: would reinstall (latest definition changed)")?;
+            } else {
+                writeln!(out, "action: {}", report::human_action(view.action))?;
+            }
             for warn in &view.warnings {
                 writeln!(out, "warning: {warn}")?;
             }
@@ -238,6 +254,32 @@ mod tests {
             "missing install cutoff / upgrade wording: {text}"
         );
         assert!(!result.refused, "info is read-only");
+    }
+
+    #[test]
+    fn info_says_a_moved_latest_cask_changed_definition() {
+        let (brew, git, snaps) = crate::cmd::test_support::greedy_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        info(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &["moved".to_string()],
+            &["--greedy".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("action: would reinstall (latest definition changed)"),
+            "{text}"
+        );
+        assert!(!text.contains("would upgrade to :latest"), "{text}");
     }
 
     #[test]

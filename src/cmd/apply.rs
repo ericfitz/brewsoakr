@@ -337,7 +337,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             "reinstall" => "reinstalling",
             _ => "upgrading",
         };
-        match view.installed.as_ref().map(report::identity_version) {
+        let from = view.installed.as_ref().map(report::identity_version);
+        if report::latest_redefined(from.as_deref(), Some(&to)) {
+            writeln!(
+                self.out,
+                "{counter}reinstalling {name} (latest definition changed)"
+            )?;
+            return Ok(());
+        }
+        match from {
             Some(from) if from != to => {
                 writeln!(self.out, "{counter}{doing} {name} {from} -> {to}")?
             }
@@ -824,13 +832,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if counted_here {
             let from = installed_id.as_ref().map(report::identity_version);
             let to = want.as_ref().map(report::identity_version);
-            let (from, to) = (
-                from.unwrap_or_else(|| "?".into()),
-                to.unwrap_or_else(|| "?".into()),
-            );
+            let versions = match (from, to) {
+                (Some(from), Some(to)) => format!(" {from} -> {to}"),
+                (Some(from), None) => format!(" {from}"),
+                (None, Some(to)) => format!(" {to}"),
+                (None, None) => String::new(),
+            };
             writeln!(
                 self.out,
-                "upgrading {dep} {from} -> {to} (dependency of {target})"
+                "upgrading {dep}{versions} (dependency of {target})"
             )?;
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
@@ -846,18 +856,40 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
             }
-            StagedRun::LoadFailure => self.hold_staged_copy(dep),
+            StagedRun::LoadFailure => {
+                // The dep was announced and counted; it is held instead.
+                if counted_here {
+                    self.uncount_dep(dep);
+                    writeln!(
+                        self.out,
+                        "held {dep} (dependency of {target}): cannot be installed from a staged copy"
+                    )?;
+                }
+                self.hold_staged_copy(dep);
+            }
             // The target cannot install without this dep: hold the target once
             // (one line, one count) rather than the dep and then the target.
             StagedRun::Untrusted(tap) => {
-                if counted_here && self.counted_deps.remove(dep) {
-                    self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                if counted_here {
+                    self.uncount_dep(dep);
+                    writeln!(
+                        self.out,
+                        "held {dep} (dependency of {target}): brew does not trust tap {tap}"
+                    )?;
                 }
                 self.hold_target_untrusted_dep(target, dep, &tap);
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// Take back the upgraded count of a dependency that was announced and
+    /// counted but then did not install.
+    fn uncount_dep(&mut self, dep: &str) {
+        if self.counted_deps.remove(dep) {
+            self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+        }
     }
 
     fn refuse_ineligible_dep(
@@ -1365,6 +1397,99 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("upgraded 2,"), "{text}");
+    }
+
+    /// Core `node` depends on `widget`, installed from `hashicorp/tap` at
+    /// 1.0.0 behind a 1.1.0 cutoff. `refusal` is brew's answer to the staged
+    /// `widget` install. Returns the output and the run's brew.
+    fn node_with_tap_dep_world(refusal: &str) -> (String, MockBrew) {
+        let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        brew.installed[1] = formula_pkg_from(
+            "widget",
+            "hashicorp/tap",
+            formula_rb("widget", "1.0.0", "oldsha"),
+        );
+        brew.taps = vec![tapped(
+            "hashicorp/tap",
+            Some("https://github.com/hashicorp/homebrew-tap"),
+        )];
+        brew.deps
+            .insert("node".to_string(), vec!["hashicorp/tap/widget".to_string()]);
+        brew.next_outputs
+            .lock()
+            .unwrap()
+            .push_back((1, refusal.as_bytes().to_vec()));
+        git.insert_blob(
+            "tapcut",
+            "Formula/widget.rb",
+            formula_rb("widget", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/widget.rb",
+            formula_rb("widget", "1.2.0", "newsha"),
+        );
+        git.insert_tree("tapcut", &["Formula/widget.rb"]);
+        git.insert_tree("taphead", &["Formula/widget.rb"]);
+        let snaps =
+            crate::cmd::test_support::tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Formula/widget.rb"]);
+        git.insert_tree("taphead", &["Formula/widget.rb"]);
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["node".to_string()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        (String::from_utf8(out).unwrap(), brew)
+    }
+
+    #[test]
+    fn untrusted_dependency_that_was_announced_is_then_reported_held() {
+        let (text, _) = node_with_tap_dep_world(
+            "Error: widget: Refusing to load formula hashicorp/tap/widget from untrusted tap hashicorp/tap.\n",
+        );
+        assert!(
+            text.contains("upgrading widget 1.0.0 -> 1.1.0 (dependency of node)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "held widget (dependency of node): brew does not trust tap hashicorp/tap"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("upgraded 0,"), "{text}");
+        assert!(text.contains("held 1,"), "{text}");
+    }
+
+    #[test]
+    fn dependency_brew_cannot_load_is_reported_held_and_not_counted_upgraded() {
+        let (text, _) = node_with_tap_dep_world("Error: cannot load such file -- helper\n");
+        assert!(
+            text.contains("upgrading widget 1.0.0 -> 1.1.0 (dependency of node)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "held widget (dependency of node): cannot be installed from a staged copy"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("upgraded 2,"), "{text}");
+        assert!(text.contains("held 1,"), "{text}");
     }
 
     #[test]
