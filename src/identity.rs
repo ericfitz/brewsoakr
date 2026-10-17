@@ -634,27 +634,38 @@ fn select_language_block(groups: &[(Vec<String>, bool)], languages: &[String]) -
 /// when the condition fails). `if`, `unless`, `case`, `begin`, `while`, `until`
 /// and `def` blocks are tracked so their `end` closes the right entry. With a
 /// `host`, the top-level `language` block that `select_language_block` picks
-/// from `host.languages` is transparent too.
+/// from `host.languages` is transparent too. Heredoc bodies, the text of
+/// multi-line string and regex literals and the `__END__` data section hold no
+/// blocks, so a well-formed file ends at depth 0 (`Pass::depth`).
 fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
     let Some(h) = host else {
-        return depth1_pass(rb, None, None).0;
+        return depth1_pass(rb, None, None).lines;
     };
-    let (lines, groups) = depth1_pass(rb, host, None);
-    match select_language_block(&groups, &h.languages) {
-        Some(i) => depth1_pass(rb, host, Some(i)).0,
-        None => lines,
+    let first = depth1_pass(rb, host, None);
+    match select_language_block(&first.groups, &h.languages) {
+        Some(i) => depth1_pass(rb, host, Some(i)).lines,
+        None => first.lines,
     }
+}
+
+/// What one `depth1_pass` walk found.
+struct Pass<'a> {
+    lines: Vec<&'a str>,
+    /// Every top-level `language` block's `(locales, default)`; empty when one
+    /// of them cannot be read.
+    groups: Vec<(Vec<String>, bool)>,
+    /// Block depth and open-block count when the text ended. A well-formed file
+    /// ends at `(0, 0)`; anything else means a construct was tracked wrongly.
+    #[cfg_attr(not(test), allow(dead_code))]
+    depth: i32,
+    #[cfg_attr(not(test), allow(dead_code))]
+    open: usize,
 }
 
 /// One walk of `depth1_lines`. `language` is the index of the top-level
 /// `language` block to read as transparent; the other `language` blocks stay
-/// opaque. Also returns every such block's `(locales, default)`; a block
-/// whose arguments cannot be read makes the list empty, so none is chosen.
-fn depth1_pass<'a>(
-    rb: &'a str,
-    host: Option<&HostPlatform>,
-    language: Option<usize>,
-) -> (Vec<&'a str>, Vec<(Vec<String>, bool)>) {
+/// opaque.
+fn depth1_pass<'a>(rb: &'a str, host: Option<&HostPlatform>, language: Option<usize>) -> Pass<'a> {
     struct Open {
         transparent: bool,
         /// An `if` chain whose conditions were all recognized so far: `Some(true)`
@@ -668,15 +679,54 @@ fn depth1_pass<'a>(
     let mut out = Vec::new();
     let mut groups = Vec::new();
     let mut unreadable = false;
-    for line in rb.lines() {
-        let t = line.trim_start();
+    let all: Vec<&str> = rb.lines().collect();
+    // Heredocs opened on earlier lines whose bodies are still being skipped.
+    let mut pending: Vec<Heredoc> = Vec::new();
+    // A string or regex literal that continues over the following lines.
+    let mut in_literal: Option<Delims> = None;
+    for (n, line) in all.iter().copied().enumerate() {
+        if let Some(h) = pending.first() {
+            if h.terminated_by(line) {
+                pending.remove(0);
+            }
+            continue;
+        }
+        let mut line = line;
+        let mut resumed = false;
+        if let Some(delims) = in_literal {
+            match after_literal_close(line, delims) {
+                Some(rest) => {
+                    line = rest;
+                    resumed = true;
+                }
+                None => continue,
+            }
+        }
+        if line.trim_end() == "__END__" {
+            // The `DATA` section (`patch :DATA`) is text, not Ruby.
+            break;
+        }
+        // What follows a string's closing quote keeps its leading space, so that
+        // ` if c` stays a modifier rather than a statement.
+        let t = if resumed { line } else { line.trim_start() };
+        // A heredoc body is text: `if`, `do` and `end` lines in it open and
+        // close nothing. Only one whose terminator exists counts.
+        pending.extend(
+            heredoc_starts(t)
+                .into_iter()
+                .filter(|h| all[n + 1..].iter().any(|l| h.terminated_by(l))),
+        );
+        // A literal that continues on the next line is text up to its closing
+        // delimiter. One with none anywhere later is just a stray quote.
+        in_literal = open_literal(t)
+            .filter(|d| all[n + 1..].iter().any(|l| l.contains(char::from(d.close))));
         if is_ruby_end(t) {
             if open_blocks.pop().is_none_or(|o| !o.transparent) {
                 depth = depth.saturating_sub(1);
             }
             continue;
         }
-        let code = t.split('#').next().unwrap_or(t).trim_end();
+        let code = strip_comment(t);
         if let Some(top) = open_blocks.last_mut().filter(|o| o.chain.is_some()) {
             let taken = top.chain == Some(true);
             let next = if code == "else" {
@@ -738,7 +788,12 @@ fn depth1_pass<'a>(
     if unreadable {
         groups.clear();
     }
-    (out, groups)
+    Pass {
+        lines: out,
+        groups,
+        depth,
+        open: open_blocks.len(),
+    }
 }
 
 /// Whether an `if` condition holds on `host`. Only `Hardware::CPU.arm?`,
@@ -766,7 +821,303 @@ fn condition_holds(cond: &str, host: &HostPlatform) -> Option<bool> {
 }
 
 fn is_stable_do(t: &str) -> bool {
-    t.split('#').next().unwrap_or(t).trim_end() == "stable do"
+    strip_comment(t) == "stable do"
+}
+
+/// A heredoc opened by `<<~ID`, `<<-ID` or `<<ID` (the id may be quoted).
+struct Heredoc {
+    id: String,
+    /// `<<~` and `<<-` allow the terminator to be indented.
+    indented: bool,
+}
+
+impl Heredoc {
+    fn terminated_by(&self, line: &str) -> bool {
+        if self.indented {
+            line.trim() == self.id
+        } else {
+            line.trim_end() == self.id
+        }
+    }
+}
+
+/// The heredocs a line opens, in order; several may share one line. String,
+/// `%`-literal and regex literals and comments are skipped. `<<~ID` takes any
+/// identifier; `<<-ID`, `<<ID` and quoted ids must be upper case, which keeps
+/// `args <<"x"` and `x <<-y` the shifts they are. `<<` followed by a space
+/// (`args << "x"`, `class << self`) is never a heredoc.
+fn heredoc_starts(line: &str) -> Vec<Heredoc> {
+    let b = line.as_bytes();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'#' {
+            break;
+        }
+        if let Some(lit) = literal_at(b, i) {
+            i = lit.end;
+            continue;
+        }
+        if b[i..].starts_with(b"<<") {
+            let before = i.checked_sub(1).map(|j| b[j]);
+            if before.is_none_or(|p| matches!(p, b' ' | b'(' | b',' | b'=' | b'\t'))
+                && let Some((h, len)) = heredoc_at(&b[i + 2..])
+            {
+                found.push(h);
+                i += 2 + len;
+                continue;
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    found
+}
+
+/// A string, `%`-literal or regex literal found in a line of Ruby.
+struct Literal {
+    /// The index just past it, or `b.len()` when it does not end on this line.
+    end: usize,
+    closed: bool,
+    delims: Delims,
+}
+
+/// How a literal opens and closes, which says how to find the end of one that
+/// continues on the next line.
+#[derive(Clone, Copy)]
+struct Delims {
+    open: u8,
+    close: u8,
+    interpolates: bool,
+}
+
+/// The literal that starts at `b[i]`, if one does: `"..."`, `'...'`, `` `...` ``,
+/// `%w[...]`, `%r{...}i`, `%(...)` and `/.../` where a value is expected.
+/// Backslash escapes and, except in `'`, `%w`, `%i`, `%q` and `%s`, `#{...}`
+/// interpolation (which may hold literals of its own) are honored.
+fn literal_at(b: &[u8], i: usize) -> Option<Literal> {
+    match b[i] {
+        q @ (b'"' | b'\'' | b'`') => Some(delimited(
+            b,
+            i + 1,
+            Delims {
+                open: q,
+                close: q,
+                interpolates: q != b'\'',
+            },
+        )),
+        b'%' => {
+            // `a % b` and `a%b` are modulo, `x = %w[a b]` and `foo %r{x}` literals.
+            if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b"_)]}".contains(&b[i - 1])) {
+                return None;
+            }
+            let (kind, at) = match b.get(i + 1)? {
+                k if b"rwWiIqQsx".contains(k) => (Some(*k), i + 2),
+                _ => (None, i + 1),
+            };
+            let open = *b.get(at)?;
+            let close = match open {
+                b'(' => b')',
+                b'[' => b']',
+                b'{' => b'}',
+                b'<' => b'>',
+                b'|' | b'!' | b'/' if kind.is_some() => open,
+                _ => return None,
+            };
+            let interpolates = !matches!(kind, Some(b'w' | b'i' | b'q' | b's'));
+            Some(delimited(
+                b,
+                at + 1,
+                Delims {
+                    open,
+                    close,
+                    interpolates,
+                },
+            ))
+        }
+        b'/' => {
+            // A regex where an operand is expected; otherwise a division.
+            let before = b[..i].trim_ascii_end();
+            let operand = match before.last() {
+                None => true,
+                Some(c) if b"(,=~!{[|&?;".contains(c) => true,
+                Some(_) => {
+                    let word_start = before
+                        .iter()
+                        .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                        .map_or(0, |p| p + 1);
+                    [
+                        &b"regex"[..],
+                        b"when",
+                        b"if",
+                        b"unless",
+                        b"and",
+                        b"or",
+                        b"split",
+                        b"match",
+                        b"gsub",
+                        b"sub",
+                        b"scan",
+                    ]
+                    .contains(&&before[word_start..])
+                }
+            };
+            let next = b.get(i + 1).copied();
+            (operand && next.is_none_or(|c| c != b' ' && c != b'=')).then(|| {
+                let delims = Delims {
+                    open: b'/',
+                    close: b'/',
+                    interpolates: true,
+                };
+                delimited(b, i + 1, delims)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Scan a literal whose body starts at `b[from]`: up to the `close` that ends
+/// it, counting nested `open`/`close` pairs when they differ.
+fn delimited(b: &[u8], from: usize, delims: Delims) -> Literal {
+    let Delims {
+        open,
+        close,
+        interpolates,
+    } = delims;
+    let mut depth = 1;
+    let mut j = from;
+    while j < b.len() {
+        match b[j] {
+            b'\\' => j += 2,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Literal {
+                        end: j + 1,
+                        closed: true,
+                        delims,
+                    };
+                }
+                j += 1;
+            }
+            c if c == open => {
+                depth += 1;
+                j += 1;
+            }
+            b'#' if interpolates && b.get(j + 1) == Some(&b'{') => {
+                j = skip_interpolation(b, j + 2);
+            }
+            _ => j += 1,
+        }
+    }
+    Literal {
+        end: b.len(),
+        closed: false,
+        delims,
+    }
+}
+
+/// The index just past the `}` that closes an interpolation whose body starts at `b[j]`.
+fn skip_interpolation(b: &[u8], mut j: usize) -> usize {
+    let mut depth = 1;
+    while j < b.len() {
+        if let Some(lit) = literal_at(b, j) {
+            j = lit.end;
+            continue;
+        }
+        match b[j] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return j + 1;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    b.len()
+}
+
+/// The literal that is still open at the end of `line`, if any: the rest of it
+/// is on the following lines.
+fn open_literal(line: &str) -> Option<Delims> {
+    let b = line.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'#' {
+            return None;
+        }
+        match literal_at(b, i) {
+            Some(lit) if !lit.closed => return Some(lit.delims),
+            Some(lit) => i = lit.end,
+            None => i += 1,
+        }
+    }
+    None
+}
+
+/// What follows the delimiter that closes a literal opened on an earlier line,
+/// or `None` if this line does not close it.
+fn after_literal_close(line: &str, delims: Delims) -> Option<&str> {
+    let rest = delimited(line.as_bytes(), 0, delims);
+    rest.closed.then(|| &line[rest.end..])
+}
+
+/// `t` without a trailing `# comment`: a `#` inside a literal, `#{...}`
+/// included, does not start one.
+fn strip_comment(t: &str) -> &str {
+    let b = t.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'#' {
+            return t[..i].trim_end();
+        }
+        i = literal_at(b, i).map_or(i + 1, |lit| lit.end);
+    }
+    t.trim_end()
+}
+
+/// The heredoc id after a `<<` (`~ID`, `-ID`, `ID`, `~'ID'`, ...) and how many
+/// bytes it spans.
+fn heredoc_at(rest: &[u8]) -> Option<(Heredoc, usize)> {
+    let (squiggly, indented, mut at) = match rest.first()? {
+        b'~' => (true, true, 1),
+        b'-' => (false, true, 1),
+        _ => (false, false, 0),
+    };
+    let quote = rest
+        .get(at)
+        .copied()
+        .filter(|q| matches!(q, b'"' | b'\'' | b'`'));
+    at += usize::from(quote.is_some());
+    let len = rest[at..]
+        .iter()
+        .take_while(|c| c.is_ascii_alphanumeric() || **c == b'_')
+        .count();
+    let id = std::str::from_utf8(&rest[at..at + len]).ok()?;
+    let first = *id.as_bytes().first()?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    if !(squiggly && quote.is_none()) && id.bytes().any(|c| c.is_ascii_lowercase()) {
+        return None;
+    }
+    let mut end = at + len;
+    if let Some(q) = quote {
+        if rest.get(end) != Some(&q) {
+            return None;
+        }
+        end += 1;
+    }
+    Some((
+        Heredoc {
+            id: id.to_string(),
+            indented,
+        },
+        end,
+    ))
 }
 
 fn is_ruby_end(t: &str) -> bool {
@@ -784,7 +1135,7 @@ fn opens_ruby_block(t: &str, at_top: bool) -> bool {
     if at_top && (t.starts_with("class ") || t.starts_with("module ") || t.starts_with("cask ")) {
         return true;
     }
-    let stripped = t.split('#').next().unwrap_or(t).trim_end();
+    let stripped = strip_comment(t);
     if stripped == "do" || stripped.ends_with(" do") || stripped.contains(" do |") {
         return true;
     }
@@ -798,15 +1149,60 @@ fn opens_ruby_block(t: &str, at_top: bool) -> bool {
     keyword && !stripped.ends_with(" end") && !is_endless_def(stripped)
 }
 
-/// `x = if ...`, `x ||= case ...`, `x += begin`: the keyword right after an
-/// assignment operator opens a block that closes with `end`. `foo if bar` and
+/// `x = if ...`, `x ||= case ...`, `args << if ...`, `foo a, unless ...`,
+/// `id = while ...`, `foo(if ...`, `break if begin`: a keyword where a value is
+/// expected opens a block that closes with `end`. That is right after `=`, `<<`,
+/// `||`, `&&`, `(`, `[` or `,`, or `begin` as the last word. `foo if bar` and
 /// `x = foo if bar` are modifiers and do not match.
 fn opens_as_expression(code: &str) -> bool {
-    ["if ", "unless ", "case "]
+    let code = blank_strings(code);
+    let code = code.as_str();
+    if code.ends_with(" begin") {
+        return true;
+    }
+    ["if", "unless", "case", "while", "until", "begin"]
         .iter()
-        .any(|k| code.contains(&format!("= {k}")))
-        || code.ends_with("= begin")
-        || code.contains("= begin ")
+        .any(|k| {
+            code.match_indices(k).any(|(at, _)| {
+                let after = &code[at + k.len()..];
+                (after.starts_with(' ') || (*k == "begin" && after.is_empty()))
+                    && !has_end_word(after)
+                    && ["=", "<<", "||", "&&", "(", "[", ","]
+                        .iter()
+                        .any(|op| code[..at].trim_end().ends_with(op))
+            })
+        })
+}
+
+/// `code` with the inside of every literal blanked out, so keywords and
+/// operators in text are not mistaken for code.
+fn blank_strings(code: &str) -> String {
+    let b = code.as_bytes();
+    let mut out = String::with_capacity(code.len());
+    let mut i = 0;
+    while i < b.len() {
+        if let Some(lit) = literal_at(b, i) {
+            out.push(char::from(b[i]));
+            out.extend(std::iter::repeat_n(' ', lit.end.saturating_sub(i + 2)));
+            if lit.closed {
+                out.push(char::from(b[lit.end - 1]));
+            }
+            i = lit.end;
+        } else {
+            // Copy the whole character: `i` is a boundary here, after ASCII only.
+            let ch = code[i..].chars().next().unwrap_or(' ');
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+/// Whether `s` holds the word `end`, as in `x = [if a then b else c end]`.
+fn has_end_word(s: &str) -> bool {
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    s.match_indices("end")
+        .any(|(at, _)| !s[..at].ends_with(word) && !s[at + 3..].starts_with(word))
 }
 
 /// `def name(args) = expr` / `def name = expr`: a method with no `end`.
@@ -2170,5 +2566,191 @@ mod platform_tests {
             Some(r#"a\"b"#)
         );
         assert_eq!(first_double_quoted("\"open"), None);
+    }
+}
+
+/// `depth1_pass` must end balanced (depth 0, no open block) on any well-formed
+/// formula or cask, whatever Ruby constructs its `def` bodies use.
+#[cfg(test)]
+mod balance_tests {
+    use super::*;
+
+    /// A formula whose `def install` holds `body`, then a later `test do`.
+    fn formula(body: &str) -> String {
+        format!(
+            "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  sha256 \"abc\"\n\n  def install\n{body}\n  end\n\n  test do\n    system \"true\"\n  end\nend\n"
+        )
+    }
+
+    fn assert_balanced(rb: &str) {
+        let p = depth1_pass(rb, None, None);
+        assert_eq!((p.depth, p.open), (0, 0), "{rb}");
+    }
+
+    #[test]
+    fn heredoc_bodies_are_skipped() {
+        for body in [
+            "    (buildpath/\"x\").write <<~EOS\n      if foo\n        bar\n      end\n    EOS",
+            "    (buildpath/\"x\").write <<~EOS\n      end\n    EOS",
+            "    (buildpath/\"x\").write <<~EOS\n      foo do\n        bar\n    EOS",
+            "    (buildpath/\"x\").write <<-EOS\n      def foo\n      EOS",
+            "    (buildpath/\"x\").write <<EOS\nwhile true\nEOS",
+            "    (buildpath/\"x\").write <<~'EOS'\n      case x\n    EOS",
+            "    (buildpath/\"x\").write <<~\"EOS\"\n      begin\n    EOS",
+            "    system \"x\", <<~A, <<~B\n      if a\n    A\n      end\n      end\n    B",
+            "    system <<~EOS.strip, \"y\"\n      end\n    EOS",
+            "    system(<<~SH)\n      if x; then\n    SH",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn heredoc_bodies_do_not_leak_into_the_identity_lines() {
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  desc <<~EOS\n    url \"https://e.com/bad-9.9.9.tar.gz\"\n    sha256 \"bad\"\n  EOS\n  sha256 \"abc\"\nend\n";
+        let lines = depth1_lines(rb, None);
+        assert!(!lines.iter().any(|l| l.contains("bad")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("sha256 \"abc\"")));
+    }
+
+    #[test]
+    fn interpolation_in_a_string_is_not_a_comment() {
+        for body in [
+            "    cd \"#{doc}/examples\" do\n      system \"x\"\n    end",
+            "    PTY.spawn(\"#{bin}/x --a > out\") do |r, w, pid|\n      r.read\n    end",
+            "    if File.exist?(\"#{prefix}/x\")\n      rm \"#{prefix}/x\"\n    end",
+            "    x = \"a#{\"b#c\"}d\" if y",
+            "    foo \"#{bar} # not a comment\" do\n      x\n    end",
+            "    foo 'it#s' do\n      x\n    end",
+            "    foo \"a\\\"#b\" do\n      x\n    end",
+            "    foo do # a comment with \"quote\n      x\n    end # another",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn a_keyword_after_an_operator_opens_a_block() {
+        for body in [
+            "    args << if OS.mac?\n      \"a\"\n    else\n      \"b\"\n    end",
+            "    args << case x\n    when 1 then \"a\"\n    else \"b\"\n    end",
+            "    assert_match \"x\", if OS.mac?\n      y\n    else\n      z\n    end",
+            "    ok = a || if b\n      c\n    end",
+            "    ok = a && unless b\n      c\n    end",
+            "    foo(if a\n      b\n    end)",
+            "    id = while read\n      break 1\n    end.to_s",
+            "    id = until done\n      break 1\n    end",
+            "    break if begin\n      true\n    rescue Foo\n      false\n    end",
+            "    x = [1, if a then 2 else 3 end]",
+            "    args << (if a then 2 else 3 end)",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn a_modifier_after_a_value_opens_no_block() {
+        for body in [
+            "    x << y if z",
+            "    foo a, b if c",
+            "    foo a, b unless c",
+            "    x = y while z",
+            "    return if a",
+            "    foo? if a",
+            "    foo(a) while b",
+            "    puts <<~EOS if a\n      text\n    EOS",
+            "    desc \"Smooth (temporarily, until AWS makes it better)\"",
+            "    puts \"a, if b\", 'x = case y', \"#{z, while w}\"",
+            "    foo \"it's\", \"[if\" if a",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn the_data_section_after_end_marker_is_not_code() {
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  patch :DATA\nend\n\n__END__\n--- a/x\n+++ b/x\n   end\n   end\n   if x\n+  url \"https://e.com/bad-9.9.9.tar.gz\"\n";
+        assert_balanced(rb);
+        let lines = depth1_lines(rb, None);
+        assert!(!lines.iter().any(|l| l.contains("bad")), "{lines:?}");
+        // The `end` markers are only the data section when alone on the line.
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  def a\n    x = \"__END__\"\n    __END__ = 1\n  end\nend\n";
+        assert_balanced(rb);
+    }
+
+    #[test]
+    fn a_string_that_spans_lines_is_text() {
+        for body in [
+            "    x = shell_output(\n      \"i=0\n      while [ $i -le 2 ];\n        do echo $i\n      done | #{bin}/x\",\n    ).chomp",
+            "    x = \"if a\n      end\n    end\n    \"",
+            "    x = 'if a\n      end\n    end'",
+            "    x = \"a #{b\n      }\n    end\" if c",
+            "    foo \"line one\n      def two\n    \" do |x|\n      x\n    end",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn quotes_inside_percent_and_regex_literals_are_text() {
+        for body in [
+            "    regex(%r{href=.*?/x[._-]v?(\\d+)[\"' >]}i)\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+            "    x = a.match(/it's \"x/)\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+            "    x = %w[don't \"quote]\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+            "    x = %q(it's)\n    y = %Q{a \"#{b}} + \"'\"\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+            "    x = a / 2 / 3\n    y = a %\"2\"\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+            "    when /'/ then 1\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+            "    x = \"#{a.split(/'/).first}\"\n    y = \"z\" + 'w'\n    if a\n      b\n    end",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn a_quote_inside_a_literal_cannot_hide_the_next_method() {
+        for first in [
+            "    regex(%r{[\"']})",
+            "    x = a.match(/[\"']/)",
+            "    x = %w[a\"b c'd]",
+            "    x = \"#{a.split(/'/).first}\"",
+        ] {
+            let body = format!("{first}\n  end\n\n  def two\n    x = \"b\"");
+            assert_balanced(&formula(&body));
+        }
+    }
+
+    #[test]
+    fn a_regex_that_spans_lines_is_text() {
+        for body in [
+            "    regex(/\n      href=[^\"' >]+\n      if x\n    /ix)\n    if a\n      b\n    end",
+            "    regex(%r{\n      end\n      \"' do\n    }x)\n    if a\n      b\n    end",
+            "    x = %w[\n      a'b\n      end\n    ]\n    if a\n      b\n    end",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn a_quote_with_no_partner_does_not_swallow_the_file() {
+        for body in [
+            "    x = %w[don't]\n    if a\n      b\n    end",
+            "    x = ?\"\n    if a\n      b\n    end",
+        ] {
+            assert_balanced(&formula(body));
+        }
+    }
+
+    #[test]
+    fn a_shift_or_a_class_singleton_is_not_a_heredoc() {
+        for body in [
+            "    args << \"x\"",
+            "    args <<\"x\"",
+            "    args << EOS",
+            "    x = 1 << 2",
+            "    str = \"a <<~EOS b\"",
+            "    foo # <<~EOS",
+        ] {
+            assert_balanced(&formula(body));
+        }
     }
 }
