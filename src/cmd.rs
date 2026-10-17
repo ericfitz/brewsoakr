@@ -997,6 +997,7 @@ pub fn reinstall(
             ..Counts::default()
         },
         done: BTreeMap::new(),
+        counted_deps: HashSet::new(),
         deferred: Vec::new(),
         nosoak: Vec::new(),
         origins: OriginRecords::load(cache),
@@ -1127,6 +1128,7 @@ fn apply_many(
             ..Counts::default()
         },
         done: BTreeMap::new(),
+        counted_deps: HashSet::new(),
         deferred: Vec::new(),
         nosoak: Vec::new(),
         origins: OriginRecords::load(cache),
@@ -1196,6 +1198,9 @@ struct ApplySession<'a, B, G, W> {
     /// installed snapshot is taken once and goes stale as soon as brew
     /// upgrades a dependency for us.
     done: BTreeMap<String, String>,
+    /// Installed dependencies a named run upgraded and counted ahead of their
+    /// own plan entry, so that entry does not count them a second time.
+    counted_deps: HashSet<String>,
     /// Holds, skips, and warnings, printed as one block at the end so they
     /// are not lost in the middle of the install scroll.
     deferred: Vec<String>,
@@ -1580,6 +1585,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 // brew may already have upgraded this as a dependency of an
                 // earlier package; running it again just prints a warning.
                 if self.already_done(&name, kind, view.cutoff.as_ref()) {
+                    if self.counted_deps.remove(&name) {
+                        self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                    }
                     self.announce_already_done(&name, &view)?;
                     return Ok(());
                 }
@@ -1703,12 +1711,40 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             name: dep.to_string(),
             kind,
         };
+        // A bare run reaches an installed dep again at its own plan entry,
+        // which counts it; any other run counts it here.
+        let counted_here = !self.bare_run && self.inv.find_in(dep_origin, dep).is_some();
+        if counted_here {
+            let from = self
+                .inv
+                .find_in(dep_origin, dep)
+                .and_then(|p| {
+                    parse_pkg(kind, &p.receipt_rb, self.brew.host_platform().as_ref()).ok()
+                })
+                .map(|id| report::identity_version(&id));
+            let to = want.as_ref().map(report::identity_version);
+            let (from, to) = (
+                from.unwrap_or_else(|| "?".into()),
+                to.unwrap_or_else(|| "?".into()),
+            );
+            writeln!(
+                self.out,
+                "upgrading {dep} {from} -> {to} (dependency of {target})"
+            )?;
+            self.counts.upgraded += 1;
+            self.counted_deps.insert(dep.to_string());
+        }
         let path = tap::write_blob(&staging_dir(self.tap_root, dep_origin), &pkg, blob)?;
-        let args = tap::brew_install_args(&pkg, &path, &[]);
+        let install_flags = self.staged_install_flags();
+        let args = tap::brew_install_args(&pkg, &path, &install_flags);
         // A dep that brew cannot load is held by name; the target is still
         // attempted and brew reports the missing dependency.
         match self.record_staged_install(dep_origin, dep, kind, &args)? {
-            StagedRun::Ran { .. } => {}
+            StagedRun::Ran { failed } => {
+                if failed && counted_here && self.counted_deps.remove(dep) {
+                    self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                }
+            }
             StagedRun::LoadFailure => self.hold_staged_copy(dep),
             StagedRun::Untrusted(tap) => self.hold_untrusted(dep, &tap),
         }
@@ -4482,8 +4518,37 @@ mod tests {
     #[test]
     fn named_upgrade_upgrades_an_outdated_installed_dependency_first() {
         let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
-        upgrade_names(&brew, &git, &["node".to_string()]);
+        let text = upgrade_names(&brew, &git, &["node".to_string()]);
         assert_eq!(staged_install_order(&brew), ["simdutf", "node"]);
+        assert!(
+            text.contains("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)"),
+            "{text}"
+        );
+        assert!(text.contains("upgraded 2,"), "{text}");
+    }
+
+    #[test]
+    fn dependency_named_alongside_its_dependent_is_counted_once() {
+        let (brew, git) = node_simdutf_world(
+            "1.0.0",
+            "1.0.0",
+            "\u{1f37a}  /opt/homebrew/Cellar/simdutf/1.1.0: 5 files, 1MB\n",
+        );
+        let names = ["node".to_string(), "simdutf".to_string()];
+        let text = upgrade_names(&brew, &git, &names);
+        assert!(text.contains("upgraded 2,"), "{text}");
+    }
+
+    #[test]
+    fn dry_run_reaches_a_dependency_install() {
+        let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        let flags = ["--dry-run".to_string()];
+        upgrade_names_flags(&brew, &git, &["node".to_string()], &flags);
+        let visible = brew.visible_runs.lock().expect("visible").clone();
+        assert_eq!(visible.len(), 2, "{visible:?}");
+        for args in &visible {
+            assert!(args.iter().any(|a| a == "--dry-run"), "{args:?}");
+        }
     }
 
     #[test]

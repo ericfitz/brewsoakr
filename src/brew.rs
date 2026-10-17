@@ -89,16 +89,19 @@ pub trait Brew {
     }
 }
 
+/// `(kind tag, a, b)` of one `compare_versions` pair.
+type OrderKey = (&'static str, String, String);
+
 pub struct ProcessBrew {
     pub bin: PathBuf,
     raw: Cell<bool>,
     /// `brew --cellar`, asked once: it never changes during a run.
     cellar: std::cell::OnceCell<Option<PathBuf>>,
     /// `compare_versions` answers for this run, keyed by `(kind, a, b)`.
-    orderings: Mutex<HashMap<(&'static str, String, String), Ordering>>,
+    orderings: Mutex<HashMap<OrderKey, Ordering>>,
     /// Pairs whose batch failed, with the failure: a broken `brew ruby` costs
     /// one spawn per run, not one per package.
-    ordering_failures: Mutex<HashMap<(&'static str, String, String), (i32, String)>>,
+    ordering_failures: Mutex<HashMap<OrderKey, (i32, String)>>,
     /// `host_platform`, asked once: the host never changes during a run.
     host: std::cell::OnceCell<Option<HostPlatform>>,
     sink: Mutex<Sink>,
