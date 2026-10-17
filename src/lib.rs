@@ -123,7 +123,7 @@ impl World for RealWorld {
 }
 
 pub fn run(args: &[String]) -> i32 {
-    match dispatch(args, &RealWorld::new()) {
+    match dispatch(args, &RealWorld::new(), &mut std::io::stdout()) {
         Ok(Dispatch::Exit(c)) => c,
         Ok(Dispatch::Exec(bin, argv)) => brew::exec(&bin, &argv),
         Err(e) => {
@@ -133,7 +133,14 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> {
+/// Parse and run one command line. Everything brewsoak itself prints on stdout
+/// goes through `out` (production passes stdout); `brew`'s own forwarded output
+/// and warnings on stderr do not.
+pub fn dispatch(
+    args: &[String],
+    world: &impl World,
+    out: &mut impl Write,
+) -> Result<Dispatch, Error> {
     paths::warn_duplicate_install();
     let inv = cli::parse_argv(args)?;
     world.brew().set_raw(inv.raw);
@@ -150,7 +157,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             &world.config_path(),
             env.as_deref(),
             world.now(),
-            &mut std::io::stdout(),
+            &mut *out,
         )?;
         return Ok(Dispatch::Exit(0));
     }
@@ -197,23 +204,23 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         }
         if cmd::is_verbose(&inv.brew_args) {
             for note in &cfg.notes {
-                println!("{note}");
+                writeln!(out, "{note}")?;
             }
         }
     }
 
     match inv.command {
         cli::Command::Version => {
-            println!("{}", cli::version_line());
+            writeln!(out, "{}", cli::version_line())?;
             Ok(Dispatch::Exit(0))
         }
         cli::Command::Help { topic: None } => {
-            print!("{}", cli::help_text());
+            write!(out, "{}", cli::help_text())?;
             Ok(Dispatch::Exit(0))
         }
         cli::Command::Help { topic: Some(topic) } => {
             if let Some(text) = cli::command_help(&topic) {
-                print!("{text}");
+                write!(out, "{text}")?;
                 Ok(Dispatch::Exit(0))
             } else {
                 Ok(Dispatch::Exec(
@@ -229,7 +236,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Update => {
             let cache = world.cache_path();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
-            let mut out = std::io::stdout();
             soaked_exit(
                 cmd::update(
                     lock.get()?,
@@ -241,7 +247,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                     &pkgs,
                     world.now(),
                     cmd::is_verbose(&inv.brew_args),
-                    &mut out,
+                    &mut *out,
                 )
                 .map(|()| cmd::RunResult {
                     refused: false,
@@ -252,7 +258,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Outdated => {
             let cache = world.cache_path();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
-            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
                 world.git(),
@@ -264,7 +269,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.now(),
                 false,
                 cmd::is_verbose(&inv.brew_args),
-                &mut out,
+                &mut *out,
             )?;
             soaked_exit(cmd::outdated(
                 world.brew(),
@@ -274,14 +279,13 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &pkgs,
                 &cfg,
                 &inv.brew_args,
-                &mut out,
+                &mut *out,
             ))
         }
         cli::Command::Info { names } => {
             let cache = world.cache_path();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let extra = cmd::explicit_tap_tokens(&names);
-            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
                 world.git(),
@@ -293,7 +297,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.now(),
                 false,
                 cmd::is_verbose(&inv.brew_args),
-                &mut out,
+                &mut *out,
             )?;
             soaked_exit(cmd::info(
                 world.brew(),
@@ -304,14 +308,13 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &cfg,
                 &names,
                 &inv.brew_args,
-                &mut out,
+                &mut *out,
             ))
         }
         cli::Command::Upgrade { names } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
-            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
                 world.git(),
@@ -323,7 +326,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.now(),
                 true,
                 cmd::is_verbose(&inv.brew_args),
-                &mut out,
+                &mut *out,
             )?;
             soaked_exit(cmd::upgrade(
                 world.brew(),
@@ -335,7 +338,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &cfg,
                 &names,
                 &inv.brew_args,
-                &mut out,
+                &mut *out,
             ))
         }
         cli::Command::Install {
@@ -346,7 +349,6 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let cache = world.cache_path();
             let tap_root = world.tap_root();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
-            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
                 world.git(),
@@ -358,7 +360,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.now(),
                 true,
                 cmd::is_verbose(&inv.brew_args),
-                &mut out,
+                &mut *out,
             )?;
             soaked_exit(cmd::install(
                 world.brew(),
@@ -372,14 +374,13 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 force_cask,
                 force_formula,
                 &inv.brew_args,
-                &mut out,
+                &mut *out,
             ))
         }
         cli::Command::Reinstall { names } => {
             let cache = world.cache_path();
             let tap_root = world.tap_root();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
-            let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
                 world.git(),
@@ -391,7 +392,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 world.now(),
                 true,
                 cmd::is_verbose(&inv.brew_args),
-                &mut out,
+                &mut *out,
             )?;
             soaked_exit(cmd::reinstall(
                 world.brew(),
@@ -403,7 +404,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &cfg,
                 &names,
                 &inv.brew_args,
-                &mut out,
+                &mut *out,
             ))
         }
     }
@@ -525,6 +526,20 @@ mod tests {
 
     fn now() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed now")
+    }
+
+    /// `dispatch` with its stdout captured in a buffer, never the real stdout.
+    fn dispatch_captured(
+        args: &[String],
+        world: &impl World,
+    ) -> (Result<Dispatch, Error>, Vec<u8>) {
+        let mut out = Vec::new();
+        let result = dispatch(args, world, &mut out);
+        (result, out)
+    }
+
+    fn dispatch_quiet(args: &[String], world: &impl World) -> Result<Dispatch, Error> {
+        dispatch_captured(args, world).0
     }
 
     fn fixture_gh() -> StaticGithub {
@@ -663,7 +678,7 @@ mod tests {
                 std::time::Duration::from_millis(50),
             )
             .unwrap();
-            let err = dispatch(&argv, &world).unwrap_err();
+            let err = dispatch_quiet(&argv, &world).unwrap_err();
             let text = err.to_string();
             assert!(matches!(err, Error::Refusal(_)), "{argv:?}: {text}");
             assert!(
@@ -680,7 +695,7 @@ mod tests {
     fn outdated_and_info_with_fresh_snapshots_read_without_the_lock() {
         let world = TestWorld::new();
         // The first run has no stored snapshot, so it refreshes under the lock.
-        dispatch(&s(&["outdated"]), &world).unwrap();
+        dispatch_quiet(&s(&["outdated"]), &world).unwrap();
         for argv in [s(&["outdated"]), s(&["info", "wget"])] {
             world.github.refreshed.set(false);
             let _held = lock::acquire_waiting(
@@ -689,7 +704,7 @@ mod tests {
                 std::time::Duration::from_millis(50),
             )
             .unwrap();
-            dispatch(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            dispatch_quiet(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             assert!(!world.github.refreshed.get(), "{argv:?} refreshed");
         }
     }
@@ -698,7 +713,7 @@ mod tests {
     fn outdated_and_info_that_must_refresh_still_need_the_lock() {
         for argv in [s(&["outdated"]), s(&["info", "wget"])] {
             let world = TestWorld::new();
-            dispatch(&s(&["outdated"]), &world).unwrap();
+            dispatch_quiet(&s(&["outdated"]), &world).unwrap();
             // A corrupt stored snapshot forces the refresh path.
             std::fs::write(world.cache_path.join("state.toml"), "[[[").unwrap();
             world.github.refreshed.set(false);
@@ -708,7 +723,7 @@ mod tests {
                 std::time::Duration::from_millis(50),
             )
             .unwrap();
-            let err = dispatch(&argv, &world).unwrap_err();
+            let err = dispatch_quiet(&argv, &world).unwrap_err();
             assert!(matches!(err, Error::Refusal(_)), "{argv:?}: {err}");
             assert!(!world.github.refreshed.get(), "{argv:?} did work");
             let state = std::fs::read_to_string(world.cache_path.join("state.toml")).unwrap();
@@ -722,7 +737,7 @@ mod tests {
         // waiter finds fresh state and must not fetch or write anything.
         for argv in [s(&["outdated"]), s(&["info", "wget"])] {
             let mut world = TestWorld::new();
-            dispatch(&s(&["outdated"]), &world).unwrap();
+            dispatch_quiet(&s(&["outdated"]), &world).unwrap();
             let state = world.cache_path.join("state.toml");
             let fresh = std::fs::read(&state).unwrap();
             std::fs::write(&state, "[[[").unwrap();
@@ -736,7 +751,7 @@ mod tests {
                 std::fs::write(&state_path, fresh).unwrap();
                 drop(held);
             });
-            dispatch(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            dispatch_quiet(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             holder.join().unwrap();
             assert!(!world.github.refreshed.get(), "{argv:?} refreshed anyway");
         }
@@ -760,7 +775,7 @@ mod tests {
         ] {
             let world = TestWorld::new();
             seed_untapped_leftovers(&world.cache_path);
-            dispatch(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            dispatch_quiet(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
             assert!(!world.cache_path.join("taps/gone").exists(), "{argv:?}");
             assert!(
                 !world.cache_path.join("staging/taps/gone").exists(),
@@ -774,9 +789,9 @@ mod tests {
     #[test]
     fn a_run_that_does_not_refresh_prunes_nothing() {
         let world = TestWorld::new();
-        dispatch(&s(&["outdated"]), &world).unwrap();
+        dispatch_quiet(&s(&["outdated"]), &world).unwrap();
         seed_untapped_leftovers(&world.cache_path);
-        dispatch(&s(&["outdated"]), &world).unwrap();
+        dispatch_quiet(&s(&["outdated"]), &world).unwrap();
         assert!(world.cache_path.join("taps/gone/tap.git").exists());
     }
 
@@ -797,14 +812,14 @@ mod tests {
                 std::time::Duration::from_millis(50),
             )
             .unwrap();
-            dispatch(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            dispatch_quiet(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         }
     }
 
     #[test]
     fn dispatch_releases_the_lock_when_it_returns() {
         let world = TestWorld::new();
-        dispatch(&s(&["outdated"]), &world).unwrap();
+        dispatch_quiet(&s(&["outdated"]), &world).unwrap();
         let again = lock::acquire_waiting(
             &world.cache_path,
             &s(&["update"]),
@@ -816,7 +831,7 @@ mod tests {
     #[test]
     fn passthrough_services_is_exec_without_soak_flag() {
         let world = TestWorld::new();
-        match dispatch(&s(&["services", "start", "foo"]), &world).expect("dispatch") {
+        match dispatch_quiet(&s(&["services", "start", "foo"]), &world).expect("dispatch") {
             Dispatch::Exec(_bin, argv) => {
                 assert_eq!(argv, s(&["services", "start", "foo"]));
                 assert!(!argv.iter().any(|a| a.contains("soak-hours")));
@@ -828,7 +843,7 @@ mod tests {
     #[test]
     fn soak_hours_persists_and_strips_from_passthrough() {
         let world = TestWorld::new();
-        match dispatch(
+        match dispatch_quiet(
             &s(&["--soak-hours", "48", "services", "start", "x"]),
             &world,
         )
@@ -849,7 +864,7 @@ mod tests {
     #[test]
     fn soak_hours_persists_on_soaked_command() {
         let world = TestWorld::new();
-        match dispatch(&s(&["--soak-hours", "48", "--version"]), &world).expect("version") {
+        match dispatch_quiet(&s(&["--soak-hours", "48", "--version"]), &world).expect("version") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -857,7 +872,7 @@ mod tests {
             !world.config_path().exists(),
             "version must not persist --soak-hours"
         );
-        match dispatch(&s(&["--soak-hours", "48", "outdated"]), &world).expect("outdated") {
+        match dispatch_quiet(&s(&["--soak-hours", "48", "outdated"]), &world).expect("outdated") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -868,7 +883,7 @@ mod tests {
     #[test]
     fn dry_run_does_not_persist_soak_hours() {
         let world = TestWorld::new();
-        let _ = dispatch(&s(&["--soak-hours", "48", "upgrade", "--dry-run"]), &world)
+        let _ = dispatch_quiet(&s(&["--soak-hours", "48", "upgrade", "--dry-run"]), &world)
             .expect("dispatch");
         assert!(
             !world.config_path().exists(),
@@ -880,7 +895,7 @@ mod tests {
     fn outdated_empty_snapshots_refreshes() {
         let world = TestWorld::new();
         assert!(!world.cache_path.join("state.toml").exists());
-        match dispatch(&s(&["outdated"]), &world).expect("dispatch") {
+        match dispatch_quiet(&s(&["outdated"]), &world).expect("dispatch") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -893,7 +908,7 @@ mod tests {
     #[test]
     fn help_install_is_soak_aware() {
         let world = TestWorld::new();
-        match dispatch(&s(&["help", "install"]), &world).expect("help") {
+        match dispatch_quiet(&s(&["help", "install"]), &world).expect("help") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -901,7 +916,7 @@ mod tests {
             !world.github.refreshed.get(),
             "help install must not refresh"
         );
-        match dispatch(&s(&["help", "services"]), &world).expect("help services") {
+        match dispatch_quiet(&s(&["help", "services"]), &world).expect("help services") {
             Dispatch::Exec(_bin, argv) => {
                 assert_eq!(argv, s(&["help", "services"]));
             }
@@ -910,13 +925,48 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_writes_settings_output_to_the_injected_writer() {
+        let world = TestWorld::new();
+        let (result, out) = dispatch_captured(&s(&["settings", "soak-hours", "48"]), &world);
+        assert!(matches!(result, Ok(Dispatch::Exit(0))), "{result:?}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(&format!("wrote {}", world.config_path().display())),
+            "{text:?}"
+        );
+        let (_, shown) = dispatch_captured(&s(&["settings", "show"]), &world);
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains("soak hours: 48"), "{shown:?}");
+    }
+
+    #[test]
+    fn dispatch_writes_version_help_and_report_output_to_the_injected_writer() {
+        let world = TestWorld::new();
+        let (_, out) = dispatch_captured(&s(&["--version"]), &world);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("{}\n", cli::version_line())
+        );
+        let (_, out) = dispatch_captured(&s(&["--help"]), &world);
+        assert_eq!(String::from_utf8(out).unwrap(), cli::help_text());
+        let (_, out) = dispatch_captured(&s(&["help", "install"]), &world);
+        assert!(!out.is_empty(), "command help lands in the writer");
+        let (result, out) = dispatch_captured(&s(&["outdated"]), &world);
+        assert!(matches!(result, Ok(Dispatch::Exit(0))), "{result:?}");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("nothing outdated"), "{text:?}");
+        let (_, out) = dispatch_captured(&s(&["outdated", "-v"]), &world);
+        assert!(!out.is_empty());
+    }
+
+    #[test]
     fn version_and_help_exit_without_refresh() {
         let world = TestWorld::new();
-        match dispatch(&s(&["--version"]), &world).expect("version") {
+        match dispatch_quiet(&s(&["--version"]), &world).expect("version") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
-        match dispatch(&s(&["--help"]), &world).expect("help") {
+        match dispatch_quiet(&s(&["--help"]), &world).expect("help") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -929,7 +979,7 @@ mod tests {
     #[test]
     fn info_untapped_token_is_soak_aware_not_exec() {
         let world = TestWorld::new();
-        match dispatch(&s(&["info", "acme/tools/foo"]), &world).expect("dispatch") {
+        match dispatch_quiet(&s(&["info", "acme/tools/foo"]), &world).expect("dispatch") {
             Dispatch::Exit(1) => {}
             other => panic!("untapped tap token is refused, not exec'd: {other:?}"),
         }
@@ -938,7 +988,7 @@ mod tests {
     #[test]
     fn outdated_ignores_names_and_does_not_exec() {
         let world = TestWorld::new();
-        match dispatch(&s(&["outdated", "acme/tools/foo"]), &world).expect("dispatch") {
+        match dispatch_quiet(&s(&["outdated", "acme/tools/foo"]), &world).expect("dispatch") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -982,7 +1032,7 @@ mod tests {
             "[[TAP]]\nname = \"hashicorp/tap\"\nsoak_hours = 100\n",
         )
         .unwrap();
-        match dispatch(&s(&["update"]), &world).expect("update") {
+        match dispatch_quiet(&s(&["update"]), &world).expect("update") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -1038,7 +1088,7 @@ mod tests {
             s(&["settings", "soak-hours", "--clear"]),
         ] {
             let world = TestWorld::new();
-            match dispatch(&args, &world) {
+            match dispatch_quiet(&args, &world) {
                 Ok(Dispatch::Exit(0)) => {}
                 other => panic!("{args:?}: {other:?}"),
             }
@@ -1049,7 +1099,7 @@ mod tests {
     #[test]
     fn settings_with_soak_hours_flag_is_usage_and_writes_nothing() {
         let world = TestWorld::new();
-        match dispatch(&s(&["--soak-hours", "1", "settings", "show"]), &world) {
+        match dispatch_quiet(&s(&["--soak-hours", "1", "settings", "show"]), &world) {
             Err(Error::Usage(m)) => assert!(m.contains("settings soak-hours"), "{m}"),
             other => panic!("{other:?}"),
         }
@@ -1182,7 +1232,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "# mine\nNO_SOAK = [\"wget\", \"a//b\", 3]\n").unwrap();
         let repair = s(&["settings", "repair"]);
-        dispatch(&repair, &world).unwrap();
+        dispatch_quiet(&repair, &world).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "# mine\nNO_SOAK = [\"wget\"]\n"
@@ -1194,7 +1244,7 @@ mod tests {
             std::fs::read_to_string(path.parent().unwrap().join(backup)).unwrap(),
             "# mine\nNO_SOAK = [\"wget\", \"a//b\", 3]\n"
         );
-        dispatch(&repair, &world).unwrap();
+        dispatch_quiet(&repair, &world).unwrap();
         assert_eq!(config_dir_names(&world), names, "second run writes nothing");
         let mut out = Vec::new();
         run_settings(
@@ -1215,12 +1265,12 @@ mod tests {
         let path = world.config_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "[[TAP]]\nname = \"a/b\"\nNO_SOAK = []\n").unwrap();
-        dispatch(&s(&["settings", "repair"]), &world).unwrap();
+        dispatch_quiet(&s(&["settings", "repair"]), &world).unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "[[TAP]]\nname = \"a/b\"\n"
         );
-        dispatch(&s(&["settings", "repair"]), &world).unwrap();
+        dispatch_quiet(&s(&["settings", "repair"]), &world).unwrap();
         assert_eq!(
             config_dir_names(&world).len(),
             2,
@@ -1235,7 +1285,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         for contents in ["[[[", "NO_SOAK = 3\n"] {
             std::fs::write(&path, contents).unwrap();
-            match dispatch(&s(&["settings", "repair"]), &world) {
+            match dispatch_quiet(&s(&["settings", "repair"]), &world) {
                 Err(Error::Refusal(_)) => {}
                 other => panic!("{contents:?}: {other:?}"),
             }
@@ -1248,21 +1298,21 @@ mod tests {
     fn settings_second_identical_edit_writes_nothing() {
         let world = TestWorld::new();
         let add = s(&["settings", "no-soak", "add", "wget"]);
-        dispatch(&add, &world).unwrap();
+        dispatch_quiet(&add, &world).unwrap();
         assert_eq!(config_dir_names(&world), ["config.toml"]);
-        dispatch(&add, &world).unwrap();
+        dispatch_quiet(&add, &world).unwrap();
         assert_eq!(
             config_dir_names(&world),
             ["config.toml"],
             "no-op edit: no write, no backup"
         );
-        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        dispatch_quiet(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
         assert_eq!(
             config_dir_names(&world).len(),
             2,
             "a real edit leaves one backup"
         );
-        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        dispatch_quiet(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
         assert_eq!(
             config_dir_names(&world).len(),
             2,
@@ -1275,7 +1325,7 @@ mod tests {
     #[test]
     fn settings_invalid_token_is_usage_and_writes_nothing() {
         let world = TestWorld::new();
-        match dispatch(&s(&["settings", "no-soak", "add", "a/b/c/d"]), &world) {
+        match dispatch_quiet(&s(&["settings", "no-soak", "add", "a/b/c/d"]), &world) {
             Err(Error::Usage(m)) => assert!(m.contains("a/b/c/d"), "{m}"),
             other => panic!("{other:?}"),
         }
@@ -1285,7 +1335,7 @@ mod tests {
     #[test]
     fn settings_clear_last_key_removes_the_file() {
         let world = TestWorld::new();
-        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        dispatch_quiet(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
         assert!(world.config_path().exists());
         let mut out = Vec::new();
         run_settings(
@@ -1313,7 +1363,7 @@ mod tests {
         let world = TestWorld::new();
         std::fs::create_dir_all(world.config_path().parent().unwrap()).unwrap();
         std::fs::write(world.config_path(), "# keep me\nSOAK_HOURS = 6 # why\n").unwrap();
-        match dispatch(&s(&["--soak-hours", "48", "outdated"]), &world).expect("outdated") {
+        match dispatch_quiet(&s(&["--soak-hours", "48", "outdated"]), &world).expect("outdated") {
             Dispatch::Exit(0) => {}
             other => panic!("{other:?}"),
         }
@@ -1329,7 +1379,7 @@ mod tests {
             env_soak: Some("36".into()),
             ..TestWorld::new()
         };
-        dispatch(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
+        dispatch_quiet(&s(&["settings", "soak-hours", "48"]), &world).unwrap();
         assert_eq!(
             std::fs::read_to_string(world.config_path()).unwrap(),
             "SOAK_HOURS = 48\n",

@@ -154,6 +154,8 @@ struct Sink {
     log: Option<std::fs::File>,
     log_path: Option<PathBuf>,
     log_failed: bool,
+    /// Where the summarized lines go; `None` is the process stdout.
+    terminal: Option<Box<dyn Write + Send>>,
 }
 
 impl Sink {
@@ -219,6 +221,13 @@ impl ProcessBrew {
             });
         }
         Ok(answers)
+    }
+
+    /// Send the summarized terminal lines of visible runs to `terminal`
+    /// instead of the process stdout (the raw log is unaffected).
+    pub fn with_terminal(self, terminal: Box<dyn Write + Send>) -> Self {
+        self.sink.lock().unwrap_or_else(|e| e.into_inner()).terminal = Some(terminal);
+        self
     }
 
     pub fn new(bin: PathBuf) -> Self {
@@ -706,7 +715,12 @@ impl ProcessBrew {
         drop(cmd);
         let raw = self.raw.get();
         let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        let captured = forward_run(reader, &mut sink, args, raw);
+        let mut terminal = sink.terminal.take();
+        let captured = match terminal.as_mut() {
+            Some(t) => forward_run(reader, &mut sink, t, args, raw),
+            None => forward_run(reader, &mut sink, &mut std::io::stdout(), args, raw),
+        };
+        sink.terminal = terminal;
         drop(sink);
         let status = child.wait()?;
         Ok(Output {
@@ -719,10 +733,15 @@ impl ProcessBrew {
 
 /// Read one brew run to EOF: raw bytes to the log and to the returned capture,
 /// one summarized line at a time to the terminal. Returns the raw output.
-fn forward_run(src: impl Read, sink: &mut Sink, args: &[String], raw: bool) -> Vec<u8> {
+fn forward_run(
+    src: impl Read,
+    sink: &mut Sink,
+    stdout: &mut impl Write,
+    args: &[String],
+    raw: bool,
+) -> Vec<u8> {
     let mut reader = std::io::BufReader::new(src);
     let mut captured = Vec::new();
-    let mut stdout = std::io::stdout();
     if let Some(log) = sink.log() {
         let _ = writeln!(log, "\n$ brew {}", args.join(" "));
     }
@@ -2348,6 +2367,20 @@ mod tests {
         assert_eq!(runs.len(), 2);
     }
 
+    /// A `Write` whose bytes the test can read back after the writer moved.
+    struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("buf").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn process_brew_run_captures_stdout() {
         let brew = ProcessBrew::new(PathBuf::from("/bin/echo"));
@@ -2362,11 +2395,18 @@ mod tests {
 
     #[test]
     fn process_brew_run_visible_forwards_and_returns_status() {
-        let brew = ProcessBrew::new(PathBuf::from("/bin/echo"));
+        let shown = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let brew = ProcessBrew::new(PathBuf::from("/bin/echo"))
+            .with_terminal(Box::new(SharedBuf(shown.clone())));
         let output = brew
             .run_visible(&["hello-visible".into()])
             .expect("run_visible");
         assert!(output.status.success());
+        let shown = String::from_utf8(shown.lock().expect("shown").clone()).expect("utf8");
+        assert!(
+            shown.contains("hello-visible"),
+            "the summary reaches the injected terminal: {shown:?}"
+        );
         assert!(
             String::from_utf8_lossy(&output.stdout).contains("hello-visible"),
             "{:?}",
