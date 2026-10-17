@@ -258,6 +258,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
                 &mut out,
             )?;
             soaked_exit(cmd::info(
+                world.brew(),
                 world.git(),
                 &snaps,
                 &cache,

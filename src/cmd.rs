@@ -24,8 +24,12 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
         DesiredAction::RefuseTooNew => format!("{name} is too new (born inside the soak window)"),
         DesiredAction::RefuseYanked => format!("{name} is missing at HEAD (yanked)"),
         DesiredAction::RefuseDeprecated => format!("{name} is deprecated or disabled at HEAD"),
+        DesiredAction::HoldUnordered => {
+            format!("{name}: brew could not compare its installed version with the cutoff")
+        }
         DesiredAction::NoOpAlreadySoaked
         | DesiredAction::LeaveAheadOfSoak
+        | DesiredAction::LeaveNewerThanCutoff
         | DesiredAction::LeaveAutoUpdates
         | DesiredAction::InstallCutoff => return None,
     };
@@ -36,6 +40,22 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
 
 pub fn ahead_message(name: &str) -> String {
     format!("{name} is ahead of soak; leaving installed artifact unchanged")
+}
+
+pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
+    format!(
+        "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed the formula)"
+    )
+}
+
+/// The installed and cutoff versions of a view, for notes.
+fn view_versions(view: &ResolvedView) -> (String, String) {
+    let version = |id: &Option<PkgIdentity>| {
+        id.as_ref()
+            .map(report::identity_version)
+            .unwrap_or_else(|| "?".into())
+    };
+    (version(&view.installed), version(&view.cutoff))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,14 +159,17 @@ fn snapshotted_pkgs<'a>(inv: &'a Inventory, snaps: &'a Snapshots) -> impl Iterat
 }
 
 fn classify_installed(
+    brew: &impl Brew,
     git: &impl GitStore,
     cache: &Path,
     snaps: &Snapshots,
     inv: &Inventory,
 ) -> Result<Vec<Classified>, Error> {
     let mut out = Vec::new();
+    prefetch_orderings(brew, git, snaps, cache, inv);
     for pkg in snapshotted_pkgs(inv, snaps) {
         let Some(mut view) = resolve_view(
+            brew,
             git,
             snaps,
             cache,
@@ -171,7 +194,9 @@ fn classify_installed(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_update_summary(
+    brew: &impl Brew,
     git: &impl GitStore,
     cache: &Path,
     snaps: &Snapshots,
@@ -180,7 +205,7 @@ fn write_update_summary(
     verbose: bool,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    let after = classify_installed(git, cache, snaps, inv)?;
+    let after = classify_installed(brew, git, cache, snaps, inv)?;
     let before_map: std::collections::HashMap<_, _> = before
         .iter()
         .map(|(n, a, _, _, _)| (n.as_str(), *a))
@@ -196,6 +221,8 @@ fn write_update_summary(
                 DesiredAction::RefuseYanked => "gone at HEAD",
                 DesiredAction::NoOpAlreadySoaked => "already at cutoff",
                 DesiredAction::LeaveAheadOfSoak => "ahead of soak",
+                DesiredAction::LeaveNewerThanCutoff => "newer than cutoff",
+                DesiredAction::HoldUnordered => "versions not comparable",
                 DesiredAction::LeaveAutoUpdates => "updates itself",
                 DesiredAction::RefuseDeprecated => "deprecated at HEAD",
             };
@@ -221,7 +248,12 @@ fn write_update_summary(
             }
             DesiredAction::RefuseTooNew => soaking.push(name.clone()),
             DesiredAction::RefuseYanked => gone.push(name.clone()),
-            _ => {}
+            DesiredAction::NoOpAlreadySoaked
+            | DesiredAction::LeaveAheadOfSoak
+            | DesiredAction::LeaveNewerThanCutoff
+            | DesiredAction::LeaveAutoUpdates
+            | DesiredAction::RefuseDeprecated
+            | DesiredAction::HoldUnordered => {}
         }
     }
     write_section(out, "==> Became eligible", &eligible)?;
@@ -258,7 +290,7 @@ pub fn update(
     )?;
     let previous = snapshot::load_state(cache)?;
     let before = match &previous {
-        Some(prev) => classify_installed(git, cache, prev, inv).unwrap_or_default(),
+        Some(prev) => classify_installed(brew, git, cache, prev, inv).unwrap_or_default(),
         None => Vec::new(),
     };
     let plan = refresh_plan(cfg, inv, &[]);
@@ -305,7 +337,7 @@ pub fn update(
         )?;
     }
     prefetch_installed(git, cache, inv, &snaps);
-    write_update_summary(git, cache, &snaps, inv, &before, verbose, out)?;
+    write_update_summary(brew, git, cache, &snaps, inv, &before, verbose, out)?;
     if inv.any_no_soak() {
         writeln!(out, "no-soak packages installed; updating brew")?;
         let output = brew.run_visible(&["update".to_string()])?;
@@ -442,6 +474,7 @@ pub fn outdated(
     let mut pinned = Vec::new();
     let mut soaked = 0usize;
     let mut no_soak_names = Vec::new();
+    prefetch_orderings(brew, git, snaps, cache, inv);
     for pkg in &inv.pkgs {
         if verbose {
             writeln!(
@@ -489,6 +522,7 @@ pub fn outdated(
             continue;
         }
         let Some(mut view) = resolve_view(
+            brew,
             git,
             snaps,
             cache,
@@ -541,12 +575,17 @@ pub fn outdated(
             }
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
-            | DesiredAction::RefuseDeprecated => {
+            | DesiredAction::RefuseDeprecated
+            | DesiredAction::HoldUnordered => {
                 if let Some(why) = hold_why(view.action) {
                     held.push(format!("{}: {why}", pkg.name));
                 }
             }
             DesiredAction::LeaveAheadOfSoak => ahead.push(pkg.name.clone()),
+            DesiredAction::LeaveNewerThanCutoff => {
+                let (installed_ver, cutoff_ver) = view_versions(&view);
+                ahead.push(format!("{} ({installed_ver}) > {cutoff_ver}", pkg.name));
+            }
             DesiredAction::LeaveAutoUpdates => {
                 let installed_ver = view
                     .installed
@@ -600,6 +639,7 @@ pub fn outdated(
 
 #[allow(clippy::too_many_arguments)]
 pub fn info(
+    brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -698,7 +738,8 @@ pub fn info(
         let receipt = inv
             .find_in(&r.origin, &r.name)
             .map(|p| p.receipt_rb.as_str());
-        let Some(view) = resolve_view(git, snaps, cache, &r.origin, &r.name, kind, receipt)? else {
+        let Some(view) = resolve_view(brew, git, snaps, cache, &r.origin, &r.name, kind, receipt)?
+        else {
             if long_form {
                 writeln!(out, "{raw}")?;
                 writeln!(out, "unparseable identity")?;
@@ -791,7 +832,7 @@ pub fn upgrade(
     // A bare `brew soak upgrade` walks everything installed, so say up front
     // how many will actually change and count them off as they go.
     let plan_total = (names.is_empty())
-        .then(|| plan_size(git, snaps, cache, inv, flags::greedy_mode(user_flags)));
+        .then(|| plan_size(brew, git, snaps, cache, inv, flags::greedy_mode(user_flags)));
     if let Some(total) = plan_total {
         let doing = if flags::is_dry_run(user_flags) {
             "would upgrade"
@@ -847,6 +888,7 @@ fn bare_skip<'a>(pkg: &Pkg, snaps: &'a Snapshots) -> Option<BareSkip<'a>> {
 /// How many installed packages the soak window says to change. Resolution is
 /// cheap (cached blobs) and errors just mean "no total to show".
 fn plan_size(
+    brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -859,11 +901,13 @@ fn plan_size(
     // `bare_action` with the same greedy mode; the test
     // `plan_size_upgrade_and_outdated_agree_under_every_greedy_mode` pins that
     // under all four modes.
+    prefetch_orderings(brew, git, snaps, cache, inv);
     snapshotted_pkgs(inv, snaps)
         .filter(|pkg| bare_skip(pkg, snaps).is_none())
         .filter(|pkg| {
             matches!(
                 resolve_view(
+                    brew,
                     git,
                     snaps,
                     cache,
@@ -996,6 +1040,7 @@ pub fn reinstall(
             )));
         };
         let Some(view) = resolve_view(
+            brew,
             git,
             snaps,
             cache,
@@ -1423,7 +1468,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         let receipt = installed.map(|p| p.receipt_rb.as_str());
         let Some(mut view) = resolve_view(
-            self.git, self.snaps, self.cache, &r.origin, &name, kind, receipt,
+            self.brew, self.git, self.snaps, self.cache, &r.origin, &name, kind, receipt,
         )?
         else {
             self.counts.skipped += 1;
@@ -1458,11 +1503,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 "left unchanged; its contents cannot be soaked"
             }
             DesiredAction::NoOpAlreadySoaked => "left unchanged",
-            DesiredAction::LeaveAheadOfSoak => "left unchanged",
+            DesiredAction::LeaveAheadOfSoak | DesiredAction::LeaveNewerThanCutoff => {
+                "left unchanged"
+            }
             DesiredAction::LeaveAutoUpdates => "left to the app",
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
-            | DesiredAction::RefuseDeprecated => "refused",
+            | DesiredAction::RefuseDeprecated
+            | DesiredAction::HoldUnordered => "refused",
         };
         if is_verbose(self.user_flags) {
             writeln!(
@@ -1501,6 +1549,24 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 } else {
                     self.defer(ahead_message(&name));
                 }
+            }
+            DesiredAction::LeaveNewerThanCutoff => {
+                let (installed_ver, cutoff_ver) = view_versions(&view);
+                if self.brew_verb == "reinstall" {
+                    self.defer(format!(
+                        "{name} is newer than its cutoff {cutoff_ver}; reinstall would downgrade it; use `brew reinstall {token}` to bypass brewsoak."
+                    ));
+                    self.refused = true;
+                } else {
+                    self.defer(newer_than_cutoff_note(&name, &installed_ver, &cutoff_ver));
+                }
+            }
+            DesiredAction::HoldUnordered => {
+                let (installed_ver, cutoff_ver) = view_versions(&view);
+                self.defer(format!(
+                    "{name}: brew could not compare installed {installed_ver} with cutoff {cutoff_ver}; holding it"
+                ));
+                self.refused = true;
             }
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
@@ -2108,7 +2174,92 @@ fn latest_note(name: &str) -> String {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_view(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    origin_tap: &str,
+    name: &str,
+    kind: PkgKind,
+    receipt_rb: Option<&str>,
+) -> Result<Option<ResolvedView>, Error> {
+    let Some(mut view) =
+        resolve_view_unordered(git, snaps, cache, origin_tap, name, kind, receipt_rb)?
+    else {
+        return Ok(None);
+    };
+    settle_order(brew, kind, &mut view);
+    Ok(Some(view))
+}
+
+/// brewsoak never downgrades. `desired_action` says `InstallCutoff` for any
+/// installed version that differs from the cutoff, so ask brew which side is
+/// newer: an installed version strictly newer than the cutoff is left alone,
+/// and a comparison brew cannot make holds the package.
+fn settle_order(brew: &impl Brew, kind: PkgKind, view: &mut ResolvedView) {
+    let Some(pair) = order_pair(kind, view) else {
+        return;
+    };
+    let order = brew
+        .compare_versions(std::slice::from_ref(&pair))
+        .ok()
+        .and_then(|answers| answers.into_iter().next());
+    view.action = match order {
+        Some(std::cmp::Ordering::Greater) => DesiredAction::LeaveNewerThanCutoff,
+        Some(_) => DesiredAction::InstallCutoff,
+        None => DesiredAction::HoldUnordered,
+    };
+}
+
+/// The versions to order for a would-be install over an installed version.
+/// An equal version string (a different artifact, same version) is an
+/// upgrade, and `:latest` has no order.
+fn order_pair(kind: PkgKind, view: &ResolvedView) -> Option<crate::brew::VersionPair> {
+    if view.action != DesiredAction::InstallCutoff {
+        return None;
+    }
+    let installed = report::identity_version(view.installed.as_ref()?);
+    let cutoff = report::identity_version(view.cutoff.as_ref()?);
+    let latest = |v: &str| v == ":latest" || v == "latest";
+    if installed == cutoff || latest(&installed) || latest(&cutoff) {
+        return None;
+    }
+    Some((kind, installed, cutoff))
+}
+
+/// Ask brew for every version order a bare run will need in one call, so
+/// `resolve_view` finds them memoized. A failure here is left for each
+/// package's own comparison to report.
+fn prefetch_orderings(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    inv: &Inventory,
+) {
+    let mut pairs = Vec::new();
+    for pkg in snapshotted_pkgs(inv, snaps).filter(|p| bare_skip(p, snaps).is_none()) {
+        if let Ok(Some(view)) = resolve_view_unordered(
+            git,
+            snaps,
+            cache,
+            &pkg.origin,
+            &pkg.name,
+            pkg.kind,
+            Some(&pkg.receipt_rb),
+        ) && let Some(pair) = order_pair(pkg.kind, &view)
+        {
+            pairs.push(pair);
+        }
+    }
+    if !pairs.is_empty() {
+        let _ = brew.compare_versions(&pairs);
+    }
+}
+
+fn resolve_view_unordered(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -2306,7 +2457,14 @@ fn hold_why(action: DesiredAction) -> Option<&'static str> {
         DesiredAction::RefuseTooNew => Some("too new (born inside the soak window)"),
         DesiredAction::RefuseYanked => Some("missing at HEAD (yanked)"),
         DesiredAction::RefuseDeprecated => Some("deprecated or disabled at HEAD"),
-        _ => None,
+        DesiredAction::HoldUnordered => {
+            Some("could not compare the installed version with the cutoff (brew)")
+        }
+        DesiredAction::NoOpAlreadySoaked
+        | DesiredAction::LeaveAheadOfSoak
+        | DesiredAction::LeaveNewerThanCutoff
+        | DesiredAction::LeaveAutoUpdates
+        | DesiredAction::InstallCutoff => None,
     }
 }
 
@@ -2661,6 +2819,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = info(
+            &MockBrew::new(),
             &git,
             &snaps,
             unused_cache(),
@@ -2686,8 +2845,18 @@ mod tests {
         let mut out = Vec::new();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        let result =
-            info(&git, &snaps, unused_cache(), &inv, &cfg, &[], &[], &mut out).expect("info");
+        let result = info(
+            &MockBrew::new(),
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("info");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "missing installed alpha: {text}");
         assert!(text.contains("beta"), "missing installed beta: {text}");
@@ -5308,6 +5477,7 @@ mod tests {
         let mut out = Vec::new();
         let names = ["alpha".to_string(), "local/tap/thing".to_string()];
         let r = info(
+            &MockBrew::new(),
             &git,
             &core_snaps(),
             unused_cache(),
@@ -5673,6 +5843,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         info(
+            &MockBrew::new(),
             &git,
             &snaps,
             unused_cache(),
@@ -5764,6 +5935,7 @@ mod tests {
         git.insert_tree("taphead", &["Casks/vacuum.rb"]);
         let mut out = Vec::new();
         info(
+            &MockBrew::new(),
             &git,
             &snaps,
             unused_cache(),
@@ -6443,6 +6615,178 @@ mod tests {
         assert!(notes.contains("cannot be soaked"), "{text}");
     }
 
+    /// `openssl@3` installed at 3.6.5 while upstream re-pointed the formula
+    /// at the 3.5 line: cutoff and HEAD are both 3.5.9.
+    fn openssl_repoint_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        let rb = formula_rb("openssl@3", "3.5.9", "sha359");
+        git.insert_blob("cutoffsha", "Formula/o/openssl@3.rb", rb.clone());
+        git.insert_blob("headsha", "Formula/o/openssl@3.rb", rb);
+        let brew = MockBrew {
+            installed: vec![formula_pkg(
+                "openssl@3",
+                formula_rb("openssl@3", "3.6.5", "sha365"),
+            )],
+            ..MockBrew::new()
+        };
+        (brew, git, core_snaps())
+    }
+
+    /// brew orders 3.6.5 after 3.5.9.
+    fn openssl_is_newer(brew: &mut MockBrew) {
+        brew.orderings.insert(
+            ("3.6.5".to_string(), "3.5.9".to_string()),
+            std::cmp::Ordering::Greater,
+        );
+    }
+
+    const OPENSSL_NOTE: &str = "openssl@3: installed 3.6.5 is newer than cutoff 3.5.9; leaving it (upstream may have re-pointed the formula)";
+
+    #[test]
+    fn bare_upgrade_never_downgrades_a_repointed_formula() {
+        let (mut brew, git, snaps) = openssl_repoint_world();
+        openssl_is_newer(&mut brew);
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        let runs = lock_runs(&brew);
+        assert!(!run_is_soaked_install(&runs, "openssl@3"), "{text}");
+        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
+        assert!(text.contains(OPENSSL_NOTE), "{text}");
+        assert!(text.contains("ahead 1"), "{text}");
+        assert!(text.contains("upgraded 0"), "{text}");
+    }
+
+    #[test]
+    fn outdated_lists_a_repointed_formula_as_ahead_not_outdated() {
+        let (mut brew, git, snaps) = openssl_repoint_world();
+        openssl_is_newer(&mut brew);
+        let text = greedy_outdated(&brew, &git, &snaps, &[]);
+        assert!(section_lines(&text, OUTDATED_HEADER).is_empty(), "{text}");
+        let ahead = section_lines(&text, "==> Ahead of soak");
+        assert_eq!(ahead, ["openssl@3 (3.6.5) > 3.5.9"], "{text}");
+    }
+
+    #[test]
+    fn named_upgrade_and_reinstall_of_a_repointed_formula_do_not_install() {
+        let (mut brew, git, snaps) = openssl_repoint_world();
+        openssl_is_newer(&mut brew);
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        let names = vec!["openssl@3".to_string()];
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &names,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !r.refused,
+            "named upgrade is left like ahead-of-soak: {text}"
+        );
+        assert!(text.contains(OPENSSL_NOTE), "{text}");
+        let mut out = Vec::new();
+        let r = reinstall(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &names,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused, "{text}");
+        assert!(text.contains("reinstall would downgrade"), "{text}");
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_version_comparison_holds_the_package() {
+        let (mut brew, git, snaps) = openssl_repoint_world();
+        brew.compare_error = Some("brew ruby exploded".into());
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "openssl@3: brew could not compare installed 3.6.5 with cutoff 3.5.9; holding it"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("held 1"), "{text}");
+        let text = greedy_outdated(&brew, &git, &snaps, &[]);
+        assert!(section_lines(&text, OUTDATED_HEADER).is_empty(), "{text}");
+        assert_eq!(section_lines(&text, "==> Held").len(), 1, "{text}");
+    }
+
+    #[test]
+    fn installed_between_cutoff_and_head_is_left_alone() {
+        let (mut brew, git, snaps) = openssl_repoint_world();
+        git.insert_blob(
+            "headsha",
+            "Formula/o/openssl@3.rb",
+            formula_rb("openssl@3", "3.7.0", "sha370"),
+        );
+        openssl_is_newer(&mut brew);
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            "{text}"
+        );
+        assert!(text.contains(OPENSSL_NOTE), "{text}");
+    }
+
+    #[test]
+    fn same_version_with_a_different_artifact_still_upgrades_without_asking_brew() {
+        let (mut brew, git, snaps) = openssl_repoint_world();
+        brew.installed = vec![formula_pkg(
+            "openssl@3",
+            formula_rb("openssl@3", "3.5.9", "oldsha"),
+        )];
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            "{text}"
+        );
+        assert!(
+            brew.compares.lock().unwrap().is_empty(),
+            "equal version strings are not compared"
+        );
+    }
+
+    #[test]
+    fn bare_upgrade_asks_brew_once_and_never_about_latest_casks() {
+        let (brew, git, snaps) = greedy_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy"]);
+        let compares = brew.compares.lock().unwrap().clone();
+        let first = compares.first().expect("a prefetch call");
+        let asked: Vec<&str> = first.iter().map(|(_, a, _)| a.as_str()).collect();
+        assert_eq!(asked, ["1.0.0", "7.38.1"], "wget and alt-tab only: {text}");
+        assert!(
+            compares.iter().skip(1).all(|c| c.len() == 1),
+            "later asks are per-package"
+        );
+    }
+
     /// Pins the claim in `plan_size`'s comment: the pre-run total, the
     /// `[i/N]` announcements and the `outdated` report agree in every mode.
     #[test]
@@ -6453,11 +6797,21 @@ mod tests {
             (&["--greedy-auto-updates"][..], 4),
             (&["--greedy"][..], 4),
         ] {
-            let (brew, git, snaps) = greedy_world();
+            let (mut brew, git, snaps) = greedy_world();
+            // A re-pointed formula is in no mode's plan.
+            brew.installed.push(formula_pkg(
+                "openssl@3",
+                formula_rb("openssl@3", "3.6.5", "sha365"),
+            ));
+            let rb = formula_rb("openssl@3", "3.5.9", "sha359");
+            git.insert_blob("cutoffsha", "Formula/o/openssl@3.rb", rb.clone());
+            git.insert_blob("headsha", "Formula/o/openssl@3.rb", rb);
+            openssl_is_newer(&mut brew);
             let cfg = cfg24();
             let inv = inv_from(&brew, &cfg);
             let owned: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
             let size = plan_size(
+                &brew,
                 &git,
                 &snaps,
                 unused_cache(),
@@ -6468,7 +6822,7 @@ mod tests {
 
             let text = greedy_upgrade(&brew, &git, &snaps, argv);
             assert!(
-                text.contains(&format!("upgrading {want} of 5 packages")),
+                text.contains(&format!("upgrading {want} of 6 packages")),
                 "{argv:?}: {text}"
             );
             let announced = text
@@ -6580,6 +6934,7 @@ mod tests {
         git.insert_blob("caskhead", "Casks/n/nightly.rb", cask_rb("nightly", "2.0"));
         let receipt = crate::brew::version_only_cask_receipt("nightly", "latest");
         let view = resolve_view(
+            &MockBrew::new(),
             &git,
             &core_snaps(),
             unused_cache(),
@@ -6596,6 +6951,7 @@ mod tests {
         git.insert_blob("caskcut", "Casks/n/nightly.rb", cask_rb("nightly", "2.0"));
         git.insert_blob("caskhead", "Casks/n/nightly.rb", cask_rb("nightly", "2.0"));
         let view = resolve_view(
+            &MockBrew::new(),
             &git,
             &core_snaps(),
             unused_cache(),
@@ -7782,6 +8138,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         info(
+            &MockBrew::new(),
             &git,
             &snaps,
             unused_cache(),

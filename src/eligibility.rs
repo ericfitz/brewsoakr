@@ -16,12 +16,24 @@ pub enum DesiredAction {
     /// The app updates itself; brew skips it on a bare `upgrade`/`outdated`
     /// without `--greedy`. Set only by bare runs, never by `desired_action`.
     LeaveAutoUpdates,
+    /// Installed and strictly newer than the cutoff by brew's version order,
+    /// and not at HEAD: upstream re-pointed the formula at an older line.
+    /// Installing the cutoff would downgrade, so it is never installed. Set
+    /// only by `cmd::resolve_view`, which can ask brew for the order.
+    LeaveNewerThanCutoff,
+    /// brew could not order the installed version against the cutoff, so
+    /// installing the cutoff might downgrade. Set only by `cmd::resolve_view`.
+    HoldUnordered,
     InstallCutoff,
     RefuseTooNew,
     RefuseYanked,
     RefuseDeprecated,
 }
 
+/// `InstallCutoff` here means "differs from the cutoff"; it is not yet known
+/// to be an upgrade. `cmd::resolve_view` orders the versions with brew and
+/// turns a would-be downgrade into `LeaveNewerThanCutoff`.
+///
 /// `cutoff_blob` / `head_blob` are raw git bytes. `today` is `YYYY-MM-DD`.
 /// `installed` is parsed receipt identity.
 pub fn upstream_status(

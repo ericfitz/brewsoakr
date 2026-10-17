@@ -3,7 +3,8 @@ use crate::quiet;
 use crate::resolve::PkgKind;
 use crate::taps::TapInfo;
 use std::cell::Cell;
-use std::collections::{BTreeMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, ErrorKind, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
@@ -34,6 +35,16 @@ pub struct SessionReport {
     pub log_path: Option<PathBuf>,
 }
 
+/// Two version strings to order: `(kind, installed, other)`.
+pub type VersionPair = (PkgKind, String, String);
+
+/// Runs under `brew ruby -e`: ARGV holds `kind installed other` triples, and
+/// each prints one `<=>` result. The strings arrive as arguments, never as
+/// Ruby source. Formulae use `PkgVersion` so a `_N` revision orders.
+const COMPARE_VERSIONS_RUBY: &str = r#"ARGV.each_slice(3) do |kind, a, b|
+  puts(kind == "cask" ? Version.new(a) <=> Version.new(b) : PkgVersion.parse(a) <=> PkgVersion.parse(b))
+end"#;
+
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
     /// Capturing run for JSON (`info`, `outdated`, `tap-info`), `deps`, `--cellar` and `--caskroom`.
@@ -57,6 +68,13 @@ pub trait Brew {
     fn keg_receipt(&self, _name: &str, _version: &str) -> Option<String> {
         None
     }
+    /// Homebrew's own order of each pair's first version against its second,
+    /// one result per pair, from one `brew ruby` call. `Greater` means the
+    /// first is newer. brewsoak does not port Homebrew's version rules. The
+    /// default reports every pair as `Less`, as if the cutoff were newer.
+    fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
+        Ok(vec![Ordering::Less; pairs.len()])
+    }
 }
 
 pub struct ProcessBrew {
@@ -64,6 +82,8 @@ pub struct ProcessBrew {
     raw: Cell<bool>,
     /// `brew --cellar`, asked once: it never changes during a run.
     cellar: std::cell::OnceCell<Option<PathBuf>>,
+    /// `compare_versions` answers for this run, keyed by `(kind, a, b)`.
+    orderings: Mutex<HashMap<(&'static str, String, String), Ordering>>,
     sink: Mutex<Sink>,
 }
 
@@ -105,6 +125,7 @@ impl ProcessBrew {
             bin,
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
+            orderings: Mutex::new(HashMap::new()),
             sink: Mutex::new(Sink::default()),
         }
     }
@@ -126,6 +147,13 @@ pub struct MockBrew {
     pub outdated: Vec<String>,
     /// What `keg_receipt` reports, keyed by `(name, cellar version)`.
     pub kegs: BTreeMap<(String, String), String>,
+    /// What `compare_versions` reports for `(installed, other)`; an
+    /// unscripted pair is `Less`.
+    pub orderings: BTreeMap<(String, String), Ordering>,
+    /// Makes every `compare_versions` call fail with this message.
+    pub compare_error: Option<String>,
+    /// The pairs of each `compare_versions` call.
+    pub compares: Mutex<Vec<Vec<VersionPair>>>,
 }
 
 impl Default for MockBrew {
@@ -142,6 +170,9 @@ impl Default for MockBrew {
             next_outputs: Mutex::new(VecDeque::new()),
             outdated: Vec::new(),
             kegs: BTreeMap::new(),
+            orderings: BTreeMap::new(),
+            compare_error: None,
+            compares: Mutex::new(Vec::new()),
         }
     }
 }
@@ -204,6 +235,55 @@ impl Brew for ProcessBrew {
     fn keg_receipt(&self, name: &str, version: &str) -> Option<String> {
         let cellar = self.cellar()?;
         read_formula_receipt(&cellar, name, Some(version))
+    }
+
+    fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
+        let key = |(kind, a, b): &VersionPair| (kind_tag(*kind), a.clone(), b.clone());
+        let mut asking: Vec<&VersionPair> = Vec::new();
+        {
+            let memo = self.orderings.lock().unwrap_or_else(|e| e.into_inner());
+            for pair in pairs {
+                if !memo.contains_key(&key(pair)) && !asking.iter().any(|q| key(q) == key(pair)) {
+                    asking.push(pair);
+                }
+            }
+        }
+        if !asking.is_empty() {
+            let mut args = vec![
+                "ruby".to_string(),
+                "-e".to_string(),
+                COMPARE_VERSIONS_RUBY.to_string(),
+                "--".to_string(),
+            ];
+            for (kind, a, b) in &asking {
+                args.extend([kind_tag(*kind).to_string(), a.clone(), b.clone()]);
+            }
+            let output = self.run(&args)?;
+            if !output.status.success() {
+                return Err(brew_fail(&output));
+            }
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let answers: Vec<Ordering> = stdout
+                .lines()
+                .map(|l| match l.trim() {
+                    "-1" => Some(Ordering::Less),
+                    "0" => Some(Ordering::Equal),
+                    "1" => Some(Ordering::Greater),
+                    _ => None,
+                })
+                .collect::<Option<_>>()
+                .filter(|a: &Vec<Ordering>| a.len() == asking.len())
+                .ok_or_else(|| Error::Brew {
+                    status: 0,
+                    message: format!("unparseable version comparison output: {}", stdout.trim()),
+                })?;
+            let mut memo = self.orderings.lock().unwrap_or_else(|e| e.into_inner());
+            for (pair, answer) in asking.iter().zip(answers) {
+                memo.insert(key(pair), answer);
+            }
+        }
+        let memo = self.orderings.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(pairs.iter().map(|p| memo[&key(p)]).collect())
     }
 
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -435,6 +515,28 @@ impl Brew for MockBrew {
             .cloned()
     }
 
+    fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
+        self.compares
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(pairs.to_vec());
+        if let Some(message) = &self.compare_error {
+            return Err(Error::Brew {
+                status: 1,
+                message: message.clone(),
+            });
+        }
+        Ok(pairs
+            .iter()
+            .map(|(_, a, b)| {
+                self.orderings
+                    .get(&(a.clone(), b.clone()))
+                    .copied()
+                    .unwrap_or(Ordering::Less)
+            })
+            .collect())
+    }
+
     fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
         let stem = Path::new(token)
             .file_stem()
@@ -468,6 +570,13 @@ pub fn exec(bin: &Path, args: &[String]) -> i32 {
 
 fn exit_status_raw(code: i32) -> i32 {
     if code == 0 { 0 } else { code << 8 }
+}
+
+fn kind_tag(kind: PkgKind) -> &'static str {
+    match kind {
+        PkgKind::Formula => "formula",
+        PkgKind::Cask => "cask",
+    }
 }
 
 fn brew_fail(output: &Output) -> Error {
@@ -1466,6 +1575,66 @@ mod tests {
             .lines()
             .count();
         assert_eq!(calls, 1, "brew --cellar was spawned {calls} times");
+    }
+
+    /// A `brew` stand-in that logs its argv (one line per call) and prints `stdout`.
+    fn compare_script(tmp: &Path, stdout: &str, status: i32) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = tmp.join("argv");
+        let script = tmp.join("brew");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\nprintf '{stdout}'\nexit {status}\n",
+                log.display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (script, log)
+    }
+
+    #[test]
+    fn compare_versions_batches_one_call_passes_argv_and_memoizes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "1\\n-1\\n", 0);
+        let brew = ProcessBrew::new(script);
+        let pairs = [
+            (PkgKind::Formula, "3.6.5".to_string(), "3.5.9".to_string()),
+            (PkgKind::Cask, "1.0".to_string(), "2.0".to_string()),
+        ];
+        let want = vec![Ordering::Greater, Ordering::Less];
+        assert_eq!(brew.compare_versions(&pairs).expect("compare"), want);
+        assert_eq!(brew.compare_versions(&pairs).expect("memo"), want);
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(
+            argv.matches("ruby -e").count(),
+            1,
+            "second ask is memoized: {argv}"
+        );
+        assert!(argv.starts_with("ruby -e "), "{argv}");
+        assert!(
+            argv.trim_end()
+                .ends_with("-- formula 3.6.5 3.5.9 cask 1.0 2.0"),
+            "versions travel as argv, not Ruby source: {argv}"
+        );
+    }
+
+    #[test]
+    fn compare_versions_errors_on_failure_or_unparseable_output() {
+        for (stdout, status) in [("", 1), ("1\\n", 0), ("banana\\nx\\n", 0), ("1\\n2\\n", 0)] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (script, _) = compare_script(tmp.path(), stdout, status);
+            let brew = ProcessBrew::new(script);
+            let pairs = [
+                (PkgKind::Formula, "1.0".to_string(), "2.0".to_string()),
+                (PkgKind::Formula, "1.0_1".to_string(), "1.0".to_string()),
+            ];
+            assert!(
+                brew.compare_versions(&pairs).is_err(),
+                "{stdout:?} exit {status} must not parse"
+            );
+        }
     }
 
     #[test]
