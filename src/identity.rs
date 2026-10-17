@@ -662,6 +662,13 @@ struct Pass<'a> {
     open: usize,
 }
 
+/// A Ruby block comment marker: `word` at column 0, alone or followed by
+/// whitespace and anything.
+fn is_block_comment_marker(line: &str, word: &str) -> bool {
+    line.strip_prefix(word)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+}
+
 /// One walk of `depth1_lines`. `language` is the index of the top-level
 /// `language` block to read as transparent; the other `language` blocks stay
 /// opaque.
@@ -684,11 +691,28 @@ fn depth1_pass<'a>(rb: &'a str, host: Option<&HostPlatform>, language: Option<us
     let mut pending: Vec<Heredoc> = Vec::new();
     // A string or regex literal that continues over the following lines.
     let mut in_literal: Option<Delims> = None;
+    // Inside a `=begin` ... `=end` block comment.
+    let mut in_block_comment = false;
     for (n, line) in all.iter().copied().enumerate() {
         if let Some(h) = pending.first() {
             if h.terminated_by(line) {
                 pending.remove(0);
             }
+            continue;
+        }
+        if in_block_comment {
+            in_block_comment = !is_block_comment_marker(line, "=end");
+            continue;
+        }
+        // A `=begin` ... `=end` comment is text up to its `=end`, which must
+        // exist; a stray `=begin` with none is not a comment.
+        if in_literal.is_none()
+            && is_block_comment_marker(line, "=begin")
+            && all[n + 1..]
+                .iter()
+                .any(|l| is_block_comment_marker(l, "=end"))
+        {
+            in_block_comment = true;
             continue;
         }
         let mut line = line;
@@ -2752,5 +2776,14 @@ mod balance_tests {
         ] {
             assert_balanced(&formula(body));
         }
+    }
+
+    #[test]
+    fn begin_end_comment_blocks_are_skipped_entirely() {
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n=begin\n  url \"https://e.com/bad-9.9.9.tar.gz\"\n  if x\n  foo do\n=end\n  sha256 \"abc\"\n  def install\n=begin extra words\n    if y\n    system \"z\" do\n=end\n    system \"make\"\n  end\nend\n";
+        let lines = depth1_lines(rb, None);
+        assert!(!lines.iter().any(|l| l.contains("bad")), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("sha256 \"abc\"")));
+        assert_balanced(rb);
     }
 }

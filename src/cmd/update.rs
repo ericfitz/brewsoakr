@@ -210,7 +210,7 @@ pub fn update(
     write_update_summary(brew, git, cache, &snaps, inv, &before, verbose, out)?;
     if inv.any_no_soak() {
         writeln!(out, "no-soak packages installed; updating brew")?;
-        let output = brew.run_visible(&["update".to_string()])?;
+        let output = brew.run_visible(&["update".to_string()], &mut *out)?;
         write_session_tail(&brew.session_report(), out)?;
         if !output.status.success() {
             let status = output.status.code().unwrap_or(1);
