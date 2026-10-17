@@ -12,9 +12,10 @@ pub enum UpstreamStatus {
 pub enum DesiredAction {
     NoOpAlreadySoaked,
     LeaveAheadOfSoak,
-    /// An installed cask with `auto_updates true` that is behind the cutoff.
-    /// The app updates itself; brew skips it on a bare `upgrade`/`outdated`
-    /// without `--greedy`. Set only by bare runs, never by `desired_action`.
+    /// An installed cask with `auto_updates true`, whether behind, newer
+    /// than, or unordered against the cutoff. The app updates itself; brew
+    /// skips it on a bare `upgrade`/`outdated` without `--greedy`. Set only
+    /// by bare runs, never by `desired_action`.
     LeaveAutoUpdates,
     /// Installed and strictly newer than the cutoff by brew's version order,
     /// and not at HEAD: upstream re-pointed the formula at an older line.

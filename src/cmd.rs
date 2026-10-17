@@ -44,7 +44,7 @@ pub fn ahead_message(name: &str) -> String {
 
 pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
     format!(
-        "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed the formula)"
+        "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed it)"
     )
 }
 
@@ -538,6 +538,9 @@ pub fn outdated(
             }
             continue;
         };
+        // `bare_action` may turn the action into `LeaveAutoUpdates`; keep the
+        // original so that entry prints the right comparison.
+        let resolved_action = view.action;
         view.action = bare_action(&view, greedy);
         for warn in &view.warnings {
             writeln!(out, "warning: {warn}")?;
@@ -597,7 +600,12 @@ pub fn outdated(
                     .as_ref()
                     .map(report::identity_version)
                     .unwrap_or_else(|| "none".into());
-                auto_updates.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
+                let cmp = match resolved_action {
+                    DesiredAction::LeaveNewerThanCutoff => '>',
+                    DesiredAction::HoldUnordered => '?',
+                    _ => '<',
+                };
+                auto_updates.push(format!("{} ({installed_ver}) {cmp} {cutoff_ver}", pkg.name));
             }
             DesiredAction::NoOpAlreadySoaked => soaked += 1,
         }
@@ -2212,8 +2220,11 @@ struct ResolvedView {
 }
 
 /// What a bare `upgrade`/`outdated` does: an installed self-updating cask
-/// that is behind the cutoff is left to the app, as brew leaves it without
-/// `--greedy` / `--greedy-auto-updates`. Everything else keeps its action.
+/// is left to the app, as brew leaves it without `--greedy` /
+/// `--greedy-auto-updates`, whether it is behind the cutoff
+/// (`InstallCutoff`), newer than it (`LeaveNewerThanCutoff`) or unordered
+/// against it (`HoldUnordered`: the app owns its version, so there is
+/// nothing to hold). `LeaveAheadOfSoak` and every other action are kept.
 /// `greedy.latest` changes no action: a `:latest` cask is reinstalled only
 /// when its cutoff definition differs from the installed one, which
 /// `desired_action` already decides; see `latest_left` for the note.
@@ -2221,7 +2232,12 @@ fn bare_action(view: &ResolvedView, greedy: flags::Greedy) -> DesiredAction {
     if view.auto_updates
         && !greedy.auto_updates
         && view.installed.is_some()
-        && view.action == DesiredAction::InstallCutoff
+        && matches!(
+            view.action,
+            DesiredAction::InstallCutoff
+                | DesiredAction::LeaveNewerThanCutoff
+                | DesiredAction::HoldUnordered
+        )
     {
         DesiredAction::LeaveAutoUpdates
     } else {
@@ -4524,6 +4540,107 @@ mod tests {
         assert!(
             text.contains("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)"),
             "{text}"
+        );
+        assert!(text.contains("upgraded 2,"), "{text}");
+    }
+
+    #[test]
+    fn named_reinstall_upgrades_an_outdated_installed_dependency_first() {
+        let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["node".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(staged_install_order(&brew), ["simdutf", "node"], "{text}");
+        assert_eq!(
+            text.matches("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("upgraded 2,"), "simdutf counted once: {text}");
+    }
+
+    #[test]
+    fn reinstall_true_repair_does_not_walk_dependencies() {
+        // node is at HEAD (a plain repair); its dependency is behind.
+        let (mut brew, git) = node_simdutf_world("1.2.0", "1.0.0", "");
+        brew.installed[0] = formula_pkg("node", formula_rb("node", "1.2.0", "newsha"));
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["node".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(staged_install_order(&brew).is_empty(), "{text}");
+        assert!(!text.contains("dependency of"), "{text}");
+        assert!(
+            lock_runs(&brew)
+                .iter()
+                .any(|a| a == &["reinstall".to_string(), "node".to_string()]),
+            "{text}"
+        );
+    }
+
+    /// Cask `app` (sorts first) depends on cask `helper`; both installed at
+    /// 1.0.0 behind a 1.1.0 cutoff.
+    fn cask_with_cask_dependency_world() -> (MockBrew, InMemoryGit) {
+        let git = InMemoryGit::new();
+        for name in ["app", "helper"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "caskcut",
+                &format!("Casks/{dir}/{name}.rb"),
+                cask_rb(name, "1.1.0"),
+            );
+            git.insert_blob(
+                "caskhead",
+                &format!("Casks/{dir}/{name}.rb"),
+                cask_rb(name, "1.2.0"),
+            );
+        }
+        let mut deps = BTreeMap::new();
+        deps.insert("app".to_string(), vec!["helper".to_string()]);
+        let brew = MockBrew {
+            installed: ["app", "helper"]
+                .map(|n| {
+                    cask_pkg_from(
+                        n,
+                        "homebrew/cask",
+                        crate::brew::version_only_cask_receipt(n, "1.0.0"),
+                    )
+                })
+                .to_vec(),
+            deps,
+            ..MockBrew::new()
+        };
+        (brew, git)
+    }
+
+    #[test]
+    fn installed_cask_dependency_is_not_reordered_ahead_of_its_dependent() {
+        let (brew, git) = cask_with_cask_dependency_world();
+        let text = upgrade_names(&brew, &git, &[]);
+        assert!(!text.contains("dependency of"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "app"), "{text}");
+        assert!(
+            run_is_soaked_install(&runs, "helper"),
+            "helper upgrades at its own plan entry: {text}"
         );
         assert!(text.contains("upgraded 2,"), "{text}");
     }
@@ -6916,6 +7033,85 @@ mod tests {
         assert!(notes.contains("cannot be soaked"), "{text}");
     }
 
+    /// Installed `alt-tab` 7.38.1 (self-updating app) while the cutoff and
+    /// HEAD cask say 7.0.0: the app updated itself past the cutoff.
+    fn auto_updates_ahead_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let (brew, git, snaps) = auto_updates_world();
+        let rb = format!("{}  auto_updates true\n", cask_rb("alt-tab", "7.0.0"));
+        git.insert_blob("caskcut", "Casks/a/alt-tab.rb", rb.clone());
+        git.insert_blob("caskhead", "Casks/a/alt-tab.rb", rb);
+        (brew, git, snaps)
+    }
+
+    const ALT_TAB_NOTE: &str = "alt-tab: installed 7.38.1 is newer than cutoff 7.0.0";
+
+    #[test]
+    fn bare_run_leaves_a_self_updating_cask_newer_than_its_cutoff_to_the_app() {
+        let (mut brew, git, snaps) = auto_updates_ahead_world();
+        brew.orderings.insert(
+            ("7.38.1".to_string(), "7.0.0".to_string()),
+            std::cmp::Ordering::Greater,
+        );
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            "{text}"
+        );
+        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
+        assert!(text.contains("ahead 0"), "{text}");
+        assert!(text.contains("auto-updates 1"), "{text}");
+        assert!(!text.contains(ALT_TAB_NOTE), "{text}");
+        let text = greedy_outdated(&brew, &git, &snaps, &[]);
+        assert!(section_lines(&text, OUTDATED_HEADER).is_empty(), "{text}");
+        assert!(
+            section_lines(&text, "==> Ahead of soak").is_empty(),
+            "{text}"
+        );
+        assert_eq!(
+            section_lines(&text, AUTO_UPDATES_HEADER),
+            ["alt-tab (7.38.1) > 7.0.0"],
+            "{text}"
+        );
+        for argv in [&["--greedy"][..], &["--greedy-auto-updates"][..]] {
+            let text = greedy_upgrade(&brew, &git, &snaps, argv);
+            assert!(text.contains("ahead 1"), "{argv:?}: {text}");
+            assert!(!text.contains("auto-updates"), "{argv:?}: {text}");
+            assert!(text.contains(ALT_TAB_NOTE), "{argv:?}: {text}");
+            let text = greedy_outdated(&brew, &git, &snaps, argv);
+            assert_eq!(
+                section_lines(&text, "==> Ahead of soak"),
+                ["alt-tab (7.38.1) > 7.0.0"],
+                "{argv:?}: {text}"
+            );
+            assert!(
+                section_lines(&text, AUTO_UPDATES_HEADER).is_empty(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_run_leaves_a_self_updating_cask_brew_cannot_order_to_the_app() {
+        let (mut brew, git, snaps) = auto_updates_ahead_world();
+        brew.compare_error = Some("brew ruby exploded".into());
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            "{text}"
+        );
+        assert!(text.contains("held 0"), "not held on a bare run: {text}");
+        assert!(text.contains("auto-updates 1"), "{text}");
+        let text = greedy_outdated(&brew, &git, &snaps, &[]);
+        assert!(section_lines(&text, "==> Held").is_empty(), "{text}");
+        assert_eq!(
+            section_lines(&text, AUTO_UPDATES_HEADER),
+            ["alt-tab (7.38.1) ? 7.0.0"],
+            "{text}"
+        );
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy"]);
+        assert!(text.contains("held 1"), "{text}");
+    }
+
     /// `openssl@3` installed at 3.6.5 while upstream re-pointed the formula
     /// at the 3.5 line: cutoff and HEAD are both 3.5.9.
     fn openssl_repoint_world() -> (MockBrew, InMemoryGit, Snapshots) {
@@ -6941,7 +7137,7 @@ mod tests {
         );
     }
 
-    const OPENSSL_NOTE: &str = "openssl@3: installed 3.6.5 is newer than cutoff 3.5.9; leaving it (upstream may have re-pointed the formula)";
+    const OPENSSL_NOTE: &str = "openssl@3: installed 3.6.5 is newer than cutoff 3.5.9; leaving it (upstream may have re-pointed it)";
 
     #[test]
     fn bare_upgrade_never_downgrades_a_repointed_formula() {
@@ -7163,6 +7359,35 @@ mod tests {
     }
 
     #[test]
+    fn bare_action_leaves_a_self_updating_cask_newer_than_or_unordered_against_its_cutoff() {
+        for action in [
+            DesiredAction::LeaveNewerThanCutoff,
+            DesiredAction::HoldUnordered,
+        ] {
+            let view = greedy_view(action, true, false);
+            for argv in [&[][..], &["--greedy-latest"][..]] {
+                assert_eq!(
+                    bare_action(&view, greedy(argv)),
+                    DesiredAction::LeaveAutoUpdates,
+                    "{action:?} {argv:?}"
+                );
+            }
+            for argv in [&["--greedy-auto-updates"][..], &["--greedy"][..]] {
+                assert_eq!(
+                    bare_action(&view, greedy(argv)),
+                    action,
+                    "{action:?} {argv:?}"
+                );
+            }
+            let mut fresh = greedy_view(action, true, false);
+            fresh.installed = None;
+            assert_eq!(bare_action(&fresh, greedy(&[])), action, "{action:?}");
+            let plain = greedy_view(action, false, false);
+            assert_eq!(bare_action(&plain, greedy(&[])), action, "{action:?}");
+        }
+    }
+
+    #[test]
     fn bare_action_only_changes_a_self_updating_install() {
         for argv in [
             &[][..],
@@ -7195,6 +7420,14 @@ mod tests {
                 DesiredAction::InstallCutoff,
                 "{argv:?}"
             );
+            for action in [
+                DesiredAction::RefuseTooNew,
+                DesiredAction::RefuseYanked,
+                DesiredAction::RefuseDeprecated,
+            ] {
+                let view = greedy_view(action, true, false);
+                assert_eq!(bare_action(&view, greedy(argv)), action, "{argv:?}");
+            }
         }
     }
 
