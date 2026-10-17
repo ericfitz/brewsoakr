@@ -73,6 +73,13 @@ pub trait GitStore {
             detail: "this git backend cannot update refs".into(),
         })
     }
+    /// Remove a pin ref; a ref that does not exist is already removed.
+    fn delete_ref(&self, _dir: &Path, ref_name: &str) -> Result<(), Error> {
+        Err(Error::Git {
+            action: format!("removing {ref_name}"),
+            detail: "this git backend cannot delete refs".into(),
+        })
+    }
     /// `git ls-tree -r --name-only <sha>`; cached per (dir, sha) in ProcessGit.
     fn ls_tree(&self, _dir: &Path, _sha: &str) -> Result<Vec<String>, Error> {
         Err(Error::Git {
@@ -473,6 +480,20 @@ impl GitStore for ProcessGit {
         }
     }
 
+    fn delete_ref(&self, dir: &Path, ref_name: &str) -> Result<(), Error> {
+        let action = format!("removing {ref_name}");
+        let dir = dir.to_string_lossy();
+        let output = run_git(
+            &action,
+            &["--git-dir", dir.as_ref(), "update-ref", "-d", ref_name],
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(git_fail(&action, &output))
+        }
+    }
+
     fn ls_tree(&self, dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
         let key = (dir.to_path_buf(), sha.to_string());
         if let Some(cached) = self.trees.borrow().get(&key) {
@@ -701,6 +722,11 @@ impl GitStore for InMemoryGit {
         self.refs
             .borrow_mut()
             .insert(Self::key(dir, ref_name), sha.to_string());
+        Ok(())
+    }
+
+    fn delete_ref(&self, dir: &Path, ref_name: &str) -> Result<(), Error> {
+        self.refs.borrow_mut().remove(&Self::key(dir, ref_name));
         Ok(())
     }
 
@@ -1131,6 +1157,26 @@ mod tests {
         git.fetch_depth1(&bare, src.to_str().unwrap(), &sha, REF_HEAD)
             .unwrap();
         (tmp, bare, sha)
+    }
+
+    #[test]
+    fn delete_ref_removes_a_pin_and_is_idempotent() {
+        let (_tmp, bare, sha) = bare_with_one_commit();
+        let git = ProcessGit::default();
+        git.update_ref(&bare, REF_CUTOFF, &sha).unwrap();
+        assert_eq!(git.rev_parse(&bare, REF_CUTOFF).unwrap(), Some(sha));
+        git.delete_ref(&bare, REF_CUTOFF).unwrap();
+        assert_eq!(git.rev_parse(&bare, REF_CUTOFF).unwrap(), None);
+        git.delete_ref(&bare, REF_CUTOFF).unwrap();
+    }
+
+    #[test]
+    fn delete_ref_on_a_non_repo_is_error_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ProcessGit::default()
+            .delete_ref(tmp.path(), REF_CUTOFF)
+            .unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err:?}");
     }
 
     #[test]

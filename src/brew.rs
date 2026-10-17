@@ -68,8 +68,9 @@ pub trait Brew {
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error>;
-    /// Names brew itself considers outdated right now (no `brew update`).
-    fn outdated_names(&self) -> Result<Vec<String>, Error>;
+    /// Names brew itself considers outdated right now (no `brew update`),
+    /// with the same greedy mode `upgrade` passes to brew.
+    fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error>;
     /// Turn the output filter off; brew output is forwarded byte for byte.
     fn set_raw(&self, _raw: bool) {}
     fn session_report(&self) -> SessionReport {
@@ -241,6 +242,8 @@ impl ProcessBrew {
 pub struct MockBrew {
     pub installed: Vec<InstalledPkg>,
     pub deps: BTreeMap<String, Vec<String>>,
+    /// Makes `deps` for this token fail with brew's stderr text.
+    pub deps_errors: BTreeMap<String, String>,
     pub taps: Vec<TapInfo>,
     pub runs: Mutex<Vec<Vec<String>>>,
     pub visible_runs: Mutex<Vec<Vec<String>>>,
@@ -252,6 +255,8 @@ pub struct MockBrew {
     pub next_outputs: Mutex<VecDeque<(i32, Vec<u8>)>>,
     /// What `outdated_names` reports.
     pub outdated: Vec<String>,
+    /// The greedy mode of each `outdated_names` call.
+    pub outdated_modes: Mutex<Vec<crate::flags::Greedy>>,
     /// What `keg_receipt` reports, keyed by `(name, cellar version)`.
     pub kegs: BTreeMap<(String, String), String>,
     /// What `compare_versions` reports for `(installed, other)`; an
@@ -297,6 +302,7 @@ impl Default for MockBrew {
         Self {
             installed: Vec::new(),
             deps: BTreeMap::new(),
+            deps_errors: BTreeMap::new(),
             taps: Vec::new(),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
@@ -305,6 +311,7 @@ impl Default for MockBrew {
             next_stderr: Vec::new(),
             next_outputs: Mutex::new(VecDeque::new()),
             outdated: Vec::new(),
+            outdated_modes: Mutex::new(Vec::new()),
             kegs: BTreeMap::new(),
             orderings: BTreeMap::new(),
             compare_error: None,
@@ -568,8 +575,10 @@ impl Brew for ProcessBrew {
         crate::taps::parse_tap_info_json(&String::from_utf8_lossy(&output.stdout))
     }
 
-    fn outdated_names(&self) -> Result<Vec<String>, Error> {
-        let output = self.run(&["outdated".into(), "--json=v2".into()])?;
+    fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
+        let mut args = vec!["outdated".to_string(), "--json=v2".to_string()];
+        args.extend(greedy_args(greedy));
+        let output = self.run(&args)?;
         if !output.status.success() {
             return Err(brew_fail(&output));
         }
@@ -581,11 +590,31 @@ impl Brew for ProcessBrew {
             PkgKind::Formula => "--formula",
             PkgKind::Cask => "--cask",
         };
-        let output = self.run(&["deps".into(), "--1".into(), flag.into(), token.into()])?;
+        // `--full-name` makes brew resolve bare dep names itself (core first,
+        // then a unique installed tap) and print `user/repo/name` for tap
+        // packages. It is accepted for casks too, where it changes nothing.
+        let output = self.run(&[
+            "deps".into(),
+            "--1".into(),
+            "--full-name".into(),
+            flag.into(),
+            token.into(),
+        ])?;
         if !output.status.success() {
             return Err(brew_fail(&output));
         }
         Ok(parse_deps_stdout(&output.stdout))
+    }
+}
+
+/// brew's spelling of a greedy mode for `brew outdated`/`upgrade`: both kinds
+/// is `--greedy`, one kind is its long form, none is no flag.
+fn greedy_args(greedy: crate::flags::Greedy) -> Vec<String> {
+    match (greedy.auto_updates, greedy.latest) {
+        (true, true) => vec!["--greedy".to_string()],
+        (true, false) => vec!["--greedy-auto-updates".to_string()],
+        (false, true) => vec!["--greedy-latest".to_string()],
+        (false, false) => Vec::new(),
     }
 }
 
@@ -759,7 +788,11 @@ impl Brew for MockBrew {
         Ok(self.taps.clone())
     }
 
-    fn outdated_names(&self) -> Result<Vec<String>, Error> {
+    fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
+        self.outdated_modes
+            .lock()
+            .expect("outdated_modes")
+            .push(greedy);
         Ok(self.outdated.clone())
     }
 
@@ -869,6 +902,12 @@ impl Brew for MockBrew {
     }
 
     fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+        if let Some(message) = self.deps_errors.get(token) {
+            return Err(Error::Brew {
+                status: 1,
+                message: message.clone(),
+            });
+        }
         let stem = Path::new(token)
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1354,7 +1393,76 @@ mod tests {
             outdated: vec!["brewsoak".into()],
             ..MockBrew::new()
         };
-        assert_eq!(brew.outdated_names().unwrap(), vec!["brewsoak".to_string()]);
+        assert_eq!(
+            brew.outdated_names(Default::default()).unwrap(),
+            vec!["brewsoak".to_string()]
+        );
+    }
+
+    #[test]
+    fn process_brew_outdated_passes_the_greedy_mode_to_brew() {
+        use crate::flags::Greedy;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = tmp.path().join("args");
+        let script = tmp.path().join("brew.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\necho '{{\"formulae\":[],\"casks\":[]}}'\n",
+                log.display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let brew = ProcessBrew::new(script);
+        for greedy in [
+            Greedy::default(),
+            Greedy {
+                auto_updates: true,
+                latest: true,
+            },
+            Greedy {
+                auto_updates: true,
+                latest: false,
+            },
+            Greedy {
+                auto_updates: false,
+                latest: true,
+            },
+        ] {
+            brew.outdated_names(greedy).expect("outdated");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log"),
+            "outdated --json=v2\noutdated --json=v2 --greedy\n\
+             outdated --json=v2 --greedy-auto-updates\noutdated --json=v2 --greedy-latest\n"
+        );
+    }
+
+    #[test]
+    fn process_brew_deps_asks_brew_for_full_names() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let log = tmp.path().join("args");
+        let script = tmp.path().join("brew.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\necho hashicorp/tap/terraform\necho wget\n",
+                log.display()
+            ),
+        )
+        .expect("script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        let brew = ProcessBrew::new(script);
+        let got = brew.deps(PkgKind::Formula, "/x/packer.rb").expect("deps");
+        assert_eq!(got, ["hashicorp/tap/terraform", "wget"]);
+        brew.deps(PkgKind::Cask, "alt-tab").expect("cask deps");
+        assert_eq!(
+            std::fs::read_to_string(&log).expect("log"),
+            "deps --1 --full-name --formula /x/packer.rb\ndeps --1 --full-name --cask alt-tab\n"
+        );
     }
 
     #[test]

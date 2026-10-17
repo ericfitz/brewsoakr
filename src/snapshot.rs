@@ -238,7 +238,12 @@ pub fn refresh_tap(
             git.update_ref(&dir, REF_CUTOFF, &sha)?;
             (Some(sha), OffsetDateTime::from_unix_timestamp(when).ok())
         }
-        None => (None, None),
+        None => {
+            // Nothing is old enough this run: a pin left from an earlier run
+            // would anchor a commit that is no longer the cutoff.
+            git.delete_ref(&dir, REF_CUTOFF)?;
+            (None, None)
+        }
     };
     Ok(TapState {
         hours: tap.hours,
@@ -567,6 +572,21 @@ mod tests {
             git.rev_parse(&clone, REF_CUTOFF).unwrap(),
             Some("hc1".into())
         );
+    }
+
+    #[test]
+    fn tap_with_no_cutoff_drops_a_stale_cutoff_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let clone = crate::taps::clone_dir(dir.path(), "young/tap");
+        git.update_ref(&clone, REF_CUTOFF, "old").unwrap();
+        let plan = tap_plan("young/tap", "https://github.com/young/homebrew-tap", 24);
+        let state = refresh_tap(&git, dir.path(), &plan, now()).expect("refresh tap");
+        assert_eq!(state.cutoff_sha, None);
+        assert_eq!(git.rev_parse(&clone, REF_CUTOFF).unwrap(), None);
+        assert_eq!(git.rev_parse(&clone, REF_HEAD).unwrap(), Some("y1".into()));
+        // A second run has no pin to remove and still succeeds.
+        refresh_tap(&git, dir.path(), &plan, now()).expect("second refresh");
     }
 
     #[test]

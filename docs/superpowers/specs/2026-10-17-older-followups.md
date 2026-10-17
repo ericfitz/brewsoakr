@@ -254,3 +254,38 @@ a run that died leaves `run.lock` with a dead pid, but the kernel dropped its
 flock, so the next run is not blocked and overwrites the record. The lock file
 is never deleted (removal would race a waiter). `src/atomic.rs` writes
 `state.toml` and `origins.toml` through a `0600` temp file, fsync and rename.
+
+### Implementation notes (B1, B3a, B5, B6, lock scope)
+
+- **B1.** `Brew::outdated_names(greedy)`; `ProcessBrew` appends `--greedy`
+  (both kinds), `--greedy-auto-updates` or `--greedy-latest`, the same mapping
+  `flags::greedy_mode` reads. `cmd::outdated` passes its mode.
+- **B3 (a).** `GitStore::delete_ref` (`git update-ref -d`, idempotent);
+  `refresh_tap` deletes `refs/brewsoak/cutoff` when the tap has no cutoff.
+  A failure is `Error::Git`.
+- **B5.** `ProcessBrew::deps` runs `brew deps --1 --full-name`. Probed against
+  Homebrew 5.x: the flag is accepted with `--cask` (cask `depends_on formula:`
+  deps print as before, e.g. `mactex-no-gui` -> `ghostscript`), so one spelling
+  serves both kinds. `CutoffDepWalk::dep_origin` no longer searches the
+  dependent's tap: a full name is that tap, a bare name is core then cask. The
+  installed-dependency check now runs before origin resolution. brew's
+  `Formulae found in multiple taps` / `TapFormulaAmbiguityError` on the `deps`
+  call holds the target (`taps::ambiguous_formula`, `refuse_ambiguous_dep`).
+  A dep in a tap with no soak snapshot is still held. State behavior:
+  read-only; a second run resolves the same way.
+- **B6.** `prune::prune_cache` runs after every refresh that rewrites the
+  snapshots (`update`; `ensure_snapshots` on a forced or first-time refresh),
+  under the run lock. It removes `<cache>/taps/<user>/<repo>.git` and
+  `<cache>/staging/taps/<user>/<repo>/` of taps not in `inv.taps`, and
+  `origins.toml` records whose package is not installed (a record is kept while
+  its package is installed, whatever its tap). `-v` prints each removal. A
+  failed removal is a warning line, not an error. State behavior: second run
+  finds nothing and writes nothing; two runs are serialized by the lock; a
+  half-pruned run is finished next time.
+- **Lock scope (decision by Claude, 2026-10-17; refines "Run lock: option A").**
+  `outdated` and `info` take the run lock only when `ensure_snapshots` will
+  refresh and write the cache (`cmd::snapshots_need_refresh`: no stored
+  snapshot, an unreadable one, or a stale tap); otherwise they read without it,
+  which is safe because `state.toml` and `origins.toml` are written atomically.
+  A reader racing a prune or gc sees `Error::Git` (B2), never a torn file.
+  `update`, `upgrade`, `install` and `reinstall` still lock always.

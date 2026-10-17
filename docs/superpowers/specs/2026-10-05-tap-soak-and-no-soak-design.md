@@ -298,6 +298,10 @@ at HEAD with no `deprecate!`/`disable!`).
   dependent's own tap first, then core. Each dep is staged from its own
   origin's cutoff snapshot. Deps that are no-soak or unsoakable are left to
   brew.
+  *Superseded 2026-10-17 (Eric, B5 in
+  [2026-10-17-older-followups.md](2026-10-17-older-followups.md)): the walk
+  runs `brew deps --full-name`, brew resolves bare names (core first, then a
+  unique installed tap), and an ambiguous name holds the target.*
 - If brew cannot load a staged tap formula (e.g. `require_relative` to a
   file elsewhere in the tap), hold the package with a note:
   `<name>: cannot be installed from a staged copy; use brew, or add it to NO_SOAK`.

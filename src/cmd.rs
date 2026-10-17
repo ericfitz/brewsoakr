@@ -9,6 +9,7 @@ use crate::identity::{self, HostPlatform, PkgIdentity};
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
 use crate::nosoak;
 use crate::origin::{self, OriginRecords};
+use crate::prune;
 use crate::quiet;
 use crate::report::{self, Counts};
 use crate::resolve::{self, PkgKind, PkgRef};
@@ -103,6 +104,31 @@ pub fn refresh_plan(cfg: &Config, inv: &Inventory, extra: &[(String, String)]) -
     }
 }
 
+/// The planned taps whose stored snapshot is missing or uses another window.
+fn stale_taps(stored: &Snapshots, plan: &RefreshPlan) -> Vec<TapPlan> {
+    plan.taps
+        .iter()
+        .filter(|t| snapshot::tap_needs_refresh(stored, &t.name, t.hours))
+        .cloned()
+        .collect()
+}
+
+/// True when `ensure_snapshots(.., force: false, ..)` would fetch and write the
+/// cache: no stored snapshot, a stale tap, or a stored snapshot it cannot read
+/// (the refresh path then reports or replaces it). `outdated` and `info` take
+/// the run lock only in that case.
+pub fn snapshots_need_refresh(
+    cache: &Path,
+    cfg: &Config,
+    inv: &Inventory,
+    extra: &[(String, String)],
+) -> bool {
+    match snapshot::load_state(cache) {
+        Ok(Some(stored)) => !stale_taps(&stored, &refresh_plan(cfg, inv, extra)).is_empty(),
+        Ok(None) | Err(_) => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ensure_snapshots(
     git: &impl GitStore,
@@ -113,6 +139,7 @@ pub fn ensure_snapshots(
     extra: &[(String, String)],
     now: time::OffsetDateTime,
     force: bool,
+    verbose: bool,
     progress: &mut impl Write,
 ) -> Result<Snapshots, Error> {
     let plan = refresh_plan(cfg, inv, extra);
@@ -123,12 +150,7 @@ pub fn ensure_snapshots(
             Some(mut s) => {
                 // outdated/info reuse the stored snapshot, but refresh any
                 // tap with no state or a different soak window.
-                let stale: Vec<TapPlan> = plan
-                    .taps
-                    .iter()
-                    .filter(|t| snapshot::tap_needs_refresh(&s, &t.name, t.hours))
-                    .cloned()
-                    .collect();
+                let stale = stale_taps(&s, &plan);
                 if !stale.is_empty() {
                     snapshot::refresh_taps(git, cache, &mut s, &stale, now, progress)?;
                 }
@@ -137,6 +159,7 @@ pub fn ensure_snapshots(
             None => snapshot::refresh_with(git, gh, cache, &plan, now, progress)?,
         }
     };
+    prune::prune_cache(cache, inv, verbose, progress)?;
     prefetch_installed(git, cache, inv, &snaps);
     Ok(snaps)
 }
@@ -297,6 +320,7 @@ pub fn update(
     };
     let plan = refresh_plan(cfg, inv, &[]);
     let snaps = snapshot::refresh_with(git, gh, cache, &plan, now, out)?;
+    prune::prune_cache(cache, inv, verbose, out)?;
     writeln!(
         out,
         "core cutoff: {}",
@@ -615,7 +639,7 @@ pub fn outdated(
     let brew_outdated = if no_soak_names.is_empty() {
         Vec::new()
     } else {
-        brew.outdated_names()?
+        brew.outdated_names(greedy)?
     };
     let no_soak: Vec<String> = no_soak_names
         .iter()
@@ -1631,6 +1655,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let token = nosoak::brew_token(origin_tap, name);
         let walked = match self.collect_cutoff_deps(origin_tap, name, kind) {
             Ok(w) => w,
+            // A bare dependency name matches formulae in several taps: brew
+            // will not pick one, and neither will brewsoak.
+            Err(Error::Brew { message, .. }) if taps::ambiguous_formula(&message) => {
+                self.refuse_ambiguous_dep(name, &token, &message)?;
+                return Ok(());
+            }
             // brew could not even read the staged tap file's dependencies.
             Err(Error::Brew { message, .. }) if !origin::is_core_or_cask(origin_tap) => {
                 match taps::untrusted_tap(&message) {
@@ -1821,6 +1851,24 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.out,
             "cannot install {target}: dependency {}: {}\nuse `brew {} {target_token}` to bypass brewsoak.",
             held.dep, held.reason, self.brew_verb
+        )?;
+        Ok(())
+    }
+
+    /// brew cannot resolve one of the target's dependency names because it
+    /// matches formulae in more than one tap.
+    fn refuse_ambiguous_dep(
+        &mut self,
+        target: &str,
+        target_token: &str,
+        message: &str,
+    ) -> Result<(), Error> {
+        self.hold_target_for_dep();
+        writeln!(
+            self.out,
+            "cannot install {target}: a dependency name is ambiguous;\n  {}\nuse `brew {} {target_token}` to bypass brewsoak.",
+            message.trim().replace('\n', "\n  "),
+            self.brew_verb
         )?;
         Ok(())
     }
@@ -2094,22 +2142,25 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         };
         let token = staged.to_string_lossy().into_owned();
         for dep in self.brew.deps(kind, &token)? {
-            let Some((dep_origin, dep_name)) = self.dep_origin(&dep, origin_tap)? else {
-                continue;
-            };
             // Already installed, from any origin: brew's, unless this run is
             // about to upgrade it; then it goes first, so the dependent never
             // links against a library the dependency has not yet shipped.
-            if let Some(pkg) = self.inv.find(&dep_name) {
+            let installed_name = inventory::parse_token(&dep)
+                .map(|t| t.name)
+                .unwrap_or_else(|_| dep.clone());
+            if let Some(pkg) = self.inv.find(&installed_name) {
                 if self.upgrades_this_run(pkg)? {
                     let (o, k) = (pkg.origin.clone(), pkg.kind);
-                    self.visit(&o, &dep_name, k, true)?;
+                    self.visit(&o, &installed_name, k, true)?;
                     if self.held.is_some() {
                         return Ok(());
                     }
                 }
                 continue;
             }
+            let Some((dep_origin, dep_name)) = self.dep_origin(&dep)? else {
+                continue;
+            };
             if self.inv.class_for(&dep_origin, &dep_name, self.cfg) != PkgClass::Soaked {
                 continue; // no-soak or unsoakable deps are brew's
             }
@@ -2192,12 +2243,11 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
             .is_some_and(|v| v.action == DesiredAction::InstallCutoff && v.cutoff_blob.is_some()))
     }
 
-    /// (origin, name) a `brew deps` token resolves to, or None when brew keeps it.
-    fn dep_origin(
-        &self,
-        dep: &str,
-        dependent_origin: &str,
-    ) -> Result<Option<(String, String)>, Error> {
+    /// (origin, name) a `brew deps --full-name` token resolves to, or None
+    /// when brew keeps it. brew has already resolved bare names (core first,
+    /// then a unique installed tap) and prints `user/repo/name` for a tap
+    /// package, so a full name is that tap and a bare name is core or cask.
+    fn dep_origin(&self, dep: &str) -> Result<Option<(String, String)>, Error> {
         if let Ok(tok) = inventory::parse_token(dep)
             && let Some(o) = tok.origin
         {
@@ -2210,12 +2260,6 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
             let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, o, dep, kind)?;
             Ok(blobs.cutoff.is_some() || blobs.head.is_some())
         };
-        if !origin::is_core_or_cask(dependent_origin)
-            && !self.snaps.held_taps.contains_key(dependent_origin)
-            && exists(dependent_origin, PkgKind::Formula)?
-        {
-            return Ok(Some((dependent_origin.to_string(), dep.to_string())));
-        }
         if exists(origin::CORE, PkgKind::Formula)? {
             return Ok(Some((origin::CORE.to_string(), dep.to_string())));
         }
@@ -3353,7 +3397,8 @@ mod tests {
 
     #[test]
     fn dep_closure_crosses_taps_and_core() {
-        // terraform (hashicorp/tap) depends on bare `helper` (same tap) and `zlib` (core);
+        // terraform (hashicorp/tap) depends on `hashicorp/tap/helper` (brew prints a
+        // tap package by full name) and bare `zlib` (core);
         // helper depends on `acme/tools/widget` (another soakable tap).
         let git = InMemoryGit::new();
         git.insert_blob(
@@ -3403,7 +3448,7 @@ mod tests {
         let mut deps = BTreeMap::new();
         deps.insert(
             staged("taps/hashicorp/tap/Formula/terraform.rb"),
-            vec!["helper".to_string(), "zlib".to_string()],
+            vec!["hashicorp/tap/helper".to_string(), "zlib".to_string()],
         );
         deps.insert(
             staged("taps/hashicorp/tap/Formula/helper.rb"),
@@ -3826,8 +3871,8 @@ mod tests {
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()
             }
-            fn outdated_names(&self) -> Result<Vec<String>, Error> {
-                self.0.outdated_names()
+            fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
+                self.0.outdated_names(greedy)
             }
             fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
                 Err(Error::Brew {
@@ -3909,8 +3954,8 @@ mod tests {
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()
             }
-            fn outdated_names(&self) -> Result<Vec<String>, Error> {
-                self.0.outdated_names()
+            fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
+                self.0.outdated_names(greedy)
             }
             fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
                 Err(Error::Brew {
@@ -4205,7 +4250,10 @@ mod tests {
     }
 
     /// A tap target with one bare dep `helper`; `setup` stages the git side.
-    fn bare_dep_refusal(setup: impl FnOnce(&InMemoryGit)) -> (String, RunResult, MockBrew) {
+    fn bare_dep_refusal(
+        dep: &str,
+        setup: impl FnOnce(&InMemoryGit),
+    ) -> (String, RunResult, MockBrew) {
         let git = InMemoryGit::new();
         git.insert_blob(
             "tapcut",
@@ -4224,7 +4272,7 @@ mod tests {
                 .join("taps/hashicorp/tap/Formula/terraform.rb")
                 .to_string_lossy()
                 .into_owned(),
-            vec!["helper".to_string()],
+            vec![dep.to_string()],
         );
         let brew = MockBrew {
             deps,
@@ -4277,8 +4325,8 @@ mod tests {
     }
 
     #[test]
-    fn same_tap_bare_dep_only_at_tap_head_refuses_target_as_too_new() {
-        let (text, r, brew) = bare_dep_refusal(|git| {
+    fn tap_dep_by_full_name_only_at_tap_head_refuses_target_as_too_new() {
+        let (text, r, brew) = bare_dep_refusal("hashicorp/tap/helper", |git| {
             git.insert_blob(
                 "taphead",
                 "Formula/helper.rb",
@@ -4291,7 +4339,7 @@ mod tests {
 
     #[test]
     fn bare_dep_only_at_core_head_refuses_target_as_too_new() {
-        let (text, r, brew) = bare_dep_refusal(|git| {
+        let (text, r, brew) = bare_dep_refusal("helper", |git| {
             git.insert_blob(
                 "headsha",
                 "Formula/h/helper.rb",
@@ -4299,6 +4347,138 @@ mod tests {
             );
         });
         assert_dep_too_new_refusal(&text, &r, &brew);
+    }
+
+    #[test]
+    fn bare_dep_name_is_core_even_when_the_dependents_tap_has_it() {
+        // brew resolves a bare dep name core first and prints a tap package
+        // by full name, so a bare `zlib` is core's, never the dependent's tap's.
+        let git = InMemoryGit::new();
+        for sha in ["tapcut", "taphead"] {
+            git.insert_blob(
+                sha,
+                "Formula/terraform.rb",
+                formula_rb("terraform", "1.1.0", "midsha"),
+            );
+            git.insert_blob(sha, "Formula/zlib.rb", formula_rb("zlib", "9.9", "tapz"));
+        }
+        for sha in ["cutoffsha", "headsha"] {
+            git.insert_blob(sha, "Formula/z/zlib.rb", formula_rb("zlib", "1.3", "z1"));
+        }
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            tap.path()
+                .join("taps/hashicorp/tap/Formula/terraform.rb")
+                .to_string_lossy()
+                .into_owned(),
+            vec!["zlib".to_string()],
+        );
+        let brew = MockBrew {
+            deps,
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Formula/terraform.rb", "Formula/zlib.rb"]);
+        git.insert_tree("taphead", &["Formula/terraform.rb", "Formula/zlib.rb"]);
+        let cache = tempfile::tempdir().unwrap();
+        install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let installs: Vec<String> = lock_runs(&brew)
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .map(|a| a.last().unwrap().clone())
+            .collect();
+        assert_eq!(installs.len(), 2, "{installs:?}");
+        assert!(
+            installs[0].ends_with("zlib.rb") && !installs[0].contains("taps/hashicorp"),
+            "the bare dep is core's: {installs:?}"
+        );
+    }
+
+    #[test]
+    fn ambiguous_dep_name_holds_the_target_with_brews_message() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps_errors = BTreeMap::new();
+        deps_errors.insert(
+            tap.path()
+                .join("taps/hashicorp/tap/Formula/terraform.rb")
+                .to_string_lossy()
+                .into_owned(),
+            "Error: Formulae found in multiple taps:\n       * a/tap/cats\n       * b/tap/cats\n\nPlease use the fully-qualified name (e.g. a/tap/cats) to refer to a specific formula.".to_string(),
+        );
+        let brew = MockBrew {
+            deps_errors,
+            taps: vec![tapped(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            )],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("cannot install terraform: a dependency name is ambiguous")
+                && text.contains("Formulae found in multiple taps")
+                && text.contains("a/tap/cats")
+                && text.contains("upgraded 0, already soaked 0, held 1"),
+            "{text}"
+        );
+        assert!(
+            lock_runs(&brew)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("install"))
+        );
     }
 
     #[test]
@@ -4383,14 +4563,14 @@ mod tests {
                 .join("taps/hashicorp/tap/Formula/terraform.rb")
                 .to_string_lossy()
                 .into_owned(),
-            vec!["helper".to_string()],
+            vec!["hashicorp/tap/helper".to_string()],
         );
         deps.insert(
             tap.path()
                 .join("taps/hashicorp/tap/Formula/helper.rb")
                 .to_string_lossy()
                 .into_owned(),
-            vec!["terraform".to_string()],
+            vec!["hashicorp/tap/terraform".to_string()],
         );
         let brew = MockBrew {
             deps,
@@ -9251,6 +9431,71 @@ mod tests {
             "soaked packages are not listed from brew's view: {text}"
         );
         assert!(!run_has_token(&lock_runs(&brew), "update"));
+    }
+
+    #[test]
+    fn no_soak_outdated_honors_the_greedy_flags_like_upgrade() {
+        for (flags, want) in [
+            (vec![], flags::Greedy::default()),
+            (
+                vec!["--greedy".to_string()],
+                flags::Greedy {
+                    auto_updates: true,
+                    latest: true,
+                },
+            ),
+            (
+                vec!["-g".to_string()],
+                flags::Greedy {
+                    auto_updates: true,
+                    latest: true,
+                },
+            ),
+            (
+                vec!["--greedy-latest".to_string()],
+                flags::Greedy {
+                    auto_updates: false,
+                    latest: true,
+                },
+            ),
+            (
+                vec!["--greedy-auto-updates".to_string()],
+                flags::Greedy {
+                    auto_updates: true,
+                    latest: false,
+                },
+            ),
+        ] {
+            let (mut brew, git, snaps) = view_world();
+            brew.installed.push(formula_pkg_from(
+                "brewsoak",
+                "ericfitz/tap",
+                formula_rb("brewsoak", "1.0.0", "b"),
+            ));
+            brew.taps.push(tapped(
+                "ericfitz/tap",
+                Some("https://github.com/ericfitz/homebrew-tap"),
+            ));
+            let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
+            let inv = inv_from(&brew, &cfg);
+            let mut out = Vec::new();
+            outdated(
+                &brew,
+                &git,
+                &snaps,
+                unused_cache(),
+                &inv,
+                &cfg,
+                &flags,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!(
+                brew.outdated_modes.lock().unwrap().as_slice(),
+                [want],
+                "{flags:?}"
+            );
+        }
     }
 
     #[test]
