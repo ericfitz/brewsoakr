@@ -265,7 +265,7 @@ fn ends_identity_scope(t: &str) -> bool {
 pub fn cask_auto_updates(rb: &str, host: Option<&HostPlatform>) -> bool {
     depth1_lines(rb, host).iter().any(|t| {
         t.strip_prefix("auto_updates")
-            .is_some_and(|r| r.trim() == "true")
+            .is_some_and(|r| r.split('#').next().unwrap_or(r).trim() == "true")
     })
 }
 
@@ -513,9 +513,11 @@ fn is_stable_do(t: &str) -> bool {
 
 fn is_ruby_end(t: &str) -> bool {
     t == "end"
-        || ["end ", "end;", "end#", "end.", "end)", "end]", "end,"]
-            .iter()
-            .any(|p| t.starts_with(p))
+        || [
+            "end ", "end;", "end#", "end.", "end&.", "end)", "end]", "end,",
+        ]
+        .iter()
+        .any(|p| t.starts_with(p))
 }
 
 /// `at_top`: outside every block, where `class` / `module` / `cask` name the
@@ -1100,6 +1102,10 @@ end
         assert!(cask_auto_updates(yes, None));
         assert!(!cask_auto_updates(no, None));
         assert!(!cask_auto_updates(off, None));
+        let commented = "cask \"atemosc\" do\n  auto_updates true # via Sparkle\nend\n";
+        assert!(cask_auto_updates(commented, None));
+        let commented_off = "cask \"x\" do\n  auto_updates false # true later\nend\n";
+        assert!(!cask_auto_updates(commented_off, None));
     }
 
     #[test]
@@ -1497,7 +1503,15 @@ mod platform_tests {
         let h = host("sequoia", "arm64");
         assert!(is_deprecated_or_disabled(APPIUM, "2026-10-17", Some(&h)));
         assert!(is_deprecated_or_disabled(APPIUM, "2026-10-17", None));
-        for end in ["end.flatten", "end.compact", "end)", "end]", "end,", "end"] {
+        for end in [
+            "end.flatten",
+            "end&.flatten",
+            "end.compact",
+            "end)",
+            "end]",
+            "end,",
+            "end",
+        ] {
             let rb = format!(
                 "cask \"x\" do\n  livecheck do\n    foo(bar.map do |r|\n      r\n    {end}\n  end\n  disable! date: \"2024-01-01\", because: :x\nend\n"
             );
