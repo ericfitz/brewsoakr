@@ -2031,8 +2031,17 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
             let Some((dep_origin, dep_name)) = self.dep_origin(&dep, origin_tap)? else {
                 continue;
             };
-            // Already installed, from any origin: brew's, not staged or walked.
-            if self.inv.find(&dep_name).is_some() {
+            // Already installed, from any origin: brew's, unless this run is
+            // about to upgrade it; then it goes first, so the dependent never
+            // links against a library the dependency has not yet shipped.
+            if let Some(pkg) = self.inv.find(&dep_name) {
+                if self.upgrades_this_run(pkg)? {
+                    let (o, k) = (pkg.origin.clone(), pkg.kind);
+                    self.visit(&o, &dep_name, k, true)?;
+                    if self.held.is_some() {
+                        return Ok(());
+                    }
+                }
                 continue;
             }
             if self.inv.class_for(&dep_origin, &dep_name, self.cfg) != PkgClass::Soaked {
@@ -2089,6 +2098,32 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 .push((origin_tap.to_string(), name.to_string(), kind));
         }
         Ok(())
+    }
+
+    /// True when an installed dependency would be upgraded to its cutoff by
+    /// its own plan entry: the same view the apply loop resolves, so a dep that
+    /// is held, ahead, newer than its cutoff or pinned stays brew's.
+    fn upgrades_this_run(&self, pkg: &Pkg) -> Result<bool, Error> {
+        if pkg.pinned
+            || pkg.kind != PkgKind::Formula
+            || self.inv.class_for(&pkg.origin, &pkg.name, self.cfg) != PkgClass::Soaked
+            || self.snaps.held_taps.contains_key(&pkg.origin)
+            || (!origin::is_core_or_cask(&pkg.origin) && self.snaps.tap(&pkg.origin).is_none())
+        {
+            return Ok(false);
+        }
+        let view = resolve_view(
+            self.brew,
+            self.git,
+            self.snaps,
+            self.cache,
+            &pkg.origin,
+            &pkg.name,
+            pkg.kind,
+            Some(&pkg.receipt_rb),
+        )?;
+        Ok(view
+            .is_some_and(|v| v.action == DesiredAction::InstallCutoff && v.cutoff_blob.is_some()))
     }
 
     /// (origin, name) a `brew deps` token resolves to, or None when brew keeps it.
@@ -4335,6 +4370,137 @@ mod tests {
         upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
         assert_eq!(visible.len(), 2, "{visible:?}");
+    }
+
+    /// `node` depends on `simdutf`; both are installed, `node` sorts first.
+    /// Cutoff is 1.1.0 and HEAD 1.2.0 for both. `simdutf_installed` and
+    /// `node_installed` are the installed versions.
+    fn node_simdutf_world(
+        node_installed: &str,
+        simdutf_installed: &str,
+        next_stdout: &str,
+    ) -> (MockBrew, InMemoryGit) {
+        let git = InMemoryGit::new();
+        for name in ["node", "simdutf"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "cutoffsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.2.0", "newsha"),
+            );
+        }
+        let mut kegs = BTreeMap::new();
+        kegs.insert(
+            ("simdutf".to_string(), "1.1.0".to_string()),
+            formula_rb("simdutf", "1.1.0", "midsha"),
+        );
+        let mut deps = BTreeMap::new();
+        deps.insert("node".to_string(), vec!["simdutf".to_string()]);
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("node", formula_rb("node", node_installed, "oldsha")),
+                formula_pkg(
+                    "simdutf",
+                    formula_rb(
+                        "simdutf",
+                        simdutf_installed,
+                        if simdutf_installed == "1.1.0" {
+                            "midsha"
+                        } else {
+                            "oldsha"
+                        },
+                    ),
+                ),
+            ],
+            deps,
+            kegs,
+            next_stdout: next_stdout.as_bytes().to_vec(),
+            ..MockBrew::new()
+        };
+        (brew, git)
+    }
+
+    /// Names of the staged packages `brew install` ran, in order.
+    fn staged_install_order(brew: &MockBrew) -> Vec<String> {
+        brew.visible_runs
+            .lock()
+            .expect("visible")
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .filter_map(|a| a.last())
+            .map(|p| {
+                Path::new(p)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(p)
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn outdated_installed_dependency_is_upgraded_before_its_dependent() {
+        let (brew, git) = node_simdutf_world(
+            "1.0.0",
+            "1.0.0",
+            "\u{1f37a}  /opt/homebrew/Cellar/simdutf/1.1.0: 5 files, 1MB\n",
+        );
+        upgrade_names(&brew, &git, &[]);
+        assert_eq!(staged_install_order(&brew), ["simdutf", "node"]);
+    }
+
+    #[test]
+    fn named_upgrade_upgrades_an_outdated_installed_dependency_first() {
+        let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        upgrade_names(&brew, &git, &["node".to_string()]);
+        assert_eq!(staged_install_order(&brew), ["simdutf", "node"]);
+    }
+
+    #[test]
+    fn dependency_upgraded_first_is_counted_once_and_not_run_again() {
+        let (brew, git) = node_simdutf_world(
+            "1.0.0",
+            "1.0.0",
+            "\u{1f37a}  /opt/homebrew/Cellar/simdutf/1.1.0: 5 files, 1MB\n",
+        );
+        let text = upgrade_names(&brew, &git, &[]);
+        assert_eq!(staged_install_order(&brew), ["simdutf", "node"], "{text}");
+        assert!(
+            text.contains("[2/2] simdutf 1.1.0: already upgraded as a dependency"),
+            "{text}"
+        );
+        assert!(text.contains("upgraded 2"), "{text}");
+    }
+
+    #[test]
+    fn installed_dependency_at_the_cutoff_is_not_reinstalled() {
+        let (brew, git) = node_simdutf_world("1.0.0", "1.1.0", "");
+        upgrade_names(&brew, &git, &[]);
+        assert_eq!(staged_install_order(&brew), ["node"]);
+    }
+
+    #[test]
+    fn installed_dependency_newer_than_the_cutoff_is_left_alone() {
+        let (mut brew, git) = node_simdutf_world("1.0.0", "1.3.0", "");
+        brew.orderings.insert(
+            ("1.3.0".to_string(), "1.1.0".to_string()),
+            std::cmp::Ordering::Greater,
+        );
+        let text = upgrade_names(&brew, &git, &[]);
+        assert_eq!(staged_install_order(&brew), ["node"], "{text}");
+    }
+
+    #[test]
+    fn pinned_installed_dependency_is_not_upgraded_for_its_dependent() {
+        let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        brew.installed[1].pinned = true;
+        upgrade_names(&brew, &git, &[]);
+        assert_eq!(staged_install_order(&brew), ["node"]);
     }
 
     #[test]
