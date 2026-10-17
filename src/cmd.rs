@@ -2263,8 +2263,15 @@ fn order_pair(kind: PkgKind, view: &ResolvedView) -> Option<crate::brew::Version
     if view.action != DesiredAction::InstallCutoff {
         return None;
     }
-    let installed = report::identity_version(view.installed.as_ref()?);
-    let cutoff = report::identity_version(view.cutoff.as_ref()?);
+    let mut installed = report::identity_version(view.installed.as_ref()?);
+    let mut cutoff = report::identity_version(view.cutoff.as_ref()?);
+    if kind == PkgKind::Cask {
+        // Everything after the first comma is a build token (`3.39.11,dy27w…,a`)
+        // that `Version.new` orders lexically, which says nothing about age.
+        for v in [&mut installed, &mut cutoff] {
+            *v = v.split(',').next().unwrap_or_default().to_string();
+        }
+    }
     let latest = |v: &str| v == ":latest" || v == "latest";
     if installed == cutoff || latest(&installed) || latest(&cutoff) {
         return None;
@@ -4519,6 +4526,50 @@ mod tests {
         brew.installed[1].pinned = true;
         upgrade_names(&brew, &git, &[]);
         assert_eq!(staged_install_order(&brew), ["node"]);
+    }
+
+    fn cask_view(installed: &str, cutoff: &str) -> ResolvedView {
+        let id = |v: &str| {
+            PkgIdentity::Cask(crate::identity::CaskIdentity {
+                version: v.into(),
+                sha256: Some("abc".into()),
+                url: None,
+            })
+        };
+        ResolvedView {
+            installed: Some(id(installed)),
+            cutoff: Some(id(cutoff)),
+            head: None,
+            action: DesiredAction::InstallCutoff,
+            cutoff_blob: None,
+            warnings: Vec::new(),
+            auto_updates: false,
+            latest: false,
+        }
+    }
+
+    #[test]
+    fn cask_build_tokens_after_the_first_comma_are_not_ordered() {
+        // `Version.new` compares `dy27whJwwmb` and `8QQF2ciKqxM` lexically, so
+        // a same-version re-release would look older or newer by token.
+        let a = "3.39.11,dy27whJwwmb,a";
+        let b = "3.39.11,8QQF2ciKqxM,a";
+        for (installed, cutoff) in [(a, b), (b, a)] {
+            let view = cask_view(installed, cutoff);
+            assert!(order_pair(PkgKind::Cask, &view).is_none(), "{installed}");
+            let mut view = view;
+            let brew = MockBrew::new();
+            settle_order(&brew, PkgKind::Cask, &mut view);
+            assert_eq!(view.action, DesiredAction::InstallCutoff);
+            assert!(brew.compares.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn cask_versions_differing_in_the_first_field_are_still_ordered() {
+        let view = cask_view("3.39.11,x,a", "3.40.0,y,a");
+        let pair = order_pair(PkgKind::Cask, &view).expect("ordered");
+        assert_eq!((pair.1.as_str(), pair.2.as_str()), ("3.39.11", "3.40.0"));
     }
 
     #[test]
