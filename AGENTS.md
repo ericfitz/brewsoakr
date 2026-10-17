@@ -40,7 +40,7 @@
 
 ## Cache state
 
-- Commands that write the cache (`update`, `upgrade`, `install`, `reinstall`) hold the `<cache>/run.lock` flock via `lock::acquire_waiting` from `dispatch`. `outdated` and `info` take it only when `cmd::snapshots_need_refresh` says they will refresh and write the cache; otherwise they read without it. `settings` never touches the cache.
+- Commands that write the cache (`update`, `upgrade`, `install`, `reinstall`) hold the `<cache>/run.lock` flock from the start of `dispatch` (`lock::LockSlot`). `outdated` and `info` start unlocked; `cmd::ensure_snapshots` takes the lock itself when it finds the snapshot missing, unreadable or stale, then re-reads `state.toml` and decides again. Code that writes `state.toml`, the clones, gc or prune takes a `&RunLock`; never write the cache without one. The holder's pid and command live in `run.lock.holder` (temp + rename). `settings` never touches the cache.
 - After a refresh, `prune::prune_cache` (under the lock) removes clone and staging dirs of taps no longer tapped and `origins.toml` records of packages no longer installed. Never prune a record because its tap is gone while the package is installed; never touch `$(brew --repository)/Library/Taps`.
-- Write `state.toml` and `origins.toml` only through `atomic::write` (temp + rename).
+- Write `state.toml` and `origins.toml` only through `atomic::write` (temp + rename, then fsync the directory).
 - `gc_prune` runs only after `state.toml` is written.

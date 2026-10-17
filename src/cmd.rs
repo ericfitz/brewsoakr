@@ -7,6 +7,7 @@ use crate::git::GitStore;
 use crate::github::GithubApi;
 use crate::identity::{self, HostPlatform, PkgIdentity};
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
+use crate::lock::{LockSlot, RunLock};
 use crate::nosoak;
 use crate::origin::{self, OriginRecords};
 use crate::prune;
@@ -113,24 +114,9 @@ fn stale_taps(stored: &Snapshots, plan: &RefreshPlan) -> Vec<TapPlan> {
         .collect()
 }
 
-/// True when `ensure_snapshots(.., force: false, ..)` would fetch and write the
-/// cache: no stored snapshot, a stale tap, or a stored snapshot it cannot read
-/// (the refresh path then reports or replaces it). `outdated` and `info` take
-/// the run lock only in that case.
-pub fn snapshots_need_refresh(
-    cache: &Path,
-    cfg: &Config,
-    inv: &Inventory,
-    extra: &[(String, String)],
-) -> bool {
-    match snapshot::load_state(cache) {
-        Ok(Some(stored)) => !stale_taps(&stored, &refresh_plan(cfg, inv, extra)).is_empty(),
-        Ok(None) | Err(_) => true,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn ensure_snapshots(
+    lock: &mut LockSlot,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
@@ -144,22 +130,42 @@ pub fn ensure_snapshots(
 ) -> Result<Snapshots, Error> {
     let plan = refresh_plan(cfg, inv, extra);
     let snaps = if force {
-        snapshot::refresh_with(git, gh, cache, &plan, now, progress)?
+        let held = lock.get()?;
+        snapshot::refresh_with(held, git, gh, cache, &plan, now, progress)?
     } else {
-        match snapshot::load_state(cache)? {
+        // Decide from state.toml, take the lock if that means writing the
+        // cache, then decide again: another run may have refreshed while this
+        // one waited. Without the lock the read-only path never writes.
+        let stored = loop {
+            let stored = snapshot::load_state(cache);
+            let needs_refresh = match &stored {
+                Ok(Some(s)) => !stale_taps(s, &plan).is_empty(),
+                Ok(None) | Err(_) => true,
+            };
+            if needs_refresh && !lock.is_held() {
+                lock.get()?;
+                continue;
+            }
+            break stored?;
+        };
+        match stored {
             Some(mut s) => {
                 // outdated/info reuse the stored snapshot, but refresh any
                 // tap with no state or a different soak window.
                 let stale = stale_taps(&s, &plan);
                 if !stale.is_empty() {
-                    snapshot::refresh_taps(git, cache, &mut s, &stale, now, progress)?;
+                    let held = lock.get()?;
+                    snapshot::refresh_taps(held, git, cache, &mut s, &stale, now, progress)?;
                 }
                 return Ok(s);
             }
-            None => snapshot::refresh_with(git, gh, cache, &plan, now, progress)?,
+            None => {
+                let held = lock.get()?;
+                snapshot::refresh_with(held, git, gh, cache, &plan, now, progress)?
+            }
         }
     };
-    prune::prune_cache(cache, inv, verbose, progress)?;
+    prune::prune_cache(lock.get()?, cache, inv, verbose, progress)?;
     prefetch_installed(git, cache, inv, &snaps);
     Ok(snaps)
 }
@@ -298,6 +304,7 @@ pub fn prefetch_installed(git: &impl GitStore, cache: &Path, inv: &Inventory, sn
 
 #[allow(clippy::too_many_arguments)]
 pub fn update(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     gh: &impl GithubApi,
@@ -319,8 +326,8 @@ pub fn update(
         None => Vec::new(),
     };
     let plan = refresh_plan(cfg, inv, &[]);
-    let snaps = snapshot::refresh_with(git, gh, cache, &plan, now, out)?;
-    prune::prune_cache(cache, inv, verbose, out)?;
+    let snaps = snapshot::refresh_with(lock, git, gh, cache, &plan, now, out)?;
+    prune::prune_cache(lock, cache, inv, verbose, out)?;
     writeln!(
         out,
         "core cutoff: {}",
@@ -1071,6 +1078,13 @@ pub fn reinstall(
                 continue;
             }
             PkgClass::Soaked => {}
+        }
+        // A held tap keeps its last good table, but that is never a basis
+        // for running brew against the tap's current HEAD: hold it as
+        // `apply_one` does (it defers the held-tap note and refuses).
+        if snaps.held_taps.contains_key(&r.origin) {
+            session.apply_one(raw)?;
+            continue;
         }
         let Some(pkg) = inv.find_in(&r.origin, &r.name) else {
             return Err(Error::Refusal(format!(
@@ -2996,6 +3010,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&MockBrew::new(), &cfg);
         update(
+            &RunLock::for_tests(),
             &MockBrew::new(),
             &git,
             &fixture_gh(),
@@ -9090,6 +9105,52 @@ mod tests {
     }
 
     #[test]
+    fn reinstall_of_a_held_tap_package_is_held() {
+        let (brew, git, mut snaps) = repair_world(0, b"");
+        snaps.held_taps.insert(
+            "hashicorp/tap".into(),
+            "while fetching history from origin, git failed:\nfatal: boom".into(),
+        );
+        let cache = tempfile::tempdir().unwrap();
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "terraform", "hashicorp/tap");
+        origins.save(cache.path()).unwrap();
+        let cfg = cfg24();
+        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = reinstall(
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["terraform".into()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(r.refused, "{text}");
+        assert!(
+            lock_runs(&brew).iter().all(|a| a[0] != "reinstall"),
+            "{:?}",
+            lock_runs(&brew)
+        );
+        assert!(
+            text.contains("terraform: tap hashicorp/tap could not be refreshed")
+                && text.contains("fatal: boom"),
+            "{text}"
+        );
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
+            Some("hashicorp/tap")
+        );
+    }
+
+    #[test]
     fn repair_reinstall_removes_the_stale_origin_record() {
         let after = repair_record_after(
             0,
@@ -9326,6 +9387,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         update(
+            &RunLock::for_tests(),
             &brew,
             &git,
             &fixture_gh(),
@@ -9345,6 +9407,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         update(
+            &RunLock::for_tests(),
             &brew,
             &git,
             &fixture_gh(),
@@ -9377,6 +9440,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         let err = update(
+            &RunLock::for_tests(),
             &brew,
             &git,
             &fixture_gh(),

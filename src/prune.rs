@@ -6,6 +6,7 @@
 
 use crate::Error;
 use crate::inventory::Inventory;
+use crate::lock::RunLock;
 use crate::origin::OriginRecords;
 use std::io::Write;
 use std::path::Path;
@@ -14,6 +15,7 @@ use std::path::Path;
 /// repeat: a second run finds nothing, and a run that died halfway is finished
 /// by the next. A removal that fails is reported and skipped, not fatal.
 pub fn prune_cache(
+    _lock: &RunLock,
     cache: &Path,
     inv: &Inventory,
     verbose: bool,
@@ -171,7 +173,7 @@ mod tests {
         let cache = dir.path();
         seed(cache);
         let mut out = Vec::new();
-        prune_cache(cache, &world(), true, &mut out).unwrap();
+        prune_cache(&RunLock::for_tests(), cache, &world(), true, &mut out).unwrap();
         assert!(!cache.join("taps/gone").exists());
         assert!(!cache.join("staging/taps/gone").exists());
         assert!(cache.join("taps/live/tap.git/f").exists());
@@ -201,7 +203,7 @@ mod tests {
         let cache = dir.path();
         seed(cache);
         let mut out = Vec::new();
-        prune_cache(cache, &world(), false, &mut out).unwrap();
+        prune_cache(&RunLock::for_tests(), cache, &world(), false, &mut out).unwrap();
         assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
         let records = std::fs::read(cache.join("origins.toml")).unwrap();
         let modified = std::fs::metadata(cache.join("origins.toml"))
@@ -209,7 +211,7 @@ mod tests {
             .modified()
             .unwrap();
         let mut again = Vec::new();
-        prune_cache(cache, &world(), true, &mut again).unwrap();
+        prune_cache(&RunLock::for_tests(), cache, &world(), true, &mut again).unwrap();
         assert!(again.is_empty(), "{}", String::from_utf8_lossy(&again));
         assert_eq!(std::fs::read(cache.join("origins.toml")).unwrap(), records);
         assert_eq!(
@@ -230,7 +232,14 @@ mod tests {
         // A previous run removed the clone and some of the staging files only.
         std::fs::remove_dir_all(cache.join("taps/gone/tap.git")).unwrap();
         std::fs::remove_file(cache.join("staging/taps/gone/tap/Formula/f")).unwrap();
-        prune_cache(cache, &world(), false, &mut Vec::new()).unwrap();
+        prune_cache(
+            &RunLock::for_tests(),
+            cache,
+            &world(),
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(!cache.join("taps/gone").exists());
         assert!(!cache.join("staging/taps/gone").exists());
     }
@@ -238,11 +247,25 @@ mod tests {
     #[test]
     fn missing_cache_dirs_and_stray_files_are_fine() {
         let dir = tempfile::tempdir().unwrap();
-        prune_cache(dir.path(), &world(), true, &mut Vec::new()).unwrap();
+        prune_cache(
+            &RunLock::for_tests(),
+            dir.path(),
+            &world(),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("taps/user")).unwrap();
         std::fs::write(dir.path().join("taps/user/notes.txt"), "x").unwrap();
         std::fs::write(dir.path().join("taps/loose"), "x").unwrap();
-        prune_cache(dir.path(), &world(), true, &mut Vec::new()).unwrap();
+        prune_cache(
+            &RunLock::for_tests(),
+            dir.path(),
+            &world(),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(dir.path().join("taps/user/notes.txt").exists());
         assert!(dir.path().join("taps/loose").exists());
     }
@@ -251,7 +274,14 @@ mod tests {
     fn tap_names_compare_case_insensitively() {
         let dir = tempfile::tempdir().unwrap();
         mk(dir.path(), "taps/Live/Tap.git");
-        prune_cache(dir.path(), &world(), false, &mut Vec::new()).unwrap();
+        prune_cache(
+            &RunLock::for_tests(),
+            dir.path(),
+            &world(),
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert!(dir.path().join("taps/Live/Tap.git/f").exists());
     }
 }

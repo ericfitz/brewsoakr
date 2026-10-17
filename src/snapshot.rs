@@ -1,5 +1,6 @@
 use crate::git::{GitStore, REF_CUTOFF, REF_HEAD};
 use crate::github::{GithubApi, cutoff_instant};
+use crate::lock::RunLock;
 use crate::taps;
 use crate::{Error, SoakHours};
 use std::collections::BTreeMap;
@@ -118,6 +119,7 @@ struct StateFile {
 }
 
 pub fn refresh(
+    lock: &RunLock,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
@@ -125,11 +127,20 @@ pub fn refresh(
     now: OffsetDateTime,
     progress: &mut impl Write,
 ) -> Result<Snapshots, Error> {
-    refresh_with(git, gh, cache, &RefreshPlan::uniform(hours), now, progress)
+    refresh_with(
+        lock,
+        git,
+        gh,
+        cache,
+        &RefreshPlan::uniform(hours),
+        now,
+        progress,
+    )
 }
 
 /// Core and cask failures abort (v1). A tap failure holds only that tap.
 pub fn refresh_with(
+    lock: &RunLock,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
@@ -165,7 +176,7 @@ pub fn refresh_with(
         taps: seeded_taps(cache, &plan.taps),
         held_taps: BTreeMap::new(),
     };
-    refresh_taps(git, cache, &mut snaps, &plan.taps, now, progress)?;
+    refresh_taps(lock, git, cache, &mut snaps, &plan.taps, now, progress)?;
     // The new cutoffs are recorded; only now may the old cutoffs' objects go.
     git.gc_prune(&cache.join("core.git"))?;
     git.gc_prune(&cache.join("cask.git"))?;
@@ -190,6 +201,7 @@ fn seeded_taps(cache: &Path, planned: &[TapPlan]) -> BTreeMap<String, TapState> 
 }
 
 pub fn refresh_taps(
+    _lock: &RunLock,
     git: &impl GitStore,
     cache: &Path,
     snaps: &mut Snapshots,
@@ -430,6 +442,7 @@ mod tests {
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
         let snaps = refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -453,6 +466,7 @@ mod tests {
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
         let snaps = refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -482,6 +496,7 @@ mod tests {
         let gh = fixture_gh();
 
         let first = refresh(
+            &RunLock::for_tests(),
             &git,
             &gh,
             dir.path(),
@@ -493,6 +508,7 @@ mod tests {
         assert_eq!(first.core.cutoff_sha, "thirtyh");
 
         let second = refresh(
+            &RunLock::for_tests(),
             &git,
             &gh,
             dir.path(),
@@ -656,8 +672,16 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let mut progress = Vec::new();
-        let snaps = refresh_with(&git, &fixture_gh(), dir.path(), &plan, now(), &mut progress)
-            .expect("core/cask ok");
+        let snaps = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut progress,
+        )
+        .expect("core/cask ok");
         assert!(
             snaps
                 .taps
@@ -708,6 +732,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let first = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -725,6 +750,7 @@ mod tests {
             fail_repo: CASK_REPO,
         };
         let err = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &failing,
             dir.path(),
@@ -746,6 +772,7 @@ mod tests {
         );
         // The next successful run records the new cutoff, then gc's the old.
         let third = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -780,6 +807,7 @@ mod tests {
             fail_repo: CASK_REPO,
         };
         refresh(
+            &RunLock::for_tests(),
             &git,
             &failing,
             dir.path(),
@@ -790,6 +818,7 @@ mod tests {
         .unwrap_err();
         assert!(git.gcs().is_empty(), "{:?}", git.gcs());
         refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -811,6 +840,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let first = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -824,6 +854,7 @@ mod tests {
 
         git.fail_remote(remote);
         let second = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -844,6 +875,7 @@ mod tests {
         let n = now().unix_timestamp();
         git.insert_commits(remote, &[("hc4", n - 60), ("hc3", n - 3600)]);
         let third = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -875,6 +907,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let mut snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -885,6 +918,7 @@ mod tests {
         .unwrap();
         git.fail_remote(remote);
         refresh_taps(
+            &RunLock::for_tests(),
             &git,
             dir.path(),
             &mut snaps,
@@ -924,6 +958,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -940,6 +975,7 @@ mod tests {
         };
         git.fail_remote("https://github.com/cyclonedx/homebrew-cyclonedx");
         let snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -973,6 +1009,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -991,6 +1028,7 @@ mod tests {
         std::fs::write(dir.path().join("state.toml"), "hours = 2").unwrap();
         let git = InMemoryGit::new();
         refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -1008,6 +1046,7 @@ mod tests {
         let git = InMemoryGit::new();
         let h = |n| SoakHours::new(n).unwrap();
         let first = refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -1026,6 +1065,7 @@ mod tests {
             .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
             .unwrap();
         let second = refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -1064,6 +1104,7 @@ mod tests {
             ],
         };
         let snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -1112,6 +1153,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let mut snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -1136,6 +1178,7 @@ mod tests {
             SoakHours::new(24).unwrap()
         ));
         refresh_taps(
+            &RunLock::for_tests(),
             &git,
             dir.path(),
             &mut snaps,
@@ -1175,6 +1218,7 @@ mod tests {
             SoakHours::new(24).unwrap(),
         );
         refresh_taps(
+            &RunLock::for_tests(),
             &git,
             dir.path(),
             &mut snaps,

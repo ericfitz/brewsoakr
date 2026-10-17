@@ -1,6 +1,6 @@
 //! Whole-file replacement for brewsoak's cache files (`state.toml`,
 //! `origins.toml`): write a private temp file, fsync it, rename it over the
-//! target. A reader sees the old file or the new one, never a partial write,
+//! target, fsync the directory. A reader sees the old file or the new one, never a partial write,
 //! and a crash leaves at worst a stale temp file that the next write sweeps.
 
 use crate::Error;
@@ -24,7 +24,15 @@ pub fn write(path: &Path, body: &str) -> Result<(), Error> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
+    // Make the rename itself durable: without this a power loss right after
+    // the rename can bring back the old file.
+    sync_dir(dir)?;
     remove_stale_temps(dir, &prefix, &tmp)
+}
+
+fn sync_dir(dir: &Path) -> Result<(), Error> {
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -90,5 +98,15 @@ mod tests {
                 "origins.toml".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn syncs_the_directory_after_the_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).expect("a directory can be fsynced");
+        assert!(sync_dir(&dir.path().join("missing")).is_err());
+        let nested = dir.path().join("a/b/state.toml");
+        write(&nested, "x = 1\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&nested).unwrap(), "x = 1\n");
     }
 }

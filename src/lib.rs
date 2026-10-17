@@ -155,26 +155,27 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         return Ok(Dispatch::Exit(0));
     }
     // Everything below the settings branch that writes the cache holds the
-    // run lock to the end of dispatch. `outdated` and `info` write it only
-    // when the stored snapshot is missing or a tap is stale, so they lock only
-    // then (see their arms); otherwise they read, and every cache write is
-    // atomic. Version, help and passthrough never touch the cache.
-    let mut _lock = match inv.command {
+    // run lock to the end of dispatch. `update`, `upgrade`, `install` and
+    // `reinstall` take it up front. `outdated` and `info` write the cache only
+    // when the stored snapshot is missing or a tap is stale, so
+    // `cmd::ensure_snapshots` takes it from this slot at that moment, after
+    // which it re-reads the snapshot and decides again. Version, help and
+    // passthrough never touch the cache.
+    let mut lock = lock::LockSlot::new(&world.cache_path(), args, world.lock_wait());
+    match inv.command {
         cli::Command::Update
         | cli::Command::Upgrade { .. }
         | cli::Command::Install { .. }
-        | cli::Command::Reinstall { .. } => Some(lock::acquire_waiting(
-            &world.cache_path(),
-            args,
-            world.lock_wait(),
-        )?),
+        | cli::Command::Reinstall { .. } => {
+            lock.get()?;
+        }
         cli::Command::Outdated
         | cli::Command::Info { .. }
         | cli::Command::Version
         | cli::Command::Help { .. }
         | cli::Command::Settings(_)
-        | cli::Command::Passthrough { .. } => None,
-    };
+        | cli::Command::Passthrough { .. } => {}
+    }
     let env = world.env_soak();
     let file = config::read_file(&world.config_path());
     let cfg = config::resolve_config(inv.soak_hours, env.as_deref(), file.as_deref())?;
@@ -231,6 +232,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let mut out = std::io::stdout();
             soaked_exit(
                 cmd::update(
+                    lock.get()?,
                     world.brew(),
                     world.git(),
                     world.github(),
@@ -250,11 +252,9 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
         cli::Command::Outdated => {
             let cache = world.cache_path();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
-            if cmd::snapshots_need_refresh(&cache, &cfg, &pkgs, &[]) {
-                _lock = Some(lock::acquire_waiting(&cache, args, world.lock_wait())?);
-            }
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
+                &mut lock,
                 world.git(),
                 world.github(),
                 &cache,
@@ -281,11 +281,9 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let cache = world.cache_path();
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let extra = cmd::explicit_tap_tokens(&names);
-            if cmd::snapshots_need_refresh(&cache, &cfg, &pkgs, &extra) {
-                _lock = Some(lock::acquire_waiting(&cache, args, world.lock_wait())?);
-            }
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
+                &mut lock,
                 world.git(),
                 world.github(),
                 &cache,
@@ -315,6 +313,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
+                &mut lock,
                 world.git(),
                 world.github(),
                 &cache,
@@ -349,6 +348,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
+                &mut lock,
                 world.git(),
                 world.github(),
                 &cache,
@@ -381,6 +381,7 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let mut out = std::io::stdout();
             let snaps = cmd::ensure_snapshots(
+                &mut lock,
                 world.git(),
                 world.github(),
                 &cache,
@@ -559,6 +560,7 @@ mod tests {
         git: InMemoryGit,
         github: RecordingGithub,
         brew: MockBrew,
+        lock_wait: std::time::Duration,
         _tmp: tempfile::TempDir,
     }
 
@@ -604,6 +606,7 @@ mod tests {
                     refreshed: Cell::new(false),
                 },
                 brew: MockBrew::new(),
+                lock_wait: std::time::Duration::from_millis(150),
                 _tmp: tmp,
             }
         }
@@ -639,7 +642,7 @@ mod tests {
             &self.brew
         }
         fn lock_wait(&self) -> std::time::Duration {
-            std::time::Duration::from_millis(150)
+            self.lock_wait
         }
     }
 
@@ -708,6 +711,34 @@ mod tests {
             let err = dispatch(&argv, &world).unwrap_err();
             assert!(matches!(err, Error::Refusal(_)), "{argv:?}: {err}");
             assert!(!world.github.refreshed.get(), "{argv:?} did work");
+            let state = std::fs::read_to_string(world.cache_path.join("state.toml")).unwrap();
+            assert_eq!(state, "[[[", "{argv:?} wrote state.toml without the lock");
+        }
+    }
+
+    #[test]
+    fn a_waiter_decides_again_after_it_gets_the_lock() {
+        // The run that held the lock refreshed while this one waited, so the
+        // waiter finds fresh state and must not fetch or write anything.
+        for argv in [s(&["outdated"]), s(&["info", "wget"])] {
+            let mut world = TestWorld::new();
+            dispatch(&s(&["outdated"]), &world).unwrap();
+            let state = world.cache_path.join("state.toml");
+            let fresh = std::fs::read(&state).unwrap();
+            std::fs::write(&state, "[[[").unwrap();
+            world.github.refreshed.set(false);
+            world.lock_wait = std::time::Duration::from_secs(10);
+            let held =
+                lock::acquire_waiting(&world.cache_path, &s(&["update"]), world.lock_wait).unwrap();
+            let state_path = state.clone();
+            let holder = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&state_path, fresh).unwrap();
+                drop(held);
+            });
+            dispatch(&argv, &world).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+            holder.join().unwrap();
+            assert!(!world.github.refreshed.get(), "{argv:?} refreshed anyway");
         }
     }
 

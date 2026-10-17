@@ -242,7 +242,8 @@ regenerable cache, and the untapped case then needs no user action.
 `src/lock.rs`: `std::fs::File::try_lock` (stable since Rust 1.89; `Cargo.toml`
 now declares `rust-version = "1.89"`; no new dependency) on `<cache>/run.lock`,
 retried every 100 ms for 5 s, then `Error::Refusal` naming the holder's pid and
-command from the file (written after acquiring). `dispatch` takes it for
+command from `<cache>/run.lock.holder` (written whole by temp + rename after
+acquiring, removed on release, so a waiter never reads a partial record). `dispatch` takes it for
 `update`, `outdated`, `info`, `upgrade`, `install` and `reinstall`, and holds it to the end of the run. `outdated` and `info` lock because
 they refresh and write `state.toml` and the clones when the stored snapshot is
 missing or a tap is stale; `version`, `help`, `settings` and
@@ -250,10 +251,11 @@ passthrough do not touch the cache (a settings edit writes only the config
 file, atomically, last writer wins; the existing contract is that settings
 never creates the cache). State behavior: second run takes the lock
 after the first exits; overlapping runs wait 5 s, then fail with the message;
-a run that died leaves `run.lock` with a dead pid, but the kernel dropped its
-flock, so the next run is not blocked and overwrites the record. The lock file
+a run that died leaves `run.lock.holder` with a dead pid, but the kernel dropped
+its flock, so the next run is not blocked and replaces the record. The lock file
 is never deleted (removal would race a waiter). `src/atomic.rs` writes
-`state.toml` and `origins.toml` through a `0600` temp file, fsync and rename.
+`state.toml` and `origins.toml` through a `0600` temp file, fsync, rename and a
+directory fsync.
 
 ### Implementation notes (B1, B3a, B5, B6, lock scope)
 
@@ -283,9 +285,16 @@ is never deleted (removal would race a waiter). `src/atomic.rs` writes
   finds nothing and writes nothing; two runs are serialized by the lock; a
   half-pruned run is finished next time.
 - **Lock scope (decision by Claude, 2026-10-17; refines "Run lock: option A").**
-  `outdated` and `info` take the run lock only when `ensure_snapshots` will
-  refresh and write the cache (`cmd::snapshots_need_refresh`: no stored
-  snapshot, an unreadable one, or a stale tap); otherwise they read without it,
-  which is safe because `state.toml` and `origins.toml` are written atomically.
-  A reader racing a prune or gc sees `Error::Git` (B2), never a torn file.
-  `update`, `upgrade`, `install` and `reinstall` still lock always.
+  `update`, `upgrade`, `install` and `reinstall` lock up front. `outdated` and
+  `info` start without the lock and `cmd::ensure_snapshots` takes it (through
+  the dispatch's `lock::LockSlot`, so one process never locks twice) at the
+  moment it finds the stored snapshot missing, unreadable or stale. After
+  acquiring it reads `state.toml` again and decides again, because another run
+  may have refreshed while this one waited; a fresh snapshot is then used
+  without a write. The decision and the acquisition are one step, so no
+  refresh can run on a state read taken before the lock. Everything that
+  writes `state.toml`, the clones, gc or prune (`snapshot::refresh_with`,
+  `refresh_taps`, `prune::prune_cache`, `cmd::update`) takes a `&RunLock`, so
+  the compiler rejects an unlocked call. A run that only reads is safe without
+  the lock because `state.toml` and `origins.toml` are written atomically; a
+  reader racing a prune or gc sees `Error::Git` (B2), never a torn file.
