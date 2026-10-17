@@ -72,7 +72,8 @@ pub fn desired_action(
                 DesiredAction::InstallCutoff
             } else if identities_match(installed, cutoff_id) {
                 DesiredAction::NoOpAlreadySoaked
-            } else if identities_match(installed, head_id) && cutoff_id != head_id {
+            } else if identities_match(installed, head_id) && !identities_match(cutoff_id, head_id)
+            {
                 DesiredAction::LeaveAheadOfSoak
             } else {
                 DesiredAction::InstallCutoff
@@ -314,6 +315,30 @@ end
         assert_eq!(
             desired_action(status, None, Some(&cutoff), Some(&head)),
             DesiredAction::InstallCutoff
+        );
+    }
+
+    /// A moved url (same version and sha) differs in `derived_from` only; it
+    /// is the same artifact, so cutoff and HEAD are not "different" and an
+    /// installed copy of it is soaked, not ahead of the soak.
+    #[test]
+    fn cutoff_and_head_at_different_urls_are_the_same_artifact() {
+        let at = |host: &str| {
+            let rb = format!(
+                "class Wget < Formula\n  url \"https://{host}/wget-1.21.4.tar.gz\"\n  sha256 \"aaa111\"\nend\n"
+            );
+            formula_id(&rb)
+        };
+        let (cutoff, head) = (at("old.example.com"), at("new.example.com"));
+        assert_ne!(cutoff, head, "derived_from differs");
+        assert_eq!(
+            desired_action(
+                UpstreamStatus::Eligible,
+                Some(&head),
+                Some(&cutoff),
+                Some(&head)
+            ),
+            DesiredAction::NoOpAlreadySoaked
         );
     }
 

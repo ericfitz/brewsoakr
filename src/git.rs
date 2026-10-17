@@ -81,12 +81,18 @@ pub trait GitStore {
     }
 }
 
+type BlobCache = RefCell<HashMap<(PathBuf, String, String), Vec<u8>>>;
+
 type TreeCache = RefCell<HashMap<(PathBuf, String), Vec<String>>>;
 
 #[derive(Default)]
 pub struct ProcessGit {
     /// `ls-tree` output per (clone dir, commit). A commit's tree never changes.
     trees: TreeCache,
+    /// Blob bytes per (clone dir, commit, path). A commit's blob never
+    /// changes; only found blobs are kept, since a missing one may arrive in
+    /// a later fetch.
+    blobs: BlobCache,
 }
 
 /// Servers that do not support partial clone answer the filter with one of
@@ -202,11 +208,16 @@ impl GitStore for ProcessGit {
     }
 
     fn show(&self, dir: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Error> {
+        let key = (dir.to_path_buf(), sha.to_string(), path.to_string());
+        if let Some(cached) = self.blobs.borrow().get(&key) {
+            return Ok(Some(cached.clone()));
+        }
         let spec = format!("{sha}:{path}");
         let action = format!("reading {path} from git commit {sha}");
         let dir = dir.to_string_lossy();
         let output = run_git(&action, &["--git-dir", dir.as_ref(), "show", &spec])?;
         if output.status.success() {
+            self.blobs.borrow_mut().insert(key, output.stdout.clone());
             Ok(Some(output.stdout))
         } else if missing_object(&output) {
             Ok(None)
@@ -1011,6 +1022,30 @@ mod tests {
             git.rev_list_before(&bare, REF_HEAD, COMMIT_UNIX).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn process_git_show_spawns_git_once_per_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        git_ok(&src, &["init", "-b", "main"]);
+        git_ok(&src, &["config", "user.email", "test@example.com"]);
+        git_ok(&src, &["config", "user.name", "Test"]);
+        std::fs::write(src.join("f"), "one\n").unwrap();
+        git_ok(&src, &["add", "f"]);
+        git_ok(&src, &["commit", "-m", "one"]);
+        let sha = git_ok(&src, &["rev-parse", "HEAD"]);
+        let gitdir = src.join(".git");
+        let git = ProcessGit::default();
+        let first = git.show(&gitdir, &sha, "f").unwrap();
+        assert_eq!(first.as_deref(), Some(b"one\n".as_slice()));
+        // With the repository gone, only a memo can answer: a second spawn
+        // would fail.
+        std::fs::remove_dir_all(&gitdir).unwrap();
+        assert_eq!(git.show(&gitdir, &sha, "f").unwrap(), first);
+        // A missing path is not memoized: the object may arrive in a fetch.
+        assert!(!matches!(git.show(&gitdir, &sha, "nope"), Ok(Some(_))));
     }
 
     #[test]

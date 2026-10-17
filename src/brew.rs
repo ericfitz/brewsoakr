@@ -238,12 +238,29 @@ pub struct MockBrew {
     pub host: Option<HostPlatform>,
     /// The pairs of each `compare_versions` call.
     pub compares: Mutex<Vec<Vec<VersionPair>>>,
-    /// What `detect_versions` reports for a url; an unscripted url is `None`.
-    pub detections: BTreeMap<String, String>,
+    /// Pairs `compare_versions` has answered: like `ProcessBrew`, a pair is
+    /// asked of brew once per run.
+    pub compared: Mutex<std::collections::HashSet<(String, String)>>,
+    /// How many `compare_versions` calls asked about a pair not yet answered
+    /// (each is one `brew ruby` spawn in `ProcessBrew`).
+    pub compare_spawns: Mutex<usize>,
+    /// What `detect_versions` reports for a `(url, tag)`; an unscripted
+    /// source is `None`.
+    pub detections: BTreeMap<(String, Option<String>), String>,
     /// Makes every `detect_versions` call fail with this message.
     pub detect_error: Option<String>,
+    /// The 1-based spawns (calls with a source not yet answered) of
+    /// `detect_versions` that fail; the sources of a failed spawn then fail
+    /// for the rest of the run, as in `ProcessBrew`.
+    pub detect_fail_spawns: std::collections::BTreeSet<usize>,
     /// The sources of each `detect_versions` call.
     pub detects: Mutex<Vec<Vec<VersionSource>>>,
+    /// Sources `detect_versions` has answered or failed.
+    pub detect_seen: Mutex<std::collections::HashSet<VersionSource>>,
+    pub detect_failed: Mutex<std::collections::HashSet<VersionSource>>,
+    /// How many `detect_versions` calls asked about a source not yet answered
+    /// (each is one `brew ruby` spawn in `ProcessBrew`).
+    pub detect_spawns: Mutex<usize>,
 }
 
 impl Default for MockBrew {
@@ -264,9 +281,15 @@ impl Default for MockBrew {
             compare_error: None,
             host: None,
             compares: Mutex::new(Vec::new()),
+            compared: Mutex::new(std::collections::HashSet::new()),
+            compare_spawns: Mutex::new(0),
             detections: BTreeMap::new(),
             detect_error: None,
+            detect_fail_spawns: std::collections::BTreeSet::new(),
             detects: Mutex::new(Vec::new()),
+            detect_seen: Mutex::new(std::collections::HashSet::new()),
+            detect_failed: Mutex::new(std::collections::HashSet::new()),
+            detect_spawns: Mutex::new(0),
         }
     }
 }
@@ -707,9 +730,46 @@ impl Brew for MockBrew {
                 message: message.clone(),
             });
         }
+        let askable = |s: &&VersionSource| !s.url.contains("#{");
+        let failed_before = self.detect_failed.lock().unwrap_or_else(|e| e.into_inner());
+        if sources.iter().any(|s| failed_before.contains(s)) {
+            return Err(Error::Brew {
+                status: 1,
+                message: "brew ruby failed earlier in this run".into(),
+            });
+        }
+        drop(failed_before);
+        let mut seen = self.detect_seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut new: Vec<&VersionSource> = Vec::new();
+        for s in sources.iter().filter(askable) {
+            if !seen.contains(s) && !new.contains(&s) {
+                new.push(s);
+            }
+        }
+        if !new.is_empty() {
+            let mut spawns = self.detect_spawns.lock().unwrap_or_else(|e| e.into_inner());
+            *spawns += 1;
+            if self.detect_fail_spawns.contains(&*spawns) {
+                let mut failed = self.detect_failed.lock().unwrap_or_else(|e| e.into_inner());
+                failed.extend(new.into_iter().cloned());
+                return Err(Error::Brew {
+                    status: 1,
+                    message: format!("brew ruby failed (spawn {})", *spawns),
+                });
+            }
+            seen.extend(new.into_iter().cloned());
+        }
         Ok(sources
             .iter()
-            .map(|s| self.detections.get(&s.url).cloned())
+            .map(|s| {
+                if s.url.contains("#{") {
+                    None
+                } else {
+                    self.detections
+                        .get(&(s.url.clone(), s.tag.clone()))
+                        .cloned()
+                }
+            })
             .collect())
     }
 
@@ -718,6 +778,17 @@ impl Brew for MockBrew {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(pairs.to_vec());
+        {
+            let mut compared = self.compared.lock().unwrap_or_else(|e| e.into_inner());
+            let before = compared.len();
+            compared.extend(pairs.iter().map(|(_, a, b)| (a.clone(), b.clone())));
+            if compared.len() > before {
+                *self
+                    .compare_spawns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) += 1;
+            }
+        }
         if let Some(message) = &self.compare_error {
             return Err(Error::Brew {
                 status: 1,

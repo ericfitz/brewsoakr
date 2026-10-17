@@ -667,6 +667,9 @@ pub fn info(
             report::soak_banner("showing info", snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
+    if names.is_empty() {
+        prefetch_orderings(brew, git, snaps, cache, inv);
+    }
     let owned_names: Vec<String> = if names.is_empty() {
         inv.pkgs.iter().map(|p| p.name.clone()).collect()
     } else {
@@ -1707,9 +1710,31 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.refuse_ineligible_dep(target, target_token, dep, status)?;
             return Ok(false);
         }
-        let want = blobs.cutoff.as_deref().and_then(|bytes| {
-            parse_pkg_bytes(self.brew, kind, bytes, self.brew.host_platform().as_ref()).ok()
-        });
+        // The wanted cutoff and the installed receipt are parsed together:
+        // one brew call for their url-derived versions, all or none.
+        let host = self.brew.host_platform();
+        let cutoff_rb = blobs
+            .cutoff
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        let installed_rb = self
+            .inv
+            .find_in(dep_origin, dep)
+            .map(|p| p.receipt_rb.as_str());
+        let sides: Vec<&str> = [cutoff_rb, installed_rb].into_iter().flatten().collect();
+        let mut parsed = parse_pkgs(self.brew, kind, &sides, host.as_ref())
+            .into_iter()
+            .map(Result::ok);
+        let want = if cutoff_rb.is_some() {
+            parsed.next().flatten()
+        } else {
+            None
+        };
+        let installed_id = if installed_rb.is_some() {
+            parsed.next().flatten()
+        } else {
+            None
+        };
         if self.already_done(dep, kind, want.as_ref()) {
             return Ok(true);
         }
@@ -1724,19 +1749,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         // which counts it; any other run counts it here.
         let counted_here = !self.bare_run && self.inv.find_in(dep_origin, dep).is_some();
         if counted_here {
-            let from = self
-                .inv
-                .find_in(dep_origin, dep)
-                .and_then(|p| {
-                    parse_pkg(
-                        self.brew,
-                        kind,
-                        &p.receipt_rb,
-                        self.brew.host_platform().as_ref(),
-                    )
-                    .ok()
-                })
-                .map(|id| report::identity_version(&id));
+            let from = installed_id.as_ref().map(report::identity_version);
             let to = want.as_ref().map(report::identity_version);
             let (from, to) = (
                 from.unwrap_or_else(|| "?".into()),
@@ -2359,9 +2372,9 @@ fn prefetch_versions(
             sources.push(src);
         }
     };
-    for pkg in snapshotted_pkgs(inv, snaps)
-        .filter(|p| p.kind == PkgKind::Formula && bare_skip(p, snaps).is_none())
-    {
+    // Every package a caller can resolve, pinned ones included: `info` and
+    // `update` resolve them though a bare upgrade leaves them alone.
+    for pkg in snapshotted_pkgs(inv, snaps).filter(|p| p.kind == PkgKind::Formula) {
         add(&pkg.receipt_rb);
         if let Ok(blobs) = resolve_pkg_blobs(git, snaps, cache, &pkg.origin, &pkg.name, pkg.kind) {
             for bytes in [blobs.cutoff.as_deref(), blobs.head.as_deref()]
@@ -2392,7 +2405,7 @@ fn prefetch_orderings(
     let mut pairs = Vec::new();
     let host = brew.host_platform();
     prefetch_versions(brew, git, snaps, cache, inv, host.as_ref());
-    for pkg in snapshotted_pkgs(inv, snaps).filter(|p| bare_skip(p, snaps).is_none()) {
+    for pkg in snapshotted_pkgs(inv, snaps) {
         if let Ok(Some(view)) = resolve_view_unordered(
             brew,
             git,
@@ -2426,26 +2439,34 @@ fn resolve_view_unordered(
     host: Option<&HostPlatform>,
 ) -> Result<Option<ResolvedView>, Error> {
     let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
-    let installed = match receipt_rb {
-        Some(rb) => match parse_pkg(brew, kind, rb, host) {
-            Ok(id) => Some(id),
-            Err(_) => return Ok(None),
-        },
-        None => None,
+    // The three sides are parsed together so a formula's url-derived versions
+    // are asked of brew in one call, and all resolve or none do.
+    fn text(bytes: &Option<Vec<u8>>) -> Option<Result<&str, ()>> {
+        bytes
+            .as_deref()
+            .map(|b| std::str::from_utf8(b).map_err(|_| ()))
+    }
+    let (Some(cutoff_rb), Some(head_rb)) = (
+        text(&blobs.cutoff).transpose().ok(),
+        text(&blobs.head).transpose().ok(),
+    ) else {
+        return Ok(None);
     };
-    let cutoff = match blobs.cutoff.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(brew, kind, bytes, host) {
-            Ok(id) => Some(id),
-            Err(_) => return Ok(None),
-        },
-        None => None,
+    let sides = [receipt_rb, cutoff_rb, head_rb];
+    let present: Vec<&str> = sides.iter().flatten().copied().collect();
+    let mut parsed = parse_pkgs(brew, kind, &present, host).into_iter();
+    let mut next_side = |side: Option<&str>| -> Result<Option<PkgIdentity>, ()> {
+        match side {
+            Some(_) => parsed.next().and_then(Result::ok).map(Some).ok_or(()),
+            None => Ok(None),
+        }
     };
-    let head = match blobs.head.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(brew, kind, bytes, host) {
-            Ok(id) => Some(id),
-            Err(_) => return Ok(None),
-        },
-        None => None,
+    let (Ok(installed), Ok(cutoff), Ok(head)) = (
+        next_side(sides[0]),
+        next_side(sides[1]),
+        next_side(sides[2]),
+    ) else {
+        return Ok(None);
     };
     let today = calendar_today();
     let status =
@@ -2621,25 +2642,68 @@ fn parse_formula_detected(
     host: Option<&HostPlatform>,
 ) -> Result<identity::FormulaIdentity, Error> {
     let mut id = identity::parse_formula(rb, host)?;
-    if let Some(src) = &id.derived_from
-        && let Ok(answers) = brew.detect_versions(std::slice::from_ref(src))
-        && let Some(Some(v)) = answers.into_iter().next()
-        && !v.is_empty()
-    {
-        id.version = v;
-    }
+    detect_versions_of(brew, &mut [&mut id]);
     Ok(id)
 }
 
-fn parse_pkg_bytes(
+/// Parses several packages of one kind, in order, asking brew for all their
+/// url-derived formula versions in one call. When that call fails, every
+/// formula keeps its local guess, so no set of related identities mixes
+/// brew's version with a guess.
+fn parse_pkgs(
     brew: &impl Brew,
     kind: PkgKind,
-    bytes: &[u8],
+    rbs: &[&str],
     host: Option<&HostPlatform>,
-) -> Result<PkgIdentity, Error> {
-    let rb = std::str::from_utf8(bytes)
-        .map_err(|_| Error::Other("package blob is not valid UTF-8".into()))?;
-    parse_pkg(brew, kind, rb, host)
+) -> Vec<Result<PkgIdentity, Error>> {
+    match kind {
+        PkgKind::Cask => rbs
+            .iter()
+            .map(|rb| identity::parse_cask(rb, host).map(PkgIdentity::Cask))
+            .collect(),
+        PkgKind::Formula => {
+            let mut parsed: Vec<Result<identity::FormulaIdentity, Error>> = rbs
+                .iter()
+                .map(|rb| identity::parse_formula(rb, host))
+                .collect();
+            let mut ids: Vec<&mut identity::FormulaIdentity> =
+                parsed.iter_mut().filter_map(|r| r.as_mut().ok()).collect();
+            detect_versions_of(brew, &mut ids);
+            parsed
+                .into_iter()
+                .map(|r| r.map(PkgIdentity::Formula))
+                .collect()
+        }
+    }
+}
+
+/// Replaces the local guess of each url-derived version with brew's answer,
+/// from one `detect_versions` call. An error leaves every guess alone; a
+/// source brew cannot tell leaves only its own.
+fn detect_versions_of(brew: &impl Brew, ids: &mut [&mut identity::FormulaIdentity]) {
+    let mut sources: Vec<identity::VersionSource> = Vec::new();
+    for src in ids.iter().filter_map(|id| id.derived_from.as_ref()) {
+        if !sources.contains(src) {
+            sources.push(src.clone());
+        }
+    }
+    if sources.is_empty() {
+        return;
+    }
+    let Ok(answers) = brew.detect_versions(&sources) else {
+        return;
+    };
+    for id in ids.iter_mut() {
+        let Some(src) = &id.derived_from else {
+            continue;
+        };
+        if let Some(i) = sources.iter().position(|s| s == src)
+            && let Some(Some(v)) = answers.get(i)
+            && !v.is_empty()
+        {
+            id.version = v.clone();
+        }
+    }
 }
 
 fn hold_why(action: DesiredAction) -> Option<&'static str> {
@@ -7384,8 +7448,10 @@ mod tests {
             ("crafty-25.2", "25.2"),
             ("crafty-25.3", "25.3"),
         ] {
-            brew.detections
-                .insert(format!("https://example.com/{url}.tar.gz"), v.to_string());
+            brew.detections.insert(
+                (format!("https://example.com/{url}.tar.gz"), None),
+                v.to_string(),
+            );
         }
         (brew, git, core_snaps())
     }
@@ -7451,10 +7517,163 @@ mod tests {
             "receipts and cutoffs of both formulae in one call: {first:?}"
         );
         assert_eq!(first.len(), 4, "no duplicates: {first:?}");
-        assert!(
-            detects.iter().skip(1).all(|c| c.len() == 1),
-            "later asks are per-package (memo hits in brew): {detects:?}"
+        assert_eq!(
+            spawns(&brew).0,
+            1,
+            "later asks are per-view memo hits in brew: {detects:?}"
         );
+    }
+
+    /// Every name installed at 1.0.0, cutoff 1.1.0 and HEAD 1.2.0 (so the
+    /// three sides have three different urls), all url-derived. `app`
+    /// depends on every other name. Brew's `Version.detect` says `d<version>-<name>`
+    /// for each url, so a detected version is never the heuristic one.
+    fn many_detect_world(names: &[&str]) -> (MockBrew, InMemoryGit) {
+        let git = InMemoryGit::new();
+        let mut brew = MockBrew::new();
+        for name in names {
+            let dir = &name[..1];
+            for (sha, ver, hash) in [
+                ("cutoffsha", "1.1.0", "midsha"),
+                ("headsha", "1.2.0", "newsha"),
+            ] {
+                git.insert_blob(
+                    sha,
+                    &format!("Formula/{dir}/{name}.rb"),
+                    formula_rb(name, ver, hash),
+                );
+            }
+            brew.installed
+                .push(formula_pkg(name, formula_rb(name, "1.0.0", "oldsha")));
+            for ver in ["1.0.0", "1.1.0", "1.2.0"] {
+                brew.detections.insert(
+                    (format!("https://example.com/{name}-{ver}.tar.gz"), None),
+                    format!("d{ver}-{name}"),
+                );
+            }
+        }
+        brew.deps.insert(
+            "app".to_string(),
+            names[1..].iter().map(|n| n.to_string()).collect(),
+        );
+        (brew, git)
+    }
+
+    fn spawns(brew: &MockBrew) -> (usize, usize) {
+        (
+            *brew.detect_spawns.lock().unwrap(),
+            *brew.compare_spawns.lock().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_named_upgrade_detects_once_per_resolved_view() {
+        let (brew, git) = many_detect_world(&["app", "bar", "baz"]);
+        let text = upgrade_names(&brew, &git, &["app".to_string()]);
+        assert!(text.contains("bar d1.0.0-bar -> d1.1.0-bar"), "{text}");
+        // app, bar and baz are three resolved views; each asks brew about
+        // its installed, cutoff and HEAD urls in one call.
+        let (detects, _) = spawns(&brew);
+        assert!(detects <= 3, "{detects} detect spawns: {text}");
+    }
+
+    #[test]
+    fn a_failed_detection_never_mixes_detected_and_heuristic_sides() {
+        for failing in 1..=3usize {
+            let (mut brew, git) = many_detect_world(&["app", "bar", "baz"]);
+            brew.detect_fail_spawns.insert(failing);
+            let text = upgrade_names(&brew, &git, &["app".to_string()]);
+            let compares = brew.compares.lock().unwrap().clone();
+            for (_, a, b) in compares.iter().flatten() {
+                assert_eq!(
+                    a.starts_with('d'),
+                    b.starts_with('d'),
+                    "spawn {failing} failed: {a} vs {b}\n{text}"
+                );
+            }
+            for line in text.lines().filter(|l| l.starts_with("upgrading ")) {
+                assert_eq!(
+                    line.contains(" d1."),
+                    line.contains("-> d1."),
+                    "spawn {failing} failed: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bare_info_detects_and_compares_once_for_every_package() {
+        let (brew, git) = many_detect_world(&["app", "bar", "baz"]);
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        info(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("d1.0.0-app"), "{text}");
+        assert_eq!(spawns(&brew), (1, 1), "{text}");
+    }
+
+    #[test]
+    fn update_summary_prefetches_pinned_formulae_too() {
+        let (mut brew, git) = many_detect_world(&["app", "bar", "baz"]);
+        brew.installed[1] = formula_pkg_pinned("bar", formula_rb("bar", "1.0.0", "oldsha"));
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        classify_installed(&brew, &git, cache.path(), &core_snaps(), &inv).unwrap();
+        assert_eq!(spawns(&brew), (1, 1));
+    }
+
+    #[test]
+    fn a_head_with_its_own_url_is_detected_in_the_prefetch_call() {
+        let (brew, git) = many_detect_world(&["app"]);
+        greedy_upgrade(&brew, &git, &core_snaps(), &[]);
+        let first = brew.detects.lock().unwrap().first().cloned().unwrap();
+        let urls: Vec<&str> = first.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(first.len(), 3, "{urls:?}");
+        assert!(
+            urls.contains(&"https://example.com/app-1.2.0.tar.gz"),
+            "{urls:?}"
+        );
+        assert_eq!(spawns(&brew).0, 1);
+    }
+
+    #[test]
+    fn detections_are_keyed_by_url_and_tag() {
+        let rb = |tag: &str| {
+            format!(
+                "class X < Formula\n  url \"https://example.com/x.git\", tag: \"{tag}\", revision: \"r{tag}\"\nend\n"
+            )
+        };
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/x/x.rb", rb("rel-2"));
+        git.insert_blob("headsha", "Formula/x/x.rb", rb("rel-2"));
+        let mut brew = MockBrew {
+            installed: vec![formula_pkg("x", rb("rel-1"))],
+            ..MockBrew::new()
+        };
+        for (tag, v) in [("rel-1", "A1"), ("rel-2", "A2")] {
+            brew.detections.insert(
+                ("https://example.com/x.git".into(), Some(tag.into())),
+                v.into(),
+            );
+        }
+        // A detection for the bare url must not answer a tagged source.
+        brew.detections
+            .insert(("https://example.com/x.git".into(), None), "WRONG".into());
+        let text = greedy_upgrade(&brew, &git, &core_snaps(), &[]);
+        assert!(text.contains("A1 -> A2"), "{text}");
     }
 
     /// Pins the claim in `plan_size`'s comment: the pre-run total, the
