@@ -70,7 +70,7 @@ HEAD) is unchanged. `outdated` prints the auto-updates entry with the
 right comparison (`<`, `>` or `?`). The newer-than-cutoff note no longer
 says "formula".
 
-## 5. `reinstall` upgrades outdated dependencies (review note 1). Decision by Claude, not Eric
+## 5. `reinstall` upgrades outdated dependencies (review note 1). Decision by Claude, approved by Eric 2026-10-17
 
 Kept as is. A brewsoak `reinstall` of a package behind its cutoff installs
 the cutoff, which is an upgrade. It takes the same path as `upgrade`, and it
@@ -85,7 +85,7 @@ bottle's recorded minimum version isn't met; brewsoak doesn't read
 bottle minimums. The true-repair branch (installed == HEAD, plain
 `brew reinstall`) doesn't walk dependencies.
 
-## 6. Cask dependencies are not reordered (review note 5). Decision by Claude, not Eric
+## 6. Cask dependencies are not reordered (review note 5). Decision by Claude, approved by Eric 2026-10-17
 
 Kept as is. An installed cask dependency isn't upgraded ahead of its
 dependent, for two reasons:
@@ -116,6 +116,30 @@ version shown. Eric chose to ask brew rather than port more of
 - If brew can't answer (a failed call, an empty result, or a url with `#{`
   interpolation), the local heuristic version is kept. The package parses
   exactly as before, and both sides of a comparison still use the same rule.
+
+## 8. Cask `language` blocks (decision by Eric, 2026-10-17: fix before the PR)
+
+29 casks keep `version`, `sha256` or `url` inside `language "xx", default: true do`
+blocks, which stayed opaque. cave-story was unparseable, and firefox and
+thunderbird had no sha256. With a known host, brewsoak now selects one
+language block per cask, as Homebrew's `Cask::DSL#language_eval` does, and
+reads that block as transparent. The other language blocks stay opaque.
+
+- Preferred languages come from brew. `brew::HOST_PLATFORM_RUBY` also prints
+  `Cask::Config.new.languages`, the list a cask load uses, on a `LANG` line.
+  An installed cask is evaluated with the languages in its saved
+  `<caskroom>/<token>/.metadata/config.json` (`explicit`, then `env`, then
+  `default`, deduplicated, as `Cask::Config#languages` orders them). That
+  list applies to all three sides of that cask, matching what `brew upgrade`
+  would pick.
+- Selection follows Homebrew's `Locale` rules (`locale.rb`):
+  - Each preferred language is taken in order.
+  - The first block with a locale `eql?` to it wins; failing that, the first
+    block whose locale it `include?`s.
+  - If no preferred language matches, the `default: true` block is used.
+  - Locales that don't parse are skipped.
+- With an unknown host, or without a `default: true` block, language blocks
+  stay opaque, as before.
 
 ## Re-running
 

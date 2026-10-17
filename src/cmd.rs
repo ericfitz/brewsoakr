@@ -696,7 +696,8 @@ pub fn info(
         match r.class {
             PkgClass::NoSoak => {
                 let installed = inv.find_in(&r.origin, &r.name).and_then(|p| {
-                    parse_pkg(brew, p.kind, &p.receipt_rb, brew.host_platform().as_ref()).ok()
+                    let host = host_for_pkg(brew, p.kind, &p.name, brew.host_platform().as_ref());
+                    parse_pkg(brew, p.kind, &p.receipt_rb, host.as_ref()).ok()
                 });
                 let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
@@ -1700,11 +1701,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         dep: &str,
     ) -> Result<bool, Error> {
         let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, dep_origin, dep, kind)?;
+        let host = host_for_pkg(self.brew, kind, dep, self.brew.host_platform().as_ref());
         let status = eligibility::upstream_status(
             blobs.cutoff.as_deref(),
             blobs.head.as_deref(),
             &calendar_today(),
-            self.brew.host_platform().as_ref(),
+            host.as_ref(),
         );
         if status != UpstreamStatus::Eligible {
             self.refuse_ineligible_dep(target, target_token, dep, status)?;
@@ -1712,7 +1714,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         // The wanted cutoff and the installed receipt are parsed together:
         // one brew call for their url-derived versions, all or none.
-        let host = self.brew.host_platform();
         let cutoff_rb = blobs
             .cutoff
             .as_deref()
@@ -2438,6 +2439,8 @@ fn resolve_view_unordered(
     receipt_rb: Option<&str>,
     host: Option<&HostPlatform>,
 ) -> Result<Option<ResolvedView>, Error> {
+    let own_host = host_for_pkg(brew, kind, name, host);
+    let host = own_host.as_ref();
     let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
     // The three sides are parsed together so a formula's url-derived versions
     // are asked of brew in one call, and all resolve or none do.
@@ -2616,6 +2619,25 @@ fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
         PkgKind::Formula => cache.join("core.git"),
         PkgKind::Cask => cache.join("cask.git"),
     }
+}
+
+/// `host` with the languages an installed cask was installed under, so every
+/// side of that cask picks the `language` block `brew upgrade` would. Any
+/// other package, or a cask whose saved config is unreadable, keeps the
+/// run-level languages.
+fn host_for_pkg(
+    brew: &impl Brew,
+    kind: PkgKind,
+    name: &str,
+    host: Option<&HostPlatform>,
+) -> Option<HostPlatform> {
+    let mut host = host.cloned();
+    if kind == PkgKind::Cask
+        && let (Some(h), Some(languages)) = (host.as_mut(), brew.cask_languages(name))
+    {
+        h.languages = languages;
+    }
+    host
 }
 
 /// `host` resolves platform blocks for both kinds; `None` leaves them opaque.
@@ -7876,6 +7898,46 @@ mod tests {
             report::identity_version(view.cutoff.as_ref().unwrap()),
             "3.39.11,dy27whJwwmb,a"
         );
+    }
+
+    #[test]
+    fn resolve_view_evaluates_a_cask_with_its_saved_languages() {
+        let cave = include_str!("../tests/fixtures/cave-story.rb");
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/c/cave-story.rb", cave);
+        git.insert_blob("caskhead", "Casks/c/cave-story.rb", cave);
+        let receipt = crate::brew::version_only_cask_receipt("cave-story", "0.2.0");
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US\n");
+        let resolve = |brew: &MockBrew| {
+            resolve_view(
+                brew,
+                &git,
+                &core_snaps(),
+                unused_cache(),
+                "homebrew/cask",
+                "cave-story",
+                PkgKind::Cask,
+                Some(&receipt),
+            )
+            .unwrap()
+            .expect("resolvable")
+        };
+        let en = resolve(&brew);
+        assert_eq!(
+            report::identity_version(en.cutoff.as_ref().unwrap()),
+            "0.1.0,2"
+        );
+        assert_ne!(en.action, DesiredAction::NoOpAlreadySoaked);
+        brew.cask_languages
+            .insert("cave-story".into(), vec!["ja".into()]);
+        let ja = resolve(&brew);
+        assert_eq!(
+            report::identity_version(ja.cutoff.as_ref().unwrap()),
+            "0.2.0"
+        );
+        assert_eq!(report::identity_version(ja.head.as_ref().unwrap()), "0.2.0");
+        assert_eq!(ja.action, DesiredAction::NoOpAlreadySoaked);
     }
 
     #[test]

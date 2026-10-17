@@ -13,19 +13,30 @@ pub struct HostPlatform {
     pub macos: String,
     /// Every `(codename, version)` brew knows, e.g. `("big_sur", "11")`.
     pub macos_versions: Vec<(String, String)>,
+    /// The preferred languages of `Cask::Config`, in order, e.g. `["en-US"]`.
+    /// Unparsed: a cask's `language` blocks skip any that `Locale` rejects.
+    pub languages: Vec<String>,
 }
 
 impl HostPlatform {
     /// Reads the output of `brew::HOST_PLATFORM_RUBY`: one `<codename>
-    /// <version>` line per known release, then `HOST <codename> <arch>`.
+    /// <version>` line per known release, then `HOST <codename> <arch>` and an
+    /// optional `LANG <language>...` line (bare when no language is set).
     /// `None` unless the host line is present, names a known codename and a
     /// known architecture, and every other line has a version.
     pub fn parse(output: &str) -> Option<Self> {
         let mut versions = Vec::new();
         let mut host = None;
+        let mut languages = None;
         for line in output.lines().filter(|l| !l.trim().is_empty()) {
             let parts: Vec<&str> = line.split_whitespace().collect();
             match parts.as_slice() {
+                ["LANG", langs @ ..] => {
+                    if languages.is_some() {
+                        return None;
+                    }
+                    languages = Some(langs.iter().map(|l| l.to_string()).collect());
+                }
                 ["HOST", codename, arch] => host = Some((*codename, *arch)),
                 [codename, version] if *codename != "HOST" => {
                     parse_dotted(version)?;
@@ -42,6 +53,7 @@ impl HostPlatform {
             arch: arch.to_string(),
             macos: macos.to_string(),
             macos_versions: versions,
+            languages: languages.unwrap_or_default(),
         })
     }
 
@@ -438,6 +450,181 @@ fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> O
     None
 }
 
+/// Homebrew's `Locale` (`Library/Homebrew/locale.rb`): a language, script and
+/// region, each optional, parsed with the same scanner and compared the same
+/// way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Locale {
+    language: Option<String>,
+    script: Option<String>,
+    region: Option<String>,
+}
+
+impl Locale {
+    /// `Locale.try_parse`: an ISO 639 language (2-3 lowercase letters), an
+    /// ISO 15924 script (`Hant`) and an ISO 3166 or UN M.49 region (`TW`,
+    /// `419`), each but the last followed by `-` unless it ends the string.
+    fn try_parse(s: &str) -> Option<Self> {
+        /// Takes `len(rest)` bytes off `rest`; a language or script must then
+        /// be followed by `-` and more, or end the string.
+        fn take<'a>(
+            rest: &mut &'a str,
+            len: fn(&str) -> usize,
+            separated: bool,
+        ) -> Option<Option<String>> {
+            let n = len(rest);
+            if n == 0 {
+                return Some(None);
+            }
+            let taken = rest[..n].to_string();
+            *rest = &rest[n..];
+            if separated {
+                let sep = rest.starts_with('-');
+                if sep {
+                    *rest = &rest[1..];
+                }
+                if (sep && rest.is_empty()) || (!sep && !rest.is_empty()) {
+                    return None;
+                }
+            }
+            Some(Some(taken))
+        }
+        let mut rest = s;
+        let language = take(&mut rest, language_len, true)?;
+        let script = take(&mut rest, script_len, true)?;
+        let region = take(&mut rest, region_len, false)?;
+        if !rest.is_empty() || (language.is_none() && script.is_none() && region.is_none()) {
+            return None;
+        }
+        Some(Self {
+            language,
+            script,
+            region,
+        })
+    }
+
+    /// `eql?` against a string; false when it does not parse.
+    fn eql(&self, other: &str) -> bool {
+        Self::try_parse(other).is_some_and(|o| *self == o)
+    }
+
+    /// `include?`: every part `other` has, `self` has too.
+    fn include(&self, other: &str) -> bool {
+        let Some(o) = Self::try_parse(other) else {
+            return false;
+        };
+        [
+            (&self.language, &o.language),
+            (&self.script, &o.script),
+            (&self.region, &o.region),
+        ]
+        .iter()
+        .all(|(mine, theirs)| theirs.is_none() || mine == theirs)
+    }
+
+    /// `detect`: the index of the first group with a locale `eql?` to this
+    /// one, else of the first group with a locale this one `include?`s.
+    fn detect(&self, groups: &[Vec<String>]) -> Option<usize> {
+        groups
+            .iter()
+            .position(|g| g.iter().any(|l| self.eql(l)))
+            .or_else(|| {
+                groups
+                    .iter()
+                    .position(|g| g.iter().any(|l| self.include(l)))
+            })
+    }
+}
+
+impl std::fmt::Display for Locale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<&str> = [&self.language, &self.script, &self.region]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        f.write_str(&parts.join("-"))
+    }
+}
+
+/// `[a-z]{2,3}`, greedy.
+fn language_len(s: &str) -> usize {
+    let n = s.bytes().take(3).take_while(u8::is_ascii_lowercase).count();
+    if n >= 2 { n } else { 0 }
+}
+
+/// `[A-Z][a-z]{3}`.
+fn script_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    if b.len() >= 4 && b[0].is_ascii_uppercase() && b[1..4].iter().all(u8::is_ascii_lowercase) {
+        4
+    } else {
+        0
+    }
+}
+
+/// `[A-Z]{2}|\d{3}`.
+fn region_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    if b.len() >= 2 && b[..2].iter().all(u8::is_ascii_uppercase) {
+        2
+    } else if b.len() >= 3 && b[..3].iter().all(u8::is_ascii_digit) {
+        3
+    } else {
+        0
+    }
+}
+
+/// Whether Homebrew's `Locale` parses `language`; `Cask::Config#languages`
+/// drops those that do not.
+pub fn is_valid_language(language: &str) -> bool {
+    Locale::try_parse(language).is_some()
+}
+
+/// A cask `language "a", "b", default: true do` line: the locales it names and
+/// whether it is the default. `None` unless every argument is a quoted string
+/// or `default: true|false`.
+fn parse_language_line(code: &str) -> Option<(Vec<String>, bool)> {
+    let args = code.strip_prefix("language ")?.strip_suffix(" do")?;
+    let mut locales = Vec::new();
+    let mut default = false;
+    for arg in args.split(',').map(str::trim) {
+        if let Some(q) = arg.strip_prefix('"').and_then(|a| a.strip_suffix('"')) {
+            if q.contains(['"', '\\', '#']) {
+                return None;
+            }
+            locales.push(q.to_string());
+        } else {
+            default = match arg {
+                "default: true" => true,
+                "default: false" => false,
+                _ => return None,
+            };
+        }
+    }
+    (!locales.is_empty()).then_some((locales, default))
+}
+
+/// `Cask::DSL#language_eval`: which of the cask's top-level `language` blocks
+/// applies. `groups` are the blocks' locales in order and `default` the index
+/// of the `default: true` one. `None` without exactly one default.
+fn select_language_block(groups: &[(Vec<String>, bool)], languages: &[String]) -> Option<usize> {
+    let mut defaults = groups
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| g.1)
+        .map(|(i, _)| i);
+    let default = defaults.next().filter(|_| defaults.next().is_none())?;
+    let locales: Vec<Vec<String>> = groups.iter().map(|g| g.0.clone()).collect();
+    Some(
+        languages
+            .iter()
+            .filter_map(|l| Locale::try_parse(l))
+            .find_map(|l| l.detect(&locales))
+            .unwrap_or(default),
+    )
+}
+
 /// Lines in the formula/cask body, not inside `resource`/`livecheck`/`bottle`/`on_*`.
 /// A body-level `stable do` block is transparent: it holds the stable spec's
 /// `url`/`version`/`sha256`, which are the formula's identity. `head do` and
@@ -445,8 +632,29 @@ fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> O
 /// (`on_arm`, `on_monterey :or_newer`, ...) that applies to it is transparent too,
 /// as is an `if` whose condition `condition_holds` can decide (and its `else`
 /// when the condition fails). `if`, `unless`, `case`, `begin`, `while`, `until`
-/// and `def` blocks are tracked so their `end` closes the right entry.
+/// and `def` blocks are tracked so their `end` closes the right entry. With a
+/// `host`, the top-level `language` block that `select_language_block` picks
+/// from `host.languages` is transparent too.
 fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
+    let Some(h) = host else {
+        return depth1_pass(rb, None, None).0;
+    };
+    let (lines, groups) = depth1_pass(rb, host, None);
+    match select_language_block(&groups, &h.languages) {
+        Some(i) => depth1_pass(rb, host, Some(i)).0,
+        None => lines,
+    }
+}
+
+/// One walk of `depth1_lines`. `language` is the index of the top-level
+/// `language` block to read as transparent; the other `language` blocks stay
+/// opaque. Also returns every such block's `(locales, default)`; a block
+/// whose arguments cannot be read makes the list empty, so none is chosen.
+fn depth1_pass<'a>(
+    rb: &'a str,
+    host: Option<&HostPlatform>,
+    language: Option<usize>,
+) -> (Vec<&'a str>, Vec<(Vec<String>, bool)>) {
     struct Open {
         transparent: bool,
         /// An `if` chain whose conditions were all recognized so far: `Some(true)`
@@ -458,6 +666,8 @@ fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
     let mut depth = 0i32;
     let mut open_blocks: Vec<Open> = Vec::new();
     let mut out = Vec::new();
+    let mut groups = Vec::new();
+    let mut unreadable = false;
     for line in rb.lines() {
         let t = line.trim_start();
         if is_ruby_end(t) {
@@ -497,8 +707,19 @@ fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
             (Some(h), Some(cond)) if depth == 1 => condition_holds(cond, h),
             _ => None,
         };
+        let mut chosen_language = false;
+        if depth == 1 && code.starts_with("language ") && code.ends_with(" do") {
+            match parse_language_line(code) {
+                Some(group) => {
+                    chosen_language = language == Some(groups.len());
+                    groups.push(group);
+                }
+                None => unreadable = true,
+            }
+        }
         let transparent = depth == 1
             && (is_stable_do(t)
+                || chosen_language
                 || host.is_some_and(|h| h.block_applies(t))
                 || condition == Some(true));
         if depth == 1 && !transparent {
@@ -514,7 +735,10 @@ fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
             }
         }
     }
-    out
+    if unreadable {
+        groups.clear();
+    }
+    (out, groups)
 }
 
 /// Whether an `if` condition holds on `host`. Only `Hardware::CPU.arm?`,
@@ -1748,5 +1972,141 @@ mod platform_tests {
             ..a.clone()
         };
         assert!(PkgIdentity::Formula(a).same_artifact(&PkgIdentity::Formula(b)));
+    }
+
+    const CAVE_STORY: &str = include_str!("../tests/fixtures/cave-story.rb");
+    const FIREFOX: &str = include_str!("../tests/fixtures/firefox.rb");
+    const CAVE_EN_SHA: &str = "30e32c5123b984d0733a1e1e510a1255d511e69b694c4227119c69161ba1dc55";
+    const CAVE_JA_SHA: &str = "fb90f6851e0351c0f8bce52f0cd22f2b26007b9f98543311377c41f6cabb472a";
+    const FIREFOX_EN_SHA: &str = "dfe8508ee8880cec1578253eb02b9154b5971a55e832d97396f463cd07b5ef67";
+    const FIREFOX_FR_SHA: &str = "83c6645f81689786e16b508b051c36107edf0089181ff33231f0b0446327e11a";
+
+    fn host_with(langs: &[&str]) -> HostPlatform {
+        HostPlatform::parse(&format!(
+            "{SYMBOLS}HOST sequoia arm64\nLANG {}\n",
+            langs.join(" ")
+        ))
+        .expect("host")
+    }
+
+    #[test]
+    fn host_platform_reads_the_lang_line() {
+        assert_eq!(host_with(&["en-US", "ja"]).languages, ["en-US", "ja"]);
+        assert!(host_with(&[]).languages.is_empty());
+        assert!(host("sequoia", "arm64").languages.is_empty());
+    }
+
+    #[test]
+    fn host_platform_rejects_a_repeated_lang_line() {
+        let out = format!("{SYMBOLS}HOST sequoia arm64\nLANG en\nLANG ja\n");
+        assert_eq!(HostPlatform::parse(&out), None);
+    }
+
+    #[test]
+    fn locale_parses_like_homebrew() {
+        let l = Locale::try_parse("zh-Hant-TW").expect("parse");
+        assert_eq!(l.to_string(), "zh-Hant-TW");
+        assert_eq!(
+            (
+                l.language.as_deref(),
+                l.script.as_deref(),
+                l.region.as_deref()
+            ),
+            (Some("zh"), Some("Hant"), Some("TW"))
+        );
+        assert_eq!(Locale::try_parse("en").unwrap().region, None);
+        assert_eq!(
+            Locale::try_parse("US").unwrap().region.as_deref(),
+            Some("US")
+        );
+        assert_eq!(
+            Locale::try_parse("419").unwrap().region.as_deref(),
+            Some("419")
+        );
+        for bad in [
+            "",
+            "e",
+            "en-",
+            "-US",
+            "en_US",
+            "en-US-",
+            "ja-JP-mac",
+            "en US",
+            "english",
+        ] {
+            assert!(Locale::try_parse(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn locale_eql_and_include_follow_homebrew() {
+        let us = Locale::try_parse("en-US").unwrap();
+        assert!(us.eql("en-US"));
+        assert!(!us.eql("en"));
+        assert!(!us.eql("garbage"));
+        assert!(us.include("en"));
+        assert!(us.include("en-US"));
+        assert!(!us.include("en-GB"));
+        assert!(!us.include("garbage"));
+        assert!(!Locale::try_parse("en").unwrap().include("en-US"));
+    }
+
+    #[test]
+    fn locale_detect_prefers_an_exact_group_over_an_earlier_inclusive_one() {
+        let groups: Vec<Vec<String>> = [&["en"][..], &["en-US"][..], &["fr", "fr-CA"][..]]
+            .iter()
+            .map(|g| g.iter().map(|s| s.to_string()).collect())
+            .collect();
+        let detect = |s: &str| Locale::try_parse(s).unwrap().detect(&groups);
+        assert_eq!(detect("en-US"), Some(1));
+        assert_eq!(detect("en-GB"), Some(0));
+        assert_eq!(detect("fr-CA"), Some(2));
+        assert_eq!(detect("de"), None);
+    }
+
+    #[test]
+    fn cave_story_language_blocks_follow_the_hosts_languages() {
+        let id = |langs: &[&str]| parse_cask(CAVE_STORY, Some(&host_with(langs))).unwrap();
+        let en = id(&["en-US"]);
+        assert_eq!(en.version, "0.1.0,2");
+        assert_eq!(en.sha256, Some(CAVE_EN_SHA.to_string()));
+        let ja = id(&["ja-JP"]);
+        assert_eq!(ja.version, "0.2.0");
+        assert_eq!(ja.sha256, Some(CAVE_JA_SHA.to_string()));
+        assert_eq!(
+            id(&[]).sha256,
+            Some(CAVE_EN_SHA.to_string()),
+            "no preference: default"
+        );
+        assert_eq!(
+            id(&["not a locale", "ja"]).sha256,
+            Some(CAVE_JA_SHA.to_string()),
+            "garbage skipped"
+        );
+        assert_eq!(
+            id(&["xx"]).sha256,
+            Some(CAVE_EN_SHA.to_string()),
+            "no match: default"
+        );
+    }
+
+    #[test]
+    fn cave_story_stays_unparseable_without_a_host() {
+        assert!(parse_cask(CAVE_STORY, None).is_err());
+    }
+
+    #[test]
+    fn firefox_prefers_the_exact_locale_then_the_inclusive_one() {
+        let sha = |langs: &[&str]| parse_cask(FIREFOX, Some(&host_with(langs))).unwrap().sha256;
+        assert_eq!(sha(&["en-US"]), Some(FIREFOX_EN_SHA.to_string()));
+        assert_eq!(sha(&["fr"]), Some(FIREFOX_FR_SHA.to_string()));
+        assert_eq!(sha(&[]), Some(FIREFOX_EN_SHA.to_string()));
+        assert_eq!(parse_cask(FIREFOX, None).unwrap().sha256, None);
+    }
+
+    #[test]
+    fn language_blocks_stay_opaque_without_a_default() {
+        let rb = "cask \"x\" do\n  language \"en\" do\n    version \"1\"\n    sha256 \"aa\"\n    \"en\"\n  end\n  language \"ja\" do\n    version \"2\"\n    sha256 \"bb\"\n    \"ja\"\n  end\nend\n";
+        assert!(parse_cask(rb, Some(&host_with(&["ja"]))).is_err());
     }
 }
