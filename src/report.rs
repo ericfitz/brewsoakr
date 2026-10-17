@@ -238,12 +238,14 @@ mod tests {
             revision: 0,
             rebuild: None,
             sha256: "aaa".into(),
+            derived_from: None,
         });
         let cut = PkgIdentity::Formula(crate::identity::FormulaIdentity {
             version: "1.1.0".into(),
             revision: 0,
             rebuild: None,
             sha256: "bbb".into(),
+            derived_from: None,
         });
         let line = compact_info_line(
             "wget",
@@ -261,6 +263,7 @@ mod tests {
             revision: 0,
             rebuild: None,
             sha256: "bbb".into(),
+            derived_from: None,
         });
         let line = evaluate_line(
             "packer",
@@ -282,6 +285,7 @@ mod tests {
             revision,
             rebuild: None,
             sha256: "s".into(),
+            derived_from: None,
         })
     }
 

@@ -44,7 +44,7 @@ pub fn ahead_message(name: &str) -> String {
 
 pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
     format!(
-        "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed the formula)"
+        "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed it)"
     )
 }
 
@@ -538,6 +538,9 @@ pub fn outdated(
             }
             continue;
         };
+        // `bare_action` may turn the action into `LeaveAutoUpdates`; keep the
+        // original so that entry prints the right comparison.
+        let resolved_action = view.action;
         view.action = bare_action(&view, greedy);
         for warn in &view.warnings {
             writeln!(out, "warning: {warn}")?;
@@ -597,7 +600,12 @@ pub fn outdated(
                     .as_ref()
                     .map(report::identity_version)
                     .unwrap_or_else(|| "none".into());
-                auto_updates.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
+                let cmp = match resolved_action {
+                    DesiredAction::LeaveNewerThanCutoff => '>',
+                    DesiredAction::HoldUnordered => '?',
+                    _ => '<',
+                };
+                auto_updates.push(format!("{} ({installed_ver}) {cmp} {cutoff_ver}", pkg.name));
             }
             DesiredAction::NoOpAlreadySoaked => soaked += 1,
         }
@@ -659,6 +667,9 @@ pub fn info(
             report::soak_banner("showing info", snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
+    if names.is_empty() {
+        prefetch_orderings(brew, git, snaps, cache, inv);
+    }
     let owned_names: Vec<String> = if names.is_empty() {
         inv.pkgs.iter().map(|p| p.name.clone()).collect()
     } else {
@@ -685,7 +696,8 @@ pub fn info(
         match r.class {
             PkgClass::NoSoak => {
                 let installed = inv.find_in(&r.origin, &r.name).and_then(|p| {
-                    parse_pkg(p.kind, &p.receipt_rb, brew.host_platform().as_ref()).ok()
+                    let host = host_for_pkg(brew, p.kind, &p.name, brew.host_platform().as_ref());
+                    parse_pkg(brew, p.kind, &p.receipt_rb, host.as_ref()).ok()
                 });
                 let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
@@ -1333,7 +1345,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let Some(rb) = self.brew.keg_receipt(name, version) else {
             return false;
         };
-        match crate::identity::parse_formula(&rb) {
+        match parse_formula_detected(self.brew, &rb, self.brew.host_platform().as_ref()) {
             Ok(have) => PkgIdentity::Formula(have).same_artifact(want),
             Err(_) => false,
         }
@@ -1689,18 +1701,41 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         dep: &str,
     ) -> Result<bool, Error> {
         let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, dep_origin, dep, kind)?;
+        let host = host_for_pkg(self.brew, kind, dep, self.brew.host_platform().as_ref());
         let status = eligibility::upstream_status(
             blobs.cutoff.as_deref(),
             blobs.head.as_deref(),
             &calendar_today(),
+            host.as_ref(),
         );
         if status != UpstreamStatus::Eligible {
             self.refuse_ineligible_dep(target, target_token, dep, status)?;
             return Ok(false);
         }
-        let want = blobs.cutoff.as_deref().and_then(|bytes| {
-            parse_pkg_bytes(kind, bytes, self.brew.host_platform().as_ref()).ok()
-        });
+        // The wanted cutoff and the installed receipt are parsed together:
+        // one brew call for their url-derived versions, all or none.
+        let cutoff_rb = blobs
+            .cutoff
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok());
+        let installed_rb = self
+            .inv
+            .find_in(dep_origin, dep)
+            .map(|p| p.receipt_rb.as_str());
+        let sides: Vec<&str> = [cutoff_rb, installed_rb].into_iter().flatten().collect();
+        let mut parsed = parse_pkgs(self.brew, kind, &sides, host.as_ref())
+            .into_iter()
+            .map(Result::ok);
+        let want = if cutoff_rb.is_some() {
+            parsed.next().flatten()
+        } else {
+            None
+        };
+        let installed_id = if installed_rb.is_some() {
+            parsed.next().flatten()
+        } else {
+            None
+        };
         if self.already_done(dep, kind, want.as_ref()) {
             return Ok(true);
         }
@@ -1715,13 +1750,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         // which counts it; any other run counts it here.
         let counted_here = !self.bare_run && self.inv.find_in(dep_origin, dep).is_some();
         if counted_here {
-            let from = self
-                .inv
-                .find_in(dep_origin, dep)
-                .and_then(|p| {
-                    parse_pkg(kind, &p.receipt_rb, self.brew.host_platform().as_ref()).ok()
-                })
-                .map(|id| report::identity_version(&id));
+            let from = installed_id.as_ref().map(report::identity_version);
             let to = want.as_ref().map(report::identity_version);
             let (from, to) = (
                 from.unwrap_or_else(|| "?".into()),
@@ -2211,8 +2240,11 @@ struct ResolvedView {
 }
 
 /// What a bare `upgrade`/`outdated` does: an installed self-updating cask
-/// that is behind the cutoff is left to the app, as brew leaves it without
-/// `--greedy` / `--greedy-auto-updates`. Everything else keeps its action.
+/// is left to the app, as brew leaves it without `--greedy` /
+/// `--greedy-auto-updates`, whether it is behind the cutoff
+/// (`InstallCutoff`), newer than it (`LeaveNewerThanCutoff`) or unordered
+/// against it (`HoldUnordered`: the app owns its version, so there is
+/// nothing to hold). `LeaveAheadOfSoak` and every other action are kept.
 /// `greedy.latest` changes no action: a `:latest` cask is reinstalled only
 /// when its cutoff definition differs from the installed one, which
 /// `desired_action` already decides; see `latest_left` for the note.
@@ -2220,7 +2252,12 @@ fn bare_action(view: &ResolvedView, greedy: flags::Greedy) -> DesiredAction {
     if view.auto_updates
         && !greedy.auto_updates
         && view.installed.is_some()
-        && view.action == DesiredAction::InstallCutoff
+        && matches!(
+            view.action,
+            DesiredAction::InstallCutoff
+                | DesiredAction::LeaveNewerThanCutoff
+                | DesiredAction::HoldUnordered
+        )
     {
         DesiredAction::LeaveAutoUpdates
     } else {
@@ -2257,6 +2294,7 @@ fn resolve_view(
 ) -> Result<Option<ResolvedView>, Error> {
     let host = brew.host_platform();
     let Some(mut view) = resolve_view_unordered(
+        brew,
         git,
         snaps,
         cache,
@@ -2315,6 +2353,46 @@ fn order_pair(kind: PkgKind, view: &ResolvedView) -> Option<crate::brew::Version
     Some((kind, installed, cutoff))
 }
 
+/// Ask brew for the version of every url-derived formula a bare run will
+/// parse (installed receipt, cutoff and HEAD) in one call, so each parse finds
+/// its answer memoized. A failure is left for each parse to meet and fall back.
+fn prefetch_versions(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    inv: &Inventory,
+    host: Option<&HostPlatform>,
+) {
+    let mut sources: Vec<identity::VersionSource> = Vec::new();
+    let mut add = |rb: &str| {
+        if let Ok(id) = identity::parse_formula(rb, host)
+            && let Some(src) = id.derived_from
+            && !sources.contains(&src)
+        {
+            sources.push(src);
+        }
+    };
+    // Every package a caller can resolve, pinned ones included: `info` and
+    // `update` resolve them though a bare upgrade leaves them alone.
+    for pkg in snapshotted_pkgs(inv, snaps).filter(|p| p.kind == PkgKind::Formula) {
+        add(&pkg.receipt_rb);
+        if let Ok(blobs) = resolve_pkg_blobs(git, snaps, cache, &pkg.origin, &pkg.name, pkg.kind) {
+            for bytes in [blobs.cutoff.as_deref(), blobs.head.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(rb) = std::str::from_utf8(bytes) {
+                    add(rb);
+                }
+            }
+        }
+    }
+    if !sources.is_empty() {
+        let _ = brew.detect_versions(&sources);
+    }
+}
+
 /// Ask brew for every version order a bare run will need in one call, so
 /// `resolve_view` finds them memoized. A failure here is left for each
 /// package's own comparison to report.
@@ -2327,8 +2405,10 @@ fn prefetch_orderings(
 ) {
     let mut pairs = Vec::new();
     let host = brew.host_platform();
-    for pkg in snapshotted_pkgs(inv, snaps).filter(|p| bare_skip(p, snaps).is_none()) {
+    prefetch_versions(brew, git, snaps, cache, inv, host.as_ref());
+    for pkg in snapshotted_pkgs(inv, snaps) {
         if let Ok(Some(view)) = resolve_view_unordered(
+            brew,
             git,
             snaps,
             cache,
@@ -2349,6 +2429,7 @@ fn prefetch_orderings(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_view_unordered(
+    brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -2358,31 +2439,41 @@ fn resolve_view_unordered(
     receipt_rb: Option<&str>,
     host: Option<&HostPlatform>,
 ) -> Result<Option<ResolvedView>, Error> {
+    let own_host = host_for_pkg(brew, kind, name, host);
+    let host = own_host.as_ref();
     let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
-    let installed = match receipt_rb {
-        Some(rb) => match parse_pkg(kind, rb, host) {
-            Ok(id) => Some(id),
-            Err(_) => return Ok(None),
-        },
-        None => None,
+    // The three sides are parsed together so a formula's url-derived versions
+    // are asked of brew in one call, and all resolve or none do.
+    fn text(bytes: &Option<Vec<u8>>) -> Option<Result<&str, ()>> {
+        bytes
+            .as_deref()
+            .map(|b| std::str::from_utf8(b).map_err(|_| ()))
+    }
+    let (Some(cutoff_rb), Some(head_rb)) = (
+        text(&blobs.cutoff).transpose().ok(),
+        text(&blobs.head).transpose().ok(),
+    ) else {
+        return Ok(None);
     };
-    let cutoff = match blobs.cutoff.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(kind, bytes, host) {
-            Ok(id) => Some(id),
-            Err(_) => return Ok(None),
-        },
-        None => None,
+    let sides = [receipt_rb, cutoff_rb, head_rb];
+    let present: Vec<&str> = sides.iter().flatten().copied().collect();
+    let mut parsed = parse_pkgs(brew, kind, &present, host).into_iter();
+    let mut next_side = |side: Option<&str>| -> Result<Option<PkgIdentity>, ()> {
+        match side {
+            Some(_) => parsed.next().and_then(Result::ok).map(Some).ok_or(()),
+            None => Ok(None),
+        }
     };
-    let head = match blobs.head.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(kind, bytes, host) {
-            Ok(id) => Some(id),
-            Err(_) => return Ok(None),
-        },
-        None => None,
+    let (Ok(installed), Ok(cutoff), Ok(head)) = (
+        next_side(sides[0]),
+        next_side(sides[1]),
+        next_side(sides[2]),
+    ) else {
+        return Ok(None);
     };
     let today = calendar_today();
     let status =
-        eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref(), &today);
+        eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref(), &today, host);
     let action =
         eligibility::desired_action(status, installed.as_ref(), cutoff.as_ref(), head.as_ref());
     let head_rb = blobs
@@ -2390,7 +2481,7 @@ fn resolve_view_unordered(
         .as_deref()
         .and_then(|b| std::str::from_utf8(b).ok());
     let warnings = match head_rb {
-        Some(rb) => identity::upcoming_lifecycle_messages(rb, &today)
+        Some(rb) => identity::upcoming_lifecycle_messages(rb, &today, host)
             .into_iter()
             .map(|msg| format!("{name} {msg}"))
             .collect(),
@@ -2530,22 +2621,125 @@ fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
     }
 }
 
-/// Formulae ignore `host`: only cask platform blocks are resolved.
-fn parse_pkg(kind: PkgKind, rb: &str, host: Option<&HostPlatform>) -> Result<PkgIdentity, Error> {
+/// `host` with the languages `brew upgrade` evaluates a cask with, so every
+/// side of that cask picks the `language` block it would: a `--language` flag
+/// first (brew's args-explicit config), then the installed cask's saved
+/// `explicit` languages, then the live run-level list (`Cask::Config.new`:
+/// `HOMEBREW_CASK_OPTS` plus the system default), deduplicated, with those
+/// `Locale` cannot parse dropped. Saved `env` and `default` are not used:
+/// `Cask::Config#merge` discards them. Formulae keep the run-level host.
+fn host_for_pkg(
+    brew: &impl Brew,
+    kind: PkgKind,
+    name: &str,
+    host: Option<&HostPlatform>,
+) -> Option<HostPlatform> {
+    let mut host = host.cloned();
+    if kind == PkgKind::Cask
+        && let Some(h) = host.as_mut()
+    {
+        let mut languages: Vec<String> = Vec::new();
+        for lang in brew
+            .cli_languages()
+            .into_iter()
+            .chain(brew.cask_languages(name).unwrap_or_default())
+            .chain(std::mem::take(&mut h.languages))
+        {
+            if identity::is_valid_language(&lang) && !languages.contains(&lang) {
+                languages.push(lang);
+            }
+        }
+        h.languages = languages;
+    }
+    host
+}
+
+/// `host` resolves platform blocks for both kinds; `None` leaves them opaque.
+/// A formula version derived from its url is brew's `Version.detect` of it.
+fn parse_pkg(
+    brew: &impl Brew,
+    kind: PkgKind,
+    rb: &str,
+    host: Option<&HostPlatform>,
+) -> Result<PkgIdentity, Error> {
     match kind {
-        PkgKind::Formula => Ok(PkgIdentity::Formula(identity::parse_formula(rb)?)),
+        PkgKind::Formula => Ok(PkgIdentity::Formula(parse_formula_detected(
+            brew, rb, host,
+        )?)),
         PkgKind::Cask => Ok(PkgIdentity::Cask(identity::parse_cask(rb, host)?)),
     }
 }
 
-fn parse_pkg_bytes(
-    kind: PkgKind,
-    bytes: &[u8],
+/// `identity::parse_formula`, with a derived version replaced by brew's
+/// answer. A failed or empty answer keeps the local guess.
+fn parse_formula_detected(
+    brew: &impl Brew,
+    rb: &str,
     host: Option<&HostPlatform>,
-) -> Result<PkgIdentity, Error> {
-    let rb = std::str::from_utf8(bytes)
-        .map_err(|_| Error::Other("package blob is not valid UTF-8".into()))?;
-    parse_pkg(kind, rb, host)
+) -> Result<identity::FormulaIdentity, Error> {
+    let mut id = identity::parse_formula(rb, host)?;
+    detect_versions_of(brew, &mut [&mut id]);
+    Ok(id)
+}
+
+/// Parses several packages of one kind, in order, asking brew for all their
+/// url-derived formula versions in one call. When that call fails, every
+/// formula keeps its local guess, so no set of related identities mixes
+/// brew's version with a guess.
+fn parse_pkgs(
+    brew: &impl Brew,
+    kind: PkgKind,
+    rbs: &[&str],
+    host: Option<&HostPlatform>,
+) -> Vec<Result<PkgIdentity, Error>> {
+    match kind {
+        PkgKind::Cask => rbs
+            .iter()
+            .map(|rb| identity::parse_cask(rb, host).map(PkgIdentity::Cask))
+            .collect(),
+        PkgKind::Formula => {
+            let mut parsed: Vec<Result<identity::FormulaIdentity, Error>> = rbs
+                .iter()
+                .map(|rb| identity::parse_formula(rb, host))
+                .collect();
+            let mut ids: Vec<&mut identity::FormulaIdentity> =
+                parsed.iter_mut().filter_map(|r| r.as_mut().ok()).collect();
+            detect_versions_of(brew, &mut ids);
+            parsed
+                .into_iter()
+                .map(|r| r.map(PkgIdentity::Formula))
+                .collect()
+        }
+    }
+}
+
+/// Replaces the local guess of each url-derived version with brew's answer,
+/// from one `detect_versions` call. An error leaves every guess alone; a
+/// source brew cannot tell leaves only its own.
+fn detect_versions_of(brew: &impl Brew, ids: &mut [&mut identity::FormulaIdentity]) {
+    let mut sources: Vec<identity::VersionSource> = Vec::new();
+    for src in ids.iter().filter_map(|id| id.derived_from.as_ref()) {
+        if !sources.contains(src) {
+            sources.push(src.clone());
+        }
+    }
+    if sources.is_empty() {
+        return;
+    }
+    let Ok(answers) = brew.detect_versions(&sources) else {
+        return;
+    };
+    for id in ids.iter_mut() {
+        let Some(src) = &id.derived_from else {
+            continue;
+        };
+        if let Some(i) = sources.iter().position(|s| s == src)
+            && let Some(Some(v)) = answers.get(i)
+            && !v.is_empty()
+        {
+            id.version = v.clone();
+        }
+    }
 }
 
 fn hold_why(action: DesiredAction) -> Option<&'static str> {
@@ -4523,6 +4717,107 @@ mod tests {
         assert!(
             text.contains("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)"),
             "{text}"
+        );
+        assert!(text.contains("upgraded 2,"), "{text}");
+    }
+
+    #[test]
+    fn named_reinstall_upgrades_an_outdated_installed_dependency_first() {
+        let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["node".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(staged_install_order(&brew), ["simdutf", "node"], "{text}");
+        assert_eq!(
+            text.matches("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)")
+                .count(),
+            1,
+            "{text}"
+        );
+        assert!(text.contains("upgraded 2,"), "simdutf counted once: {text}");
+    }
+
+    #[test]
+    fn reinstall_true_repair_does_not_walk_dependencies() {
+        // node is at HEAD (a plain repair); its dependency is behind.
+        let (mut brew, git) = node_simdutf_world("1.2.0", "1.0.0", "");
+        brew.installed[0] = formula_pkg("node", formula_rb("node", "1.2.0", "newsha"));
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["node".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(staged_install_order(&brew).is_empty(), "{text}");
+        assert!(!text.contains("dependency of"), "{text}");
+        assert!(
+            lock_runs(&brew)
+                .iter()
+                .any(|a| a == &["reinstall".to_string(), "node".to_string()]),
+            "{text}"
+        );
+    }
+
+    /// Cask `app` (sorts first) depends on cask `helper`; both installed at
+    /// 1.0.0 behind a 1.1.0 cutoff.
+    fn cask_with_cask_dependency_world() -> (MockBrew, InMemoryGit) {
+        let git = InMemoryGit::new();
+        for name in ["app", "helper"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "caskcut",
+                &format!("Casks/{dir}/{name}.rb"),
+                cask_rb(name, "1.1.0"),
+            );
+            git.insert_blob(
+                "caskhead",
+                &format!("Casks/{dir}/{name}.rb"),
+                cask_rb(name, "1.2.0"),
+            );
+        }
+        let mut deps = BTreeMap::new();
+        deps.insert("app".to_string(), vec!["helper".to_string()]);
+        let brew = MockBrew {
+            installed: ["app", "helper"]
+                .map(|n| {
+                    cask_pkg_from(
+                        n,
+                        "homebrew/cask",
+                        crate::brew::version_only_cask_receipt(n, "1.0.0"),
+                    )
+                })
+                .to_vec(),
+            deps,
+            ..MockBrew::new()
+        };
+        (brew, git)
+    }
+
+    #[test]
+    fn installed_cask_dependency_is_not_reordered_ahead_of_its_dependent() {
+        let (brew, git) = cask_with_cask_dependency_world();
+        let text = upgrade_names(&brew, &git, &[]);
+        assert!(!text.contains("dependency of"), "{text}");
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "app"), "{text}");
+        assert!(
+            run_is_soaked_install(&runs, "helper"),
+            "helper upgrades at its own plan entry: {text}"
         );
         assert!(text.contains("upgraded 2,"), "{text}");
     }
@@ -6915,6 +7210,85 @@ mod tests {
         assert!(notes.contains("cannot be soaked"), "{text}");
     }
 
+    /// Installed `alt-tab` 7.38.1 (self-updating app) while the cutoff and
+    /// HEAD cask say 7.0.0: the app updated itself past the cutoff.
+    fn auto_updates_ahead_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let (brew, git, snaps) = auto_updates_world();
+        let rb = format!("{}  auto_updates true\n", cask_rb("alt-tab", "7.0.0"));
+        git.insert_blob("caskcut", "Casks/a/alt-tab.rb", rb.clone());
+        git.insert_blob("caskhead", "Casks/a/alt-tab.rb", rb);
+        (brew, git, snaps)
+    }
+
+    const ALT_TAB_NOTE: &str = "alt-tab: installed 7.38.1 is newer than cutoff 7.0.0";
+
+    #[test]
+    fn bare_run_leaves_a_self_updating_cask_newer_than_its_cutoff_to_the_app() {
+        let (mut brew, git, snaps) = auto_updates_ahead_world();
+        brew.orderings.insert(
+            ("7.38.1".to_string(), "7.0.0".to_string()),
+            std::cmp::Ordering::Greater,
+        );
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            "{text}"
+        );
+        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
+        assert!(text.contains("ahead 0"), "{text}");
+        assert!(text.contains("auto-updates 1"), "{text}");
+        assert!(!text.contains(ALT_TAB_NOTE), "{text}");
+        let text = greedy_outdated(&brew, &git, &snaps, &[]);
+        assert!(section_lines(&text, OUTDATED_HEADER).is_empty(), "{text}");
+        assert!(
+            section_lines(&text, "==> Ahead of soak").is_empty(),
+            "{text}"
+        );
+        assert_eq!(
+            section_lines(&text, AUTO_UPDATES_HEADER),
+            ["alt-tab (7.38.1) > 7.0.0"],
+            "{text}"
+        );
+        for argv in [&["--greedy"][..], &["--greedy-auto-updates"][..]] {
+            let text = greedy_upgrade(&brew, &git, &snaps, argv);
+            assert!(text.contains("ahead 1"), "{argv:?}: {text}");
+            assert!(!text.contains("auto-updates"), "{argv:?}: {text}");
+            assert!(text.contains(ALT_TAB_NOTE), "{argv:?}: {text}");
+            let text = greedy_outdated(&brew, &git, &snaps, argv);
+            assert_eq!(
+                section_lines(&text, "==> Ahead of soak"),
+                ["alt-tab (7.38.1) > 7.0.0"],
+                "{argv:?}: {text}"
+            );
+            assert!(
+                section_lines(&text, AUTO_UPDATES_HEADER).is_empty(),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_run_leaves_a_self_updating_cask_brew_cannot_order_to_the_app() {
+        let (mut brew, git, snaps) = auto_updates_ahead_world();
+        brew.compare_error = Some("brew ruby exploded".into());
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            "{text}"
+        );
+        assert!(text.contains("held 0"), "not held on a bare run: {text}");
+        assert!(text.contains("auto-updates 1"), "{text}");
+        let text = greedy_outdated(&brew, &git, &snaps, &[]);
+        assert!(section_lines(&text, "==> Held").is_empty(), "{text}");
+        assert_eq!(
+            section_lines(&text, AUTO_UPDATES_HEADER),
+            ["alt-tab (7.38.1) ? 7.0.0"],
+            "{text}"
+        );
+        let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy"]);
+        assert!(text.contains("held 1"), "{text}");
+    }
+
     /// `openssl@3` installed at 3.6.5 while upstream re-pointed the formula
     /// at the 3.5 line: cutoff and HEAD are both 3.5.9.
     fn openssl_repoint_world() -> (MockBrew, InMemoryGit, Snapshots) {
@@ -6940,7 +7314,7 @@ mod tests {
         );
     }
 
-    const OPENSSL_NOTE: &str = "openssl@3: installed 3.6.5 is newer than cutoff 3.5.9; leaving it (upstream may have re-pointed the formula)";
+    const OPENSSL_NOTE: &str = "openssl@3: installed 3.6.5 is newer than cutoff 3.5.9; leaving it (upstream may have re-pointed it)";
 
     #[test]
     fn bare_upgrade_never_downgrades_a_repointed_formula() {
@@ -7087,6 +7461,257 @@ mod tests {
         );
     }
 
+    /// stockfish installed at `sf_18`, cutoff and HEAD at `sf_19`; brew's
+    /// `Version.detect` calls them 18 and 19. `crafty` is url-derived too.
+    fn detect_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        let new = formula_rb("stockfish", "sf_19", "sha19");
+        git.insert_blob("cutoffsha", "Formula/s/stockfish.rb", new.clone());
+        git.insert_blob("headsha", "Formula/s/stockfish.rb", new);
+        let crafty = formula_rb("crafty", "25.3", "craftynew");
+        git.insert_blob("cutoffsha", "Formula/c/crafty.rb", crafty.clone());
+        git.insert_blob("headsha", "Formula/c/crafty.rb", crafty);
+        let mut brew = MockBrew {
+            installed: vec![
+                formula_pkg("stockfish", formula_rb("stockfish", "sf_18", "sha18")),
+                formula_pkg("crafty", formula_rb("crafty", "25.2", "craftyold")),
+            ],
+            ..MockBrew::new()
+        };
+        for (url, v) in [
+            ("stockfish-sf_18", "18"),
+            ("stockfish-sf_19", "19"),
+            ("crafty-25.2", "25.2"),
+            ("crafty-25.3", "25.3"),
+        ] {
+            brew.detections.insert(
+                (format!("https://example.com/{url}.tar.gz"), None),
+                v.to_string(),
+            );
+        }
+        (brew, git, core_snaps())
+    }
+
+    fn stockfish_pairs(brew: &MockBrew) -> Vec<(String, String)> {
+        brew.compares
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|(_, a, _)| a.contains("18"))
+            .map(|(_, a, b)| (a.clone(), b.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_url_derived_version_comes_from_brew_not_the_heuristic() {
+        let (brew, git, snaps) = detect_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(text.contains("18 -> 19"), "{text}");
+        assert!(!text.contains("sf_"), "{text}");
+        let pairs = stockfish_pairs(&brew);
+        assert!(!pairs.is_empty(), "{text}");
+        assert!(
+            pairs.iter().all(|p| *p == ("18".into(), "19".into())),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_detection_keeps_the_heuristic_version() {
+        let (mut brew, git, snaps) = detect_world();
+        brew.detect_error = Some("brew ruby exploded".into());
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            text.contains("stockfish-sf_18 -> stockfish-sf_19"),
+            "{text}"
+        );
+        let pairs = stockfish_pairs(&brew);
+        assert!(!pairs.is_empty(), "{text}");
+        assert!(
+            pairs
+                .iter()
+                .all(|p| *p == ("stockfish-sf_18".into(), "stockfish-sf_19".into())),
+            "{pairs:?}"
+        );
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew), "stockfish"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_bare_run_detects_every_derived_version_in_one_call_first() {
+        let (brew, git, snaps) = detect_world();
+        greedy_upgrade(&brew, &git, &snaps, &[]);
+        let detects = brew.detects.lock().unwrap().clone();
+        let first = detects.first().expect("a prefetch call");
+        let urls: std::collections::BTreeSet<&str> = first.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls.len(),
+            4,
+            "receipts and cutoffs of both formulae in one call: {first:?}"
+        );
+        assert_eq!(first.len(), 4, "no duplicates: {first:?}");
+        assert_eq!(
+            spawns(&brew).0,
+            1,
+            "later asks are per-view memo hits in brew: {detects:?}"
+        );
+    }
+
+    /// Every name installed at 1.0.0, cutoff 1.1.0 and HEAD 1.2.0 (so the
+    /// three sides have three different urls), all url-derived. `app`
+    /// depends on every other name. Brew's `Version.detect` says `d<version>-<name>`
+    /// for each url, so a detected version is never the heuristic one.
+    fn many_detect_world(names: &[&str]) -> (MockBrew, InMemoryGit) {
+        let git = InMemoryGit::new();
+        let mut brew = MockBrew::new();
+        for name in names {
+            let dir = &name[..1];
+            for (sha, ver, hash) in [
+                ("cutoffsha", "1.1.0", "midsha"),
+                ("headsha", "1.2.0", "newsha"),
+            ] {
+                git.insert_blob(
+                    sha,
+                    &format!("Formula/{dir}/{name}.rb"),
+                    formula_rb(name, ver, hash),
+                );
+            }
+            brew.installed
+                .push(formula_pkg(name, formula_rb(name, "1.0.0", "oldsha")));
+            for ver in ["1.0.0", "1.1.0", "1.2.0"] {
+                brew.detections.insert(
+                    (format!("https://example.com/{name}-{ver}.tar.gz"), None),
+                    format!("d{ver}-{name}"),
+                );
+            }
+        }
+        brew.deps.insert(
+            "app".to_string(),
+            names[1..].iter().map(|n| n.to_string()).collect(),
+        );
+        (brew, git)
+    }
+
+    fn spawns(brew: &MockBrew) -> (usize, usize) {
+        (
+            *brew.detect_spawns.lock().unwrap(),
+            *brew.compare_spawns.lock().unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_named_upgrade_detects_once_per_resolved_view() {
+        let (brew, git) = many_detect_world(&["app", "bar", "baz"]);
+        let text = upgrade_names(&brew, &git, &["app".to_string()]);
+        assert!(text.contains("bar d1.0.0-bar -> d1.1.0-bar"), "{text}");
+        // app, bar and baz are three resolved views; each asks brew about
+        // its installed, cutoff and HEAD urls in one call.
+        let (detects, _) = spawns(&brew);
+        assert!(detects <= 3, "{detects} detect spawns: {text}");
+    }
+
+    #[test]
+    fn a_failed_detection_never_mixes_detected_and_heuristic_sides() {
+        for failing in 1..=3usize {
+            let (mut brew, git) = many_detect_world(&["app", "bar", "baz"]);
+            brew.detect_fail_spawns.insert(failing);
+            let text = upgrade_names(&brew, &git, &["app".to_string()]);
+            let compares = brew.compares.lock().unwrap().clone();
+            for (_, a, b) in compares.iter().flatten() {
+                assert_eq!(
+                    a.starts_with('d'),
+                    b.starts_with('d'),
+                    "spawn {failing} failed: {a} vs {b}\n{text}"
+                );
+            }
+            for line in text.lines().filter(|l| l.starts_with("upgrading ")) {
+                assert_eq!(
+                    line.contains(" d1."),
+                    line.contains("-> d1."),
+                    "spawn {failing} failed: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bare_info_detects_and_compares_once_for_every_package() {
+        let (brew, git) = many_detect_world(&["app", "bar", "baz"]);
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        info(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("d1.0.0-app"), "{text}");
+        assert_eq!(spawns(&brew), (1, 1), "{text}");
+    }
+
+    #[test]
+    fn update_summary_prefetches_pinned_formulae_too() {
+        let (mut brew, git) = many_detect_world(&["app", "bar", "baz"]);
+        brew.installed[1] = formula_pkg_pinned("bar", formula_rb("bar", "1.0.0", "oldsha"));
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        classify_installed(&brew, &git, cache.path(), &core_snaps(), &inv).unwrap();
+        assert_eq!(spawns(&brew), (1, 1));
+    }
+
+    #[test]
+    fn a_head_with_its_own_url_is_detected_in_the_prefetch_call() {
+        let (brew, git) = many_detect_world(&["app"]);
+        greedy_upgrade(&brew, &git, &core_snaps(), &[]);
+        let first = brew.detects.lock().unwrap().first().cloned().unwrap();
+        let urls: Vec<&str> = first.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(first.len(), 3, "{urls:?}");
+        assert!(
+            urls.contains(&"https://example.com/app-1.2.0.tar.gz"),
+            "{urls:?}"
+        );
+        assert_eq!(spawns(&brew).0, 1);
+    }
+
+    #[test]
+    fn detections_are_keyed_by_url_and_tag() {
+        let rb = |tag: &str| {
+            format!(
+                "class X < Formula\n  url \"https://example.com/x.git\", tag: \"{tag}\", revision: \"r{tag}\"\nend\n"
+            )
+        };
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/x/x.rb", rb("rel-2"));
+        git.insert_blob("headsha", "Formula/x/x.rb", rb("rel-2"));
+        let mut brew = MockBrew {
+            installed: vec![formula_pkg("x", rb("rel-1"))],
+            ..MockBrew::new()
+        };
+        for (tag, v) in [("rel-1", "A1"), ("rel-2", "A2")] {
+            brew.detections.insert(
+                ("https://example.com/x.git".into(), Some(tag.into())),
+                v.into(),
+            );
+        }
+        // A detection for the bare url must not answer a tagged source.
+        brew.detections
+            .insert(("https://example.com/x.git".into(), None), "WRONG".into());
+        let text = greedy_upgrade(&brew, &git, &core_snaps(), &[]);
+        assert!(text.contains("A1 -> A2"), "{text}");
+    }
+
     /// Pins the claim in `plan_size`'s comment: the pre-run total, the
     /// `[i/N]` announcements and the `outdated` report agree in every mode.
     #[test]
@@ -7162,6 +7787,35 @@ mod tests {
     }
 
     #[test]
+    fn bare_action_leaves_a_self_updating_cask_newer_than_or_unordered_against_its_cutoff() {
+        for action in [
+            DesiredAction::LeaveNewerThanCutoff,
+            DesiredAction::HoldUnordered,
+        ] {
+            let view = greedy_view(action, true, false);
+            for argv in [&[][..], &["--greedy-latest"][..]] {
+                assert_eq!(
+                    bare_action(&view, greedy(argv)),
+                    DesiredAction::LeaveAutoUpdates,
+                    "{action:?} {argv:?}"
+                );
+            }
+            for argv in [&["--greedy-auto-updates"][..], &["--greedy"][..]] {
+                assert_eq!(
+                    bare_action(&view, greedy(argv)),
+                    action,
+                    "{action:?} {argv:?}"
+                );
+            }
+            let mut fresh = greedy_view(action, true, false);
+            fresh.installed = None;
+            assert_eq!(bare_action(&fresh, greedy(&[])), action, "{action:?}");
+            let plain = greedy_view(action, false, false);
+            assert_eq!(bare_action(&plain, greedy(&[])), action, "{action:?}");
+        }
+    }
+
+    #[test]
     fn bare_action_only_changes_a_self_updating_install() {
         for argv in [
             &[][..],
@@ -7194,6 +7848,14 @@ mod tests {
                 DesiredAction::InstallCutoff,
                 "{argv:?}"
             );
+            for action in [
+                DesiredAction::RefuseTooNew,
+                DesiredAction::RefuseYanked,
+                DesiredAction::RefuseDeprecated,
+            ] {
+                let view = greedy_view(action, true, false);
+                assert_eq!(bare_action(&view, greedy(argv)), action, "{argv:?}");
+            }
         }
     }
 
@@ -7250,6 +7912,120 @@ mod tests {
             report::identity_version(view.cutoff.as_ref().unwrap()),
             "3.39.11,dy27whJwwmb,a"
         );
+    }
+
+    #[test]
+    fn resolve_view_evaluates_a_cask_with_its_saved_languages() {
+        let cave = include_str!("../tests/fixtures/cave-story.rb");
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/c/cave-story.rb", cave);
+        git.insert_blob("caskhead", "Casks/c/cave-story.rb", cave);
+        let receipt = crate::brew::version_only_cask_receipt("cave-story", "0.2.0");
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US\n");
+        let resolve = |brew: &MockBrew| {
+            resolve_view(
+                brew,
+                &git,
+                &core_snaps(),
+                unused_cache(),
+                "homebrew/cask",
+                "cave-story",
+                PkgKind::Cask,
+                Some(&receipt),
+            )
+            .unwrap()
+            .expect("resolvable")
+        };
+        let en = resolve(&brew);
+        assert_eq!(
+            report::identity_version(en.cutoff.as_ref().unwrap()),
+            "0.1.0,2"
+        );
+        assert_ne!(en.action, DesiredAction::NoOpAlreadySoaked);
+        brew.cask_languages
+            .insert("cave-story".into(), vec!["ja".into()]);
+        let ja = resolve(&brew);
+        assert_eq!(
+            report::identity_version(ja.cutoff.as_ref().unwrap()),
+            "0.2.0"
+        );
+        assert_eq!(report::identity_version(ja.head.as_ref().unwrap()), "0.2.0");
+        assert_eq!(ja.action, DesiredAction::NoOpAlreadySoaked);
+    }
+
+    fn host_langs(brew: &MockBrew, name: &str, kind: PkgKind) -> Vec<String> {
+        host_for_pkg(brew, kind, name, brew.host_platform().as_ref())
+            .expect("host")
+            .languages
+    }
+
+    #[test]
+    fn host_for_pkg_puts_saved_explicit_before_the_live_run_languages() {
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US fr\n");
+        // Nothing saved for the cask: the run-level list.
+        assert_eq!(host_langs(&brew, "firefox", PkgKind::Cask), ["en-US", "fr"]);
+        // Saved `explicit` (all `read_cask_languages` returns) leads, then the
+        // live list, deduplicated, invalid dropped.
+        brew.cask_languages
+            .insert("firefox".into(), vec!["de".into(), "fr".into()]);
+        assert_eq!(
+            host_langs(&brew, "firefox", PkgKind::Cask),
+            ["de", "fr", "en-US"]
+        );
+        // A formula never takes cask languages.
+        brew.cask_languages.insert("wget".into(), vec!["de".into()]);
+        assert_eq!(host_langs(&brew, "wget", PkgKind::Formula), ["en-US", "fr"]);
+    }
+
+    #[test]
+    fn host_for_pkg_puts_the_language_flag_before_everything() {
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US\n");
+        brew.cli_languages = vec!["de".into(), "bad_one".into(), "fr".into()];
+        brew.cask_languages
+            .insert("firefox".into(), vec!["fr".into(), "ja".into()]);
+        assert_eq!(
+            host_langs(&brew, "firefox", PkgKind::Cask),
+            ["de", "fr", "ja", "en-US"]
+        );
+        // The flag applies to a cask with nothing saved too.
+        assert_eq!(
+            host_langs(&brew, "other", PkgKind::Cask),
+            ["de", "fr", "en-US"]
+        );
+    }
+
+    #[test]
+    fn a_saved_default_language_does_not_pick_the_block() {
+        // Saved config {"default":{"languages":["en-US"... fr]}} reads as no
+        // explicit languages, so the live run-level en-US picks the block.
+        let cave = include_str!("../tests/fixtures/cave-story.rb");
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/c/cave-story.rb", cave);
+        git.insert_blob("caskhead", "Casks/c/cave-story.rb", cave);
+        let receipt = crate::brew::version_only_cask_receipt("cave-story", "0.2.0");
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US\n");
+        let version = |brew: &MockBrew| {
+            let v = resolve_view(
+                brew,
+                &git,
+                &core_snaps(),
+                unused_cache(),
+                "homebrew/cask",
+                "cave-story",
+                PkgKind::Cask,
+                Some(&receipt),
+            )
+            .unwrap()
+            .expect("resolvable");
+            report::identity_version(v.cutoff.as_ref().unwrap())
+        };
+        assert_eq!(version(&brew), "0.1.0,2");
+        brew.cli_languages = vec!["ja".into()];
+        assert_eq!(version(&brew), "0.2.0");
     }
 
     #[test]

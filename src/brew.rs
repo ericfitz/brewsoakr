@@ -1,5 +1,5 @@
 use crate::Error;
-use crate::identity::HostPlatform;
+use crate::identity::{HostPlatform, VersionSource};
 use crate::quiet;
 use crate::resolve::PkgKind;
 use crate::taps::TapInfo;
@@ -46,10 +46,17 @@ const COMPARE_VERSIONS_RUBY: &str = r#"ARGV.each_slice(3) do |kind, a, b|
   puts(kind == "cask" ? Version.new(a) <=> Version.new(b) : PkgVersion.parse(a) <=> PkgVersion.parse(b))
 end"#;
 
+/// Runs under `brew ruby -e`: ARGV holds `url tag` pairs (an empty tag means
+/// none), and each prints brew's `Version.detect` of it, empty when brew
+/// cannot tell. The strings arrive as arguments, never as Ruby source.
+const DETECT_VERSIONS_RUBY: &str = r#"ARGV.each_slice(2) { |url, tag| puts Version.detect(url, **(tag.empty? ? {} : { tag: tag })).to_s }"#;
+
 /// Runs under `brew ruby -e`: prints every `<codename> <version>` pair brew
-/// knows, then `HOST <codename> <arch>` for this machine.
+/// knows, then `HOST <codename> <arch>` for this machine and `LANG` with the
+/// languages a cask load prefers (`Cask::Config#languages`).
 const HOST_PLATFORM_RUBY: &str = r##"puts MacOSVersion::SYMBOLS.map { |k, v| "#{k} #{v}" }
-puts "HOST #{MacOS.version.to_sym} #{Hardware::CPU.arch}""##;
+puts "HOST #{MacOS.version.to_sym} #{Hardware::CPU.arch}"
+puts "LANG #{Cask::Config.new.languages.join(" ")}".strip"##;
 
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
@@ -87,6 +94,27 @@ pub trait Brew {
     fn host_platform(&self) -> Option<HostPlatform> {
         None
     }
+    /// The `explicit` languages in the installed cask `token`'s saved config:
+    /// the only part `brew upgrade` carries over. `None` when it is not
+    /// installed or the config cannot be read. Callers put these before the
+    /// run-level `host_platform().languages`. The default reports none.
+    fn cask_languages(&self, _token: &str) -> Option<Vec<String>> {
+        None
+    }
+    /// The languages of a `--language=<list>` flag on this run, in order.
+    /// Brew treats the flag as explicit config over everything saved or live.
+    fn cli_languages(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Records the `--language` flag's languages for this run.
+    fn set_cli_languages(&self, _languages: Vec<String>) {}
+    /// Homebrew's `Version.detect` of each source, one entry per source, from
+    /// one `brew ruby` call. `None` when brew cannot tell (or the url holds a
+    /// `#{` interpolation, which is never asked). The default answers `None`
+    /// for all, so the caller keeps its own guess.
+    fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
+        Ok(vec![None; sources.len()])
+    }
 }
 
 /// `(kind tag, a, b)` of one `compare_versions` pair.
@@ -97,11 +125,21 @@ pub struct ProcessBrew {
     raw: Cell<bool>,
     /// `brew --cellar`, asked once: it never changes during a run.
     cellar: std::cell::OnceCell<Option<PathBuf>>,
+    /// `brew --caskroom`, asked once.
+    caskroom: std::cell::OnceCell<Option<PathBuf>>,
+    /// `read_cask_languages` answers for this run, keyed by cask token.
+    languages: Mutex<HashMap<String, Option<Vec<String>>>>,
+    /// The `--language` flag's languages (`set_cli_languages`).
+    cli: Mutex<Vec<String>>,
     /// `compare_versions` answers for this run, keyed by `(kind, a, b)`.
     orderings: Mutex<HashMap<OrderKey, Ordering>>,
     /// Pairs whose batch failed, with the failure: a broken `brew ruby` costs
     /// one spawn per run, not one per package.
     ordering_failures: Mutex<HashMap<OrderKey, (i32, String)>>,
+    /// `detect_versions` answers for this run.
+    detected: Mutex<HashMap<VersionSource, Option<String>>>,
+    /// Sources whose batch failed, with the failure.
+    detect_failures: Mutex<HashMap<VersionSource, (i32, String)>>,
     /// `host_platform`, asked once: the host never changes during a run.
     host: std::cell::OnceCell<Option<HostPlatform>>,
     sink: Mutex<Sink>,
@@ -163,13 +201,37 @@ impl ProcessBrew {
             })
     }
 
+    fn ask_versions(&self, args: &[String], count: usize) -> Result<Vec<Option<String>>, Error> {
+        let output = self.run(args)?;
+        if !output.status.success() {
+            return Err(brew_fail(&output));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answers: Vec<Option<String>> = stdout
+            .lines()
+            .map(|l| Some(l.trim()).filter(|v| !v.is_empty()).map(String::from))
+            .collect();
+        if answers.len() != count {
+            return Err(Error::Brew {
+                status: 0,
+                message: format!("unparseable version detection output: {}", stdout.trim()),
+            });
+        }
+        Ok(answers)
+    }
+
     pub fn new(bin: PathBuf) -> Self {
         Self {
             bin,
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
+            caskroom: std::cell::OnceCell::new(),
+            languages: Mutex::new(HashMap::new()),
+            cli: Mutex::new(Vec::new()),
             orderings: Mutex::new(HashMap::new()),
             ordering_failures: Mutex::new(HashMap::new()),
+            detected: Mutex::new(HashMap::new()),
+            detect_failures: Mutex::new(HashMap::new()),
             host: std::cell::OnceCell::new(),
             sink: Mutex::new(Sink::default()),
         }
@@ -199,8 +261,35 @@ pub struct MockBrew {
     pub compare_error: Option<String>,
     /// What `host_platform` reports; `None` means the host is unknown.
     pub host: Option<HostPlatform>,
+    /// What `cask_languages` reports per installed cask token.
+    pub cask_languages: BTreeMap<String, Vec<String>>,
+    /// What `cli_languages` reports.
+    pub cli_languages: Vec<String>,
     /// The pairs of each `compare_versions` call.
     pub compares: Mutex<Vec<Vec<VersionPair>>>,
+    /// Pairs `compare_versions` has answered: like `ProcessBrew`, a pair is
+    /// asked of brew once per run.
+    pub compared: Mutex<std::collections::HashSet<(String, String)>>,
+    /// How many `compare_versions` calls asked about a pair not yet answered
+    /// (each is one `brew ruby` spawn in `ProcessBrew`).
+    pub compare_spawns: Mutex<usize>,
+    /// What `detect_versions` reports for a `(url, tag)`; an unscripted
+    /// source is `None`.
+    pub detections: BTreeMap<(String, Option<String>), String>,
+    /// Makes every `detect_versions` call fail with this message.
+    pub detect_error: Option<String>,
+    /// The 1-based spawns (calls with a source not yet answered) of
+    /// `detect_versions` that fail; the sources of a failed spawn then fail
+    /// for the rest of the run, as in `ProcessBrew`.
+    pub detect_fail_spawns: std::collections::BTreeSet<usize>,
+    /// The sources of each `detect_versions` call.
+    pub detects: Mutex<Vec<Vec<VersionSource>>>,
+    /// Sources `detect_versions` has answered or failed.
+    pub detect_seen: Mutex<std::collections::HashSet<VersionSource>>,
+    pub detect_failed: Mutex<std::collections::HashSet<VersionSource>>,
+    /// How many `detect_versions` calls asked about a source not yet answered
+    /// (each is one `brew ruby` spawn in `ProcessBrew`).
+    pub detect_spawns: Mutex<usize>,
 }
 
 impl Default for MockBrew {
@@ -220,7 +309,18 @@ impl Default for MockBrew {
             orderings: BTreeMap::new(),
             compare_error: None,
             host: None,
+            cask_languages: BTreeMap::new(),
+            cli_languages: Vec::new(),
             compares: Mutex::new(Vec::new()),
+            compared: Mutex::new(std::collections::HashSet::new()),
+            compare_spawns: Mutex::new(0),
+            detections: BTreeMap::new(),
+            detect_error: None,
+            detect_fail_spawns: std::collections::BTreeSet::new(),
+            detects: Mutex::new(Vec::new()),
+            detect_seen: Mutex::new(std::collections::HashSet::new()),
+            detect_failed: Mutex::new(std::collections::HashSet::new()),
+            detect_spawns: Mutex::new(0),
         }
     }
 }
@@ -295,6 +395,22 @@ impl Brew for ProcessBrew {
             .clone()
     }
 
+    fn cask_languages(&self, token: &str) -> Option<Vec<String>> {
+        let caskroom = self.caskroom()?;
+        let mut memo = self.languages.lock().unwrap_or_else(|e| e.into_inner());
+        memo.entry(token.to_string())
+            .or_insert_with(|| read_cask_languages(&caskroom, token))
+            .clone()
+    }
+
+    fn cli_languages(&self) -> Vec<String> {
+        self.cli.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_cli_languages(&self, languages: Vec<String>) {
+        *self.cli.lock().unwrap_or_else(|e| e.into_inner()) = languages;
+    }
+
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
         let key = |(kind, a, b): &VersionPair| (kind_tag(*kind), a.clone(), b.clone());
         let mut asking: Vec<&VersionPair> = Vec::new();
@@ -354,6 +470,69 @@ impl Brew for ProcessBrew {
         Ok(pairs.iter().map(|p| memo[&key(p)]).collect())
     }
 
+    fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
+        let askable = |s: &VersionSource| !s.url.contains("#{");
+        let mut asking: Vec<&VersionSource> = Vec::new();
+        {
+            let memo = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+            for s in sources.iter().filter(|s| askable(s)) {
+                if !memo.contains_key(s) && !asking.contains(&s) {
+                    asking.push(s);
+                }
+            }
+        }
+        {
+            let failures = self
+                .detect_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((status, message)) = sources.iter().find_map(|s| failures.get(s)) {
+                return Err(Error::Brew {
+                    status: *status,
+                    message: message.clone(),
+                });
+            }
+        }
+        if !asking.is_empty() {
+            let mut args = vec![
+                "ruby".to_string(),
+                "-e".to_string(),
+                DETECT_VERSIONS_RUBY.to_string(),
+                "--".to_string(),
+            ];
+            for s in &asking {
+                args.extend([s.url.clone(), s.tag.clone().unwrap_or_default()]);
+            }
+            match self.ask_versions(&args, asking.len()) {
+                Ok(answers) => {
+                    let mut memo = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+                    for (s, answer) in asking.iter().zip(answers) {
+                        memo.insert((*s).clone(), answer);
+                    }
+                }
+                Err(e) => {
+                    let (status, message) = match &e {
+                        Error::Brew { status, message } => (*status, message.clone()),
+                        other => (1, other.to_string()),
+                    };
+                    let mut failures = self
+                        .detect_failures
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for s in &asking {
+                        failures.insert((*s).clone(), (status, message.clone()));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let memo = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(sources
+            .iter()
+            .map(|s| memo.get(s).cloned().flatten())
+            .collect())
+    }
+
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
         let output = self.run(&["info".into(), "--json=v2".into(), "--installed".into()])?;
         if !output.status.success() {
@@ -361,7 +540,7 @@ impl Brew for ProcessBrew {
         }
         let json = String::from_utf8_lossy(&output.stdout);
         let cellar = self.cellar();
-        let caskroom = self.brew_dir("--caskroom");
+        let caskroom = self.caskroom();
         parse_installed_json(
             &json,
             |name, kind, version| match kind {
@@ -442,6 +621,13 @@ impl ProcessBrew {
     fn cellar(&self) -> Option<PathBuf> {
         self.cellar
             .get_or_init(|| self.brew_dir("--cellar"))
+            .clone()
+    }
+
+    /// `brew --caskroom`, asked once and shared by every reader.
+    fn caskroom(&self) -> Option<PathBuf> {
+        self.caskroom
+            .get_or_init(|| self.brew_dir("--caskroom"))
             .clone()
     }
 
@@ -587,11 +773,84 @@ impl Brew for MockBrew {
         self.host.clone()
     }
 
+    fn cask_languages(&self, token: &str) -> Option<Vec<String>> {
+        self.cask_languages.get(token).cloned()
+    }
+
+    fn cli_languages(&self) -> Vec<String> {
+        self.cli_languages.clone()
+    }
+
+    fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
+        self.detects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sources.to_vec());
+        if let Some(message) = &self.detect_error {
+            return Err(Error::Brew {
+                status: 1,
+                message: message.clone(),
+            });
+        }
+        let askable = |s: &&VersionSource| !s.url.contains("#{");
+        let failed_before = self.detect_failed.lock().unwrap_or_else(|e| e.into_inner());
+        if sources.iter().any(|s| failed_before.contains(s)) {
+            return Err(Error::Brew {
+                status: 1,
+                message: "brew ruby failed earlier in this run".into(),
+            });
+        }
+        drop(failed_before);
+        let mut seen = self.detect_seen.lock().unwrap_or_else(|e| e.into_inner());
+        let mut new: Vec<&VersionSource> = Vec::new();
+        for s in sources.iter().filter(askable) {
+            if !seen.contains(s) && !new.contains(&s) {
+                new.push(s);
+            }
+        }
+        if !new.is_empty() {
+            let mut spawns = self.detect_spawns.lock().unwrap_or_else(|e| e.into_inner());
+            *spawns += 1;
+            if self.detect_fail_spawns.contains(&*spawns) {
+                let mut failed = self.detect_failed.lock().unwrap_or_else(|e| e.into_inner());
+                failed.extend(new.into_iter().cloned());
+                return Err(Error::Brew {
+                    status: 1,
+                    message: format!("brew ruby failed (spawn {})", *spawns),
+                });
+            }
+            seen.extend(new.into_iter().cloned());
+        }
+        Ok(sources
+            .iter()
+            .map(|s| {
+                if s.url.contains("#{") {
+                    None
+                } else {
+                    self.detections
+                        .get(&(s.url.clone(), s.tag.clone()))
+                        .cloned()
+                }
+            })
+            .collect())
+    }
+
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
         self.compares
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(pairs.to_vec());
+        {
+            let mut compared = self.compared.lock().unwrap_or_else(|e| e.into_inner());
+            let before = compared.len();
+            compared.extend(pairs.iter().map(|(_, a, b)| (a.clone(), b.clone())));
+            if compared.len() > before {
+                *self
+                    .compare_spawns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) += 1;
+            }
+        }
         if let Some(message) = &self.compare_error {
             return Err(Error::Brew {
                 status: 1,
@@ -737,6 +996,62 @@ fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Opti
     walk_metadata_for_file(&metadata, &target)
 }
 
+/// The languages in `explicit` of `<caskroom>/<token>/.metadata/config.json`,
+/// deduplicated, with those `Locale` cannot parse dropped. Only `explicit`
+/// counts: `brew upgrade` rebuilds the config with `default_config.merge(saved)`,
+/// and `Cask::Config#merge` keeps nothing but `explicit`, so `env` and
+/// `default` are read live again (the run-level `host_platform().languages`).
+/// `None` when the file is missing or unreadable, has no `explicit` object, or
+/// its `languages` value is not an array of strings.
+fn read_cask_languages(caskroom: &Path, token: &str) -> Option<Vec<String>> {
+    let path = caskroom.join(token).join(".metadata").join("config.json");
+    let json = std::fs::read_to_string(path).ok()?;
+    let b = json.as_bytes();
+    let after = find_json_key(&json, "explicit")?;
+    let start = skip_ws(b, json.len() - after.len());
+    if b.get(start) != Some(&b'{') {
+        return None;
+    }
+    let obj = json.get(start..skip_delimited(b, start, b'{', b'}')?)?;
+    let mut out: Vec<String> = Vec::new();
+    if let Some(after) = find_json_key(obj, "languages") {
+        for lang in json_string_array(after.trim_start())? {
+            if crate::identity::is_valid_language(&lang) && !out.contains(&lang) {
+                out.push(lang);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `["a", "b"]` at the start of `s`.
+fn json_string_array(s: &str) -> Option<Vec<String>> {
+    let mut rest = s.strip_prefix('[')?.trim_start();
+    let mut out = Vec::new();
+    loop {
+        if rest.starts_with(']') {
+            return Some(out);
+        }
+        let item = parse_json_string(rest)?;
+        // The item is the quoted text plus its escapes; find where it ends.
+        let mut end = 1;
+        let mut esc = false;
+        for (i, c) in rest.char_indices().skip(1) {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                end = i + 1;
+                break;
+            }
+        }
+        out.push(item);
+        rest = rest[end..].trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+    }
+}
+
 /// Homebrew >= 4 saves an installed cask as
 /// `.metadata/<version>/<timestamp>/Casks/<token>.json`
 /// (`Cask::Installer#save_caskfile`: `to_installed_json_hash`, which holds
@@ -877,17 +1192,40 @@ pub(crate) fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<
     scan_array_objects(rest).ok_or_else(|| Error::Other(format!("json {key} array is malformed")))
 }
 
+/// The text after `"key":` for a key of the object `json` itself: a key of a
+/// nested object or array is skipped, as is `"key":` inside a string value.
+/// A text that does not start with `{` is read as the members of an object.
 pub(crate) fn find_json_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{key}\"");
-    let mut search = json;
-    loop {
-        let (_, after) = search.split_once(&pat)?;
-        let after = after.trim_start();
-        if let Some(rest) = after.strip_prefix(':') {
-            return Some(rest);
+    let b = json.as_bytes();
+    let top = if b.get(skip_ws(b, 0)) == Some(&b'{') {
+        1
+    } else {
+        0
+    };
+    let mut depth = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if depth == top && json.get(start..i) == Some(key) {
+                    let after = skip_ws(b, i + 1);
+                    if b.get(after) == Some(&b':') {
+                        return json.get(after + 1..);
+                    }
+                }
+            }
+            _ => {}
         }
-        search = after;
+        i += 1;
     }
+    None
 }
 
 pub(crate) fn scan_array_objects(s: &str) -> Option<Vec<&str>> {
@@ -1692,6 +2030,90 @@ mod tests {
         );
     }
 
+    fn source(url: &str, tag: Option<&str>) -> VersionSource {
+        VersionSource {
+            url: url.to_string(),
+            tag: tag.map(String::from),
+        }
+    }
+
+    #[test]
+    fn detect_versions_batches_one_call_passes_argv_and_memoizes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "19\n\n1.2.3\n", 0);
+        let brew = ProcessBrew::new(script);
+        let sources = [
+            source("https://x.test/sf_19.tar.gz", None),
+            source("https://x.test/download", None),
+            source("https://x.test/foo.git", Some("v1.2.3")),
+            source("https://x.test/#{version}.tgz", None),
+        ];
+        let want = vec![
+            Some("19".to_string()),
+            None,
+            Some("1.2.3".to_string()),
+            None,
+        ];
+        assert_eq!(brew.detect_versions(&sources).expect("detect"), want);
+        assert_eq!(brew.detect_versions(&sources).expect("memo"), want);
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(
+            argv.matches("ruby -e").count(),
+            1,
+            "second ask is memoized: {argv}"
+        );
+        assert!(argv.contains("Version.detect"), "{argv}");
+        assert!(
+            argv.trim_end().ends_with(
+                "-- https://x.test/sf_19.tar.gz  https://x.test/download  https://x.test/foo.git v1.2.3"
+            ),
+            "strings travel as argv, an empty tag as an empty argument: {argv}"
+        );
+    }
+
+    #[test]
+    fn detect_versions_failure_is_memoized_for_the_run() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "", 1);
+        let brew = ProcessBrew::new(script);
+        let one = source("https://x.test/a-1.tgz", None);
+        assert!(brew.detect_versions(std::slice::from_ref(&one)).is_err());
+        assert!(brew.detect_versions(std::slice::from_ref(&one)).is_err());
+        let two = source("https://x.test/b-1.tgz", None);
+        assert!(brew.detect_versions(&[one, two]).is_err());
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(argv.matches("ruby -e").count(), 1, "{argv}");
+    }
+
+    #[test]
+    fn detect_versions_errors_on_failure_or_wrong_line_count() {
+        for (stdout, status) in [("", 1), ("1\n", 1), ("1\n", 0), ("1\n2\n3\n", 0)] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (script, _) = compare_script(tmp.path(), stdout, status);
+            let brew = ProcessBrew::new(script);
+            let sources = [
+                source("https://x.test/a-1.tgz", None),
+                source("https://x.test/b-2.tgz", None),
+            ];
+            assert!(
+                brew.detect_versions(&sources).is_err(),
+                "{stdout:?} exit {status} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_versions_never_asks_for_an_interpolated_url() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "", 0);
+        let brew = ProcessBrew::new(script);
+        let got = brew
+            .detect_versions(&[source("https://x.test/#{version}.tgz", None)])
+            .expect("detect");
+        assert_eq!(got, vec![None]);
+        assert!(!log.exists(), "brew must not be spawned");
+    }
+
     #[test]
     fn compare_versions_failure_is_memoized_for_the_run() {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -1911,5 +2333,123 @@ mod tests {
             Some(0),
             "queue empty: falls back to next_status"
         );
+    }
+
+    fn write_cask_config(caskroom: &Path, token: &str, json: &str) {
+        let meta = caskroom.join(token).join(".metadata");
+        std::fs::create_dir_all(&meta).expect("metadata");
+        std::fs::write(meta.join("config.json"), json).expect("config");
+    }
+
+    #[test]
+    fn cask_languages_reads_only_the_saved_explicit_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cask_config(
+            tmp.path(),
+            "cave-story",
+            r#"{"default":{"languages":["en-US","ja"],"appdir":"/Applications"},"env":{"languages":["fr","ja"]},"explicit":{"languages":["ja","de","ja"]}}"#,
+        );
+        assert_eq!(
+            read_cask_languages(tmp.path(), "cave-story"),
+            Some(vec!["ja".into(), "de".into()])
+        );
+        write_cask_config(
+            tmp.path(),
+            "fr-default",
+            r#"{"default":{"languages":["fr"]},"env":{},"explicit":{}}"#,
+        );
+        assert_eq!(
+            read_cask_languages(tmp.path(), "fr-default"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn find_json_key_matches_only_the_immediate_object_level() {
+        let obj = r#"{"extra":{"languages":["de"]},"languages":["fr"]}"#;
+        assert_eq!(
+            find_json_key(obj, "languages").map(str::trim_start),
+            Some(r#"["fr"]}"#)
+        );
+        assert_eq!(find_json_key(obj, "nope"), None);
+        // A key text inside a string value is not a key.
+        let tricky = r#"{"a":"\"languages\":[1]","languages":["x"]}"#;
+        assert_eq!(
+            find_json_key(tricky, "languages").map(str::trim_start),
+            Some(r#"["x"]}"#)
+        );
+        let cfg = r#"{"default":{"extra":{"languages":["de"]},"languages":["fr"]},"explicit":{"extra":{"languages":["de"]}}}"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cask_config(tmp.path(), "n", cfg);
+        assert_eq!(read_cask_languages(tmp.path(), "n"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn process_brew_memoizes_cask_languages_per_token() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cask_config(
+            tmp.path(),
+            "a",
+            r#"{"default":{},"env":{},"explicit":{"languages":["ja"]}}"#,
+        );
+        let brew = ProcessBrew::new(PathBuf::from("/nonexistent/brew"));
+        let _ = brew.caskroom.set(Some(tmp.path().to_path_buf()));
+        assert_eq!(brew.cask_languages("a"), Some(vec!["ja".into()]));
+        write_cask_config(
+            tmp.path(),
+            "a",
+            r#"{"default":{},"env":{},"explicit":{"languages":["de"]}}"#,
+        );
+        assert_eq!(
+            brew.cask_languages("a"),
+            Some(vec!["ja".into()]),
+            "second call must not re-read"
+        );
+        assert_eq!(brew.cask_languages("missing"), None);
+        std::fs::remove_dir_all(tmp.path().join("a")).expect("rm");
+        assert_eq!(brew.cask_languages("a"), Some(vec!["ja".into()]));
+    }
+
+    #[test]
+    fn process_brew_shares_one_caskroom_lookup() {
+        let brew = ProcessBrew::new(PathBuf::from("/nonexistent/brew"));
+        let _ = brew.caskroom.set(Some(PathBuf::from("/cr")));
+        assert_eq!(brew.caskroom(), Some(PathBuf::from("/cr")));
+        assert_eq!(brew.caskroom(), Some(PathBuf::from("/cr")));
+    }
+
+    #[test]
+    fn cask_languages_drops_invalid_locales_and_reads_an_empty_list() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cask_config(
+            tmp.path(),
+            "a",
+            r#"{"default":{},"env":{},"explicit":{"languages":["en_US","ja-JP-mac","en-US"]}}"#,
+        );
+        assert_eq!(
+            read_cask_languages(tmp.path(), "a"),
+            Some(vec!["en-US".into()])
+        );
+        write_cask_config(tmp.path(), "b", r#"{"default":{},"env":{},"explicit":{}}"#);
+        assert_eq!(read_cask_languages(tmp.path(), "b"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn cask_languages_is_none_when_missing_or_unreadable() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(read_cask_languages(tmp.path(), "nope"), None);
+        write_cask_config(tmp.path(), "bad", "not json");
+        assert_eq!(read_cask_languages(tmp.path(), "bad"), None);
+        write_cask_config(tmp.path(), "arr", r#"{"explicit":{"languages":"en"}}"#);
+        assert_eq!(read_cask_languages(tmp.path(), "arr"), None);
+    }
+
+    #[test]
+    fn mock_cask_languages_reports_the_configured_list() {
+        let mut brew = MockBrew::new();
+        brew.cask_languages
+            .insert("cave-story".into(), vec!["ja".into()]);
+        assert_eq!(brew.cask_languages("cave-story"), Some(vec!["ja".into()]));
+        assert_eq!(brew.cask_languages("other"), None);
     }
 }

@@ -130,6 +130,9 @@ pub fn dispatch(args: &[String], world: &impl World) -> Result<Dispatch, Error> 
     paths::warn_duplicate_install();
     let inv = cli::parse_argv(args)?;
     world.brew().set_raw(inv.raw);
+    world
+        .brew()
+        .set_cli_languages(flags::language_list(&inv.brew_args));
     if let cli::Command::Settings(cmd) = &inv.command {
         // Before config resolution, brew, git, or snapshots: settings reads
         // and writes the file and nothing else, and refuses invalid TOML
