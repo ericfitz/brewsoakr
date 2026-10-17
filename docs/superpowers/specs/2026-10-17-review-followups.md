@@ -33,9 +33,11 @@ behave with an unknown host.
   `on_macos do on_arm do`.
 - An `if` whose condition is built only from `Hardware::CPU.arm?`,
   `Hardware::CPU.intel?`, `Hardware::CPU.is_64_bit?`, `OS.mac?`, `OS.linux?`,
-  `!` and `&&` is transparent when the condition holds on the host, and its
-  `else` branch is transparent when it doesn't. Any other condition, and
-  any `elsif`, stays opaque.
+  `!` and `&&` is transparent when the condition holds on the host. Each
+  `elsif` in such a chain is evaluated the same way while no earlier branch
+  has held; endava/tap `cats` keeps its arm url in one. `else` is
+  transparent when no branch held. An unrecognized condition is opaque, and
+  so is the rest of its chain.
 - In Ruby, the later definition wins. For a formula, `version`, `url` and
   `sha256` are the last applicable definitions before `bottle do`. heroku
   declares the x64 url first and the arm override after it.

@@ -449,8 +449,11 @@ fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> O
 fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
     struct Open {
         transparent: bool,
-        /// A recognized `if` whose `else` swaps transparency; `elsif` clears it.
-        flips_on_else: bool,
+        /// An `if` chain whose conditions were all recognized so far: `Some(true)`
+        /// once a branch has held. An `elsif` is evaluated only while no branch
+        /// has held, and an `else` applies only if none did. An unrecognized
+        /// condition makes the rest of the chain opaque.
+        chain: Option<bool>,
     }
     let mut depth = 0i32;
     let mut open_blocks: Vec<Open> = Vec::new();
@@ -464,20 +467,29 @@ fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
             continue;
         }
         let code = t.split('#').next().unwrap_or(t).trim_end();
-        if let Some(top) = open_blocks.last_mut().filter(|o| o.flips_on_else) {
-            if code == "else" {
-                top.transparent = !top.transparent;
-                top.flips_on_else = false;
-                depth += if top.transparent { -1 } else { 1 };
-                continue;
-            }
-            if code.starts_with("elsif ") {
-                // The rest of the chain is opaque.
-                if top.transparent {
-                    top.transparent = false;
-                    depth += 1;
+        if let Some(top) = open_blocks.last_mut().filter(|o| o.chain.is_some()) {
+            let taken = top.chain == Some(true);
+            let next = if code == "else" {
+                Some((!taken, None))
+            } else if let Some(cond) = code.strip_prefix("elsif ") {
+                let holds = if taken {
+                    Some(false)
+                } else {
+                    host.and_then(|h| condition_holds(cond, h))
+                };
+                Some(match holds {
+                    Some(h) => (h, Some(taken || h)),
+                    None => (false, None),
+                })
+            } else {
+                None
+            };
+            if let Some((transparent, chain)) = next {
+                if transparent != top.transparent {
+                    depth += if transparent { -1 } else { 1 };
                 }
-                top.flips_on_else = false;
+                top.transparent = transparent;
+                top.chain = chain;
                 continue;
             }
         }
@@ -495,7 +507,7 @@ fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
         if opens_ruby_block(t, open_blocks.is_empty()) {
             open_blocks.push(Open {
                 transparent,
-                flips_on_else: condition.is_some(),
+                chain: condition,
             });
             if !transparent {
                 depth += 1;
@@ -1470,14 +1482,17 @@ mod platform_tests {
     }
 
     #[test]
-    fn unrecognized_conditions_and_elsif_stay_opaque() {
+    fn unrecognized_conditions_stay_opaque() {
         let h = host("sequoia", "arm64");
         for body in [
             "  if Hardware::CPU.arm? && foo?\n    sha256 \"x\"\n  end\n",
             "  if Hardware::CPU.arm? || OS.linux?\n    sha256 \"x\"\n  end\n",
             "  if foo?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
             "  unless OS.linux?\n    sha256 \"x\"\n  end\n",
-            "  if OS.linux?\n    sha256 \"x\"\n  elsif Hardware::CPU.arm?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
+            "  if OS.linux?\n    sha256 \"x\"\n  elsif Hardware::CPU.arm?\n    sha256 \"holds\"\n  else\n    sha256 \"x\"\n  end\n",
+            "  if OS.linux?\n    sha256 \"x\"\n  elsif foo?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
+            "  if OS.linux?\n    sha256 \"x\"\n  elsif Hardware::CPU.intel?\n    sha256 \"x\"\n  else\n    sha256 \"holds\"\n  end\n",
+            "  if OS.linux?\n    sha256 \"x\"\n  elsif foo?\n    sha256 \"x\"\n  elsif Hardware::CPU.arm?\n    sha256 \"x\"\n  end\n",
             "  if Hardware::CPU.arm?\n    sha256 \"holds\"\n  elsif OS.mac?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
         ] {
             let want = if body.contains("\"holds\"") {
@@ -1516,6 +1531,23 @@ mod platform_tests {
         assert_eq!(
             upcoming_lifecycle_messages(future, "2026-01-01", None).len(),
             1
+        );
+    }
+
+    const CATS: &str = include_str!("../tests/fixtures/cats.rb");
+
+    /// endava/tap `cats`: the arm url sits in an `elsif` nested in `if OS.mac?`.
+    #[test]
+    fn an_elsif_that_holds_supplies_the_identity() {
+        let arm = parse_formula(CATS, Some(&host("sequoia", "arm64"))).unwrap();
+        assert_eq!(
+            arm.sha256,
+            "89f5ac4b179ec8b760c26e9293cdb5f403acda8152618be81a4d54289653b788"
+        );
+        let intel = parse_formula(CATS, Some(&host("sequoia", "x86_64"))).unwrap();
+        assert_eq!(
+            intel.sha256,
+            "44de442d123f2bfa421b5cf78e5fa529d3fe6b8756d15b7cd2a9ab4953a95b2d"
         );
     }
 
