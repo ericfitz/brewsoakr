@@ -168,8 +168,14 @@ impl Filter {
     }
 
     fn skip_list_line(&mut self, t: &str) -> Option<String> {
-        // The list is bare package names; anything decorated ends it.
-        if t.trim().is_empty() || t.starts_with("==> ") || t.starts_with(CHECK) {
+        // The list is bare package names; anything decorated ends it, and a
+        // warning or error must never be swallowed as a list entry.
+        if t.trim().is_empty()
+            || t.starts_with("==> ")
+            || t.starts_with(CHECK)
+            || t.starts_with("Warning: ")
+            || t.starts_with("Error: ")
+        {
             self.state = Some(State::Normal);
             return self.normal_line(t);
         }
@@ -574,6 +580,26 @@ To reinstall 1.0.0, run:
   brew reinstall y";
         let (out, _) = run(input);
         assert_eq!(out, vec!["  brew reinstall y"], "{out:#?}");
+    }
+
+    #[test]
+    fn warning_inside_would_install_list_ends_the_list() {
+        let input = "\
+==> Would install 2 formulae:
+aws-c-auth
+Warning: something went wrong
+Error: and then this
+other-name";
+        let (out, _) = run(input);
+        assert_eq!(
+            out,
+            vec![
+                "Warning: something went wrong",
+                "Error: and then this",
+                "other-name",
+            ],
+            "{out:#?}"
+        );
     }
 
     #[test]
