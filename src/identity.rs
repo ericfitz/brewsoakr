@@ -75,7 +75,7 @@ impl HostPlatform {
     /// do` opens a block that applies to this host. Anything unrecognized,
     /// including an unknown codename, does not apply.
     fn block_applies(&self, line: &str) -> bool {
-        let code = line.split('#').next().unwrap_or(line).trim();
+        let code = strip_comment(line).trim();
         let Some(head) = code.strip_suffix(" do") else {
             return false;
         };
@@ -290,7 +290,7 @@ fn formula_class(rb: &str) -> &str {
 
 /// A depth-1 line after which no `url`/`version`/`sha256` of the formula can follow.
 fn ends_identity_scope(t: &str) -> bool {
-    let code = t.split('#').next().unwrap_or(t).trim_end();
+    let code = strip_comment(t);
     is_bottle_do(code) || code.starts_with("def ") || code == "test do" || code == "service do"
 }
 
@@ -299,7 +299,7 @@ fn ends_identity_scope(t: &str) -> bool {
 pub fn cask_auto_updates(rb: &str, host: Option<&HostPlatform>) -> bool {
     depth1_lines(rb, host).iter().any(|t| {
         t.strip_prefix("auto_updates")
-            .is_some_and(|r| r.split('#').next().unwrap_or(r).trim() == "true")
+            .is_some_and(|r| strip_comment(r).trim() == "true")
     })
 }
 
@@ -866,26 +866,39 @@ impl Heredoc {
 }
 
 /// The heredocs a line opens, in order; several may share one line. String,
-/// `%`-literal and regex literals and comments are skipped. `<<~ID` takes any
-/// identifier; `<<-ID`, `<<ID` and quoted ids must be upper case, which keeps
-/// `args <<"x"` and `x <<-y` the shifts they are. `<<` followed by a space
-/// (`args << "x"`, `class << self`) is never a heredoc.
+/// `%`-literal and regex literals and comments are skipped, but a `#{...}` in
+/// an interpolating literal is searched (`"#{<<~EOS}"`). `<<~ID`, `<<-ID` and
+/// quoted ids may be lower case; a bare `<<ID` must be upper case. A start
+/// counts only when its terminator line exists (the caller checks), which
+/// keeps `args <<"x"` and `x <<-y` the shifts they are. `<<` followed by a
+/// space (`args << "x"`, `class << self`) is never a heredoc.
 fn heredoc_starts(line: &str) -> Vec<Heredoc> {
-    let b = line.as_bytes();
     let mut found = Vec::new();
+    heredoc_starts_in(line.as_bytes(), &mut found);
+    found
+}
+
+fn heredoc_starts_in(b: &[u8], found: &mut Vec<Heredoc>) {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'#' {
             break;
         }
         if let Some(lit) = literal_at(b, i) {
+            if lit.delims.interpolates {
+                interpolated_heredocs(&b[i..lit.end], found);
+            }
             i = lit.end;
             continue;
         }
         if b[i..].starts_with(b"<<") {
             let before = i.checked_sub(1).map(|j| b[j]);
-            if before.is_none_or(|p| matches!(p, b' ' | b'(' | b',' | b'=' | b'\t'))
-                && let Some((h, len)) = heredoc_at(&b[i + 2..])
+            if before.is_none_or(|p| {
+                matches!(
+                    p,
+                    b' ' | b'\t' | b'(' | b',' | b'=' | b'[' | b'{' | b'+' | b'?' | b':'
+                )
+            }) && let Some((h, len)) = heredoc_at(&b[i + 2..])
             {
                 found.push(h);
                 i += 2 + len;
@@ -895,7 +908,27 @@ fn heredoc_starts(line: &str) -> Vec<Heredoc> {
         }
         i += 1;
     }
-    found
+}
+
+/// The heredocs opened inside the `#{...}` parts of the literal `lit`.
+fn interpolated_heredocs(lit: &[u8], found: &mut Vec<Heredoc>) {
+    let mut j = 0;
+    while j + 1 < lit.len() {
+        match lit[j] {
+            b'\\' => j += 2,
+            b'#' if lit[j + 1] == b'{' => {
+                let end = skip_interpolation(lit, j + 2);
+                let body_end = if end > j + 2 && lit[end - 1] == b'}' {
+                    end - 1
+                } else {
+                    end
+                };
+                heredoc_starts_in(&lit[j + 2..body_end], found);
+                j = end;
+            }
+            _ => j += 1,
+        }
+    }
 }
 
 /// A string, `%`-literal or regex literal found in a line of Ruby.
@@ -961,33 +994,8 @@ fn literal_at(b: &[u8], i: usize) -> Option<Literal> {
         }
         b'/' => {
             // A regex where an operand is expected; otherwise a division.
-            let before = b[..i].trim_ascii_end();
-            let operand = match before.last() {
-                None => true,
-                Some(c) if b"(,=~!{[|&?;".contains(c) => true,
-                Some(_) => {
-                    let word_start = before
-                        .iter()
-                        .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
-                        .map_or(0, |p| p + 1);
-                    [
-                        &b"regex"[..],
-                        b"when",
-                        b"if",
-                        b"unless",
-                        b"and",
-                        b"or",
-                        b"split",
-                        b"match",
-                        b"gsub",
-                        b"sub",
-                        b"scan",
-                    ]
-                    .contains(&&before[word_start..])
-                }
-            };
             let next = b.get(i + 1).copied();
-            (operand && next.is_none_or(|c| c != b' ' && c != b'=')).then(|| {
+            (regex_expected(b, i) && next.is_none_or(|c| c != b' ' && c != b'=')).then(|| {
                 let delims = Delims {
                     open: b'/',
                     close: b'/',
@@ -996,8 +1004,82 @@ fn literal_at(b: &[u8], i: usize) -> Option<Literal> {
                 delimited(b, i + 1, delims)
             })
         }
+        b'?' => char_literal_end(b, i).map(|end| Literal {
+            end,
+            closed: true,
+            delims: Delims {
+                open: b'?',
+                close: b'?',
+                interpolates: false,
+            },
+        }),
         _ => None,
     }
+}
+
+/// Words after which a `/` starts a regex, whatever the spacing.
+const REGEX_AFTER: &[&[u8]] = &[
+    b"if", b"unless", b"elsif", b"else", b"then", b"return", b"when", b"and", b"or", b"not",
+    b"while", b"until", b"case", b"do", b"in", b"yield", b"break", b"next", b"puts", b"print",
+    b"regex", b"split", b"match", b"gsub", b"sub", b"scan",
+];
+
+/// Whether the `/` at `b[i]` starts a regex, following Ruby: after an operator,
+/// an opening bracket, a comma, a keyword or a method name followed by a space
+/// (`assert_match /x/`, with no space after the `/`), but a division after a
+/// number, a variable or a closing bracket.
+fn regex_expected(b: &[u8], i: usize) -> bool {
+    let before = b[..i].trim_ascii_end();
+    let Some(&last) = before.last() else {
+        return true;
+    };
+    if b"(,=~!{[|&?;<>:+-*^".contains(&last) {
+        return true;
+    }
+    let word_start = before
+        .iter()
+        .rposition(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+        .map_or(0, |p| p + 1);
+    let word = &before[word_start..];
+    // A quote, a closing bracket or a character like `%`, or a variable or symbol.
+    if word.is_empty()
+        || word_start
+            .checked_sub(1)
+            .is_some_and(|j| matches!(before[j], b'@' | b'$' | b':'))
+    {
+        return false;
+    }
+    if REGEX_AFTER.contains(&word) {
+        return true;
+    }
+    // `foo /x/`: a method called with a regex. `a/2` and `a / 2` divide, and a
+    // number, constant or value keyword is never a method.
+    before.len() < i
+        && word[0].is_ascii_lowercase()
+        && ![&b"end"[..], b"self", b"nil", b"true", b"false"].contains(&word)
+}
+
+/// The end of the character literal `?x` or `?\n` at `b[i]`, if it is one: `?`
+/// begins an expression there, not a method name (`end_with?`) or a ternary
+/// (`a ? b : c`), and nothing name-like follows. ASCII only, so the end is
+/// always a character boundary.
+fn char_literal_end(b: &[u8], i: usize) -> Option<usize> {
+    if i > 0 && !(b[i - 1].is_ascii_whitespace() || b"(,=[{|&;!<>+-*/%^~:".contains(&b[i - 1])) {
+        return None;
+    }
+    let end = match *b.get(i + 1)? {
+        // `a ?<<~EOS : b` is a ternary with a heredoc, not the character `<`.
+        b'<' if b.get(i + 2) == Some(&b'<') => return None,
+        b'\\' => i + 3,
+        c if c.is_ascii_graphic() => i + 2,
+        _ => return None,
+    };
+    if !b.get(i + 2..end)?.iter().all(|c| c.is_ascii_graphic()) {
+        return None;
+    }
+    b.get(end)
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+        .then_some(end)
 }
 
 /// Scan a literal whose body starts at `b[from]`: up to the `close` that ends
@@ -1106,10 +1188,9 @@ fn strip_comment(t: &str) -> &str {
 /// The heredoc id after a `<<` (`~ID`, `-ID`, `ID`, `~'ID'`, ...) and how many
 /// bytes it spans.
 fn heredoc_at(rest: &[u8]) -> Option<(Heredoc, usize)> {
-    let (squiggly, indented, mut at) = match rest.first()? {
-        b'~' => (true, true, 1),
-        b'-' => (false, true, 1),
-        _ => (false, false, 0),
+    let (indented, mut at) = match rest.first()? {
+        b'~' | b'-' => (true, 1),
+        _ => (false, 0),
     };
     let quote = rest
         .get(at)
@@ -1125,7 +1206,8 @@ fn heredoc_at(rest: &[u8]) -> Option<(Heredoc, usize)> {
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return None;
     }
-    if !(squiggly && quote.is_none()) && id.bytes().any(|c| c.is_ascii_lowercase()) {
+    // A bare `<<id` is far more often a shift of a variable than a heredoc.
+    if !indented && quote.is_none() && id.bytes().any(|c| c.is_ascii_lowercase()) {
         return None;
     }
     let mut end = at + len;
@@ -1153,14 +1235,23 @@ fn is_ruby_end(t: &str) -> bool {
         .any(|p| t.starts_with(p))
 }
 
-/// `at_top`: outside every block, where `class` / `module` / `cask` name the
-/// definition; deeper they are a `cask "token"` livecheck reference or similar.
+/// `at_top`: outside every block, where `cask` names the definition; deeper it
+/// is a `cask "token"` livecheck reference or similar.
 fn opens_ruby_block(t: &str, at_top: bool) -> bool {
-    if at_top && (t.starts_with("class ") || t.starts_with("module ") || t.starts_with("cask ")) {
+    let stripped = strip_comment(t);
+    // `class Foo`, `module Foo` and the singleton `class << self` at any depth;
+    // a one-liner (`class << self; end`) closes itself.
+    if (stripped.starts_with("class ") || stripped.starts_with("module "))
+        && !has_end_word(stripped)
+    {
         return true;
     }
-    let stripped = strip_comment(t);
-    if stripped == "do" || stripped.ends_with(" do") || stripped.contains(" do |") {
+    if at_top && stripped.starts_with("cask ") {
+        return true;
+    }
+    // `do` in a string (`desc "Run it and do"`) opens nothing.
+    let code = blank_strings(stripped);
+    if code == "do" || code.ends_with(" do") || code.contains(" do |") {
         return true;
     }
     let keyword = stripped == "begin"
@@ -2756,12 +2847,14 @@ mod balance_tests {
 
     #[test]
     fn a_quote_with_no_partner_does_not_swallow_the_file() {
-        for body in [
-            "    x = %w[don't]\n    if a\n      b\n    end",
-            "    x = ?\"\n    if a\n      b\n    end",
-        ] {
-            assert_balanced(&formula(body));
-        }
+        // An unpartnered quote swallows text up to the next quote. `if`/`end`
+        // pairs inside the swallowed text cancel out, so balance alone proves
+        // nothing: the stanzas after the quote must be read too.
+        lexer_edge_tests::assert_block_bodies(&[
+            "      x = %w[don't]",
+            "      x = ?\"",
+            "      x = ?'",
+        ]);
     }
 
     #[test]
@@ -2785,5 +2878,260 @@ mod balance_tests {
         assert!(!lines.iter().any(|l| l.contains("bad")), "{lines:?}");
         assert!(lines.iter().any(|l| l.starts_with("sha256 \"abc\"")));
         assert_balanced(rb);
+    }
+}
+
+/// Lexer edge cases the line-based block tracker must get right: each one is
+/// placed where a miss hides or invents identity (a livecheck `strategy` block
+/// followed by a `resource`, `sha256`, `revision` and `deprecate!`, and the
+/// same shape at class level), and checked for balance and for the identity
+/// read with and without a host.
+#[cfg(test)]
+mod lexer_edge_tests {
+    use super::*;
+
+    const HOST_TXT: &str = "golden_gate 27\ntahoe 26\nsequoia 15\nsonoma 14\nventura 13\nmonterey 12\nbig_sur 11\nHOST golden_gate arm64\nLANG en-US\n";
+
+    /// `body` inside a livecheck `strategy ... do |page|` block (depth 2 or deeper).
+    fn formula_in_block(body: &str) -> String {
+        format!(
+            "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  livecheck do\n    url :stable\n    strategy :page_match do |page|\n{body}\n    end\n  end\n  resource \"bar\" do\n    url \"https://e.com/bar-9.9.9.tar.gz\"\n    sha256 \"bad\"\n  end\n  sha256 \"abc\"\n  revision 3\n  deprecate! date: \"2020-01-01\", because: :unmaintained\n\n  def install\n    # don't\n    system \"true\"\n  end\nend\n"
+        )
+    }
+
+    fn cask_in_block(body: &str) -> String {
+        format!(
+            "cask \"foo\" do\n  version \"1.2.3\"\n  sha256 \"abc\"\n  url \"https://e.com/foo.dmg\"\n  livecheck do\n    url :url\n    strategy :page_match do |page|\n{body}\n    end\n  end\n  auto_updates true\n  depends_on macos: \">= :big_sur\"\n  app \"Foo.app\"\n  zap trash: \"bad\"\n  # don't\nend\n"
+        )
+    }
+
+    /// `body` at class level, between the `url` and the stanzas that follow it.
+    fn formula_at_top(body: &str) -> String {
+        format!(
+            "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n{body}\n  resource \"bar\" do\n    url \"https://e.com/bar-9.9.9.tar.gz\"\n    sha256 \"bad\"\n  end\n  sha256 \"abc\"\n  revision 3\n  deprecate! date: \"2020-01-01\", because: :unmaintained\n\n  def install\n    # don't\n    system \"true\"\n  end\nend\n"
+        )
+    }
+
+    fn cask_at_top(body: &str) -> String {
+        format!(
+            "cask \"foo\" do\n  version \"1.2.3\"\n  sha256 \"abc\"\n  url \"https://e.com/foo.dmg\"\n{body}\n  auto_updates true\n  depends_on macos: \">= :big_sur\"\n  app \"Foo.app\"\n  zap trash: \"bad\"\n  # don't\nend\n"
+        )
+    }
+
+    /// Balance and identity of a formula and a cask, each without a host and
+    /// with one; the first thing that is off, described.
+    fn check_intact(formula: &str, cask: &str) -> Result<(), String> {
+        let host = HostPlatform::parse(HOST_TXT).expect("host");
+        for host in [None, Some(&host)] {
+            let with = if host.is_some() { "with" } else { "without" };
+            let p = depth1_pass(formula, host, None);
+            if (p.depth, p.open) != (0, 0) {
+                return Err(format!(
+                    "formula {with} host: depth={} open={}",
+                    p.depth, p.open
+                ));
+            }
+            let id =
+                parse_formula(formula, host).map_err(|e| format!("formula {with} host: {e}"))?;
+            if (id.version.as_str(), id.sha256.as_str(), id.revision) != ("1.2.3", "abc", 3) {
+                return Err(format!(
+                    "formula {with} host: v={} sha={} rev={}",
+                    id.version, id.sha256, id.revision
+                ));
+            }
+            if lifecycle_flags(formula, host).len() != 1 {
+                return Err(format!("formula {with} host: deprecate! lost"));
+            }
+            let p = depth1_pass(cask, host, None);
+            if (p.depth, p.open) != (0, 0) {
+                return Err(format!(
+                    "cask {with} host: depth={} open={}",
+                    p.depth, p.open
+                ));
+            }
+            if !cask_auto_updates(cask, host) {
+                return Err(format!("cask {with} host: auto_updates lost"));
+            }
+            let id = parse_cask(cask, host).map_err(|e| format!("cask {with} host: {e}"))?;
+            if (id.version.as_str(), id.sha256.as_deref()) != ("1.2.3", Some("abc")) {
+                return Err(format!(
+                    "cask {with} host: v={} sha={:?}",
+                    id.version, id.sha256
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Every body must leave the stanzas after it intact; all failures are listed.
+    fn assert_bodies(bodies: &[&str], place: fn(&str) -> (String, String)) {
+        let failed: Vec<String> = bodies
+            .iter()
+            .filter_map(|body| {
+                let (formula, cask) = place(body);
+                check_intact(&formula, &cask)
+                    .err()
+                    .map(|why| format!("{body:?}: {why}"))
+            })
+            .collect();
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    pub(super) fn assert_block_bodies(bodies: &[&str]) {
+        assert_bodies(bodies, |b| (formula_in_block(b), cask_in_block(b)));
+    }
+
+    fn assert_top_bodies(bodies: &[&str]) {
+        assert_bodies(bodies, |b| (formula_at_top(b), cask_at_top(b)));
+    }
+
+    #[test]
+    fn a_regex_after_a_keyword_operator_or_bracket_is_text() {
+        assert_block_bodies(&[
+            "      if a\n        b\n      elsif /x\"y/ =~ z\n        c\n      end",
+            "      x = if a then /it's/ else b end",
+            "      return /x\"y/ if a",
+            "      puts /x'/.match?(a)",
+            "      args << /it's/",
+            "      h = { \"a\" => /it's/ }",
+            "      foo(bar: /it's/)",
+            "      foo bar: /it's/",
+            "      x = !/it's/.match?(y)",
+            "      foo(a, /it's/)",
+            "      foo(/it's/)",
+            "      x = y.map { |f| /it's/ =~ f }",
+            "      assert_match /it's/, out",
+            "      refute_match /x\"y/, out",
+            "      x = y.select { |f| f =~ /it's/ }",
+            "      case a\n      when 1 then /it's/\n      else b\n      end",
+        ]);
+    }
+
+    #[test]
+    fn a_slash_after_a_value_is_still_a_division() {
+        assert_block_bodies(&[
+            "      x = a / 2 / 3\n      y = 'q'\n      z = \"w\"",
+            "      x /= 2\n      y = \"q\"",
+            "      y = a.size? / 2\n      z = 'q'",
+            "      x = a[0] / 2\n      y = 'q'",
+            "      x = (a) / b\n      y = \"c/d\"",
+            "      x = 10 / 2\n      y = \"q\"",
+            "      x = @a / 2\n      y = 'q'",
+            "      x = end_of / 2\n      y = \"q\"",
+            "      x = prefix/\"bin\"\n      y = 'q'",
+            "      x = a.b/\"c\"\n      y = 'q'",
+        ]);
+    }
+
+    #[test]
+    fn a_character_literal_is_one_character() {
+        assert_block_bodies(&[
+            "      x = ?\"",
+            "      x = ?'",
+            "      x = page.end_with?(?/)",
+            "      x = ?#",
+            "      x = ?\\n",
+            "      x = foo(?\", ?')",
+            "      x = a ? ?\" : ?'",
+        ]);
+    }
+
+    #[test]
+    fn a_question_mark_after_a_name_or_before_a_space_is_not_a_character_literal() {
+        assert_block_bodies(&[
+            "      x = a.nil? ? \"b\" : 'c'\n      y = \"d\"",
+            "      x = a.end_with?(\"a\") ? 'b' : \"c\"",
+            "      x = a ? \"b\" : 'c'",
+            "      x = a.empty?\n      y = \"it's\"",
+        ]);
+    }
+
+    #[test]
+    fn a_heredoc_after_a_bracket_operator_or_interpolation_is_text() {
+        assert_block_bodies(&[
+            "      x = [<<~EOS]\n        end\n      EOS",
+            "      x = {<<~EOS => 1}\n        end\n      EOS",
+            "      x = \"a\" + <<~EOS\n        end\n      EOS",
+            "      x = a ?<<~EOS : b\n        end\n      EOS",
+            "      x = a ? b :<<~EOS\n        end\n      EOS",
+            "      x = \"#{<<~EOS}\"\n        end\n      EOS",
+            "      x = `#{<<~EOS}`\n        end\n      EOS",
+            "      x = \"a#{b + \"c\"}#{<<~EOS}\"\n        end\n      EOS",
+            "      x = <<~'eos'\n        end\n      eos",
+            "      x = <<~\"eos\"\n        end\n      eos",
+            "      x = <<-eos\n        end\n      eos",
+            "      x = <<-'eos'\n        end\n      eos",
+            "      x = <<'eos'\n        end\neos",
+            "      x = <<~eos\n        end\n      eos",
+        ]);
+    }
+
+    #[test]
+    fn a_shift_with_no_terminator_is_not_a_heredoc() {
+        assert_block_bodies(&[
+            "      x <<-y\n      z = \"q\"\n      if a\n        b\n      end",
+            "      args <<\"x\"\n      if a\n        b\n      end",
+            "      x = '#{<<~EOS}'\n      if a\n        b\n      end",
+        ]);
+    }
+
+    #[test]
+    fn a_class_singleton_block_closes_with_its_end() {
+        assert_top_bodies(&[
+            "  class << self\n    def foo\n      1\n    end\n  end",
+            "  class << self # singleton\n    attr_accessor :x\n  end",
+            "  class <<self\n    attr_accessor :x\n  end",
+            "  class << self; end",
+            "  class << self; attr_accessor :x; end",
+        ]);
+        assert_block_bodies(&[
+            "      class << self\n        def foo\n          1\n        end\n      end",
+            "      class << self; end",
+        ]);
+    }
+
+    #[test]
+    fn a_nested_class_or_module_closes_with_its_end() {
+        assert_top_bodies(&[
+            "  module Helper\n    def self.x\n      1\n    end\n  end",
+            "  class Helper\n    def x\n      1\n    end\n  end",
+        ]);
+    }
+
+    #[test]
+    fn do_inside_a_string_opens_no_block() {
+        assert_top_bodies(&[
+            "  desc \"Things to do | list\"",
+            "  desc \"Run it and do\"",
+            "  desc 'Things to do | list'",
+            "  desc \"Run it and do\" # a comment",
+            "  desc \"x\" \\\n       \"to do |\"",
+        ]);
+        assert_block_bodies(&[
+            "      x = \"Things to do | list\"",
+            "      x = \"Run it and do\"",
+        ]);
+    }
+
+    #[test]
+    fn do_after_a_string_still_opens_a_block() {
+        assert_top_bodies(&[
+            "  foo \"a do\" do\n    x\n  end",
+            "  foo \"a\" do |x|\n    x\n  end",
+            "  foo 'it''s' do\n    x\n  end",
+        ]);
+    }
+
+    #[test]
+    fn a_trailing_comment_is_not_part_of_a_line_that_ends_a_scope_or_sets_auto_updates() {
+        let rb = "cask \"foo\" do\n  version \"1.2.3\"\n  auto_updates true # \"x\" #\nend\n";
+        assert!(cask_auto_updates(rb, None));
+        let rb = "cask \"foo\" do\n  version \"1.2.3\"\n  auto_updates \"true # \"\nend\n";
+        assert!(!cask_auto_updates(rb, None));
+        let host = HostPlatform::parse(HOST_TXT).expect("host");
+        let rb = "cask \"foo\" do\n  on_arm do # \"x\n    version \"2.0\" # y\n  end\nend\n";
+        assert_eq!(parse_cask(rb, Some(&host)).expect("cask").version, "2.0");
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  sha256 \"abc\"\n  def install # \"x\n  end\n  url \"https://e.com/bad-9.9.9.tar.gz\"\nend\n";
+        assert_eq!(parse_formula(rb, None).expect("formula").version, "1.2.3");
     }
 }
