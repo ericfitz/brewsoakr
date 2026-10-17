@@ -67,6 +67,9 @@ pub struct Filter {
     /// Set right after `==> Upgrading x`, when the next indented line is the
     /// `  0.1.0 -> 0.2.0` continuation.
     expect_version_line: bool,
+    /// Set right after a dropped `To reinstall x, run:` line; only the line
+    /// directly following it is the `  brew reinstall x` command to drop.
+    expect_reinstall_cmd: bool,
     caveats: Vec<Caveat>,
     /// Cellar version of everything brew reported installing this session,
     /// including transitive dependencies we did not ask for by name.
@@ -85,6 +88,7 @@ impl Filter {
     pub fn start_run(&mut self) {
         self.state = Some(State::Normal);
         self.expect_version_line = false;
+        self.expect_reinstall_cmd = false;
         self.last_shown = None;
     }
 
@@ -175,6 +179,8 @@ impl Filter {
     fn normal_line(&mut self, t: &str) -> Option<String> {
         let was_expecting_version = self.expect_version_line;
         self.expect_version_line = false;
+        let was_expecting_reinstall = self.expect_reinstall_cmd;
+        self.expect_reinstall_cmd = false;
 
         if t.trim().is_empty() {
             return None;
@@ -183,8 +189,14 @@ impl Filter {
         if was_expecting_version && t.starts_with(' ') && t.contains("->") {
             return None;
         }
-        // `To reinstall 1.0.0, run:` / `  brew reinstall x` add nothing.
-        if t.starts_with("To reinstall ") || t.trim_start().starts_with("brew reinstall ") {
+        // `To reinstall 1.0.0, run:` / `  brew reinstall x` add nothing. The
+        // command is dropped only directly after the hint: brew's rebuild
+        // advice also contains a `brew reinstall` line the user needs.
+        if t.starts_with("To reinstall ") {
+            self.expect_reinstall_cmd = true;
+            return None;
+        }
+        if was_expecting_reinstall && t.trim_start().starts_with("brew reinstall ") {
             return None;
         }
         if is_already_up_to_date(t) || is_outdated_preamble(t) {
@@ -531,6 +543,37 @@ To reinstall 1.0.0, run:
         );
         assert_eq!(f.added_bytes(), 1024 * 1024);
         assert_eq!(f.freed_bytes(), (418.3 * 1024.0) as u64);
+    }
+
+    #[test]
+    fn rebuild_hint_keeps_its_reinstall_command() {
+        let input = "\
+Warning: ada-url has broken dynamic library links:
+  
+Rebuild this from source with:
+  brew reinstall --build-from-source ada-url
+If that's successful, file an issue.";
+        let (out, _) = run(input);
+        assert_eq!(
+            out,
+            vec![
+                "Warning: ada-url has broken dynamic library links:",
+                "Rebuild this from source with:",
+                "  brew reinstall --build-from-source ada-url",
+                "If that's successful, file an issue.",
+            ],
+            "{out:#?}"
+        );
+    }
+
+    #[test]
+    fn reinstall_command_only_dropped_right_after_the_hint() {
+        let input = "\
+To reinstall 1.0.0, run:
+  brew reinstall x
+  brew reinstall y";
+        let (out, _) = run(input);
+        assert_eq!(out, vec!["  brew reinstall y"], "{out:#?}");
     }
 
     #[test]
