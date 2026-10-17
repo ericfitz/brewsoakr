@@ -477,14 +477,18 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(r.refused);
         assert_eq!(r.brew_status, None);
-        for name in ["widget", "packer"] {
-            assert!(
-                text.contains(&format!(
-                    "{name}: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
-                )),
-                "{text}"
-            );
-        }
+        assert_eq!(
+            text.matches("brew does not trust tap").count(),
+            1,
+            "one hold line for the target, not one per package: {text}"
+        );
+        assert!(
+            text.contains(
+                "packer: dependency widget: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("held 1"), "the target is held once: {text}");
         assert!(text.contains("upgraded 0,"), "{text}");
     }
 

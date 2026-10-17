@@ -14,6 +14,17 @@ use crate::snapshot::Snapshots;
 use std::io::Write;
 use std::path::Path;
 
+/// `name (installed) < cutoff`. A `:latest` cask has no version to order, and
+/// is listed only because its cutoff definition (url or sha) differs from the
+/// installed one, so say that in brew's own `outdated --verbose` style
+/// (`Cask#outdated_info`: `token (latest) != latest`, without the colon).
+fn compare_line(name: &str, installed: &str, cmp: char, cutoff: &str) -> String {
+    if installed == ":latest" && cutoff == ":latest" {
+        return format!("{name} (latest) != latest (definition changed)");
+    }
+    format!("{name} ({installed}) {cmp} {cutoff}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn outdated(
     brew: &impl Brew,
@@ -146,7 +157,7 @@ pub fn outdated(
                     .as_ref()
                     .map(report::identity_version)
                     .unwrap_or_else(|| "none".into());
-                upgrades.push(format!("{} ({installed_ver}) < {cutoff_ver}", pkg.name));
+                upgrades.push(compare_line(&pkg.name, &installed_ver, '<', &cutoff_ver));
             }
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
@@ -177,7 +188,7 @@ pub fn outdated(
                     DesiredAction::HoldUnordered => '?',
                     _ => '<',
                 };
-                auto_updates.push(format!("{} ({installed_ver}) {cmp} {cutoff_ver}", pkg.name));
+                auto_updates.push(compare_line(&pkg.name, &installed_ver, cmp, &cutoff_ver));
             }
             DesiredAction::NoOpAlreadySoaked => soaked += 1,
         }
@@ -449,11 +460,11 @@ mod tests {
             "{text}"
         );
         assert!(
-            upgrades.contains(&"self-latest (:latest) < :latest".to_string()),
+            upgrades.contains(&"self-latest (latest) != latest (definition changed)".to_string()),
             "{text}"
         );
         assert!(
-            upgrades.contains(&"moved (:latest) < :latest".to_string()),
+            upgrades.contains(&"moved (latest) != latest (definition changed)".to_string()),
             "{text}"
         );
         assert!(

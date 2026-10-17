@@ -847,7 +847,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 }
             }
             StagedRun::LoadFailure => self.hold_staged_copy(dep),
-            StagedRun::Untrusted(tap) => self.hold_untrusted(dep, &tap),
+            // The target cannot install without this dep: hold the target once
+            // (one line, one count) rather than the dep and then the target.
+            StagedRun::Untrusted(tap) => {
+                if counted_here && self.counted_deps.remove(dep) {
+                    self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                }
+                self.hold_target_untrusted_dep(target, dep, &tap);
+                return Ok(false);
+            }
         }
         Ok(true)
     }
@@ -945,6 +953,16 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         ));
         self.counts.held += 1;
         self.refused = true;
+    }
+
+    /// A dependency lives in a tap brew does not trust, so the target cannot
+    /// install: one hold line naming the dependency and the tap, and the
+    /// target counted once as held.
+    fn hold_target_untrusted_dep(&mut self, target: &str, dep: &str, tap: &str) {
+        self.hold_target_for_dep();
+        self.defer(format!(
+            "{target}: dependency {dep}: brew does not trust tap {tap}; run brew trust {tap}, or add it to NO_SOAK"
+        ));
     }
 
     /// The target was counted as upgraded when it was announced; it is held
