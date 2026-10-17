@@ -97,6 +97,24 @@ dependent, for two reasons:
 The dependency keeps its own plan entry. Installed formula dependencies of a
 cask are still walked.
 
+## 7. Formula versions derived by brew (decision by Eric, 2026-10-17)
+
+A corpus scan found ~550 core formulae whose url-derived version differs from
+Homebrew's (`sf_19` vs `19`, `download` vs `8.14.18`, `9.10.3-src` vs `9.10.3`).
+The version feeds brew's version ordering (`settle_order`) and every
+version shown. Eric chose to ask brew rather than port more of
+`Version.parse`.
+
+- An explicit `version` stanza is still read from the file.
+- When the version is derived (no `version` stanza), `parse_formula` records
+  the url and git `tag:` it derived it from. brewsoak asks brew for
+  `Version.detect(url, tag:)` in one batched `brew ruby` call, memoized for
+  the run (failures too), like `compare_versions`. Bare runs prefetch every
+  derived version they will parse in one call, before ordering.
+- If brew can't answer (a failed call, an empty result, or a url with `#{`
+  interpolation), the local heuristic version is kept. The package parses
+  exactly as before, and both sides of a comparison still use the same rule.
+
 ## Re-running
 
 No persistent state is added. Classification and parsing are recomputed each

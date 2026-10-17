@@ -117,6 +117,19 @@ pub struct FormulaIdentity {
     /// receipts omit that block, so this is `None` and must not be treated as 0.
     pub rebuild: Option<u32>,
     pub sha256: String,
+    /// What `version` was derived from, when no `version` stanza gave it:
+    /// `version` is then only a local guess, and brew's `Version.detect` of
+    /// this source is the better answer. `None` for an explicit `version`.
+    /// Not part of `same_artifact`.
+    pub derived_from: Option<VersionSource>,
+}
+
+/// The `url` (and git `tag:`) a formula version was derived from, as
+/// `Version.detect(url, tag:)` takes them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VersionSource {
+    pub url: String,
+    pub tag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -187,18 +200,26 @@ pub fn parse_formula(rb: &str, host: Option<&HostPlatform>) -> Result<FormulaIde
     };
     let git_tag = keyword_quoted(scope, "tag:");
     let git_rev = keyword_quoted(scope, "revision:");
+    let url = pick_quoted(scope, "url ", last);
+    let mut derived_from = None;
     let version = match pick_quoted(scope, "version ", last) {
         Some(v) => v,
         None => {
             if let Some(tag) = git_tag.as_deref() {
+                derived_from = url.clone().map(|url| VersionSource {
+                    url,
+                    tag: Some(tag.to_string()),
+                });
                 drop_tag_v(tag).to_string()
             } else {
-                let url = pick_quoted(scope, "url ", last).ok_or_else(|| {
+                let url = url.ok_or_else(|| {
                     Error::Other("formula missing version, git tag, and url".into())
                 })?;
-                version_from_url(&url).ok_or_else(|| {
+                let v = version_from_url(&url).ok_or_else(|| {
                     Error::Other("could not derive formula version from url".into())
-                })?
+                })?;
+                derived_from = Some(VersionSource { url, tag: None });
+                v
             }
         }
     };
@@ -213,6 +234,7 @@ pub fn parse_formula(rb: &str, host: Option<&HostPlatform>) -> Result<FormulaIde
         revision,
         rebuild,
         sha256,
+        derived_from,
     })
 }
 
@@ -866,6 +888,7 @@ end
                 revision: 1,
                 rebuild: Some(2),
                 sha256: "0d5cd86965f869a26cf64f4b71be7b96f90a3ba8b3d74e27e8e9d9d5550f31ba".into(),
+                derived_from: None,
             }
         );
     }
@@ -1188,6 +1211,7 @@ end
             revision: 0,
             rebuild: None,
             sha256: "s".into(),
+            derived_from: None,
         });
         assert!(latest.is_latest_cask());
         assert!(
@@ -1643,5 +1667,54 @@ mod platform_tests {
             (got.version.as_str(), got.sha256.as_str()),
             ("2.3", "abc123")
         );
+    }
+
+    #[test]
+    fn derived_from_records_the_url_or_tag_only_when_the_version_is_guessed() {
+        let from_url = parse_formula(
+            "class Foo < Formula\n  url \"https://example.com/foo-sf_19.tar.gz\"\n  sha256 \"a\"\nend\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            from_url.derived_from,
+            Some(VersionSource {
+                url: "https://example.com/foo-sf_19.tar.gz".into(),
+                tag: None
+            })
+        );
+        let tagged = parse_formula(
+            "class Foo < Formula\n  url \"https://example.org/foo.git\", tag: \"v2.3\", revision: \"abc\"\nend\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            tagged.derived_from,
+            Some(VersionSource {
+                url: "https://example.org/foo.git".into(),
+                tag: Some("v2.3".into())
+            })
+        );
+        let explicit = parse_formula(
+            "class Foo < Formula\n  url \"https://example.com/download\"\n  version \"8.1\"\n  sha256 \"a\"\nend\n",
+            None,
+        )
+        .unwrap();
+        assert_eq!(explicit.derived_from, None);
+        assert_eq!(explicit.version, "8.1");
+    }
+
+    #[test]
+    fn same_artifact_ignores_what_the_version_was_derived_from() {
+        let a = parse_formula(
+            "class Foo < Formula\n  url \"https://example.com/foo-1.tar.gz\"\n  sha256 \"a\"\nend\n",
+            None,
+        )
+        .unwrap();
+        let b = FormulaIdentity {
+            derived_from: None,
+            ..a.clone()
+        };
+        assert!(PkgIdentity::Formula(a).same_artifact(&PkgIdentity::Formula(b)));
     }
 }

@@ -1,5 +1,5 @@
 use crate::Error;
-use crate::identity::HostPlatform;
+use crate::identity::{HostPlatform, VersionSource};
 use crate::quiet;
 use crate::resolve::PkgKind;
 use crate::taps::TapInfo;
@@ -46,6 +46,11 @@ const COMPARE_VERSIONS_RUBY: &str = r#"ARGV.each_slice(3) do |kind, a, b|
   puts(kind == "cask" ? Version.new(a) <=> Version.new(b) : PkgVersion.parse(a) <=> PkgVersion.parse(b))
 end"#;
 
+/// Runs under `brew ruby -e`: ARGV holds `url tag` pairs (an empty tag means
+/// none), and each prints brew's `Version.detect` of it, empty when brew
+/// cannot tell. The strings arrive as arguments, never as Ruby source.
+const DETECT_VERSIONS_RUBY: &str = r#"ARGV.each_slice(2) { |url, tag| puts Version.detect(url, **(tag.empty? ? {} : { tag: tag })).to_s }"#;
+
 /// Runs under `brew ruby -e`: prints every `<codename> <version>` pair brew
 /// knows, then `HOST <codename> <arch>` for this machine.
 const HOST_PLATFORM_RUBY: &str = r##"puts MacOSVersion::SYMBOLS.map { |k, v| "#{k} #{v}" }
@@ -87,6 +92,13 @@ pub trait Brew {
     fn host_platform(&self) -> Option<HostPlatform> {
         None
     }
+    /// Homebrew's `Version.detect` of each source, one entry per source, from
+    /// one `brew ruby` call. `None` when brew cannot tell (or the url holds a
+    /// `#{` interpolation, which is never asked). The default answers `None`
+    /// for all, so the caller keeps its own guess.
+    fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
+        Ok(vec![None; sources.len()])
+    }
 }
 
 /// `(kind tag, a, b)` of one `compare_versions` pair.
@@ -102,6 +114,10 @@ pub struct ProcessBrew {
     /// Pairs whose batch failed, with the failure: a broken `brew ruby` costs
     /// one spawn per run, not one per package.
     ordering_failures: Mutex<HashMap<OrderKey, (i32, String)>>,
+    /// `detect_versions` answers for this run.
+    detected: Mutex<HashMap<VersionSource, Option<String>>>,
+    /// Sources whose batch failed, with the failure.
+    detect_failures: Mutex<HashMap<VersionSource, (i32, String)>>,
     /// `host_platform`, asked once: the host never changes during a run.
     host: std::cell::OnceCell<Option<HostPlatform>>,
     sink: Mutex<Sink>,
@@ -163,6 +179,25 @@ impl ProcessBrew {
             })
     }
 
+    fn ask_versions(&self, args: &[String], count: usize) -> Result<Vec<Option<String>>, Error> {
+        let output = self.run(args)?;
+        if !output.status.success() {
+            return Err(brew_fail(&output));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let answers: Vec<Option<String>> = stdout
+            .lines()
+            .map(|l| Some(l.trim()).filter(|v| !v.is_empty()).map(String::from))
+            .collect();
+        if answers.len() != count {
+            return Err(Error::Brew {
+                status: 0,
+                message: format!("unparseable version detection output: {}", stdout.trim()),
+            });
+        }
+        Ok(answers)
+    }
+
     pub fn new(bin: PathBuf) -> Self {
         Self {
             bin,
@@ -170,6 +205,8 @@ impl ProcessBrew {
             cellar: std::cell::OnceCell::new(),
             orderings: Mutex::new(HashMap::new()),
             ordering_failures: Mutex::new(HashMap::new()),
+            detected: Mutex::new(HashMap::new()),
+            detect_failures: Mutex::new(HashMap::new()),
             host: std::cell::OnceCell::new(),
             sink: Mutex::new(Sink::default()),
         }
@@ -201,6 +238,12 @@ pub struct MockBrew {
     pub host: Option<HostPlatform>,
     /// The pairs of each `compare_versions` call.
     pub compares: Mutex<Vec<Vec<VersionPair>>>,
+    /// What `detect_versions` reports for a url; an unscripted url is `None`.
+    pub detections: BTreeMap<String, String>,
+    /// Makes every `detect_versions` call fail with this message.
+    pub detect_error: Option<String>,
+    /// The sources of each `detect_versions` call.
+    pub detects: Mutex<Vec<Vec<VersionSource>>>,
 }
 
 impl Default for MockBrew {
@@ -221,6 +264,9 @@ impl Default for MockBrew {
             compare_error: None,
             host: None,
             compares: Mutex::new(Vec::new()),
+            detections: BTreeMap::new(),
+            detect_error: None,
+            detects: Mutex::new(Vec::new()),
         }
     }
 }
@@ -352,6 +398,69 @@ impl Brew for ProcessBrew {
         }
         let memo = self.orderings.lock().unwrap_or_else(|e| e.into_inner());
         Ok(pairs.iter().map(|p| memo[&key(p)]).collect())
+    }
+
+    fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
+        let askable = |s: &VersionSource| !s.url.contains("#{");
+        let mut asking: Vec<&VersionSource> = Vec::new();
+        {
+            let memo = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+            for s in sources.iter().filter(|s| askable(s)) {
+                if !memo.contains_key(s) && !asking.contains(&s) {
+                    asking.push(s);
+                }
+            }
+        }
+        {
+            let failures = self
+                .detect_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some((status, message)) = sources.iter().find_map(|s| failures.get(s)) {
+                return Err(Error::Brew {
+                    status: *status,
+                    message: message.clone(),
+                });
+            }
+        }
+        if !asking.is_empty() {
+            let mut args = vec![
+                "ruby".to_string(),
+                "-e".to_string(),
+                DETECT_VERSIONS_RUBY.to_string(),
+                "--".to_string(),
+            ];
+            for s in &asking {
+                args.extend([s.url.clone(), s.tag.clone().unwrap_or_default()]);
+            }
+            match self.ask_versions(&args, asking.len()) {
+                Ok(answers) => {
+                    let mut memo = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+                    for (s, answer) in asking.iter().zip(answers) {
+                        memo.insert((*s).clone(), answer);
+                    }
+                }
+                Err(e) => {
+                    let (status, message) = match &e {
+                        Error::Brew { status, message } => (*status, message.clone()),
+                        other => (1, other.to_string()),
+                    };
+                    let mut failures = self
+                        .detect_failures
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for s in &asking {
+                        failures.insert((*s).clone(), (status, message.clone()));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        let memo = self.detected.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(sources
+            .iter()
+            .map(|s| memo.get(s).cloned().flatten())
+            .collect())
     }
 
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
@@ -585,6 +694,23 @@ impl Brew for MockBrew {
 
     fn host_platform(&self) -> Option<HostPlatform> {
         self.host.clone()
+    }
+
+    fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
+        self.detects
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(sources.to_vec());
+        if let Some(message) = &self.detect_error {
+            return Err(Error::Brew {
+                status: 1,
+                message: message.clone(),
+            });
+        }
+        Ok(sources
+            .iter()
+            .map(|s| self.detections.get(&s.url).cloned())
+            .collect())
     }
 
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
@@ -1690,6 +1816,90 @@ mod tests {
                 .ends_with("-- formula 3.6.5 3.5.9 cask 1.0 2.0"),
             "versions travel as argv, not Ruby source: {argv}"
         );
+    }
+
+    fn source(url: &str, tag: Option<&str>) -> VersionSource {
+        VersionSource {
+            url: url.to_string(),
+            tag: tag.map(String::from),
+        }
+    }
+
+    #[test]
+    fn detect_versions_batches_one_call_passes_argv_and_memoizes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "19\n\n1.2.3\n", 0);
+        let brew = ProcessBrew::new(script);
+        let sources = [
+            source("https://x.test/sf_19.tar.gz", None),
+            source("https://x.test/download", None),
+            source("https://x.test/foo.git", Some("v1.2.3")),
+            source("https://x.test/#{version}.tgz", None),
+        ];
+        let want = vec![
+            Some("19".to_string()),
+            None,
+            Some("1.2.3".to_string()),
+            None,
+        ];
+        assert_eq!(brew.detect_versions(&sources).expect("detect"), want);
+        assert_eq!(brew.detect_versions(&sources).expect("memo"), want);
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(
+            argv.matches("ruby -e").count(),
+            1,
+            "second ask is memoized: {argv}"
+        );
+        assert!(argv.contains("Version.detect"), "{argv}");
+        assert!(
+            argv.trim_end().ends_with(
+                "-- https://x.test/sf_19.tar.gz  https://x.test/download  https://x.test/foo.git v1.2.3"
+            ),
+            "strings travel as argv, an empty tag as an empty argument: {argv}"
+        );
+    }
+
+    #[test]
+    fn detect_versions_failure_is_memoized_for_the_run() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "", 1);
+        let brew = ProcessBrew::new(script);
+        let one = source("https://x.test/a-1.tgz", None);
+        assert!(brew.detect_versions(std::slice::from_ref(&one)).is_err());
+        assert!(brew.detect_versions(std::slice::from_ref(&one)).is_err());
+        let two = source("https://x.test/b-1.tgz", None);
+        assert!(brew.detect_versions(&[one, two]).is_err());
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(argv.matches("ruby -e").count(), 1, "{argv}");
+    }
+
+    #[test]
+    fn detect_versions_errors_on_failure_or_wrong_line_count() {
+        for (stdout, status) in [("", 1), ("1\n", 1), ("1\n", 0), ("1\n2\n3\n", 0)] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (script, _) = compare_script(tmp.path(), stdout, status);
+            let brew = ProcessBrew::new(script);
+            let sources = [
+                source("https://x.test/a-1.tgz", None),
+                source("https://x.test/b-2.tgz", None),
+            ];
+            assert!(
+                brew.detect_versions(&sources).is_err(),
+                "{stdout:?} exit {status} must not parse"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_versions_never_asks_for_an_interpolated_url() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(tmp.path(), "", 0);
+        let brew = ProcessBrew::new(script);
+        let got = brew
+            .detect_versions(&[source("https://x.test/#{version}.tgz", None)])
+            .expect("detect");
+        assert_eq!(got, vec![None]);
+        assert!(!log.exists(), "brew must not be spawned");
     }
 
     #[test]

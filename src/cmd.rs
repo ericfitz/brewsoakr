@@ -693,7 +693,7 @@ pub fn info(
         match r.class {
             PkgClass::NoSoak => {
                 let installed = inv.find_in(&r.origin, &r.name).and_then(|p| {
-                    parse_pkg(p.kind, &p.receipt_rb, brew.host_platform().as_ref()).ok()
+                    parse_pkg(brew, p.kind, &p.receipt_rb, brew.host_platform().as_ref()).ok()
                 });
                 let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
@@ -1341,7 +1341,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let Some(rb) = self.brew.keg_receipt(name, version) else {
             return false;
         };
-        match crate::identity::parse_formula(&rb, self.brew.host_platform().as_ref()) {
+        match parse_formula_detected(self.brew, &rb, self.brew.host_platform().as_ref()) {
             Ok(have) => PkgIdentity::Formula(have).same_artifact(want),
             Err(_) => false,
         }
@@ -1708,7 +1708,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             return Ok(false);
         }
         let want = blobs.cutoff.as_deref().and_then(|bytes| {
-            parse_pkg_bytes(kind, bytes, self.brew.host_platform().as_ref()).ok()
+            parse_pkg_bytes(self.brew, kind, bytes, self.brew.host_platform().as_ref()).ok()
         });
         if self.already_done(dep, kind, want.as_ref()) {
             return Ok(true);
@@ -1728,7 +1728,13 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 .inv
                 .find_in(dep_origin, dep)
                 .and_then(|p| {
-                    parse_pkg(kind, &p.receipt_rb, self.brew.host_platform().as_ref()).ok()
+                    parse_pkg(
+                        self.brew,
+                        kind,
+                        &p.receipt_rb,
+                        self.brew.host_platform().as_ref(),
+                    )
+                    .ok()
                 })
                 .map(|id| report::identity_version(&id));
             let to = want.as_ref().map(report::identity_version);
@@ -2274,6 +2280,7 @@ fn resolve_view(
 ) -> Result<Option<ResolvedView>, Error> {
     let host = brew.host_platform();
     let Some(mut view) = resolve_view_unordered(
+        brew,
         git,
         snaps,
         cache,
@@ -2332,6 +2339,46 @@ fn order_pair(kind: PkgKind, view: &ResolvedView) -> Option<crate::brew::Version
     Some((kind, installed, cutoff))
 }
 
+/// Ask brew for the version of every url-derived formula a bare run will
+/// parse (installed receipt, cutoff and HEAD) in one call, so each parse finds
+/// its answer memoized. A failure is left for each parse to meet and fall back.
+fn prefetch_versions(
+    brew: &impl Brew,
+    git: &impl GitStore,
+    snaps: &Snapshots,
+    cache: &Path,
+    inv: &Inventory,
+    host: Option<&HostPlatform>,
+) {
+    let mut sources: Vec<identity::VersionSource> = Vec::new();
+    let mut add = |rb: &str| {
+        if let Ok(id) = identity::parse_formula(rb, host)
+            && let Some(src) = id.derived_from
+            && !sources.contains(&src)
+        {
+            sources.push(src);
+        }
+    };
+    for pkg in snapshotted_pkgs(inv, snaps)
+        .filter(|p| p.kind == PkgKind::Formula && bare_skip(p, snaps).is_none())
+    {
+        add(&pkg.receipt_rb);
+        if let Ok(blobs) = resolve_pkg_blobs(git, snaps, cache, &pkg.origin, &pkg.name, pkg.kind) {
+            for bytes in [blobs.cutoff.as_deref(), blobs.head.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if let Ok(rb) = std::str::from_utf8(bytes) {
+                    add(rb);
+                }
+            }
+        }
+    }
+    if !sources.is_empty() {
+        let _ = brew.detect_versions(&sources);
+    }
+}
+
 /// Ask brew for every version order a bare run will need in one call, so
 /// `resolve_view` finds them memoized. A failure here is left for each
 /// package's own comparison to report.
@@ -2344,8 +2391,10 @@ fn prefetch_orderings(
 ) {
     let mut pairs = Vec::new();
     let host = brew.host_platform();
+    prefetch_versions(brew, git, snaps, cache, inv, host.as_ref());
     for pkg in snapshotted_pkgs(inv, snaps).filter(|p| bare_skip(p, snaps).is_none()) {
         if let Ok(Some(view)) = resolve_view_unordered(
+            brew,
             git,
             snaps,
             cache,
@@ -2366,6 +2415,7 @@ fn prefetch_orderings(
 
 #[allow(clippy::too_many_arguments)]
 fn resolve_view_unordered(
+    brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
@@ -2377,21 +2427,21 @@ fn resolve_view_unordered(
 ) -> Result<Option<ResolvedView>, Error> {
     let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
     let installed = match receipt_rb {
-        Some(rb) => match parse_pkg(kind, rb, host) {
+        Some(rb) => match parse_pkg(brew, kind, rb, host) {
             Ok(id) => Some(id),
             Err(_) => return Ok(None),
         },
         None => None,
     };
     let cutoff = match blobs.cutoff.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(kind, bytes, host) {
+        Some(bytes) => match parse_pkg_bytes(brew, kind, bytes, host) {
             Ok(id) => Some(id),
             Err(_) => return Ok(None),
         },
         None => None,
     };
     let head = match blobs.head.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(kind, bytes, host) {
+        Some(bytes) => match parse_pkg_bytes(brew, kind, bytes, host) {
             Ok(id) => Some(id),
             Err(_) => return Ok(None),
         },
@@ -2548,21 +2598,48 @@ fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
 }
 
 /// `host` resolves platform blocks for both kinds; `None` leaves them opaque.
-fn parse_pkg(kind: PkgKind, rb: &str, host: Option<&HostPlatform>) -> Result<PkgIdentity, Error> {
+/// A formula version derived from its url is brew's `Version.detect` of it.
+fn parse_pkg(
+    brew: &impl Brew,
+    kind: PkgKind,
+    rb: &str,
+    host: Option<&HostPlatform>,
+) -> Result<PkgIdentity, Error> {
     match kind {
-        PkgKind::Formula => Ok(PkgIdentity::Formula(identity::parse_formula(rb, host)?)),
+        PkgKind::Formula => Ok(PkgIdentity::Formula(parse_formula_detected(
+            brew, rb, host,
+        )?)),
         PkgKind::Cask => Ok(PkgIdentity::Cask(identity::parse_cask(rb, host)?)),
     }
 }
 
+/// `identity::parse_formula`, with a derived version replaced by brew's
+/// answer. A failed or empty answer keeps the local guess.
+fn parse_formula_detected(
+    brew: &impl Brew,
+    rb: &str,
+    host: Option<&HostPlatform>,
+) -> Result<identity::FormulaIdentity, Error> {
+    let mut id = identity::parse_formula(rb, host)?;
+    if let Some(src) = &id.derived_from
+        && let Ok(answers) = brew.detect_versions(std::slice::from_ref(src))
+        && let Some(Some(v)) = answers.into_iter().next()
+        && !v.is_empty()
+    {
+        id.version = v;
+    }
+    Ok(id)
+}
+
 fn parse_pkg_bytes(
+    brew: &impl Brew,
     kind: PkgKind,
     bytes: &[u8],
     host: Option<&HostPlatform>,
 ) -> Result<PkgIdentity, Error> {
     let rb = std::str::from_utf8(bytes)
         .map_err(|_| Error::Other("package blob is not valid UTF-8".into()))?;
-    parse_pkg(kind, rb, host)
+    parse_pkg(brew, kind, rb, host)
 }
 
 fn hold_why(action: DesiredAction) -> Option<&'static str> {
@@ -7281,6 +7358,102 @@ mod tests {
         assert!(
             compares.iter().skip(1).all(|c| c.len() == 1),
             "later asks are per-package"
+        );
+    }
+
+    /// stockfish installed at `sf_18`, cutoff and HEAD at `sf_19`; brew's
+    /// `Version.detect` calls them 18 and 19. `crafty` is url-derived too.
+    fn detect_world() -> (MockBrew, InMemoryGit, Snapshots) {
+        let git = InMemoryGit::new();
+        let new = formula_rb("stockfish", "sf_19", "sha19");
+        git.insert_blob("cutoffsha", "Formula/s/stockfish.rb", new.clone());
+        git.insert_blob("headsha", "Formula/s/stockfish.rb", new);
+        let crafty = formula_rb("crafty", "25.3", "craftynew");
+        git.insert_blob("cutoffsha", "Formula/c/crafty.rb", crafty.clone());
+        git.insert_blob("headsha", "Formula/c/crafty.rb", crafty);
+        let mut brew = MockBrew {
+            installed: vec![
+                formula_pkg("stockfish", formula_rb("stockfish", "sf_18", "sha18")),
+                formula_pkg("crafty", formula_rb("crafty", "25.2", "craftyold")),
+            ],
+            ..MockBrew::new()
+        };
+        for (url, v) in [
+            ("stockfish-sf_18", "18"),
+            ("stockfish-sf_19", "19"),
+            ("crafty-25.2", "25.2"),
+            ("crafty-25.3", "25.3"),
+        ] {
+            brew.detections
+                .insert(format!("https://example.com/{url}.tar.gz"), v.to_string());
+        }
+        (brew, git, core_snaps())
+    }
+
+    fn stockfish_pairs(brew: &MockBrew) -> Vec<(String, String)> {
+        brew.compares
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|(_, a, _)| a.contains("18"))
+            .map(|(_, a, b)| (a.clone(), b.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_url_derived_version_comes_from_brew_not_the_heuristic() {
+        let (brew, git, snaps) = detect_world();
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(text.contains("18 -> 19"), "{text}");
+        assert!(!text.contains("sf_"), "{text}");
+        let pairs = stockfish_pairs(&brew);
+        assert!(!pairs.is_empty(), "{text}");
+        assert!(
+            pairs.iter().all(|p| *p == ("18".into(), "19".into())),
+            "{pairs:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_detection_keeps_the_heuristic_version() {
+        let (mut brew, git, snaps) = detect_world();
+        brew.detect_error = Some("brew ruby exploded".into());
+        let text = greedy_upgrade(&brew, &git, &snaps, &[]);
+        assert!(
+            text.contains("stockfish-sf_18 -> stockfish-sf_19"),
+            "{text}"
+        );
+        let pairs = stockfish_pairs(&brew);
+        assert!(!pairs.is_empty(), "{text}");
+        assert!(
+            pairs
+                .iter()
+                .all(|p| *p == ("stockfish-sf_18".into(), "stockfish-sf_19".into())),
+            "{pairs:?}"
+        );
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew), "stockfish"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_bare_run_detects_every_derived_version_in_one_call_first() {
+        let (brew, git, snaps) = detect_world();
+        greedy_upgrade(&brew, &git, &snaps, &[]);
+        let detects = brew.detects.lock().unwrap().clone();
+        let first = detects.first().expect("a prefetch call");
+        let urls: std::collections::BTreeSet<&str> = first.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls.len(),
+            4,
+            "receipts and cutoffs of both formulae in one call: {first:?}"
+        );
+        assert_eq!(first.len(), 4, "no duplicates: {first:?}");
+        assert!(
+            detects.iter().skip(1).all(|c| c.len() == 1),
+            "later asks are per-package (memo hits in brew): {detects:?}"
         );
     }
 
