@@ -70,8 +70,7 @@ impl OriginRecords {
         for (k, v) in &self.map {
             body.push_str(&format!("{k:?} = {v:?}\n"));
         }
-        std::fs::write(Self::path(cache), body)?;
-        Ok(())
+        crate::atomic::write(&Self::path(cache), &body)
     }
 
     pub fn get(&self, kind: PkgKind, name: &str) -> Option<&str> {
@@ -85,6 +84,28 @@ impl OriginRecords {
 
     pub fn remove(&mut self, kind: PkgKind, name: &str) {
         self.map.remove(&record_key(kind, name));
+    }
+
+    /// Drop the records of packages `installed` says are gone, returning each
+    /// removed `(key, origin)`. A key that is not `formula:<name>` or
+    /// `cask:<name>` is not ours to judge and stays.
+    pub fn remove_uninstalled(
+        &mut self,
+        installed: impl Fn(PkgKind, &str) -> bool,
+    ) -> Vec<(String, String)> {
+        let gone: Vec<String> = self
+            .map
+            .keys()
+            .filter(|key| match key.split_once(':') {
+                Some(("formula", name)) => !installed(PkgKind::Formula, name),
+                Some(("cask", name)) => !installed(PkgKind::Cask, name),
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        gone.into_iter()
+            .filter_map(|key| self.map.remove(&key).map(|origin| (key, origin)))
+            .collect()
     }
 }
 
@@ -181,6 +202,25 @@ mod tests {
         r.set(PkgKind::Formula, "terraform", "hashicorp/tap");
         r.remove(PkgKind::Formula, "terraform");
         assert_eq!(r.get(PkgKind::Formula, "terraform"), None);
+    }
+
+    #[test]
+    fn remove_uninstalled_keeps_installed_and_foreign_keys() {
+        let mut r = OriginRecords::default();
+        r.set(PkgKind::Formula, "kept", "a/b");
+        r.set(PkgKind::Formula, "gone", "a/b");
+        r.set(PkgKind::Cask, "kept", "a/b");
+        r.map.insert("other:thing".into(), "a/b".into());
+        let removed = r.remove_uninstalled(|kind, name| kind == PkgKind::Formula && name == "kept");
+        assert_eq!(
+            removed,
+            vec![
+                ("cask:kept".to_string(), "a/b".to_string()),
+                ("formula:gone".to_string(), "a/b".to_string())
+            ]
+        );
+        assert_eq!(r.get(PkgKind::Formula, "kept"), Some("a/b"));
+        assert!(r.map.contains_key("other:thing"));
     }
 
     #[test]

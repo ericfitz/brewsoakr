@@ -234,33 +234,113 @@ fn no_soak_array(doc: &mut DocumentMut) -> Result<Option<&mut Array>, Error> {
     }
 }
 
-/// Drop every element `gone` matches. The first element's prefix and the
-/// last one's suffix hold the array's padding (`[ "a"`, `"b"\n]`); hand them
-/// to whichever element becomes first or last. Returns how many went.
+/// Split `s` after the end of its first line when that line holds only spaces
+/// and an optional comment: `("  # note\n", rest)`. Text without such a line
+/// end (`" "`, `"  # c"`) is all `rest`.
+fn split_line_end(s: &str) -> (&str, &str) {
+    let t = s.trim_start_matches([' ', '\t']);
+    let end = if t.starts_with('#') {
+        t.find('\n')
+    } else if t.starts_with('\n') {
+        Some(0)
+    } else if t.starts_with("\r\n") {
+        Some(1)
+    } else {
+        None
+    };
+    match end {
+        Some(i) => s.split_at(s.len() - t.len() + i + 1),
+        None => ("", s),
+    }
+}
+
+/// Drop every element `gone` matches, with the comments that belong to it.
+///
+/// toml_edit keeps an element's own leading comments in its prefix, but the
+/// comment after the previous element's comma is in this element's prefix
+/// too (or in the array's trailing text, or the last element's suffix, for
+/// the last one). Split each prefix into that line end and the element's own
+/// leading text, then reassemble the survivors so a removed element takes
+/// its leading and trailing comments with it and its neighbors keep theirs.
+/// The text after `[` goes to whichever element is first, and the closing
+/// padding (`\n]`) to whichever is last. Returns how many went.
 fn retain_keeping_padding(arr: &mut Array, gone: impl Fn(&Value) -> bool) -> usize {
-    let first_gone = arr.get(0).filter(|v| gone(v)).map(|v| prefix_of(v.decor()));
-    let last_gone = arr.iter().last().filter(|v| gone(v)).map(|v| {
-        v.decor()
-            .suffix()
-            .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string()
-    });
-    let before = arr.len();
-    arr.retain(|v| !gone(v));
-    let removed = before - arr.len();
+    let n = arr.len();
+    let keep: Vec<bool> = arr.iter().map(|v| !gone(v)).collect();
+    let removed = keep.iter().filter(|k| !**k).count();
     if removed == 0 {
         return 0;
     }
-    if let Some(prefix) = first_gone
-        && let Some(first) = arr.get_mut(0)
-    {
-        first.decor_mut().set_prefix(prefix);
+    let prefixes: Vec<String> = arr.iter().map(|v| prefix_of(v.decor())).collect();
+    let comma = arr.trailing_comma();
+    let closing = if comma {
+        arr.trailing().as_str().unwrap_or("").to_string()
+    } else {
+        arr.iter()
+            .last()
+            .and_then(|v| v.decor().suffix())
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let (open_trail, first_lead) = split_line_end(&prefixes[0]);
+    let mut lead = vec![first_lead];
+    let mut trail = Vec::with_capacity(n);
+    for p in &prefixes[1..] {
+        let (t, l) = split_line_end(p);
+        trail.push(t);
+        lead.push(l);
     }
-    if let Some(suffix) = last_gone
-        && let Some(last) = arr.len().checked_sub(1).and_then(|i| arr.get_mut(i))
-    {
-        last.decor_mut().set_suffix(suffix);
+    let (last_trail, pad) = split_line_end(&closing);
+    trail.push(last_trail);
+    let kept: Vec<usize> = (0..n).filter(|i| keep[*i]).collect();
+    let (open_trail, pad) = (open_trail.to_string(), pad.to_string());
+    let (lead0, mut prefixes_new) = (lead[0].to_string(), Vec::new());
+    for (j, &i) in kept.iter().enumerate() {
+        let prefix = if j > 0 {
+            format!("{}{}", trail[kept[j - 1]], lead[i])
+        } else if i == 0 {
+            format!("{open_trail}{}", lead[0])
+        } else {
+            // The new first element: drop the blank lines that separated it
+            // from the removed ones.
+            let mut own = lead[i];
+            loop {
+                let (t, rest) = split_line_end(own);
+                if t.is_empty() || t.contains('#') {
+                    break;
+                }
+                own = rest;
+            }
+            if open_trail.is_empty() && !own.contains('#') {
+                lead0.clone()
+            } else {
+                format!("{open_trail}{own}")
+            }
+        };
+        prefixes_new.push(prefix);
+    }
+    let tail = kept
+        .last()
+        .map(|i| format!("{}{pad}", trail[*i]))
+        .unwrap_or_default();
+    arr.retain(|v| !gone(v));
+    for (j, v) in arr.iter_mut().enumerate() {
+        v.decor_mut().set_prefix(prefixes_new[j].clone());
+    }
+    if kept.is_empty() {
+        // Nothing left to carry the comment after `[`, so it stays in the
+        // array's own text: `[ # list\n]`.
+        arr.set_trailing(if open_trail.contains('#') {
+            open_trail.as_str()
+        } else {
+            ""
+        });
+        arr.set_trailing_comma(false);
+    } else if comma {
+        arr.set_trailing(tail);
+    } else if let Some(last) = arr.len().checked_sub(1).and_then(|i| arr.get_mut(i)) {
+        last.decor_mut().set_suffix(tail);
     }
     removed
 }
@@ -1232,6 +1312,96 @@ mod tests {
         let mut d = doc("NO_SOAK = [\"wget\"]\n");
         no_soak_remove(&mut d, &s(&["wget"])).unwrap();
         assert_eq!(d.to_string(), "NO_SOAK = []\n");
+    }
+
+    #[test]
+    fn no_soak_remove_takes_its_own_comments_and_keeps_its_neighbors() {
+        let multi = "NO_SOAK = [\n  # about a\n  \"a\", # a note\n  # about b\n  \"b\", # b note\n\n  # about c\n  \"c\" # c note\n]\n";
+        let comma =
+            "NO_SOAK = [\n  # about a\n  \"a\", # a note\n  # about b\n  \"b\", # b note\n]\n";
+        let cases = [
+            (
+                multi,
+                "a",
+                "NO_SOAK = [\n  # about b\n  \"b\", # b note\n\n  # about c\n  \"c\" # c note\n]\n",
+            ),
+            (
+                multi,
+                "b",
+                "NO_SOAK = [\n  # about a\n  \"a\", # a note\n\n  # about c\n  \"c\" # c note\n]\n",
+            ),
+            (
+                multi,
+                "c",
+                "NO_SOAK = [\n  # about a\n  \"a\", # a note\n  # about b\n  \"b\" # b note\n]\n",
+            ),
+            (
+                comma,
+                "a",
+                "NO_SOAK = [\n  # about b\n  \"b\", # b note\n]\n",
+            ),
+            (
+                comma,
+                "b",
+                "NO_SOAK = [\n  # about a\n  \"a\", # a note\n]\n",
+            ),
+            (
+                "NO_SOAK = [\n  \"a\",\n\n  \"b\",\n]\n",
+                "a",
+                "NO_SOAK = [\n  \"b\",\n]\n",
+            ),
+            (
+                "NO_SOAK = [\"a\", \"b\"] # list\n",
+                "a",
+                "NO_SOAK = [\"b\"] # list\n",
+            ),
+            (
+                "NO_SOAK = [ \"a\", \"b\" ] # list\n",
+                "b",
+                "NO_SOAK = [ \"a\" ] # list\n",
+            ),
+            (
+                "NO_SOAK = [\n  # about a\n  \"a\" # a note\n]\n",
+                "a",
+                "NO_SOAK = []\n",
+            ),
+            (
+                "NO_SOAK = [\n  # about a\n  \"a\", # a note\n]\n",
+                "a",
+                "NO_SOAK = []\n",
+            ),
+        ];
+        for (input, token, want) in cases {
+            let mut d = doc(input);
+            no_soak_remove(&mut d, &s(&[token])).unwrap();
+            assert_eq!(d.to_string(), want, "{input:?} - {token}");
+            assert!(
+                d.to_string().parse::<DocumentMut>().is_ok(),
+                "still valid TOML: {want:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_soak_remove_of_every_entry_keeps_the_open_bracket_comment() {
+        for (input, want) in [
+            (
+                "NO_SOAK = [ # list\n  \"a\",\n  \"b\",\n]\n",
+                "NO_SOAK = [ # list\n]\n",
+            ),
+            (
+                "NO_SOAK = [ # list\n  \"a\",\n  \"b\"\n]\n",
+                "NO_SOAK = [ # list\n]\n",
+            ),
+        ] {
+            let mut d = doc(input);
+            no_soak_remove(&mut d, &s(&["a", "b"])).unwrap();
+            assert_eq!(d.to_string(), want, "{input:?}");
+            assert!(
+                d.to_string().parse::<DocumentMut>().is_ok(),
+                "still valid TOML: {want:?}"
+            );
+        }
     }
 
     #[test]

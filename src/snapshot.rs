@@ -1,5 +1,6 @@
 use crate::git::{GitStore, REF_CUTOFF, REF_HEAD};
 use crate::github::{GithubApi, cutoff_instant};
+use crate::lock::RunLock;
 use crate::taps;
 use crate::{Error, SoakHours};
 use std::collections::BTreeMap;
@@ -39,8 +40,9 @@ pub struct Snapshots {
     pub core_hours: SoakHours,
     pub cask_hours: SoakHours,
     pub taps: BTreeMap<String, TapState>,
-    /// Taps whose refresh failed this run (`Error::Git` text). Not persisted,
-    /// so the next run tries again.
+    /// Taps whose refresh failed this run (`Error::Git` text). Not persisted.
+    /// Such a tap may still have a (stale) entry in `taps`; consumers check
+    /// this map first.
     pub held_taps: BTreeMap<String, String>,
 }
 
@@ -117,6 +119,7 @@ struct StateFile {
 }
 
 pub fn refresh(
+    lock: &RunLock,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
@@ -124,11 +127,20 @@ pub fn refresh(
     now: OffsetDateTime,
     progress: &mut impl Write,
 ) -> Result<Snapshots, Error> {
-    refresh_with(git, gh, cache, &RefreshPlan::uniform(hours), now, progress)
+    refresh_with(
+        lock,
+        git,
+        gh,
+        cache,
+        &RefreshPlan::uniform(hours),
+        now,
+        progress,
+    )
 }
 
 /// Core and cask failures abort (v1). A tap failure holds only that tap.
 pub fn refresh_with(
+    lock: &RunLock,
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
@@ -161,14 +173,35 @@ pub fn refresh_with(
         hours: plan.hours,
         core_hours: plan.core_hours,
         cask_hours: plan.cask_hours,
-        taps: BTreeMap::new(),
+        taps: seeded_taps(cache, &plan.taps),
         held_taps: BTreeMap::new(),
     };
-    refresh_taps(git, cache, &mut snaps, &plan.taps, now, progress)?;
+    refresh_taps(lock, git, cache, &mut snaps, &plan.taps, now, progress)?;
+    // The new cutoffs are recorded; only now may the old cutoffs' objects go.
+    git.gc_prune(&cache.join("core.git"))?;
+    git.gc_prune(&cache.join("cask.git"))?;
     Ok(snaps)
 }
 
+/// The last good table of each planned tap, so a failed fetch keeps it. Taps
+/// outside the plan (untapped) are not carried over. An unreadable
+/// `state.toml` seeds nothing: this refresh rewrites it.
+fn seeded_taps(cache: &Path, planned: &[TapPlan]) -> BTreeMap<String, TapState> {
+    let Ok(Some(previous)) = load_state(cache) else {
+        return BTreeMap::new();
+    };
+    planned
+        .iter()
+        .filter_map(|tap| {
+            let name = tap.name.to_ascii_lowercase();
+            let state = previous.taps.get(&name)?.clone();
+            Some((name, state))
+        })
+        .collect()
+}
+
 pub fn refresh_taps(
+    _lock: &RunLock,
     git: &impl GitStore,
     cache: &Path,
     snaps: &mut Snapshots,
@@ -185,7 +218,8 @@ pub fn refresh_taps(
                 snaps.taps.insert(name, state);
             }
             Err(e @ Error::Git { .. }) => {
-                snaps.taps.remove(&name);
+                // The last good table (if any) stays, in memory and on disk;
+                // `held_taps` is what keeps this run from using it for installs.
                 snaps.held_taps.insert(name, e.to_string());
             }
             Err(e) => return Err(e),
@@ -216,7 +250,12 @@ pub fn refresh_tap(
             git.update_ref(&dir, REF_CUTOFF, &sha)?;
             (Some(sha), OffsetDateTime::from_unix_timestamp(when).ok())
         }
-        None => (None, None),
+        None => {
+            // Nothing is old enough this run: a pin left from an earlier run
+            // would anchor a commit that is no longer the cutoff.
+            git.delete_ref(&dir, REF_CUTOFF)?;
+            (None, None)
+        }
     };
     Ok(TapState {
         hours: tap.hours,
@@ -321,8 +360,7 @@ fn write_state(cache: &Path, snaps: &Snapshots) -> Result<(), Error> {
             .collect(),
     };
     let body = toml::to_string(&file).map_err(|e| Error::Other(format!("state.toml: {e}")))?;
-    std::fs::write(cache.join("state.toml"), body)?;
-    Ok(())
+    crate::atomic::write(&cache.join("state.toml"), &body)
 }
 
 fn refresh_core_tap(
@@ -341,7 +379,8 @@ fn refresh_core_tap(
     };
     git.fetch_depth1(dir, remote, &cutoff_sha, REF_CUTOFF)?;
     git.fetch_depth1(dir, remote, &head_sha, REF_HEAD)?;
-    git.gc_prune(dir)?;
+    // No gc here: state.toml still names the previous cutoff until the whole
+    // refresh succeeds, so its objects must stay readable until then.
     Ok(TapSnapshot {
         cutoff_sha,
         head_sha,
@@ -403,6 +442,7 @@ mod tests {
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
         let snaps = refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -426,6 +466,7 @@ mod tests {
         let git = InMemoryGit::new();
         let hours = SoakHours::new(24).expect("hours >= 1");
         let snaps = refresh(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -455,6 +496,7 @@ mod tests {
         let gh = fixture_gh();
 
         let first = refresh(
+            &RunLock::for_tests(),
             &git,
             &gh,
             dir.path(),
@@ -466,6 +508,7 @@ mod tests {
         assert_eq!(first.core.cutoff_sha, "thirtyh");
 
         let second = refresh(
+            &RunLock::for_tests(),
             &git,
             &gh,
             dir.path(),
@@ -548,6 +591,21 @@ mod tests {
     }
 
     #[test]
+    fn tap_with_no_cutoff_drops_a_stale_cutoff_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let clone = crate::taps::clone_dir(dir.path(), "young/tap");
+        git.update_ref(&clone, REF_CUTOFF, "old").unwrap();
+        let plan = tap_plan("young/tap", "https://github.com/young/homebrew-tap", 24);
+        let state = refresh_tap(&git, dir.path(), &plan, now()).expect("refresh tap");
+        assert_eq!(state.cutoff_sha, None);
+        assert_eq!(git.rev_parse(&clone, REF_CUTOFF).unwrap(), None);
+        assert_eq!(git.rev_parse(&clone, REF_HEAD).unwrap(), Some("y1".into()));
+        // A second run has no pin to remove and still succeeds.
+        refresh_tap(&git, dir.path(), &plan, now()).expect("second refresh");
+    }
+
+    #[test]
     fn per_tap_hours_give_different_cutoffs() {
         let dir = tempfile::tempdir().unwrap();
         let git = tap_git(now());
@@ -614,8 +672,16 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let mut progress = Vec::new();
-        let snaps = refresh_with(&git, &fixture_gh(), dir.path(), &plan, now(), &mut progress)
-            .expect("core/cask ok");
+        let snaps = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut progress,
+        )
+        .expect("core/cask ok");
         assert!(
             snaps
                 .taps
@@ -628,6 +694,396 @@ mod tests {
         let text = String::from_utf8(progress).unwrap();
         assert!(text.contains("fetching hashicorp/tap"), "{text}");
         assert!(text.contains("fetching cyclonedx/cyclonedx"), "{text}");
+    }
+
+    /// `StaticGithub` whose commit lookups for `fail_repo` fail, like an
+    /// outage that hits the cask fetch after core has already moved.
+    struct FailRepoGithub {
+        inner: StaticGithub,
+        fail_repo: &'static str,
+    }
+
+    impl GithubApi for FailRepoGithub {
+        fn head_sha(&self, repo: &str) -> Result<String, Error> {
+            if repo == self.fail_repo {
+                return Err(Error::Other(format!("github: {repo} unreachable")));
+            }
+            self.inner.head_sha(repo)
+        }
+
+        fn latest_commit_until(
+            &self,
+            repo: &str,
+            until: OffsetDateTime,
+        ) -> Result<crate::github::CommitInfo, Error> {
+            self.inner.latest_commit_until(repo, until)
+        }
+    }
+
+    #[test]
+    fn failed_cask_refresh_leaves_the_old_core_cutoff_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = InMemoryGit::new();
+        git.insert_blob("thirtyh", "Formula/a.rb", "old cutoff blob");
+        // Cask stays on a 8h window throughout so it never pins core's cutoffs.
+        let plan = |core: u32| RefreshPlan {
+            core_hours: SoakHours::new(core).unwrap(),
+            cask_hours: SoakHours::new(8).unwrap(),
+            ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
+        };
+        let first = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan(24),
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("first refresh");
+        assert_eq!(first.core.cutoff_sha, "thirtyh");
+        git.insert_blob("tenh", "Formula/a.rb", "new cutoff blob");
+        // A shorter window moves core's cutoff to `tenh`; the cask fetch then
+        // fails before state.toml is rewritten.
+        let failing = FailRepoGithub {
+            inner: fixture_gh(),
+            fail_repo: CASK_REPO,
+        };
+        let err = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &failing,
+            dir.path(),
+            &plan(8),
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unreachable"), "{err}");
+        let stored = load_state(dir.path()).unwrap().expect("state kept");
+        assert_eq!(stored.core.cutoff_sha, "thirtyh", "state is unchanged");
+        let core_dir = dir.path().join("core.git");
+        assert_eq!(
+            git.show(&core_dir, &stored.core.cutoff_sha, "Formula/a.rb")
+                .unwrap()
+                .as_deref(),
+            Some(b"old cutoff blob".as_slice()),
+            "the stored cutoff's objects must survive a failed refresh"
+        );
+        // The next successful run records the new cutoff, then gc's the old.
+        let third = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan(8),
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("recovery run");
+        assert_eq!(third.core.cutoff_sha, "tenh");
+        assert_eq!(
+            load_state(dir.path()).unwrap().unwrap().core.cutoff_sha,
+            "tenh"
+        );
+        assert_eq!(
+            git.show(&core_dir, "tenh", "Formula/a.rb")
+                .unwrap()
+                .as_deref(),
+            Some(b"new cutoff blob".as_slice())
+        );
+        assert_eq!(
+            git.show(&core_dir, "thirtyh", "Formula/a.rb").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn gc_runs_only_after_state_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = InMemoryGit::new();
+        let failing = FailRepoGithub {
+            inner: fixture_gh(),
+            fail_repo: CASK_REPO,
+        };
+        refresh(
+            &RunLock::for_tests(),
+            &git,
+            &failing,
+            dir.path(),
+            SoakHours::new(24).unwrap(),
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap_err();
+        assert!(git.gcs().is_empty(), "{:?}", git.gcs());
+        refresh(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            SoakHours::new(24).unwrap(),
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_eq!(git.gcs().len(), 2, "core and cask each gc'd once");
+    }
+
+    #[test]
+    fn failed_tap_fetch_keeps_the_last_good_table_until_a_fetch_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let remote = "https://github.com/hashicorp/homebrew-tap";
+        let plan = RefreshPlan {
+            taps: vec![tap_plan("hashicorp/tap", remote, 72)],
+            ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
+        };
+        let first = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        let good = first.tap("hashicorp/tap").cloned().expect("fetched");
+        assert_eq!(good.head_sha, "hc3");
+
+        git.fail_remote(remote);
+        let second = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("a tap failure never aborts");
+        assert_eq!(second.tap("hashicorp/tap"), Some(&good), "kept in memory");
+        let note = second.held_taps.get("hashicorp/tap").expect("held");
+        assert!(note.contains("fetching history"), "{note}");
+        let stored = load_state(dir.path()).unwrap().unwrap();
+        assert_eq!(stored.tap("hashicorp/tap"), Some(&good), "kept on disk");
+        assert!(stored.held_taps.is_empty(), "held is never persisted");
+
+        // The remote recovers with a newer head: the table is replaced.
+        git.heal_remote(remote);
+        let n = now().unix_timestamp();
+        git.insert_commits(remote, &[("hc4", n - 60), ("hc3", n - 3600)]);
+        let third = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_eq!(third.tap("hashicorp/tap").unwrap().head_sha, "hc4");
+        assert!(third.held_taps.is_empty());
+        assert_eq!(
+            load_state(dir.path())
+                .unwrap()
+                .unwrap()
+                .tap("hashicorp/tap")
+                .unwrap()
+                .head_sha,
+            "hc4"
+        );
+    }
+
+    #[test]
+    fn failed_refresh_taps_keeps_an_existing_table_in_memory_and_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let remote = "https://github.com/hashicorp/homebrew-tap";
+        let plan = RefreshPlan {
+            taps: vec![tap_plan("hashicorp/tap", remote, 72)],
+            ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
+        };
+        let mut snaps = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        git.fail_remote(remote);
+        refresh_taps(
+            &RunLock::for_tests(),
+            &git,
+            dir.path(),
+            &mut snaps,
+            &plan.taps,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert!(snaps.tap("hashicorp/tap").is_some());
+        assert!(snaps.held_taps.contains_key("hashicorp/tap"));
+        assert!(
+            load_state(dir.path())
+                .unwrap()
+                .unwrap()
+                .tap("hashicorp/tap")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn refresh_with_seeds_only_planned_taps_from_the_stored_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let both = RefreshPlan {
+            taps: vec![
+                tap_plan(
+                    "hashicorp/tap",
+                    "https://github.com/hashicorp/homebrew-tap",
+                    72,
+                ),
+                tap_plan(
+                    "cyclonedx/cyclonedx",
+                    "https://github.com/cyclonedx/homebrew-cyclonedx",
+                    24,
+                ),
+            ],
+            ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
+        };
+        refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &both,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        // cyclonedx is no longer planned (untapped) and its remote is down:
+        // its table must drop out rather than be carried over.
+        let only_hashicorp = RefreshPlan {
+            taps: vec![both.taps[0].clone()],
+            ..both.clone()
+        };
+        git.fail_remote("https://github.com/cyclonedx/homebrew-cyclonedx");
+        let snaps = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &only_hashicorp,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert!(snaps.tap("hashicorp/tap").is_some());
+        assert!(snaps.tap("cyclonedx/cyclonedx").is_none());
+        assert!(
+            load_state(dir.path())
+                .unwrap()
+                .unwrap()
+                .tap("cyclonedx/cyclonedx")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_tap_failing_on_the_first_run_has_no_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        git.fail_remote("https://github.com/hashicorp/homebrew-tap");
+        let plan = RefreshPlan {
+            taps: vec![tap_plan(
+                "hashicorp/tap",
+                "https://github.com/hashicorp/homebrew-tap",
+                72,
+            )],
+            ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
+        };
+        let snaps = refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert!(snaps.tap("hashicorp/tap").is_none());
+        assert!(snaps.held_taps.contains_key("hashicorp/tap"));
+    }
+
+    #[test]
+    fn a_corrupt_state_file_does_not_block_a_forced_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("state.toml"), "hours = 2").unwrap();
+        let git = InMemoryGit::new();
+        refresh(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            SoakHours::new(24).unwrap(),
+            now(),
+            &mut std::io::sink(),
+        )
+        .expect("refresh replaces the unreadable state");
+        assert!(load_state(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn write_state_leaves_no_temp_file_and_replaces_wholesale() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = InMemoryGit::new();
+        let h = |n| SoakHours::new(n).unwrap();
+        let first = refresh(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            h(24),
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        // A truncated leftover temp from a crashed writer is swept on the next write.
+        let stale = dir.path().join(".state.toml.tmp-999999");
+        std::fs::write(&stale, "hours = ").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        let second = refresh(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            h(8),
+            now(),
+            &mut std::io::sink(),
+        )
+        .unwrap();
+        assert_ne!(first.core.cutoff_sha, second.core.cutoff_sha);
+        assert_eq!(load_state(dir.path()).unwrap().unwrap(), second);
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|n| !n.contains(".tmp")),
+            "no temp files left: {names:?}"
+        );
     }
 
     #[test]
@@ -648,6 +1104,7 @@ mod tests {
             ],
         };
         let snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -696,6 +1153,7 @@ mod tests {
             ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
         };
         let mut snaps = refresh_with(
+            &RunLock::for_tests(),
             &git,
             &fixture_gh(),
             dir.path(),
@@ -720,6 +1178,7 @@ mod tests {
             SoakHours::new(24).unwrap()
         ));
         refresh_taps(
+            &RunLock::for_tests(),
             &git,
             dir.path(),
             &mut snaps,
@@ -759,6 +1218,7 @@ mod tests {
             SoakHours::new(24).unwrap(),
         );
         refresh_taps(
+            &RunLock::for_tests(),
             &git,
             dir.path(),
             &mut snaps,

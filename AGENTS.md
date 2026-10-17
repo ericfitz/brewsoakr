@@ -13,6 +13,7 @@
 ## Origins and staging
 
 - A package's origin is its receipt tap when it is non-empty and not `brewsoakr/soaked`: for a formula, `source.tap` in the keg's `INSTALL_RECEIPT.json` (never `brew info`'s top-level `tap`, which is where brew resolves the name now and says `homebrew/core` for a staged tap keg that shares a core name); when a formula's `source.tap` is null and `source.path` is under `<cache>/staging/taps/<user>/<repo>/`, the origin is `<user>/<repo>`; for a cask, `tap` from `brew info --json=v2 --installed`; else `<cache>/origins.toml` (`"formula:<name>" = "user/repo"`); else `homebrew/core` / `homebrew/cask`. A staged install leaves the receipt tap null, so write the origin record after every successful staged tap install and remove it after a staged core/cask install.
+- The dependency walk runs `brew deps --1 --full-name`: brew resolves bare dep names (core first, then a unique installed tap) and prints `user/repo/name` for tap packages, so a full name is that tap and a bare name is core or cask. An ambiguous name (`TapFormulaAmbiguityError`) holds the target.
 - Tap packages are staged under `<cache>/staging/taps/<user>/<repo>/{Formula,Casks}/<name>.rb`; core and cask stay directly under `<cache>/staging/`. Never let a tap formula land in the core staging root.
 - Tap history lives in `<cache>/taps/<user>/<repo>.git`: a bare clone with a named `origin` remote, fetched `--filter=blob:none` (retry without the filter if the server rejects it). Never fetch into, or move the checkout of, anything under `$(brew --repository)/Library/Taps`. No GitHub API calls for taps.
 - `NO_SOAK` packages are never staged. They go to brew as full tokens (`user/repo/name` for tap packages) in one `brew update` + one `brew upgrade|install|reinstall` after all soaked work. A no-soak package whose keg was staged by brewsoak is moved to its real tap with `brew install user/repo/name`.
@@ -36,3 +37,10 @@
   - `action`: what brewsoak was doing, in our words
   - `detail`: git's stderr (or why git could not start)
 - Do not leak a raw git message as the only user-visible text.
+
+## Cache state
+
+- Commands that write the cache (`update`, `upgrade`, `install`, `reinstall`) hold the `<cache>/run.lock` flock from the start of `dispatch` (`lock::LockSlot`). `outdated` and `info` start unlocked; `cmd::ensure_snapshots` takes the lock itself when it finds the snapshot missing, unreadable or stale, then re-reads `state.toml` and decides again. Code that writes `state.toml`, the clones, gc or prune takes a `&RunLock`; never write the cache without one. The holder's pid and command live in `run.lock.holder` (temp + rename). `settings` never touches the cache.
+- After a refresh, `prune::prune_cache` (under the lock) removes clone and staging dirs of taps no longer tapped and `origins.toml` records of packages no longer installed. Never prune a record because its tap is gone while the package is installed; never touch `$(brew --repository)/Library/Taps`.
+- Write `state.toml` and `origins.toml` only through `atomic::write` (temp + rename, then fsync the directory).
+- `gc_prune` runs only after `state.toml` is written.

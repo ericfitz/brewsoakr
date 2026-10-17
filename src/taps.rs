@@ -127,9 +127,26 @@ pub fn untrusted_tap(brew_output: &str) -> Option<String> {
     (!tap.is_empty()).then(|| tap.to_string())
 }
 
+/// True when brew's output is its `TapFormulaAmbiguityError`: a bare formula
+/// name that matches formulae in more than one installed tap.
+pub fn ambiguous_formula(brew_output: &str) -> bool {
+    brew_output.contains("Formulae found in multiple taps")
+        || brew_output.contains("TapFormulaAmbiguityError")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ambiguous_formula_reads_brews_ambiguity_error() {
+        let msg = "Error: Formulae found in multiple taps:\n       * a/tap/cats\n       * b/tap/cats\n\nPlease use the fully-qualified name (e.g. a/tap/cats) to refer to a specific formula.";
+        assert!(ambiguous_formula(msg));
+        assert!(ambiguous_formula("TapFormulaAmbiguityError: cats"));
+        assert!(!ambiguous_formula(
+            "Error: No available formula with the name \"cats\"."
+        ));
+    }
+
     #[test]
     fn untrusted_tap_reads_the_tap_from_brews_refusal() {
         let msg = "Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap HashiCorp/tap.\nRun `brew trust hashicorp/tap` to trust it.";

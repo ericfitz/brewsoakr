@@ -1,6 +1,6 @@
 use crate::Error;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -17,7 +17,8 @@ pub trait GitStore {
         sha: &str,
         ref_name: &str,
     ) -> Result<(), Error>;
-    /// Returns `None` if the path is missing (git exit 128 / “does not exist”).
+    /// Returns `None` if the path is missing from a commit that exists. A missing
+    /// clone or commit is `Error::Git`.
     fn show(&self, dir: &Path, sha: &str, path: &str) -> Result<Option<Vec<u8>>, Error>;
     fn rev_parse(&self, dir: &Path, rev: &str) -> Result<Option<String>, Error>;
     fn gc_prune(&self, dir: &Path) -> Result<(), Error>;
@@ -72,6 +73,13 @@ pub trait GitStore {
             detail: "this git backend cannot update refs".into(),
         })
     }
+    /// Remove a pin ref; a ref that does not exist is already removed.
+    fn delete_ref(&self, _dir: &Path, ref_name: &str) -> Result<(), Error> {
+        Err(Error::Git {
+            action: format!("removing {ref_name}"),
+            detail: "this git backend cannot delete refs".into(),
+        })
+    }
     /// `git ls-tree -r --name-only <sha>`; cached per (dir, sha) in ProcessGit.
     fn ls_tree(&self, _dir: &Path, _sha: &str) -> Result<Vec<String>, Error> {
         Err(Error::Git {
@@ -93,6 +101,9 @@ pub struct ProcessGit {
     /// changes; only found blobs are kept, since a missing one may arrive in
     /// a later fetch.
     blobs: BlobCache,
+    /// `(clone dir, commit)` pairs verified present. Only hits are kept: a
+    /// missing commit may arrive in a later fetch.
+    commits: RefCell<HashSet<(PathBuf, String)>>,
 }
 
 /// Servers that do not support partial clone answer the filter with one of
@@ -112,6 +123,33 @@ impl ProcessGit {
         // Callers match git's English stderr (`already exists`, filter refusals).
         cmd.env("LC_ALL", "C");
         cmd
+    }
+}
+
+impl ProcessGit {
+    /// Errors unless `sha` is a commit in the clone at `dir`.
+    fn require_commit(&self, action: &str, dir: &str, sha: &str) -> Result<(), Error> {
+        let key = (PathBuf::from(dir), sha.to_string());
+        if self.commits.borrow().contains(&key) {
+            return Ok(());
+        }
+        let spec = format!("{sha}^{{commit}}");
+        let output = run_git(
+            action,
+            &["--git-dir", dir, "rev-parse", "--verify", "--quiet", &spec],
+        )?;
+        if output.status.success() {
+            self.commits.borrow_mut().insert(key);
+            Ok(())
+        } else if output.status.code() == Some(1) && output.stderr.is_empty() {
+            // `--verify --quiet` exits 1 silently for an unknown object.
+            Err(Error::Git {
+                action: action.to_string(),
+                detail: format!("commit {sha} is not in the soak store; run brewsoak update"),
+            })
+        } else {
+            Err(git_fail(action, &output))
+        }
     }
 }
 
@@ -159,9 +197,20 @@ fn git_date_arg(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
+/// True only when git says the object, path or ref is absent. Exit 128 alone
+/// is not enough: a missing, corrupt or unreadable clone (`not a git
+/// repository`) exits 128 too and must surface as `Error::Git`.
 fn missing_object(output: &Output) -> bool {
-    output.status.code() == Some(128)
-        || String::from_utf8_lossy(&output.stderr).contains("does not exist")
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    [
+        "does not exist in",
+        "unknown revision",
+        "bad revision",
+        "ambiguous argument",
+        "Not a valid object name",
+    ]
+    .iter()
+    .any(|pattern| stderr.contains(pattern))
 }
 
 impl GitStore for ProcessGit {
@@ -220,6 +269,8 @@ impl GitStore for ProcessGit {
             self.blobs.borrow_mut().insert(key, output.stdout.clone());
             Ok(Some(output.stdout))
         } else if missing_object(&output) {
+            // The same text answers an absent path and an absent commit.
+            self.require_commit(&action, &dir, sha)?;
             Ok(None)
         } else {
             Err(git_fail(&action, &output))
@@ -429,6 +480,20 @@ impl GitStore for ProcessGit {
         }
     }
 
+    fn delete_ref(&self, dir: &Path, ref_name: &str) -> Result<(), Error> {
+        let action = format!("removing {ref_name}");
+        let dir = dir.to_string_lossy();
+        let output = run_git(
+            &action,
+            &["--git-dir", dir.as_ref(), "update-ref", "-d", ref_name],
+        )?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(git_fail(&action, &output))
+        }
+    }
+
     fn ls_tree(&self, dir: &Path, sha: &str) -> Result<Vec<String>, Error> {
         let key = (dir.to_path_buf(), sha.to_string());
         if let Some(cached) = self.trees.borrow().get(&key) {
@@ -471,6 +536,8 @@ pub struct InMemoryGit {
     trees: RefCell<HashMap<String, Vec<String>>>,
     remotes: RefCell<HashMap<(String, String), String>>, // (dir, name) -> url
     failing: RefCell<std::collections::HashSet<String>>,
+    /// Directories `gc_prune` ran on, in order.
+    gcs: RefCell<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -512,6 +579,15 @@ impl InMemoryGit {
 
     pub fn fail_remote(&self, remote_url: &str) {
         self.failing.borrow_mut().insert(remote_url.to_string());
+    }
+
+    pub fn heal_remote(&self, remote_url: &str) {
+        self.failing.borrow_mut().remove(remote_url);
+    }
+
+    /// Directories `gc_prune` ran on, in order.
+    pub fn gcs(&self) -> Vec<String> {
+        self.gcs.borrow().clone()
     }
 
     pub fn remote_url(&self, dir: &Path) -> Option<String> {
@@ -556,7 +632,16 @@ impl GitStore for InMemoryGit {
         Ok(self.refs.borrow().get(&Self::key(dir, rev)).cloned())
     }
 
-    fn gc_prune(&self, _dir: &Path) -> Result<(), Error> {
+    /// Like git's `gc --prune=now`: blobs of commits that no ref pins are gone.
+    fn gc_prune(&self, dir: &Path) -> Result<(), Error> {
+        self.gcs
+            .borrow_mut()
+            .push(dir.to_string_lossy().into_owned());
+        let pinned: std::collections::HashSet<String> =
+            self.refs.borrow().values().cloned().collect();
+        self.blobs
+            .borrow_mut()
+            .retain(|(sha, _), _| pinned.contains(sha));
         Ok(())
     }
 
@@ -637,6 +722,11 @@ impl GitStore for InMemoryGit {
         self.refs
             .borrow_mut()
             .insert(Self::key(dir, ref_name), sha.to_string());
+        Ok(())
+    }
+
+    fn delete_ref(&self, dir: &Path, ref_name: &str) -> Result<(), Error> {
+        self.refs.borrow_mut().remove(&Self::key(dir, ref_name));
         Ok(())
     }
 
@@ -1045,7 +1135,146 @@ mod tests {
         std::fs::remove_dir_all(&gitdir).unwrap();
         assert_eq!(git.show(&gitdir, &sha, "f").unwrap(), first);
         // A missing path is not memoized: the object may arrive in a fetch.
-        assert!(!matches!(git.show(&gitdir, &sha, "nope"), Ok(Some(_))));
+        assert!(git.show(&gitdir, &sha, "nope").is_err());
+    }
+
+    /// A real bare store with one commit pinned at `REF_HEAD`; returns
+    /// `(tempdir, bare, sha)`.
+    fn bare_with_one_commit() -> (tempfile::TempDir, PathBuf, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        git_ok(&src, &["init", "-b", "main"]);
+        git_ok(&src, &["config", "user.email", "test@example.com"]);
+        git_ok(&src, &["config", "user.name", "Test"]);
+        std::fs::write(src.join("f"), "one\n").unwrap();
+        git_ok(&src, &["add", "f"]);
+        git_ok(&src, &["commit", "-m", "one"]);
+        let sha = git_ok(&src, &["rev-parse", "HEAD"]);
+        let bare = tmp.path().join("store.git");
+        let git = ProcessGit::default();
+        git.init_bare(&bare).unwrap();
+        git.fetch_depth1(&bare, src.to_str().unwrap(), &sha, REF_HEAD)
+            .unwrap();
+        (tmp, bare, sha)
+    }
+
+    #[test]
+    fn delete_ref_removes_a_pin_and_is_idempotent() {
+        let (_tmp, bare, sha) = bare_with_one_commit();
+        let git = ProcessGit::default();
+        git.update_ref(&bare, REF_CUTOFF, &sha).unwrap();
+        assert_eq!(git.rev_parse(&bare, REF_CUTOFF).unwrap(), Some(sha));
+        git.delete_ref(&bare, REF_CUTOFF).unwrap();
+        assert_eq!(git.rev_parse(&bare, REF_CUTOFF).unwrap(), None);
+        git.delete_ref(&bare, REF_CUTOFF).unwrap();
+    }
+
+    #[test]
+    fn delete_ref_on_a_non_repo_is_error_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ProcessGit::default()
+            .delete_ref(tmp.path(), REF_CUTOFF)
+            .unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn show_on_a_non_repo_is_error_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ProcessGit::default()
+            .show(tmp.path(), &"a".repeat(40), "Formula/x.rb")
+            .unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+    }
+
+    #[test]
+    fn rev_parse_on_a_non_repo_is_error_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ProcessGit::default()
+            .rev_parse(tmp.path(), REF_HEAD)
+            .unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+    }
+
+    #[test]
+    fn log_sha_before_on_a_non_repo_is_error_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = ProcessGit::default()
+            .log_sha_before(tmp.path(), COMMIT_UNIX)
+            .unwrap_err();
+        assert!(matches!(err, Error::Git { .. }), "{err}");
+    }
+
+    #[test]
+    fn show_of_an_unknown_commit_names_the_sha_and_the_fix() {
+        let (_tmp, bare, _sha) = bare_with_one_commit();
+        let missing = "deadbeef".repeat(5);
+        let err = ProcessGit::default()
+            .show(&bare, &missing, "f")
+            .unwrap_err();
+        let Error::Git { detail, .. } = &err else {
+            panic!("expected Error::Git, got {err}");
+        };
+        assert!(detail.contains(&missing), "{detail}");
+        assert!(detail.contains("brewsoak update"), "{detail}");
+    }
+
+    #[test]
+    fn show_of_a_missing_path_on_a_real_commit_is_none() {
+        let (_tmp, bare, sha) = bare_with_one_commit();
+        let git = ProcessGit::default();
+        assert_eq!(git.show(&bare, &sha, "nope").unwrap(), None);
+        assert_eq!(
+            git.show(&bare, &sha, "f").unwrap().as_deref(),
+            Some(b"one\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn rev_parse_of_a_missing_ref_in_a_real_repo_is_none() {
+        let (_tmp, bare, _sha) = bare_with_one_commit();
+        assert_eq!(
+            ProcessGit::default().rev_parse(&bare, REF_CUTOFF).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn log_sha_before_missing_window_in_a_real_repo_is_none() {
+        let (_tmp, bare, _sha) = bare_with_one_commit();
+        assert_eq!(
+            ProcessGit::default()
+                .log_sha_before(&bare, COMMIT_UNIX)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_object_matches_stderr_text_not_the_exit_code() {
+        let out = |code: i32, stderr: &str| {
+            use std::os::unix::process::ExitStatusExt;
+            Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: stderr.as_bytes().to_vec(),
+            }
+        };
+        assert!(missing_object(&out(
+            128,
+            "fatal: path 'x' does not exist in 'abc'"
+        )));
+        assert!(missing_object(&out(
+            128,
+            "fatal: ambiguous argument 'r': unknown revision or path not in the working tree."
+        )));
+        assert!(!missing_object(&out(
+            128,
+            "fatal: not a git repository: 'x'"
+        )));
+        assert!(!missing_object(&out(128, "fatal: unable to read tree abc")));
+        assert!(!missing_object(&out(128, "")));
     }
 
     #[test]
