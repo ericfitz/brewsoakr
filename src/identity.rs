@@ -176,15 +176,17 @@ fn both_or_skip(a: &Option<String>, b: &Option<String>) -> bool {
 /// to it (Ruby's later definition wins, and heroku overrides its x64 url for
 /// arm after it). Without one, those blocks stay opaque and the first match wins.
 pub fn parse_formula(rb: &str, host: Option<&HostPlatform>) -> Result<FormulaIdentity, Error> {
-    let git_tag = keyword_quoted(rb, "tag:");
-    let git_rev = keyword_quoted(rb, "revision:");
-    let lines = depth1_lines(rb, host);
+    let lines = depth1_lines(formula_class(rb), host);
     let last = host.is_some();
-    // With a host, identity fields come from before `bottle do` only.
-    let scope: &[&str] = match lines.iter().position(|t| is_bottle_do(t)) {
-        Some(i) if last => &lines[..i],
-        _ => &lines,
+    // Homebrew's component order puts `url`/`version`/`sha256` before
+    // `bottle do`, `service do`, every `def` and `test do`. A Cellar receipt has
+    // no bottle block, so those are what end the identity scope.
+    let scope: &[&str] = match lines.iter().position(|t| ends_identity_scope(t)) {
+        Some(i) => &lines[..i],
+        None => &lines,
     };
+    let git_tag = keyword_quoted(scope, "tag:");
+    let git_rev = keyword_quoted(scope, "revision:");
     let version = match pick_quoted(scope, "version ", last) {
         Some(v) => v,
         None => {
@@ -202,7 +204,7 @@ pub fn parse_formula(rb: &str, host: Option<&HostPlatform>) -> Result<FormulaIde
     };
     let revision = first_u32_in(depth1_lines(rb, None), "revision ").unwrap_or(0);
     let rebuild = first_u32(rb, "rebuild ");
-    let sha256 = sha256_before_bottle(&lines, last)
+    let sha256 = pick_quoted(scope, "sha256 ", last)
         .or(git_rev)
         .or(git_tag)
         .ok_or_else(|| Error::Other("formula missing sha256 and git revision".into()))?;
@@ -224,15 +226,38 @@ fn pick_quoted(lines: &[&str], key: &str, last: bool) -> Option<String> {
     }
 }
 
-/// `tag: "v1.2.3"` / `revision: "abc…"` (Homebrew git-url kwargs).
-fn keyword_quoted(rb: &str, key: &str) -> Option<String> {
-    for line in rb.lines() {
-        let t = line.trim_start();
-        if let Some(rest) = t.strip_prefix(key) {
-            return first_double_quoted(rest.trim_start());
+/// `tag: "v1.2.3"` / `revision: "abc…"` (Homebrew git-url kwargs), on a
+/// continuation line of the `url` statement or after it on the same line.
+/// Only lines of `scope` count, so a resource's `url ..., revision:` does not.
+fn keyword_quoted(scope: &[&str], key: &str) -> Option<String> {
+    scope.iter().find_map(|t| {
+        let rest = if t.starts_with("url ") {
+            let pos = t.find(key).filter(|&p| t[..p].ends_with([' ', ',']))?;
+            &t[pos + key.len()..]
+        } else {
+            t.strip_prefix(key)?
+        };
+        first_double_quoted(rest.trim_start())
+    })
+}
+
+/// The text from the formula's own `class X < Formula` line: helper classes
+/// before it (glibc defines requirements first) have `def`s of their own.
+fn formula_class(rb: &str) -> &str {
+    let mut pos = 0;
+    for line in rb.split_inclusive('\n') {
+        if line.starts_with("class ") && line.contains("< Formula") {
+            return &rb[pos..];
         }
+        pos += line.len();
     }
-    None
+    rb
+}
+
+/// A depth-1 line after which no `url`/`version`/`sha256` of the formula can follow.
+fn ends_identity_scope(t: &str) -> bool {
+    let code = t.split('#').next().unwrap_or(t).trim_end();
+    is_bottle_do(code) || code.starts_with("def ") || code == "test do" || code == "service do"
 }
 
 /// Top-level `auto_updates true`: the app updates itself, and `brew upgrade`
@@ -445,7 +470,7 @@ fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
         if depth == 1 && !transparent {
             out.push(t);
         }
-        if opens_ruby_block(t) {
+        if opens_ruby_block(t, open_blocks.is_empty()) {
             open_blocks.push(Open {
                 transparent,
                 flips_on_else: condition.is_some(),
@@ -487,11 +512,16 @@ fn is_stable_do(t: &str) -> bool {
 }
 
 fn is_ruby_end(t: &str) -> bool {
-    t == "end" || t.starts_with("end ") || t.starts_with("end;") || t.starts_with("end#")
+    t == "end"
+        || ["end ", "end;", "end#", "end.", "end)", "end]", "end,"]
+            .iter()
+            .any(|p| t.starts_with(p))
 }
 
-fn opens_ruby_block(t: &str) -> bool {
-    if t.starts_with("class ") || t.starts_with("module ") || t.starts_with("cask ") {
+/// `at_top`: outside every block, where `class` / `module` / `cask` name the
+/// definition; deeper they are a `cask "token"` livecheck reference or similar.
+fn opens_ruby_block(t: &str, at_top: bool) -> bool {
+    if at_top && (t.starts_with("class ") || t.starts_with("module ") || t.starts_with("cask ")) {
         return true;
     }
     let stripped = t.split('#').next().unwrap_or(t).trim_end();
@@ -499,19 +529,57 @@ fn opens_ruby_block(t: &str) -> bool {
         return true;
     }
     let keyword = stripped == "begin"
-        || ["if ", "unless ", "case ", "while ", "until ", "def "]
-            .iter()
-            .any(|k| stripped.starts_with(k));
+        || [
+            "if ", "unless ", "case ", "while ", "until ", "for ", "def ",
+        ]
+        .iter()
+        .any(|k| stripped.starts_with(k))
+        || opens_as_expression(stripped);
     keyword && !stripped.ends_with(" end") && !is_endless_def(stripped)
 }
 
+/// `x = if ...`, `x ||= case ...`, `x += begin`: the keyword right after an
+/// assignment operator opens a block that closes with `end`. `foo if bar` and
+/// `x = foo if bar` are modifiers and do not match.
+fn opens_as_expression(code: &str) -> bool {
+    ["if ", "unless ", "case "]
+        .iter()
+        .any(|k| code.contains(&format!("= {k}")))
+        || code.ends_with("= begin")
+        || code.contains("= begin ")
+}
+
 /// `def name(args) = expr` / `def name = expr`: a method with no `end`.
+/// Operator names (`<=>`, `[]=`, `==`) and setters (`foo=(v)`) contain an `=`
+/// that is part of the name, not the endless marker.
 fn is_endless_def(line: &str) -> bool {
     let Some(rest) = line.strip_prefix("def ") else {
         return false;
     };
-    let name_end = rest.find(['(', ' ', '=']).unwrap_or(rest.len());
-    let mut after = &rest[name_end..];
+    let rest = rest.trim_start();
+    const OPERATORS: &[&str] = &[
+        "[]=", "<=>", "===", "[]", "==", "=~", "!=", "<<", ">>", "<=", ">=", "**", "+@", "-@",
+        "!~", "+", "-", "*", "/", "%", "<", ">", "!", "~", "&", "|", "^",
+    ];
+    let name_len = if rest.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_') {
+        let mut n = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .unwrap_or(rest.len());
+        let tail = &rest[n..];
+        if tail.starts_with('?') || tail.starts_with('!') {
+            n += 1;
+        } else if tail.starts_with("=(") {
+            // `def foo=(v)` is a setter.
+            n += 1;
+        }
+        n
+    } else {
+        OPERATORS
+            .iter()
+            .find(|op| rest.starts_with(**op))
+            .map_or(0, |op| op.len())
+    };
+    let mut after = &rest[name_len..];
     if after.starts_with('(') {
         let Some(close) = after.find(')') else {
             return false;
@@ -621,12 +689,6 @@ fn is_bottle_do(line: &str) -> bool {
             .chars()
             .next()
             .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
-}
-
-/// The `sha256 "..."` before `bottle do`: the first, or with `last` the last.
-fn sha256_before_bottle(lines: &[&str], last: bool) -> Option<String> {
-    let end = lines.iter().position(|t| is_bottle_do(t));
-    pick_quoted(&lines[..end.unwrap_or(lines.len())], "sha256 ", last)
 }
 
 fn version_from_url(url: &str) -> Option<String> {
@@ -1386,17 +1448,23 @@ mod platform_tests {
             "  if foo?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
             "  unless OS.linux?\n    sha256 \"x\"\n  end\n",
             "  if OS.linux?\n    sha256 \"x\"\n  elsif Hardware::CPU.arm?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
-            "  if Hardware::CPU.arm?\n    sha256 \"base\"\n  elsif OS.mac?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
+            "  if Hardware::CPU.arm?\n    sha256 \"holds\"\n  elsif OS.mac?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
         ] {
-            assert_eq!(sha_for(body, &h), "base", "{body}");
+            let want = if body.contains("\"holds\"") {
+                "holds"
+            } else {
+                "base"
+            };
+            assert_eq!(sha_for(body, &h), want, "{body}");
         }
     }
 
     #[test]
     fn formulae_stop_at_bottle_and_ignore_def_bodies() {
         let h = host("sequoia", "arm64");
-        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"base\"\n  bottle do\n    sha256 cellar: :any, arm64_sequoia: \"b\"\n  end\n  on_arm do\n    sha256 \"late\"\n  end\nend\n";
-        assert_eq!(parse_formula(rb, Some(&h)).unwrap().sha256, "base");
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"base\"\n  def install\n    version \"9.9\"\n    sha256 \"indef\"\n  end\n  bottle do\n    sha256 cellar: :any, arm64_sequoia: \"b\"\n  end\n  on_arm do\n    sha256 \"late\"\n  end\nend\n";
+        let got = parse_formula(rb, Some(&h)).unwrap();
+        assert_eq!((got.version.as_str(), got.sha256.as_str()), ("1.0", "base"));
     }
 
     #[test]
@@ -1418,6 +1486,148 @@ mod platform_tests {
         assert_eq!(
             upcoming_lifecycle_messages(future, "2026-01-01", None).len(),
             1
+        );
+    }
+
+    const APPIUM: &str = include_str!("../tests/fixtures/appium-inspector.rb");
+    const GDBM_RECEIPT: &str = include_str!("../tests/fixtures/python-gdbm-receipt.rb");
+
+    #[test]
+    fn end_followed_by_a_method_call_still_closes_the_block() {
+        let h = host("sequoia", "arm64");
+        assert!(is_deprecated_or_disabled(APPIUM, "2026-10-17", Some(&h)));
+        assert!(is_deprecated_or_disabled(APPIUM, "2026-10-17", None));
+        for end in ["end.flatten", "end.compact", "end)", "end]", "end,", "end"] {
+            let rb = format!(
+                "cask \"x\" do\n  livecheck do\n    foo(bar.map do |r|\n      r\n    {end}\n  end\n  disable! date: \"2024-01-01\", because: :x\nend\n"
+            );
+            let flags = lifecycle_flags(&rb, Some(&h));
+            assert_eq!(flags.len(), 1, "{end}");
+        }
+    }
+
+    fn lifecycle_after(body: &str) -> usize {
+        let rb = format!(
+            "class Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"a\"\n{body}  deprecate! date: \"2020-01-01\", because: :x\nend\n"
+        );
+        lifecycle_flags(&rb, Some(&host("sequoia", "arm64"))).len()
+    }
+
+    #[test]
+    fn expression_openers_and_for_loops_close_with_end() {
+        for opener in [
+            "x = if OS.mac?",
+            "x = case y",
+            "x = unless OS.mac?",
+            "x = begin",
+            "x ||= if OS.mac?",
+            "x += if OS.mac?",
+            "for x in y",
+            "for x in y do",
+        ] {
+            let body = format!("  def install\n    {opener}\n      1\n    end\n  end\n");
+            assert_eq!(lifecycle_after(&body), 1, "{opener}");
+        }
+    }
+
+    #[test]
+    fn modifiers_and_comparisons_open_no_block() {
+        for line in [
+            "foo if bar",
+            "x = foo if bar",
+            "x = foo unless bar",
+            "x = (a == b)",
+            "x = a if b == c",
+            "x = if a then b else c end",
+        ] {
+            let body = format!("  def install\n    {line}\n  end\n");
+            assert_eq!(lifecycle_after(&body), 1, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_receipt_without_a_bottle_block_keeps_the_top_level_identity() {
+        // `python_include = if OS.mac?` in `def install` and the heredoc line
+        // `version = "#{version}"` must not displace the real version.
+        for h in [Some(host("sequoia", "arm64")), None] {
+            let got = parse_formula(GDBM_RECEIPT, h.as_ref()).unwrap();
+            assert_eq!(got.version, "3.13.16", "{h:?}");
+            assert!(got.sha256.starts_with("cfac63bd"), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn identity_scope_ends_at_the_first_def_test_or_service() {
+        for stop in ["def install\n  end", "test do\n  end", "service do\n  end"] {
+            let rb = format!(
+                "class Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"base\"\n  {stop}\n  version \"9.9\"\n  sha256 \"late\"\nend\n"
+            );
+            for h in [Some(host("sequoia", "arm64")), None] {
+                let got = parse_formula(&rb, h.as_ref()).unwrap();
+                assert_eq!(
+                    (got.version.as_str(), got.sha256.as_str()),
+                    ("1.0", "base"),
+                    "{stop}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn helper_classes_before_the_formula_do_not_end_the_identity_scope() {
+        const RB: &str = "class Helper < Requirement\n  def message\n    \"x\"\n  end\nend\n\nclass Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"a\"\nend\n";
+        for h in [Some(host("sequoia", "arm64")), None] {
+            let got = parse_formula(RB, h.as_ref()).unwrap();
+            assert_eq!(got.version, "1.0", "{h:?}");
+        }
+    }
+
+    #[test]
+    fn a_cask_token_inside_livecheck_is_not_a_block() {
+        const RB: &str = "cask \"x\" do\n  version \"1\"\n  sha256 \"a\"\n  livecheck do\n    cask \"x-suite\"\n  end\n\n  auto_updates true\n  app \"X.app\"\nend\n";
+        for h in [Some(host("sequoia", "arm64")), None] {
+            assert!(cask_auto_updates(RB, h.as_ref()), "{h:?}");
+        }
+    }
+
+    #[test]
+    fn operator_method_defs_are_not_endless() {
+        for (def, opens) in [
+            ("def <=>(other)", true),
+            ("def []=(k, v)", true),
+            ("def ==(o)", true),
+            ("def [](k)", true),
+            ("def +(o)", true),
+            ("def foo=(v)", true),
+            ("def self.foo(a)", true),
+            ("def foo?", true),
+            ("def foo = 1", false),
+            ("def foo(a) = a", false),
+            ("def foo() = 1", false),
+            ("def self.foo(a) = a", false),
+            ("def ==(o) = true", false),
+            ("def <=>(o) = 0", false),
+        ] {
+            assert_eq!(opens_ruby_block(def, true), opens, "{def}");
+        }
+    }
+
+    #[test]
+    fn git_kwargs_on_the_url_line_are_found() {
+        const NETPBM: &str = "class Netpbm < Formula\n  url \"https://svn.example.org/stable\", revision: \"5358\"\n  version \"11.02.30\"\n\n  resource \"ug\" do\n    url \"https://svn.example.org/ug\", revision: \"5348\"\n  end\n\n  bottle do\n    sha256 arm64_sequoia: \"b\"\n  end\nend\n";
+        for h in [Some(host("sequoia", "arm64")), None] {
+            let got = parse_formula(NETPBM, h.as_ref()).unwrap();
+            assert_eq!(
+                (got.version.as_str(), got.sha256.as_str()),
+                ("11.02.30", "5358"),
+                "{h:?}"
+            );
+        }
+        const TAGGED: &str = "class Foo < Formula\n  url \"https://example.org/foo.git\", tag: \"v2.3\", revision: \"abc123\"\nend\n";
+        let got = parse_formula(TAGGED, None).unwrap();
+        assert_eq!(
+            (got.version.as_str(), got.sha256.as_str()),
+            ("2.3", "abc123")
         );
     }
 }
