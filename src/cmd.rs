@@ -1333,7 +1333,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let Some(rb) = self.brew.keg_receipt(name, version) else {
             return false;
         };
-        match crate::identity::parse_formula(&rb) {
+        match crate::identity::parse_formula(&rb, self.brew.host_platform().as_ref()) {
             Ok(have) => PkgIdentity::Formula(have).same_artifact(want),
             Err(_) => false,
         }
@@ -1693,6 +1693,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             blobs.cutoff.as_deref(),
             blobs.head.as_deref(),
             &calendar_today(),
+            self.brew.host_platform().as_ref(),
         );
         if status != UpstreamStatus::Eligible {
             self.refuse_ineligible_dep(target, target_token, dep, status)?;
@@ -2382,7 +2383,7 @@ fn resolve_view_unordered(
     };
     let today = calendar_today();
     let status =
-        eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref(), &today);
+        eligibility::upstream_status(blobs.cutoff.as_deref(), blobs.head.as_deref(), &today, host);
     let action =
         eligibility::desired_action(status, installed.as_ref(), cutoff.as_ref(), head.as_ref());
     let head_rb = blobs
@@ -2390,7 +2391,7 @@ fn resolve_view_unordered(
         .as_deref()
         .and_then(|b| std::str::from_utf8(b).ok());
     let warnings = match head_rb {
-        Some(rb) => identity::upcoming_lifecycle_messages(rb, &today)
+        Some(rb) => identity::upcoming_lifecycle_messages(rb, &today, host)
             .into_iter()
             .map(|msg| format!("{name} {msg}"))
             .collect(),
@@ -2530,10 +2531,10 @@ fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
     }
 }
 
-/// Formulae ignore `host`: only cask platform blocks are resolved.
+/// `host` resolves platform blocks for both kinds; `None` leaves them opaque.
 fn parse_pkg(kind: PkgKind, rb: &str, host: Option<&HostPlatform>) -> Result<PkgIdentity, Error> {
     match kind {
-        PkgKind::Formula => Ok(PkgIdentity::Formula(identity::parse_formula(rb)?)),
+        PkgKind::Formula => Ok(PkgIdentity::Formula(identity::parse_formula(rb, host)?)),
         PkgKind::Cask => Ok(PkgIdentity::Cask(identity::parse_cask(rb, host)?)),
     }
 }

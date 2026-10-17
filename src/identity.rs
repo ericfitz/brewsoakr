@@ -171,16 +171,27 @@ fn both_or_skip(a: &Option<String>, b: &Option<String>) -> bool {
     }
 }
 
-pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
+/// With a `host`, `version`, `url` and `sha256` come from the last definition
+/// before `bottle do` inside the platform blocks and `if` branches that apply
+/// to it (Ruby's later definition wins, and heroku overrides its x64 url for
+/// arm after it). Without one, those blocks stay opaque and the first match wins.
+pub fn parse_formula(rb: &str, host: Option<&HostPlatform>) -> Result<FormulaIdentity, Error> {
     let git_tag = keyword_quoted(rb, "tag:");
     let git_rev = keyword_quoted(rb, "revision:");
-    let version = match first_quoted(rb, "version ") {
+    let lines = depth1_lines(rb, host);
+    let last = host.is_some();
+    // With a host, identity fields come from before `bottle do` only.
+    let scope: &[&str] = match lines.iter().position(|t| is_bottle_do(t)) {
+        Some(i) if last => &lines[..i],
+        _ => &lines,
+    };
+    let version = match pick_quoted(scope, "version ", last) {
         Some(v) => v,
         None => {
             if let Some(tag) = git_tag.as_deref() {
                 drop_tag_v(tag).to_string()
             } else {
-                let url = first_quoted(rb, "url ").ok_or_else(|| {
+                let url = pick_quoted(scope, "url ", last).ok_or_else(|| {
                     Error::Other("formula missing version, git tag, and url".into())
                 })?;
                 version_from_url(&url).ok_or_else(|| {
@@ -191,7 +202,7 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
     };
     let revision = first_u32_in(depth1_lines(rb, None), "revision ").unwrap_or(0);
     let rebuild = first_u32(rb, "rebuild ");
-    let sha256 = first_sha256_before_bottle(rb)
+    let sha256 = sha256_before_bottle(&lines, last)
         .or(git_rev)
         .or(git_tag)
         .ok_or_else(|| Error::Other("formula missing sha256 and git revision".into()))?;
@@ -201,6 +212,16 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
         rebuild,
         sha256,
     })
+}
+
+/// The first (or, with `last`, the last) `key "..."` among `lines`.
+fn pick_quoted(lines: &[&str], key: &str, last: bool) -> Option<String> {
+    let find = |t: &&str| t.strip_prefix(key).and_then(first_double_quoted);
+    if last {
+        lines.iter().rev().find_map(find)
+    } else {
+        lines.iter().find_map(find)
+    }
 }
 
 /// `tag: "v1.2.3"` / `revision: "abc…"` (Homebrew git-url kwargs).
@@ -252,10 +273,15 @@ pub struct LifecycleFlag {
 }
 
 /// Homebrew `deprecate!` / `disable!` calls. `date:` is a required keyword.
-pub fn lifecycle_flags(rb: &str) -> Vec<LifecycleFlag> {
+/// With a `host`, only lines outside platform blocks that do not apply to it
+/// count; without one, every line is scanned (refusing is the conservative failure).
+pub fn lifecycle_flags(rb: &str, host: Option<&HostPlatform>) -> Vec<LifecycleFlag> {
     let mut out = Vec::new();
-    for line in rb.lines() {
-        let t = line.trim_start();
+    let lines: Vec<&str> = match host {
+        Some(_) => depth1_lines(rb, host),
+        None => rb.lines().map(str::trim_start).collect(),
+    };
+    for t in lines {
         let kind = if starts_with_bang_call(t, "deprecate!") {
             LifecycleKind::Deprecated
         } else if starts_with_bang_call(t, "disable!") {
@@ -274,17 +300,21 @@ pub fn lifecycle_flags(rb: &str) -> Vec<LifecycleFlag> {
 /// True when a `deprecate!`/`disable!` date is today or earlier, or the date
 /// is missing/unparseable. Future dates are not yet in effect (Homebrew
 /// `Date.parse(date) <= Date.today`).
-pub fn is_deprecated_or_disabled(rb: &str, today: &str) -> bool {
-    lifecycle_flags(rb)
+pub fn is_deprecated_or_disabled(rb: &str, today: &str, host: Option<&HostPlatform>) -> bool {
+    lifecycle_flags(rb, host)
         .iter()
         .any(|flag| flag_in_effect(flag, today))
 }
 
 /// Deprecations more than a year out are not actionable; only warn about the
 /// ones close enough to plan around.
-pub fn upcoming_lifecycle_messages(rb: &str, today: &str) -> Vec<String> {
+pub fn upcoming_lifecycle_messages(
+    rb: &str,
+    today: &str,
+    host: Option<&HostPlatform>,
+) -> Vec<String> {
     let horizon = one_year_out(today);
-    lifecycle_flags(rb)
+    lifecycle_flags(rb, host)
         .into_iter()
         .filter(|flag| !flag_in_effect(flag, today))
         .filter_map(|flag| {
@@ -352,10 +382,6 @@ fn starts_with_bang_call(line: &str, keyword: &str) -> bool {
             .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
-fn first_quoted(rb: &str, key: &str) -> Option<String> {
-    first_quoted_in(depth1_lines(rb, None), key)
-}
-
 fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> Option<String> {
     for t in lines {
         if let Some(q) = t.strip_prefix(key).and_then(first_double_quoted) {
@@ -369,33 +395,91 @@ fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> O
 /// A body-level `stable do` block is transparent: it holds the stable spec's
 /// `url`/`version`/`sha256`, which are the formula's identity. `head do` and
 /// every other block stay opaque, except that with a `host` a platform block
-/// (`on_arm`, `on_monterey :or_newer`, ...) that applies to it is transparent too.
+/// (`on_arm`, `on_monterey :or_newer`, ...) that applies to it is transparent too,
+/// as is an `if` whose condition `condition_holds` can decide (and its `else`
+/// when the condition fails). `if`, `unless`, `case`, `begin`, `while`, `until`
+/// and `def` blocks are tracked so their `end` closes the right entry.
 fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
+    struct Open {
+        transparent: bool,
+        /// A recognized `if` whose `else` swaps transparency; `elsif` clears it.
+        flips_on_else: bool,
+    }
     let mut depth = 0i32;
-    // One entry per open block; true when the block was transparent.
-    let mut open_blocks: Vec<bool> = Vec::new();
+    let mut open_blocks: Vec<Open> = Vec::new();
     let mut out = Vec::new();
     for line in rb.lines() {
         let t = line.trim_start();
         if is_ruby_end(t) {
-            if open_blocks.pop() != Some(true) {
+            if open_blocks.pop().is_none_or(|o| !o.transparent) {
                 depth = depth.saturating_sub(1);
             }
             continue;
         }
-        let transparent =
-            depth == 1 && (is_stable_do(t) || host.is_some_and(|h| h.block_applies(t)));
+        let code = t.split('#').next().unwrap_or(t).trim_end();
+        if let Some(top) = open_blocks.last_mut().filter(|o| o.flips_on_else) {
+            if code == "else" {
+                top.transparent = !top.transparent;
+                top.flips_on_else = false;
+                depth += if top.transparent { -1 } else { 1 };
+                continue;
+            }
+            if code.starts_with("elsif ") {
+                // The rest of the chain is opaque.
+                if top.transparent {
+                    top.transparent = false;
+                    depth += 1;
+                }
+                top.flips_on_else = false;
+                continue;
+            }
+        }
+        let condition = match (host, code.strip_prefix("if ")) {
+            (Some(h), Some(cond)) if depth == 1 => condition_holds(cond, h),
+            _ => None,
+        };
+        let transparent = depth == 1
+            && (is_stable_do(t)
+                || host.is_some_and(|h| h.block_applies(t))
+                || condition == Some(true));
         if depth == 1 && !transparent {
             out.push(t);
         }
         if opens_ruby_block(t) {
-            open_blocks.push(transparent);
+            open_blocks.push(Open {
+                transparent,
+                flips_on_else: condition.is_some(),
+            });
             if !transparent {
                 depth += 1;
             }
         }
     }
     out
+}
+
+/// Whether an `if` condition holds on `host`. Only `Hardware::CPU.arm?`,
+/// `Hardware::CPU.intel?`, `Hardware::CPU.is_64_bit?` (true on arm64 and
+/// x86_64), `OS.mac?` (true), `OS.linux?` (false), `!` and `&&` are known;
+/// anything else, including `||`, parentheses and `then`, is `None`.
+fn condition_holds(cond: &str, host: &HostPlatform) -> Option<bool> {
+    let mut holds = true;
+    for term in cond.split("&&") {
+        let term = term.trim();
+        let (negated, name) = match term.strip_prefix('!') {
+            Some(rest) => (true, rest.trim_start()),
+            None => (false, term),
+        };
+        let value = match name {
+            "Hardware::CPU.arm?" => host.is_arm(),
+            "Hardware::CPU.intel?" => !host.is_arm(),
+            "Hardware::CPU.is_64_bit?" | "OS.mac?" => true,
+            "OS.linux?" => false,
+            _ => return None,
+        };
+        holds &= value != negated;
+    }
+    Some(holds)
 }
 
 fn is_stable_do(t: &str) -> bool {
@@ -411,7 +495,31 @@ fn opens_ruby_block(t: &str) -> bool {
         return true;
     }
     let stripped = t.split('#').next().unwrap_or(t).trim_end();
-    stripped == "do" || stripped.ends_with(" do") || stripped.contains(" do |")
+    if stripped == "do" || stripped.ends_with(" do") || stripped.contains(" do |") {
+        return true;
+    }
+    let keyword = stripped == "begin"
+        || ["if ", "unless ", "case ", "while ", "until ", "def "]
+            .iter()
+            .any(|k| stripped.starts_with(k));
+    keyword && !stripped.ends_with(" end") && !is_endless_def(stripped)
+}
+
+/// `def name(args) = expr` / `def name = expr`: a method with no `end`.
+fn is_endless_def(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("def ") else {
+        return false;
+    };
+    let name_end = rest.find(['(', ' ', '=']).unwrap_or(rest.len());
+    let mut after = &rest[name_end..];
+    if after.starts_with('(') {
+        let Some(close) = after.find(')') else {
+            return false;
+        };
+        after = &after[close + 1..];
+    }
+    let after = after.trim_start();
+    after.starts_with('=') && !after.starts_with("==") && !after.starts_with("=~")
 }
 
 /// The cask `sha256`. Besides the plain form it reads `sha256 arm: "x", intel:
@@ -515,16 +623,10 @@ fn is_bottle_do(line: &str) -> bool {
             .is_some_and(|c| !c.is_ascii_alphanumeric() && c != '_')
 }
 
-fn first_sha256_before_bottle(rb: &str) -> Option<String> {
-    for t in depth1_lines(rb, None) {
-        if is_bottle_do(t) {
-            break;
-        }
-        if let Some(q) = t.strip_prefix("sha256 ").and_then(first_double_quoted) {
-            return Some(q);
-        }
-    }
-    None
+/// The `sha256 "..."` before `bottle do`: the first, or with `last` the last.
+fn sha256_before_bottle(lines: &[&str], last: bool) -> Option<String> {
+    let end = lines.iter().position(|t| is_bottle_do(t));
+    pick_quoted(&lines[..end.unwrap_or(lines.len())], "sha256 ", last)
 }
 
 fn version_from_url(url: &str) -> Option<String> {
@@ -643,7 +745,7 @@ class CaCertificates < Formula
   sha256 "f66dff1bdf8f96060b8177976f8b7d9254bc89bc4db933d769f7384d28480bc9"
 end
 "#;
-        let got = parse_formula(RB).expect("parse ca-certificates");
+        let got = parse_formula(RB, None).expect("parse ca-certificates");
         assert_eq!(got.version, "2026-08-13");
     }
 
@@ -692,7 +794,7 @@ end
 
     #[test]
     fn stable_block_supplies_identity() {
-        let got = parse_formula(STABLE_BLOCK_RB).expect("parse stable block");
+        let got = parse_formula(STABLE_BLOCK_RB, None).expect("parse stable block");
         assert_eq!(
             got,
             FormulaIdentity {
@@ -719,7 +821,7 @@ class Foo < Formula
   end
 end
 "#;
-        let got = parse_formula(RB).expect("parse head + stable");
+        let got = parse_formula(RB, None).expect("parse head + stable");
         assert_eq!(got.version, "1.0");
         assert_eq!(got.sha256, "aaa111");
     }
@@ -739,7 +841,7 @@ class Foo < Formula
   end
 end
 "#;
-        let got = parse_formula(RB).expect("parse nested resource");
+        let got = parse_formula(RB, None).expect("parse nested resource");
         assert_eq!(got.version, "1.0");
         assert_eq!(got.sha256, "aaa111");
     }
@@ -796,14 +898,14 @@ class Wget < Formula
   sha256 "aaa111"
 end
 "#;
-        let id = parse_formula(rb).unwrap();
+        let id = parse_formula(rb, None).unwrap();
         assert_eq!(id.version, "1.21.4");
         assert_eq!(id.sha256, "aaa111");
     }
 
     #[test]
     fn parse_formula_from_url_version_and_source_sha() {
-        let id = parse_formula(WGET_FORMULA).unwrap();
+        let id = parse_formula(WGET_FORMULA, None).unwrap();
         assert_eq!(id.version, "1.21.4");
         assert_eq!(id.revision, 1);
         assert_eq!(id.rebuild, Some(2));
@@ -812,8 +914,8 @@ end
 
     #[test]
     fn different_source_sha256_yields_different_identity() {
-        let a = parse_formula(WGET_FORMULA).unwrap();
-        let b = parse_formula(WGET_FORMULA_OTHER_SHA).unwrap();
+        let a = parse_formula(WGET_FORMULA, None).unwrap();
+        let b = parse_formula(WGET_FORMULA_OTHER_SHA, None).unwrap();
         assert_eq!(a.version, b.version);
         assert_ne!(a, b);
         assert_ne!(PkgIdentity::Formula(a), PkgIdentity::Formula(b));
@@ -836,9 +938,9 @@ class Wget < Formula
   revision 1
 end
 "#;
-        let id = parse_formula(rb).unwrap();
+        let id = parse_formula(rb, None).unwrap();
         assert_eq!(id.rebuild, None);
-        let with_bottle = parse_formula(WGET_FORMULA).unwrap();
+        let with_bottle = parse_formula(WGET_FORMULA, None).unwrap();
         assert_eq!(with_bottle.rebuild, Some(2));
         assert!(
             PkgIdentity::Formula(id.clone())
@@ -865,7 +967,7 @@ class Helm < Formula
   end
 end
 "#;
-        let id = parse_formula(rb).unwrap();
+        let id = parse_formula(rb, None).unwrap();
         assert_eq!(id.version, "4.2.3");
         assert_eq!(id.sha256, "43e8b7feece8beb0fcba47059ec9b522fd929a64");
     }
@@ -882,7 +984,7 @@ class X264 < Formula
   end
 end
 "#;
-        let id = parse_formula(rb).unwrap();
+        let id = parse_formula(rb, None).unwrap();
         assert_eq!(id.version, "r3222");
         assert_eq!(id.sha256, "b35605ace3ddf7c1a5d67a2eb553f034aef41d55");
     }
@@ -949,7 +1051,7 @@ class Soon < Formula
 end
 "#;
         assert_eq!(
-            upcoming_lifecycle_messages(rb, "2026-08-13"),
+            upcoming_lifecycle_messages(rb, "2026-08-13", None),
             ["scheduled to be deprecated on 2027-01-15"],
             "warn inside a year, stay quiet beyond it"
         );
@@ -957,8 +1059,16 @@ end
 
     #[test]
     fn detects_deprecate_bang() {
-        assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA, "2024-01-01"));
-        assert!(is_deprecated_or_disabled(DEPRECATED_FORMULA, "2026-08-13"));
+        assert!(is_deprecated_or_disabled(
+            DEPRECATED_FORMULA,
+            "2024-01-01",
+            None
+        ));
+        assert!(is_deprecated_or_disabled(
+            DEPRECATED_FORMULA,
+            "2026-08-13",
+            None
+        ));
     }
 
     #[test]
@@ -971,22 +1081,22 @@ class New < Formula
   disable! date: "2031-11-01", because: :deprecated_upstream
 end
 "#;
-        assert!(!is_deprecated_or_disabled(rb, "2026-08-13"));
+        assert!(!is_deprecated_or_disabled(rb, "2026-08-13", None));
         // Both dates are years out, so neither is worth a warning today.
-        assert!(upcoming_lifecycle_messages(rb, "2026-08-13").is_empty());
+        assert!(upcoming_lifecycle_messages(rb, "2026-08-13", None).is_empty());
     }
 
     #[test]
     fn missing_date_is_treated_as_in_effect() {
         let rb = "  deprecate! because: :unmaintained\n";
-        assert!(is_deprecated_or_disabled(rb, "2026-08-13"));
-        assert!(upcoming_lifecycle_messages(rb, "2026-08-13").is_empty());
+        assert!(is_deprecated_or_disabled(rb, "2026-08-13", None));
+        assert!(upcoming_lifecycle_messages(rb, "2026-08-13", None).is_empty());
     }
 
     #[test]
     fn comment_disable_does_not_match() {
         let rb = "# disable! maybe\nclass X < Formula\nend\n";
-        assert!(!is_deprecated_or_disabled(rb, "2026-08-13"));
+        assert!(!is_deprecated_or_disabled(rb, "2026-08-13", None));
     }
 
     #[test]
@@ -1039,6 +1149,8 @@ mod platform_tests {
 
     const NGROK: &str = include_str!("../tests/fixtures/ngrok.rb");
     const WIRESHARK: &str = include_str!("../tests/fixtures/wireshark-app.rb");
+    const CYCLONEDX: &str = include_str!("../tests/fixtures/cyclonedx-cli.rb");
+    const HEROKU: &str = include_str!("../tests/fixtures/heroku.rb");
     const WS_ARM: &str = "c869615ebbe8f1db1ebf62d503df7011b7c347f4c26997dc28cb4b68db0a4b49";
     const WS_INTEL: &str = "344ec1a1c85f6a46c3446392544dc179a25f94f4fdf7dbcad1159e3e5dc60fba";
 
@@ -1145,7 +1257,7 @@ mod platform_tests {
     #[test]
     fn formula_parsing_ignores_platform_blocks() {
         let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  sha256 \"abc\"\n  on_macos do\n    depends_on \"bar\"\n  end\n  bottle do\n    rebuild 2\n    sha256 cellar: :any, arm64_sequoia: \"def\"\n  end\nend\n";
-        let id = parse_formula(rb).unwrap();
+        let id = parse_formula(rb, None).unwrap();
         assert_eq!(
             (id.version.as_str(), id.sha256.as_str(), id.rebuild),
             ("1.2.3", "abc", Some(2))
@@ -1176,5 +1288,136 @@ mod platform_tests {
         ] {
             assert_eq!(HostPlatform::parse(bad), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_def_body_does_not_close_the_wrong_block() {
+        // The `end` of `def install` must not leave `test do` at depth 1.
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  sha256 \"abc\"\n  def install\n    bin.install \"x\"\n  end\n  test do\n    url \"https://e.com/bad-9.9.9.tar.gz\"\n    sha256 \"bad\"\n  end\nend\n";
+        let lines = depth1_lines(rb, None);
+        assert!(!lines.iter().any(|l| l.contains("bad")), "{lines:?}");
+        let id = parse_formula(rb, None).unwrap();
+        assert_eq!((id.version.as_str(), id.sha256.as_str()), ("1.2.3", "abc"));
+    }
+
+    #[test]
+    fn cyclonedx_is_unparseable_without_a_host() {
+        // Every url and sha256 sits inside `on_macos`/`on_linux`.
+        assert!(parse_formula(CYCLONEDX, None).is_err());
+    }
+
+    #[test]
+    fn one_liners_and_endless_defs_open_no_block() {
+        let rb = "class Foo < Formula\n  def a = 1\n  def b(x) = x + 1\n  def c; end\n  x = 1 if true\n  if y then z end\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  sha256 \"abc\"\nend\n";
+        let lines = depth1_lines(rb, None);
+        assert!(lines.iter().any(|l| l.starts_with("sha256")), "{lines:?}");
+    }
+
+    const HEROKU_ARM: &str = "a1bc52e3f0675bff8a3dcf7c821c6ea8056d279d550addc767ca79114087e95e";
+    const HEROKU_INTEL: &str = "108487ac8f232f6d43e342cf0e27341b101cb62dfcf6094ba5e96cd7140da9a0";
+    const CDX_ARM: &str = "750c148780154833f6401f9067d08c5a4c31567b6ee3c26c062c3a95c62d741c";
+    const CDX_INTEL: &str = "0ea92306fc7d7c30ed112a7463781a200585a3bf1cdaf77229181c5aabd1d4b6";
+
+    #[test]
+    fn heroku_takes_the_last_applicable_definition() {
+        let arm = parse_formula(HEROKU, Some(&host("sequoia", "arm64"))).unwrap();
+        assert_eq!(
+            (arm.version.as_str(), arm.sha256.as_str()),
+            ("11.12.0", HEROKU_ARM)
+        );
+        let intel = parse_formula(HEROKU, Some(&host("sequoia", "x86_64"))).unwrap();
+        assert_eq!(
+            (intel.version.as_str(), intel.sha256.as_str()),
+            ("11.12.0", HEROKU_INTEL)
+        );
+        // Unknown host: blocks stay opaque, first match wins.
+        let none = parse_formula(HEROKU, None).unwrap();
+        assert_eq!(
+            (none.version.as_str(), none.sha256.as_str()),
+            ("11.12.0", HEROKU_INTEL)
+        );
+    }
+
+    #[test]
+    fn cyclonedx_resolves_if_conditions_against_the_host() {
+        let arm = parse_formula(CYCLONEDX, Some(&host("sequoia", "arm64"))).unwrap();
+        assert_eq!(
+            (arm.version.as_str(), arm.sha256.as_str()),
+            ("0.33.1", CDX_ARM)
+        );
+        let intel = parse_formula(CYCLONEDX, Some(&host("sequoia", "x86_64"))).unwrap();
+        assert_eq!(
+            (intel.version.as_str(), intel.sha256.as_str()),
+            ("0.33.1", CDX_INTEL)
+        );
+    }
+
+    fn formula_with(body: &str) -> String {
+        format!(
+            "class Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"base\"\n{body}  bottle do\n    sha256 cellar: :any, arm64_sequoia: \"b\"\n  end\nend\n"
+        )
+    }
+
+    fn sha_for(body: &str, h: &HostPlatform) -> String {
+        parse_formula(&formula_with(body), Some(h)).unwrap().sha256
+    }
+
+    #[test]
+    fn if_else_picks_the_branch_that_holds() {
+        let body = "  if Hardware::CPU.arm?\n    sha256 \"armsha\"\n  else\n    sha256 \"othersha\"\n  end\n";
+        assert_eq!(sha_for(body, &host("sequoia", "arm64")), "armsha");
+        assert_eq!(sha_for(body, &host("sequoia", "x86_64")), "othersha");
+        let neg = "  if !Hardware::CPU.intel? && OS.mac?\n    sha256 \"a\"\n  else\n    sha256 \"b\"\n  end\n";
+        assert_eq!(sha_for(neg, &host("sequoia", "arm64")), "a");
+        assert_eq!(sha_for(neg, &host("sequoia", "x86_64")), "b");
+        let linux = "  if OS.linux?\n    sha256 \"l\"\n  else\n    sha256 \"m\"\n  end\n";
+        assert_eq!(sha_for(linux, &host("sequoia", "arm64")), "m");
+        let bits = "  if Hardware::CPU.is_64_bit?\n    sha256 \"s\"\n  end\n";
+        assert_eq!(sha_for(bits, &host("sequoia", "x86_64")), "s");
+        assert_eq!(sha_for(bits, &host("sequoia", "arm64")), "s");
+    }
+
+    #[test]
+    fn unrecognized_conditions_and_elsif_stay_opaque() {
+        let h = host("sequoia", "arm64");
+        for body in [
+            "  if Hardware::CPU.arm? && foo?\n    sha256 \"x\"\n  end\n",
+            "  if Hardware::CPU.arm? || OS.linux?\n    sha256 \"x\"\n  end\n",
+            "  if foo?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
+            "  unless OS.linux?\n    sha256 \"x\"\n  end\n",
+            "  if OS.linux?\n    sha256 \"x\"\n  elsif Hardware::CPU.arm?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
+            "  if Hardware::CPU.arm?\n    sha256 \"base\"\n  elsif OS.mac?\n    sha256 \"x\"\n  else\n    sha256 \"x\"\n  end\n",
+        ] {
+            assert_eq!(sha_for(body, &h), "base", "{body}");
+        }
+    }
+
+    #[test]
+    fn formulae_stop_at_bottle_and_ignore_def_bodies() {
+        let h = host("sequoia", "arm64");
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.0.tar.gz\"\n  sha256 \"base\"\n  bottle do\n    sha256 cellar: :any, arm64_sequoia: \"b\"\n  end\n  on_arm do\n    sha256 \"late\"\n  end\nend\n";
+        assert_eq!(parse_formula(rb, Some(&h)).unwrap().sha256, "base");
+    }
+
+    #[test]
+    fn deprecate_in_a_foreign_platform_block_is_ignored() {
+        let arm = host("sequoia", "arm64");
+        let rb = "class Foo < Formula\n  on_linux do\n    deprecate! date: \"2020-01-01\", because: :x\n  end\nend\n";
+        assert!(!is_deprecated_or_disabled(rb, "2026-01-01", Some(&arm)));
+        assert!(upcoming_lifecycle_messages(rb, "2026-01-01", Some(&arm)).is_empty());
+        assert!(is_deprecated_or_disabled(rb, "2026-01-01", None));
+        let rb = "class Foo < Formula\n  on_arm do\n    deprecate! date: \"2020-01-01\", because: :x\n  end\nend\n";
+        assert!(is_deprecated_or_disabled(rb, "2026-01-01", Some(&arm)));
+        assert!(!is_deprecated_or_disabled(
+            rb,
+            "2026-01-01",
+            Some(&host("sequoia", "x86_64"))
+        ));
+        let future = "class Foo < Formula\n  on_linux do\n    disable! date: \"2026-06-01\", because: :x\n  end\nend\n";
+        assert!(upcoming_lifecycle_messages(future, "2026-01-01", Some(&arm)).is_empty());
+        assert_eq!(
+            upcoming_lifecycle_messages(future, "2026-01-01", None).len(),
+            1
+        );
     }
 }

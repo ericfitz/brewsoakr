@@ -1,4 +1,4 @@
-use crate::identity::{self, PkgIdentity};
+use crate::identity::{self, HostPlatform, PkgIdentity};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamStatus {
@@ -40,12 +40,13 @@ pub fn upstream_status(
     cutoff_blob: Option<&[u8]>,
     head_blob: Option<&[u8]>,
     today: &str,
+    host: Option<&HostPlatform>,
 ) -> UpstreamStatus {
     let Some(head) = head_blob else {
         return UpstreamStatus::Yanked;
     };
-    let deprecated =
-        std::str::from_utf8(head).is_ok_and(|rb| identity::is_deprecated_or_disabled(rb, today));
+    let deprecated = std::str::from_utf8(head)
+        .is_ok_and(|rb| identity::is_deprecated_or_disabled(rb, today, host));
     if deprecated {
         UpstreamStatus::Deprecated
     } else if cutoff_blob.is_none() {
@@ -138,13 +139,13 @@ end
     const TODAY: &str = "2026-08-13";
 
     fn formula_id(rb: &str) -> PkgIdentity {
-        PkgIdentity::Formula(parse_formula(rb).unwrap())
+        PkgIdentity::Formula(parse_formula(rb, None).unwrap())
     }
 
     #[test]
     fn too_new() {
         let head = formula_id(HEAD_RB);
-        let status = upstream_status(None, Some(HEAD_RB.as_bytes()), TODAY);
+        let status = upstream_status(None, Some(HEAD_RB.as_bytes()), TODAY, None);
         assert_eq!(status, UpstreamStatus::TooNew);
         assert_eq!(
             desired_action(status, None, None, Some(&head)),
@@ -155,7 +156,7 @@ end
     #[test]
     fn yanked() {
         let cutoff = formula_id(CUTOFF_RB);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), None, TODAY);
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), None, TODAY, None);
         assert_eq!(status, UpstreamStatus::Yanked);
         assert_eq!(
             desired_action(status, None, Some(&cutoff), None),
@@ -171,6 +172,7 @@ end
             Some(CUTOFF_RB.as_bytes()),
             Some(DEPRECATED_HEAD_RB.as_bytes()),
             TODAY,
+            None,
         );
         assert_eq!(status, UpstreamStatus::Deprecated);
         assert_eq!(
@@ -180,10 +182,30 @@ end
     }
 
     #[test]
+    fn deprecation_in_a_foreign_platform_block_is_not_refused() {
+        let host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\n").unwrap();
+        let head = "class Wget < Formula\n  on_linux do\n    deprecate! date: \"2020-01-01\", because: :x\n  end\nend\n";
+        let cutoff = Some(CUTOFF_RB.as_bytes());
+        assert_eq!(
+            upstream_status(cutoff, Some(head.as_bytes()), TODAY, Some(&host)),
+            UpstreamStatus::Eligible
+        );
+        assert_eq!(
+            upstream_status(cutoff, Some(head.as_bytes()), TODAY, None),
+            UpstreamStatus::Deprecated
+        );
+    }
+
+    #[test]
     fn already_soaked() {
         let cutoff = formula_id(CUTOFF_RB);
         let head = formula_id(HEAD_RB);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
+        let status = upstream_status(
+            Some(CUTOFF_RB.as_bytes()),
+            Some(HEAD_RB.as_bytes()),
+            TODAY,
+            None,
+        );
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&cutoff), Some(&cutoff), Some(&head)),
@@ -209,7 +231,12 @@ end
             installed, cutoff,
             "exact identity still sees missing rebuild"
         );
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
+        let status = upstream_status(
+            Some(CUTOFF_RB.as_bytes()),
+            Some(HEAD_RB.as_bytes()),
+            TODAY,
+            None,
+        );
         assert_eq!(
             desired_action(status, Some(&installed), Some(&cutoff), Some(&head)),
             DesiredAction::NoOpAlreadySoaked
@@ -229,7 +256,12 @@ end
             ("1.21.4", "1.21.4")
         );
         assert_ne!(cutoff, head);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
+        let status = upstream_status(
+            Some(CUTOFF_RB.as_bytes()),
+            Some(HEAD_RB.as_bytes()),
+            TODAY,
+            None,
+        );
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&head), Some(&cutoff), Some(&head)),
@@ -252,7 +284,12 @@ end
         );
         assert_ne!(installed, cutoff);
         assert_ne!(installed, head);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
+        let status = upstream_status(
+            Some(CUTOFF_RB.as_bytes()),
+            Some(HEAD_RB.as_bytes()),
+            TODAY,
+            None,
+        );
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, Some(&installed), Some(&cutoff), Some(&head)),
@@ -271,7 +308,7 @@ end
 "#;
         let cutoff = formula_id(CUTOFF_RB);
         let head = formula_id(rb);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(rb.as_bytes()), TODAY);
+        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(rb.as_bytes()), TODAY, None);
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, None, Some(&cutoff), Some(&head)),
@@ -283,7 +320,12 @@ end
     fn not_installed_eligible() {
         let cutoff = formula_id(CUTOFF_RB);
         let head = formula_id(HEAD_RB);
-        let status = upstream_status(Some(CUTOFF_RB.as_bytes()), Some(HEAD_RB.as_bytes()), TODAY);
+        let status = upstream_status(
+            Some(CUTOFF_RB.as_bytes()),
+            Some(HEAD_RB.as_bytes()),
+            TODAY,
+            None,
+        );
         assert_eq!(status, UpstreamStatus::Eligible);
         assert_eq!(
             desired_action(status, None, Some(&cutoff), Some(&head)),
