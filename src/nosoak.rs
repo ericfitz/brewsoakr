@@ -151,7 +151,7 @@ pub fn run_step(
     let token_of = |t: &Target| brew_token(&t.origin, &t.name);
 
     writeln!(out, "no-soak: updating brew")?;
-    let update = brew.run_visible(&["update".to_string()])?;
+    let update = brew.run_visible(&["update".to_string()], &mut *out)?;
     if !update.status.success() {
         let code = update.status.code().unwrap_or(1);
         result.notes.push(format!(
@@ -190,7 +190,7 @@ pub fn run_step(
         args.extend(kind_flag.map(str::to_string));
         args.extend(group.iter().map(|t| token_of(t)));
         writeln!(out, "no-soak: brew {}", args.join(" "))?;
-        let output = brew.run_visible(&args)?;
+        let output = brew.run_visible(&args, &mut *out)?;
         result
             .installed
             .extend(quiet::installed_from_output(&output.stdout));
@@ -241,7 +241,7 @@ pub fn run_step(
             "no-soak: brew {} (moving staged kegs to their tap)",
             args.join(" ")
         )?;
-        let output = brew.run_visible(&args)?;
+        let output = brew.run_visible(&args, &mut *out)?;
         // Only Cellar lines are evidence of a written keg; casks have none, so
         // for them (and formulae alike) success means exit 0 with no
         // already-installed message for the target.

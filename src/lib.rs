@@ -133,9 +133,9 @@ pub fn run(args: &[String]) -> i32 {
     }
 }
 
-/// Parse and run one command line. Everything brewsoak itself prints on stdout
-/// goes through `out` (production passes stdout); `brew`'s own forwarded output
-/// and warnings on stderr do not.
+/// Parse and run one command line. Everything brewsoak prints on stdout, and
+/// the live output of visible `brew` runs, goes through `out` (production
+/// passes stdout), so the two stay in order. Warnings go to stderr.
 pub fn dispatch(
     args: &[String],
     world: &impl World,
@@ -659,6 +659,114 @@ mod tests {
         fn lock_wait(&self) -> std::time::Duration {
             self.lock_wait
         }
+    }
+
+    /// A mock brew whose visible runs really spawn `/bin/echo`, so a dispatch
+    /// run produces both brewsoak lines and live brew output.
+    struct EchoVisibleBrew {
+        mock: MockBrew,
+        real: brew::ProcessBrew,
+    }
+
+    impl Brew for EchoVisibleBrew {
+        fn brew_bin(&self) -> &Path {
+            self.mock.brew_bin()
+        }
+        fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
+            self.mock.run(a)
+        }
+        fn run_visible(
+            &self,
+            a: &[String],
+            terminal: &mut dyn Write,
+        ) -> Result<std::process::Output, Error> {
+            self.real.run_visible(a, terminal)
+        }
+        fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
+            self.mock.installed_packages()
+        }
+        fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
+            self.mock.tap_info()
+        }
+        fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
+            self.mock.outdated_names(greedy)
+        }
+        fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+            self.mock.deps(kind, token)
+        }
+    }
+
+    struct EchoWorld {
+        inner: TestWorld,
+        brew: EchoVisibleBrew,
+    }
+
+    impl World for EchoWorld {
+        type Git = InMemoryGit;
+        type Github = RecordingGithub;
+        type Brew = EchoVisibleBrew;
+
+        fn config_path(&self) -> PathBuf {
+            self.inner.config_path()
+        }
+        fn cache_path(&self) -> PathBuf {
+            self.inner.cache_path()
+        }
+        fn env_soak(&self) -> Option<String> {
+            None
+        }
+        fn now(&self) -> OffsetDateTime {
+            now()
+        }
+        fn tap_root(&self) -> PathBuf {
+            self.inner.tap_root()
+        }
+        fn git(&self) -> &InMemoryGit {
+            &self.inner.git
+        }
+        fn github(&self) -> &RecordingGithub {
+            &self.inner.github
+        }
+        fn brew(&self) -> &EchoVisibleBrew {
+            &self.brew
+        }
+        fn lock_wait(&self) -> std::time::Duration {
+            self.inner.lock_wait
+        }
+    }
+
+    #[test]
+    fn dispatch_interleaves_brewsoak_and_brew_lines_in_the_injected_writer() {
+        let inner = TestWorld::new();
+        std::fs::create_dir_all(inner.config_path.parent().unwrap()).unwrap();
+        std::fs::write(&inner.config_path, "NO_SOAK = [\"wget\"]\n").unwrap();
+        let world = EchoWorld {
+            inner,
+            brew: EchoVisibleBrew {
+                mock: MockBrew {
+                    installed: vec![InstalledPkg {
+                        name: "wget".into(),
+                        kind: PkgKind::Formula,
+                        receipt_rb: "class Wget < Formula\nend\n".into(),
+                        pinned: false,
+                        tap: None,
+                        staged_path: None,
+                    }],
+                    ..MockBrew::new()
+                },
+                real: brew::ProcessBrew::new(PathBuf::from("/bin/echo")),
+            },
+        };
+        let (result, out) = dispatch_captured(&s(&["update"]), &world);
+        assert!(matches!(result, Ok(Dispatch::Exit(0))), "{result:?}");
+        let text = String::from_utf8(out).unwrap();
+        let before = text.find("no-soak packages installed; updating brew\n");
+        let brew_line = text.find("\nupdate\n");
+        let after = text.find("snapshots refreshed\n");
+        assert!(
+            matches!((before, brew_line, after), (Some(a), Some(b), Some(c)) if a < b && b < c),
+            "brewsoak and brew lines must interleave in the injected writer: {text:?}"
+        );
     }
 
     #[test]

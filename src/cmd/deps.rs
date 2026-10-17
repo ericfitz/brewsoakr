@@ -502,8 +502,12 @@ mod tests {
             fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
                 self.0.run(a)
             }
-            fn run_visible(&self, a: &[String]) -> Result<std::process::Output, Error> {
-                self.0.run_visible(a)
+            fn run_visible(
+                &self,
+                a: &[String],
+                t: &mut dyn std::io::Write,
+            ) -> Result<std::process::Output, Error> {
+                self.0.run_visible(a, t)
             }
             fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
                 self.0.installed_packages()
@@ -585,8 +589,12 @@ mod tests {
             fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
                 self.0.run(a)
             }
-            fn run_visible(&self, a: &[String]) -> Result<std::process::Output, Error> {
-                self.0.run_visible(a)
+            fn run_visible(
+                &self,
+                a: &[String],
+                t: &mut dyn std::io::Write,
+            ) -> Result<std::process::Output, Error> {
+                self.0.run_visible(a, t)
             }
             fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
                 self.0.installed_packages()

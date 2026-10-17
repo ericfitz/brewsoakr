@@ -63,7 +63,9 @@ pub trait Brew {
     /// Capturing run for JSON (`info`, `outdated`, `tap-info`), `deps`, `--cellar` and `--caskroom`.
     fn run(&self, args: &[String]) -> Result<Output, Error>;
     /// Live stdout/stderr for install/upgrade/reinstall and brew passthrough.
-    fn run_visible(&self, args: &[String]) -> Result<Output, Error>;
+    /// The summarized lines go to `terminal`: callers pass the writer they
+    /// write their own lines to, so the two streams cannot split or reorder.
+    fn run_visible(&self, args: &[String], terminal: &mut dyn Write) -> Result<Output, Error>;
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
@@ -154,8 +156,6 @@ struct Sink {
     log: Option<std::fs::File>,
     log_path: Option<PathBuf>,
     log_failed: bool,
-    /// Where the summarized lines go; `None` is the process stdout.
-    terminal: Option<Box<dyn Write + Send>>,
 }
 
 impl Sink {
@@ -221,13 +221,6 @@ impl ProcessBrew {
             });
         }
         Ok(answers)
-    }
-
-    /// Send the summarized terminal lines of visible runs to `terminal`
-    /// instead of the process stdout (the raw log is unaffected).
-    pub fn with_terminal(self, terminal: Box<dyn Write + Send>) -> Self {
-        self.sink.lock().unwrap_or_else(|e| e.into_inner()).terminal = Some(terminal);
-        self
     }
 
     pub fn new(bin: PathBuf) -> Self {
@@ -375,11 +368,11 @@ impl Brew for ProcessBrew {
     }
 
     fn run(&self, args: &[String]) -> Result<Output, Error> {
-        self.spawn_brew(args, false)
+        self.spawn_brew(args, None)
     }
 
-    fn run_visible(&self, args: &[String]) -> Result<Output, Error> {
-        self.spawn_brew(args, true)
+    fn run_visible(&self, args: &[String], terminal: &mut dyn Write) -> Result<Output, Error> {
+        self.spawn_brew(args, Some(terminal))
     }
 
     fn set_raw(&self, raw: bool) {
@@ -683,11 +676,16 @@ impl ProcessBrew {
         }
     }
 
-    fn spawn_brew(&self, args: &[String], visible: bool) -> Result<Output, Error> {
+    /// `terminal` is `Some` for a visible run: its summarized lines go there.
+    fn spawn_brew(
+        &self,
+        args: &[String],
+        terminal: Option<&mut dyn Write>,
+    ) -> Result<Output, Error> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args);
         apply_brewsoak_brew_env(&mut cmd);
-        if !visible {
+        let Some(terminal) = terminal else {
             return match cmd.output() {
                 Ok(output) => Ok(output),
                 Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -695,7 +693,7 @@ impl ProcessBrew {
                 }
                 Err(e) => Err(Error::from(e)),
             };
-        }
+        };
         // One pipe for both streams: the summarizer needs brew's stdout and
         // stderr in the order brew wrote them, which two reader threads cannot
         // guarantee. Everything lands in Output.stdout; the only callers that
@@ -715,12 +713,7 @@ impl ProcessBrew {
         drop(cmd);
         let raw = self.raw.get();
         let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        let mut terminal = sink.terminal.take();
-        let captured = match terminal.as_mut() {
-            Some(t) => forward_run(reader, &mut sink, t, args, raw),
-            None => forward_run(reader, &mut sink, &mut std::io::stdout(), args, raw),
-        };
-        sink.terminal = terminal;
+        let captured = forward_run(reader, &mut sink, terminal, args, raw);
         drop(sink);
         let status = child.wait()?;
         Ok(Output {
@@ -736,7 +729,7 @@ impl ProcessBrew {
 fn forward_run(
     src: impl Read,
     sink: &mut Sink,
-    stdout: &mut impl Write,
+    stdout: &mut dyn Write,
     args: &[String],
     raw: bool,
 ) -> Vec<u8> {
@@ -781,7 +774,7 @@ impl Brew for MockBrew {
         Ok(self.mock_output())
     }
 
-    fn run_visible(&self, args: &[String]) -> Result<Output, Error> {
+    fn run_visible(&self, args: &[String], _terminal: &mut dyn Write) -> Result<Output, Error> {
         self.record(args);
         self.record_visible(args);
         let queued = self
@@ -2339,7 +2332,7 @@ mod tests {
         let brew = ProcessBrew::new(PathBuf::from("/bin/sh"));
         let script = "echo '==> Cleanup'; echo 'Removing: /x... (1 files, 1KB)' 1>&2";
         let output = brew
-            .run_visible(&["-c".into(), script.into()])
+            .run_visible(&["-c".into(), script.into()], &mut Vec::new())
             .expect("run_visible");
         assert!(output.status.success());
         let captured = String::from_utf8_lossy(&output.stdout);
@@ -2355,7 +2348,7 @@ mod tests {
     #[test]
     fn mock_run_visible_records_separately() {
         let brew = MockBrew::new();
-        brew.run_visible(&["install".into(), "wget".into()])
+        brew.run_visible(&["install".into(), "wget".into()], &mut Vec::new())
             .expect("visible");
         brew.run(&["deps".into(), "wget".into()]).expect("capture");
         let visible = brew.visible_runs.lock().expect("visible_runs");
@@ -2365,20 +2358,6 @@ mod tests {
         );
         let runs = brew.runs.lock().expect("runs");
         assert_eq!(runs.len(), 2);
-    }
-
-    /// A `Write` whose bytes the test can read back after the writer moved.
-    struct SharedBuf(std::sync::Arc<Mutex<Vec<u8>>>);
-
-    impl Write for SharedBuf {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("buf").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     #[test]
@@ -2395,14 +2374,13 @@ mod tests {
 
     #[test]
     fn process_brew_run_visible_forwards_and_returns_status() {
-        let shown = std::sync::Arc::new(Mutex::new(Vec::new()));
-        let brew = ProcessBrew::new(PathBuf::from("/bin/echo"))
-            .with_terminal(Box::new(SharedBuf(shown.clone())));
+        let mut shown = Vec::new();
+        let brew = ProcessBrew::new(PathBuf::from("/bin/echo"));
         let output = brew
-            .run_visible(&["hello-visible".into()])
+            .run_visible(&["hello-visible".into()], &mut shown)
             .expect("run_visible");
         assert!(output.status.success());
-        let shown = String::from_utf8(shown.lock().expect("shown").clone()).expect("utf8");
+        let shown = String::from_utf8(shown).expect("utf8");
         assert!(
             shown.contains("hello-visible"),
             "the summary reaches the injected terminal: {shown:?}"
@@ -2472,10 +2450,10 @@ mod tests {
             next_status: 0,
             ..MockBrew::new()
         };
-        let a = brew.run_visible(&["x".into()]).unwrap();
+        let a = brew.run_visible(&["x".into()], &mut Vec::new()).unwrap();
         assert_eq!(a.status.code(), Some(2));
         assert_eq!(a.stdout, b"first\n");
-        let b = brew.run_visible(&["y".into()]).unwrap();
+        let b = brew.run_visible(&["y".into()], &mut Vec::new()).unwrap();
         assert_eq!(
             b.status.code(),
             Some(0),

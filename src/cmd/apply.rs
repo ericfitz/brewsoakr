@@ -1031,7 +1031,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         kind: PkgKind,
         args: &[String],
     ) -> Result<StagedRun, Error> {
-        let output = self.brew.run_visible(args)?;
+        let output = self.brew.run_visible(args, &mut self.out)?;
         let text = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() && !origin::is_core_or_cask(origin_tap) {
             if let Some(tap) = taps::untrusted_tap(&text) {
@@ -1097,7 +1097,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// Runs brew; returns whether it succeeded, and whether it really
     /// installed something (not brew's "already installed" no-op answer).
     fn record_run(&mut self, args: &[String]) -> Result<(bool, bool), Error> {
-        let output = self.brew.run_visible(args)?;
+        let output = self.brew.run_visible(args, &mut self.out)?;
         self.done
             .extend(quiet::installed_from_output(&output.stdout));
         let ok = !brew_failed(&output);
