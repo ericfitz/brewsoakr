@@ -53,6 +53,8 @@ pub fn human_action(action: DesiredAction) -> &'static str {
         DesiredAction::NoOpAlreadySoaked => "up to date (soaked)",
         DesiredAction::LeaveAheadOfSoak => "ahead of soak (leave installed)",
         DesiredAction::LeaveAutoUpdates => "auto-updates (left to the app; name it to upgrade)",
+        DesiredAction::LeaveNewerThanCutoff => "ahead of soak (newer than cutoff; leave installed)",
+        DesiredAction::HoldUnordered => "held: could not compare versions",
         DesiredAction::RefuseTooNew => "held: too new",
         DesiredAction::RefuseYanked => "held: yanked",
         DesiredAction::RefuseDeprecated => "held: deprecated",
@@ -105,6 +107,16 @@ pub fn evaluate_line(
             "ahead of soak; installed {} matches HEAD {}; {did}",
             inst.unwrap_or("?"),
             hd.unwrap_or("?")
+        ),
+        DesiredAction::LeaveNewerThanCutoff => format!(
+            "ahead of soak; installed {} is newer than cutoff {}; {did}",
+            inst.unwrap_or("?"),
+            cut.unwrap_or("?")
+        ),
+        DesiredAction::HoldUnordered => format!(
+            "held; could not compare installed {} with cutoff {}; {did}",
+            inst.unwrap_or("?"),
+            cut.unwrap_or("?")
         ),
         DesiredAction::LeaveAutoUpdates => format!(
             "auto-updates; installed {} is left to the app, cutoff {}; {did}",
@@ -168,11 +180,14 @@ impl Counts {
         match action {
             DesiredAction::InstallCutoff => self.upgraded += 1,
             DesiredAction::NoOpAlreadySoaked => self.soaked += 1,
-            DesiredAction::LeaveAheadOfSoak => self.ahead += 1,
+            DesiredAction::LeaveAheadOfSoak | DesiredAction::LeaveNewerThanCutoff => {
+                self.ahead += 1
+            }
             DesiredAction::LeaveAutoUpdates => self.auto_updates += 1,
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
-            | DesiredAction::RefuseDeprecated => self.held += 1,
+            | DesiredAction::RefuseDeprecated
+            | DesiredAction::HoldUnordered => self.held += 1,
         }
     }
 
