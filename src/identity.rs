@@ -1,4 +1,113 @@
 use crate::Error;
+use std::cmp::Ordering;
+
+/// What brew said about the machine it runs on: the CPU architecture, the
+/// macOS codename, and every codename brew knows with its version number.
+/// brewsoak holds no codename table of its own; `brew::HOST_PLATFORM_RUBY`
+/// reads all of this from `MacOSVersion::SYMBOLS` and `MacOS.version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPlatform {
+    /// `arm64` or `x86_64`, as `Hardware::CPU.arch` prints it.
+    pub arch: String,
+    /// The running macOS codename, e.g. `sequoia`.
+    pub macos: String,
+    /// Every `(codename, version)` brew knows, e.g. `("big_sur", "11")`.
+    pub macos_versions: Vec<(String, String)>,
+}
+
+impl HostPlatform {
+    /// Reads the output of `brew::HOST_PLATFORM_RUBY`: one `<codename>
+    /// <version>` line per known release, then `HOST <codename> <arch>`.
+    /// `None` unless the host line is present, names a known codename and a
+    /// known architecture, and every other line has a version.
+    pub fn parse(output: &str) -> Option<Self> {
+        let mut versions = Vec::new();
+        let mut host = None;
+        for line in output.lines().filter(|l| !l.trim().is_empty()) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            match parts.as_slice() {
+                ["HOST", codename, arch] => host = Some((*codename, *arch)),
+                [codename, version] if *codename != "HOST" => {
+                    parse_dotted(version)?;
+                    versions.push((codename.to_string(), version.to_string()));
+                }
+                _ => return None,
+            }
+        }
+        let (macos, arch) = host?;
+        if !matches!(arch, "arm64" | "x86_64") || !versions.iter().any(|(c, _)| c == macos) {
+            return None;
+        }
+        Some(Self {
+            arch: arch.to_string(),
+            macos: macos.to_string(),
+            macos_versions: versions,
+        })
+    }
+
+    fn is_arm(&self) -> bool {
+        self.arch == "arm64"
+    }
+
+    /// The `arm:`/`intel:` keyword that applies to this host.
+    fn arch_keyword(&self) -> &'static str {
+        if self.is_arm() { "arm:" } else { "intel:" }
+    }
+
+    fn version_of(&self, codename: &str) -> Option<Vec<u32>> {
+        let (_, v) = self.macos_versions.iter().find(|(c, _)| c == codename)?;
+        parse_dotted(v)
+    }
+
+    /// Whether a cask body line such as `on_arm do` or `on_monterey :or_newer
+    /// do` opens a block that applies to this host. Anything unrecognized,
+    /// including an unknown codename, does not apply.
+    fn block_applies(&self, line: &str) -> bool {
+        let code = line.split('#').next().unwrap_or(line).trim();
+        let Some(head) = code.strip_suffix(" do") else {
+            return false;
+        };
+        let mut words = head.split_whitespace();
+        let (Some(name), qualifier, None) = (words.next(), words.next(), words.next()) else {
+            return false;
+        };
+        match (name, qualifier) {
+            ("on_arm", None) => self.is_arm(),
+            ("on_intel", None) => !self.is_arm(),
+            ("on_macos", None) => true,
+            (_, q) => {
+                let Some(target) = name.strip_prefix("on_").and_then(|c| self.version_of(c)) else {
+                    return false;
+                };
+                let Some(host) = self.version_of(&self.macos) else {
+                    return false;
+                };
+                match (q, cmp_dotted(&host, &target)) {
+                    (None, o) => o == Ordering::Equal,
+                    (Some(":or_newer"), o) => o != Ordering::Less,
+                    (Some(":or_older"), o) => o != Ordering::Greater,
+                    _ => false,
+                }
+            }
+        }
+    }
+}
+
+fn parse_dotted(v: &str) -> Option<Vec<u32>> {
+    v.split('.').map(|p| p.parse().ok()).collect()
+}
+
+fn cmp_dotted(a: &[u32], b: &[u32]) -> Ordering {
+    (0..a.len().max(b.len()))
+        .map(|i| {
+            a.get(i)
+                .copied()
+                .unwrap_or(0)
+                .cmp(&b.get(i).copied().unwrap_or(0))
+        })
+        .find(|o| *o != Ordering::Equal)
+        .unwrap_or(Ordering::Equal)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormulaIdentity {
@@ -80,7 +189,7 @@ pub fn parse_formula(rb: &str) -> Result<FormulaIdentity, Error> {
             }
         }
     };
-    let revision = first_u32_in(depth1_lines(rb), "revision ").unwrap_or(0);
+    let revision = first_u32_in(depth1_lines(rb, None), "revision ").unwrap_or(0);
     let rebuild = first_u32(rb, "rebuild ");
     let sha256 = first_sha256_before_bottle(rb)
         .or(git_rev)
@@ -107,18 +216,21 @@ fn keyword_quoted(rb: &str, key: &str) -> Option<String> {
 
 /// Top-level `auto_updates true`: the app updates itself, and `brew upgrade`
 /// / `brew outdated` skip it unless `--greedy` or it is named explicitly.
-pub fn cask_auto_updates(rb: &str) -> bool {
-    depth1_lines(rb).iter().any(|t| {
+pub fn cask_auto_updates(rb: &str, host: Option<&HostPlatform>) -> bool {
+    depth1_lines(rb, host).iter().any(|t| {
         t.strip_prefix("auto_updates")
             .is_some_and(|r| r.trim() == "true")
     })
 }
 
-pub fn parse_cask(rb: &str) -> Result<CaskIdentity, Error> {
-    let version = first_quoted_or_symbol(rb, "version ")
+/// With a `host`, `version`, `sha256` and `url` inside the platform blocks that
+/// apply to it are read; without one, those blocks stay opaque.
+pub fn parse_cask(rb: &str, host: Option<&HostPlatform>) -> Result<CaskIdentity, Error> {
+    let lines = depth1_lines(rb, host);
+    let version = quoted_or_symbol_in(&lines, "version ")
         .ok_or_else(|| Error::Other("cask missing version".into()))?;
-    let sha256 = first_quoted_or_symbol(rb, "sha256 ");
-    let url = first_quoted(rb, "url ");
+    let sha256 = cask_sha256(&lines, host);
+    let url = first_quoted_in(lines.iter().copied(), "url ");
     Ok(CaskIdentity {
         version,
         sha256,
@@ -241,7 +353,7 @@ fn starts_with_bang_call(line: &str, keyword: &str) -> bool {
 }
 
 fn first_quoted(rb: &str, key: &str) -> Option<String> {
-    first_quoted_in(depth1_lines(rb), key)
+    first_quoted_in(depth1_lines(rb, None), key)
 }
 
 fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> Option<String> {
@@ -256,8 +368,9 @@ fn first_quoted_in<'a>(lines: impl IntoIterator<Item = &'a str>, key: &str) -> O
 /// Lines in the formula/cask body, not inside `resource`/`livecheck`/`bottle`/`on_*`.
 /// A body-level `stable do` block is transparent: it holds the stable spec's
 /// `url`/`version`/`sha256`, which are the formula's identity. `head do` and
-/// every other block stay opaque.
-fn depth1_lines(rb: &str) -> Vec<&str> {
+/// every other block stay opaque, except that with a `host` a platform block
+/// (`on_arm`, `on_monterey :or_newer`, ...) that applies to it is transparent too.
+fn depth1_lines<'a>(rb: &'a str, host: Option<&HostPlatform>) -> Vec<&'a str> {
     let mut depth = 0i32;
     // One entry per open block; true when the block was transparent.
     let mut open_blocks: Vec<bool> = Vec::new();
@@ -270,7 +383,8 @@ fn depth1_lines(rb: &str) -> Vec<&str> {
             }
             continue;
         }
-        let transparent = depth == 1 && is_stable_do(t);
+        let transparent =
+            depth == 1 && (is_stable_do(t) || host.is_some_and(|h| h.block_applies(t)));
         if depth == 1 && !transparent {
             out.push(t);
         }
@@ -300,9 +414,39 @@ fn opens_ruby_block(t: &str) -> bool {
     stripped == "do" || stripped.ends_with(" do") || stripped.contains(" do |")
 }
 
+/// The cask `sha256`. Besides the plain form it reads `sha256 arm: "x", intel:
+/// "y"` (possibly continued on the next line) by the host's architecture; with
+/// no host that form falls through to the first quoted string, as before.
+fn cask_sha256(lines: &[&str], host: Option<&HostPlatform>) -> Option<String> {
+    let Some(host) = host else {
+        return quoted_or_symbol_in(lines, "sha256 ");
+    };
+    for (i, t) in lines.iter().enumerate() {
+        let Some(rest) = t.strip_prefix("sha256 ") else {
+            continue;
+        };
+        if !rest
+            .trim_start()
+            .starts_with(|c: char| c.is_ascii_lowercase())
+        {
+            return quoted_or_symbol_in(&[*t], "sha256 ");
+        }
+        let mut stmt = rest.trim_end().to_string();
+        let mut j = i + 1;
+        while stmt.ends_with(',') && j < lines.len() {
+            stmt.push(' ');
+            stmt.push_str(lines[j]);
+            j += 1;
+        }
+        let pos = stmt.find(host.arch_keyword())?;
+        return first_double_quoted(&stmt[pos..]);
+    }
+    None
+}
+
 /// Quoted string, or a Ruby symbol such as `:latest` / `:no_check`.
-fn first_quoted_or_symbol(rb: &str, key: &str) -> Option<String> {
-    for t in depth1_lines(rb) {
+fn quoted_or_symbol_in(lines: &[&str], key: &str) -> Option<String> {
+    for t in lines {
         let Some(rest) = t.strip_prefix(key) else {
             continue;
         };
@@ -372,7 +516,7 @@ fn is_bottle_do(line: &str) -> bool {
 }
 
 fn first_sha256_before_bottle(rb: &str) -> Option<String> {
-    for t in depth1_lines(rb) {
+    for t in depth1_lines(rb, None) {
         if is_bottle_do(t) {
             break;
         }
@@ -677,7 +821,7 @@ end
 
     #[test]
     fn parse_cask_fields() {
-        let id = parse_cask(FOO_CASK).unwrap();
+        let id = parse_cask(FOO_CASK, None).unwrap();
         assert_eq!(id.version, "3.0");
         assert_eq!(id.sha256.as_deref(), Some("ccc333"));
         assert_eq!(id.url.as_deref(), Some("https://example.com/foo-3.0.dmg"));
@@ -752,7 +896,7 @@ cask "nightly" do
   url "https://example.com/nightly.dmg"
 end
 "#;
-        let id = parse_cask(rb).unwrap();
+        let id = parse_cask(rb, None).unwrap();
         assert_eq!(id.version, ":latest");
         assert_eq!(id.sha256.as_deref(), Some(":no_check"));
         assert_eq!(id.url.as_deref(), Some("https://example.com/nightly.dmg"));
@@ -763,14 +907,14 @@ end
         // Installed casks on Homebrew >= 4 carry only a version (see
         // `brew::version_only_cask_receipt`); sha256 and url compare only
         // when both sides have them, like a formula's bottle rebuild.
-        let installed = parse_cask("cask \"ant\" do\n  version \"1.38.0\"\nend\n").unwrap();
+        let installed = parse_cask("cask \"ant\" do\n  version \"1.38.0\"\nend\n", None).unwrap();
         assert_eq!(installed.version, "1.38.0");
         assert_eq!(installed.sha256, None);
         assert_eq!(installed.url, None);
         let full = |v: &str, sha: &str| {
             parse_cask(&format!(
                 "cask \"ant\" do\n  version \"{v}\"\n  sha256 \"{sha}\"\n  url \"https://e.com/ant-{v}.zip\"\nend\n"
-            ))
+            ), None)
             .unwrap()
         };
         let cask = PkgIdentity::Cask;
@@ -780,7 +924,7 @@ end
             !cask(full("1.38.0", "aaa")).same_artifact(&cask(full("1.38.0", "bbb"))),
             "two full receipts still compare sha256"
         );
-        let latest = parse_cask("cask \"font-x\" do\n  version :latest\nend\n").unwrap();
+        let latest = parse_cask("cask \"font-x\" do\n  version :latest\nend\n", None).unwrap();
         assert_eq!(latest.version, ":latest");
     }
 
@@ -789,9 +933,9 @@ end
         let yes = "cask \"alt-tab\" do\n  version \"11.8.0\"\n  auto_updates true\nend\n";
         let no = "cask \"alt-tab\" do\n  version \"11.8.0\"\nend\n";
         let off = "cask \"alt-tab\" do\n  version \"11.8.0\"\n  auto_updates false\nend\n";
-        assert!(cask_auto_updates(yes));
-        assert!(!cask_auto_updates(no));
-        assert!(!cask_auto_updates(off));
+        assert!(cask_auto_updates(yes, None));
+        assert!(!cask_auto_updates(no, None));
+        assert!(!cask_auto_updates(off, None));
     }
 
     #[test]
@@ -848,11 +992,18 @@ end
     #[test]
     fn is_latest_cask_reads_only_the_cutoff_side() {
         let latest = PkgIdentity::Cask(
-            parse_cask("cask \"nightly\" do\n  version :latest\n  sha256 :no_check\nend\n")
-                .unwrap(),
+            parse_cask(
+                "cask \"nightly\" do\n  version :latest\n  sha256 :no_check\nend\n",
+                None,
+            )
+            .unwrap(),
         );
         let numbered = PkgIdentity::Cask(
-            parse_cask("cask \"nightly\" do\n  version \"2.0\"\n  sha256 \"abc\"\nend\n").unwrap(),
+            parse_cask(
+                "cask \"nightly\" do\n  version \"2.0\"\n  sha256 \"abc\"\nend\n",
+                None,
+            )
+            .unwrap(),
         );
         let formula = PkgIdentity::Formula(FormulaIdentity {
             version: ":latest".into(),
@@ -868,12 +1019,162 @@ end
         assert!(!formula.is_latest_cask(), "only casks have :latest");
         // brew's version-only receipt for an installed :latest cask.
         let receipt = PkgIdentity::Cask(
-            parse_cask(&crate::brew::version_only_cask_receipt("nightly", "latest")).unwrap(),
+            parse_cask(
+                &crate::brew::version_only_cask_receipt("nightly", "latest"),
+                None,
+            )
+            .unwrap(),
         );
         assert!(receipt.is_latest_cask());
         assert!(
             receipt.same_artifact(&latest),
             "same definition: already soaked"
         );
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    const NGROK: &str = include_str!("../tests/fixtures/ngrok.rb");
+    const WIRESHARK: &str = include_str!("../tests/fixtures/wireshark-app.rb");
+    const WS_ARM: &str = "c869615ebbe8f1db1ebf62d503df7011b7c347f4c26997dc28cb4b68db0a4b49";
+    const WS_INTEL: &str = "344ec1a1c85f6a46c3446392544dc179a25f94f4fdf7dbcad1159e3e5dc60fba";
+
+    const SYMBOLS: &str = "golden_gate 27\ntahoe 26\nsequoia 15\nsonoma 14\nventura 13\nmonterey 12\nbig_sur 11\ncatalina 10.15\n";
+
+    fn host(macos: &str, arch: &str) -> HostPlatform {
+        HostPlatform::parse(&format!("{SYMBOLS}HOST {macos} {arch}\n")).expect("host")
+    }
+
+    #[test]
+    fn without_a_host_platform_blocks_stay_opaque() {
+        for rb in [NGROK, WIRESHARK] {
+            let err = parse_cask(rb, None).unwrap_err().to_string();
+            assert!(err.contains("cask missing version"), "{err}");
+        }
+    }
+
+    #[test]
+    fn ngrok_version_and_sha_follow_the_architecture() {
+        let arm = parse_cask(NGROK, Some(&host("sequoia", "arm64"))).unwrap();
+        assert_eq!(arm.version, "3.39.11,dy27whJwwmb,a");
+        assert!(arm.sha256.as_deref().unwrap().starts_with("9324a655"));
+        let intel = parse_cask(NGROK, Some(&host("sequoia", "x86_64"))).unwrap();
+        assert_eq!(intel.version, "3.39.11,8QQF2ciKqxM,a");
+        assert!(intel.sha256.as_deref().unwrap().starts_with("c6b9b3d9"));
+        assert!(arm.url.unwrap().starts_with("https://bin.ngrok.com/"));
+    }
+
+    #[test]
+    fn wireshark_on_big_sur_takes_the_old_stable_with_the_arch_sha() {
+        let arm = parse_cask(WIRESHARK, Some(&host("big_sur", "arm64"))).unwrap();
+        assert_eq!(arm.version, "4.4.17");
+        assert_eq!(arm.sha256.as_deref(), Some(WS_ARM));
+        assert!(arm.url.unwrap().contains("%20#{arch}%2064.dmg"));
+        let intel = parse_cask(WIRESHARK, Some(&host("big_sur", "x86_64"))).unwrap();
+        assert_eq!(intel.version, "4.4.17");
+        assert_eq!(intel.sha256.as_deref(), Some(WS_INTEL));
+    }
+
+    #[test]
+    fn wireshark_on_a_newer_macos_takes_the_current_release() {
+        for macos in ["monterey", "sequoia", "golden_gate"] {
+            let id = parse_cask(WIRESHARK, Some(&host(macos, "arm64"))).unwrap();
+            assert_eq!(id.version, "4.6.9", "{macos}");
+            assert!(id.sha256.as_deref().unwrap().starts_with("10bd54cc"));
+            assert!(id.url.unwrap().ends_with("%20#{version}.dmg"));
+        }
+    }
+
+    #[test]
+    fn exact_and_older_codename_blocks() {
+        let rb = "cask \"x\" do\n  on_sonoma do\n    version \"14\"\n  end\n  on_sequoia do\n    version \"15\"\n  end\n  on_ventura :or_older do\n    version \"13\"\n  end\nend\n";
+        let v = |m: &str| parse_cask(rb, Some(&host(m, "arm64"))).map(|i| i.version);
+        assert_eq!(v("sonoma").unwrap(), "14");
+        assert_eq!(v("sequoia").unwrap(), "15");
+        assert_eq!(v("ventura").unwrap(), "13");
+        assert_eq!(v("catalina").unwrap(), "13");
+        assert!(v("tahoe").is_err(), "no block applies");
+    }
+
+    #[test]
+    fn linux_unknown_codename_and_unknown_forms_stay_opaque() {
+        let h = host("sequoia", "arm64");
+        for block in [
+            "on_linux do",
+            "on_nonesuch :or_newer do",
+            "on_sequoia :sometimes do",
+            "on_system :linux, macos: :big_sur_or_newer do",
+        ] {
+            let rb = format!("cask \"x\" do\n  {block}\n    version \"9\"\n  end\nend\n");
+            assert!(parse_cask(&rb, Some(&h)).is_err(), "{block}");
+        }
+        let rb = "cask \"x\" do\n  on_macos do\n    version \"9\"\n  end\nend\n";
+        assert_eq!(parse_cask(rb, Some(&h)).unwrap().version, "9");
+    }
+
+    #[test]
+    fn nested_blocks_inside_an_applying_block_stay_opaque() {
+        let rb = "cask \"x\" do\n  on_arm do\n    version \"1\"\n    livecheck do\n      url \"https://nope\"\n    end\n  end\n  url \"https://yes\"\nend\n";
+        let id = parse_cask(rb, Some(&host("sequoia", "arm64"))).unwrap();
+        assert_eq!(id.version, "1");
+        assert_eq!(id.url.as_deref(), Some("https://yes"));
+    }
+
+    #[test]
+    fn sha256_keyword_form_selects_by_arch_at_top_level() {
+        let rb = "cask \"x\" do\n  version \"1\"\n  sha256 arm: \"aa\", intel: \"bb\"\nend\n";
+        let sha = |arch: &str| parse_cask(rb, Some(&host("sequoia", arch))).unwrap().sha256;
+        assert_eq!(sha("arm64").as_deref(), Some("aa"));
+        assert_eq!(sha("x86_64").as_deref(), Some("bb"));
+        let one = "cask \"x\" do\n  version \"1\"\n  sha256 arm: \"aa\"\nend\n";
+        let id = parse_cask(one, Some(&host("sequoia", "x86_64"))).unwrap();
+        assert_eq!(id.sha256, None, "no sha for this arch");
+    }
+
+    #[test]
+    fn auto_updates_inside_an_applying_block() {
+        let rb = "cask \"x\" do\n  on_arm do\n    auto_updates true\n  end\nend\n";
+        assert!(!cask_auto_updates(rb, None));
+        assert!(cask_auto_updates(rb, Some(&host("sequoia", "arm64"))));
+        assert!(!cask_auto_updates(rb, Some(&host("sequoia", "x86_64"))));
+    }
+
+    #[test]
+    fn formula_parsing_ignores_platform_blocks() {
+        let rb = "class Foo < Formula\n  url \"https://e.com/foo-1.2.3.tar.gz\"\n  sha256 \"abc\"\n  on_macos do\n    depends_on \"bar\"\n  end\n  bottle do\n    rebuild 2\n    sha256 cellar: :any, arm64_sequoia: \"def\"\n  end\nend\n";
+        let id = parse_formula(rb).unwrap();
+        assert_eq!(
+            (id.version.as_str(), id.sha256.as_str(), id.rebuild),
+            ("1.2.3", "abc", Some(2))
+        );
+    }
+
+    #[test]
+    fn host_platform_parse_accepts_brew_output() {
+        let h = host("golden_gate", "arm64");
+        assert_eq!(h.macos, "golden_gate");
+        assert_eq!(h.arch, "arm64");
+        assert_eq!(h.macos_versions.len(), 8);
+        assert_eq!(h.macos_versions[0], ("golden_gate".into(), "27".into()));
+    }
+
+    #[test]
+    fn host_platform_parse_rejects_garbage() {
+        for bad in [
+            "",
+            "garbage",
+            "sequoia 15\n",
+            "sequoia 15\nHOST sequoia\n",
+            "sequoia 15\nHOST sonoma arm64\n",
+            "sequoia 15\nHOST sequoia riscv\n",
+            "sequoia fifteen\nHOST sequoia arm64\n",
+            "sequoia 15 extra\nHOST sequoia arm64\n",
+            "Error: brew ruby failed\n",
+        ] {
+            assert_eq!(HostPlatform::parse(bad), None, "{bad:?}");
+        }
     }
 }

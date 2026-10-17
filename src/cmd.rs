@@ -5,7 +5,7 @@ use crate::eligibility::{self, DesiredAction, UpstreamStatus};
 use crate::flags;
 use crate::git::GitStore;
 use crate::github::GithubApi;
-use crate::identity::{self, PkgIdentity};
+use crate::identity::{self, HostPlatform, PkgIdentity};
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
 use crate::nosoak;
 use crate::origin::{self, OriginRecords};
@@ -684,9 +684,9 @@ pub fn info(
         }
         match r.class {
             PkgClass::NoSoak => {
-                let installed = inv
-                    .find_in(&r.origin, &r.name)
-                    .and_then(|p| parse_pkg(p.kind, &p.receipt_rb).ok());
+                let installed = inv.find_in(&r.origin, &r.name).and_then(|p| {
+                    parse_pkg(p.kind, &p.receipt_rb, brew.host_platform().as_ref()).ok()
+                });
                 let inst = installed.as_ref().map(report::identity_version);
                 if long_form {
                     writeln!(out, "{raw}")?;
@@ -1690,10 +1690,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.refuse_ineligible_dep(target, target_token, dep, status)?;
             return Ok(false);
         }
-        let want = blobs
-            .cutoff
-            .as_deref()
-            .and_then(|bytes| parse_pkg_bytes(kind, bytes).ok());
+        let want = blobs.cutoff.as_deref().and_then(|bytes| {
+            parse_pkg_bytes(kind, bytes, self.brew.host_platform().as_ref()).ok()
+        });
         if self.already_done(dep, kind, want.as_ref()) {
             return Ok(true);
         }
@@ -2220,8 +2219,17 @@ fn resolve_view(
     kind: PkgKind,
     receipt_rb: Option<&str>,
 ) -> Result<Option<ResolvedView>, Error> {
-    let Some(mut view) =
-        resolve_view_unordered(git, snaps, cache, origin_tap, name, kind, receipt_rb)?
+    let host = brew.host_platform();
+    let Some(mut view) = resolve_view_unordered(
+        git,
+        snaps,
+        cache,
+        origin_tap,
+        name,
+        kind,
+        receipt_rb,
+        host.as_ref(),
+    )?
     else {
         return Ok(None);
     };
@@ -2275,6 +2283,7 @@ fn prefetch_orderings(
     inv: &Inventory,
 ) {
     let mut pairs = Vec::new();
+    let host = brew.host_platform();
     for pkg in snapshotted_pkgs(inv, snaps).filter(|p| bare_skip(p, snaps).is_none()) {
         if let Ok(Some(view)) = resolve_view_unordered(
             git,
@@ -2284,6 +2293,7 @@ fn prefetch_orderings(
             &pkg.name,
             pkg.kind,
             Some(&pkg.receipt_rb),
+            host.as_ref(),
         ) && let Some(pair) = order_pair(pkg.kind, &view)
         {
             pairs.push(pair);
@@ -2294,6 +2304,7 @@ fn prefetch_orderings(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn resolve_view_unordered(
     git: &impl GitStore,
     snaps: &Snapshots,
@@ -2302,24 +2313,25 @@ fn resolve_view_unordered(
     name: &str,
     kind: PkgKind,
     receipt_rb: Option<&str>,
+    host: Option<&HostPlatform>,
 ) -> Result<Option<ResolvedView>, Error> {
     let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
     let installed = match receipt_rb {
-        Some(rb) => match parse_pkg(kind, rb) {
+        Some(rb) => match parse_pkg(kind, rb, host) {
             Ok(id) => Some(id),
             Err(_) => return Ok(None),
         },
         None => None,
     };
     let cutoff = match blobs.cutoff.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(kind, bytes) {
+        Some(bytes) => match parse_pkg_bytes(kind, bytes, host) {
             Ok(id) => Some(id),
             Err(_) => return Ok(None),
         },
         None => None,
     };
     let head = match blobs.head.as_deref() {
-        Some(bytes) => match parse_pkg_bytes(kind, bytes) {
+        Some(bytes) => match parse_pkg_bytes(kind, bytes, host) {
             Ok(id) => Some(id),
             Err(_) => return Ok(None),
         },
@@ -2341,7 +2353,8 @@ fn resolve_view_unordered(
             .collect(),
         None => Vec::new(),
     };
-    let auto_updates = kind == PkgKind::Cask && head_rb.is_some_and(identity::cask_auto_updates);
+    let auto_updates =
+        kind == PkgKind::Cask && head_rb.is_some_and(|rb| identity::cask_auto_updates(rb, host));
     let latest = cutoff.as_ref().is_some_and(PkgIdentity::is_latest_cask);
     Ok(Some(ResolvedView {
         installed,
@@ -2474,17 +2487,22 @@ fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
     }
 }
 
-fn parse_pkg(kind: PkgKind, rb: &str) -> Result<PkgIdentity, Error> {
+/// Formulae ignore `host`: only cask platform blocks are resolved.
+fn parse_pkg(kind: PkgKind, rb: &str, host: Option<&HostPlatform>) -> Result<PkgIdentity, Error> {
     match kind {
         PkgKind::Formula => Ok(PkgIdentity::Formula(identity::parse_formula(rb)?)),
-        PkgKind::Cask => Ok(PkgIdentity::Cask(identity::parse_cask(rb)?)),
+        PkgKind::Cask => Ok(PkgIdentity::Cask(identity::parse_cask(rb, host)?)),
     }
 }
 
-fn parse_pkg_bytes(kind: PkgKind, bytes: &[u8]) -> Result<PkgIdentity, Error> {
+fn parse_pkg_bytes(
+    kind: PkgKind,
+    bytes: &[u8],
+    host: Option<&HostPlatform>,
+) -> Result<PkgIdentity, Error> {
     let rb = std::str::from_utf8(bytes)
         .map_err(|_| Error::Other("package blob is not valid UTF-8".into()))?;
-    parse_pkg(kind, rb)
+    parse_pkg(kind, rb, host)
 }
 
 fn hold_why(action: DesiredAction) -> Option<&'static str> {
@@ -6371,7 +6389,7 @@ mod tests {
     fn greedy_view(action: DesiredAction, auto_updates: bool, latest: bool) -> ResolvedView {
         let id = |v: &str| {
             PkgIdentity::Cask(
-                crate::identity::parse_cask(&format!("cask \"x\" do\n  version {v}\nend\n"))
+                crate::identity::parse_cask(&format!("cask \"x\" do\n  version {v}\nend\n"), None)
                     .unwrap(),
             )
         };
@@ -7086,6 +7104,35 @@ mod tests {
         assert_eq!(
             latest_note("nightly"),
             "nightly: version :latest left unchanged; the contents of a :latest cask cannot be soaked"
+        );
+    }
+
+    #[test]
+    fn resolve_view_resolves_cask_platform_blocks_with_the_hosts_from_brew() {
+        let ngrok = include_str!("../tests/fixtures/ngrok.rb");
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/n/ngrok.rb", ngrok);
+        git.insert_blob("caskhead", "Casks/n/ngrok.rb", ngrok);
+        let resolve = |brew: &MockBrew| {
+            resolve_view(
+                brew,
+                &git,
+                &core_snaps(),
+                unused_cache(),
+                "homebrew/cask",
+                "ngrok",
+                PkgKind::Cask,
+                None,
+            )
+            .unwrap()
+        };
+        let mut brew = MockBrew::new();
+        assert!(resolve(&brew).is_none(), "no host: blocks stay opaque");
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\n");
+        let view = resolve(&brew).expect("parseable on a known host");
+        assert_eq!(
+            report::identity_version(view.cutoff.as_ref().unwrap()),
+            "3.39.11,dy27whJwwmb,a"
         );
     }
 

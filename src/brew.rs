@@ -1,4 +1,5 @@
 use crate::Error;
+use crate::identity::HostPlatform;
 use crate::quiet;
 use crate::resolve::PkgKind;
 use crate::taps::TapInfo;
@@ -45,6 +46,11 @@ const COMPARE_VERSIONS_RUBY: &str = r#"ARGV.each_slice(3) do |kind, a, b|
   puts(kind == "cask" ? Version.new(a) <=> Version.new(b) : PkgVersion.parse(a) <=> PkgVersion.parse(b))
 end"#;
 
+/// Runs under `brew ruby -e`: prints every `<codename> <version>` pair brew
+/// knows, then `HOST <codename> <arch>` for this machine.
+const HOST_PLATFORM_RUBY: &str = r##"puts MacOSVersion::SYMBOLS.map { |k, v| "#{k} #{v}" }
+puts "HOST #{MacOS.version.to_sym} #{Hardware::CPU.arch}""##;
+
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
     /// Capturing run for JSON (`info`, `outdated`, `tap-info`), `deps`, `--cellar` and `--caskroom`.
@@ -75,6 +81,12 @@ pub trait Brew {
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
         Ok(vec![Ordering::Less; pairs.len()])
     }
+    /// The architecture and macOS release brew runs on, asked once per run.
+    /// `None` when it cannot be read; cask platform blocks then stay opaque.
+    /// The default reports no host.
+    fn host_platform(&self) -> Option<HostPlatform> {
+        None
+    }
 }
 
 pub struct ProcessBrew {
@@ -84,6 +96,8 @@ pub struct ProcessBrew {
     cellar: std::cell::OnceCell<Option<PathBuf>>,
     /// `compare_versions` answers for this run, keyed by `(kind, a, b)`.
     orderings: Mutex<HashMap<(&'static str, String, String), Ordering>>,
+    /// `host_platform`, asked once: the host never changes during a run.
+    host: std::cell::OnceCell<Option<HostPlatform>>,
     sink: Mutex<Sink>,
 }
 
@@ -126,6 +140,7 @@ impl ProcessBrew {
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
             orderings: Mutex::new(HashMap::new()),
+            host: std::cell::OnceCell::new(),
             sink: Mutex::new(Sink::default()),
         }
     }
@@ -152,6 +167,8 @@ pub struct MockBrew {
     pub orderings: BTreeMap<(String, String), Ordering>,
     /// Makes every `compare_versions` call fail with this message.
     pub compare_error: Option<String>,
+    /// What `host_platform` reports; `None` means the host is unknown.
+    pub host: Option<HostPlatform>,
     /// The pairs of each `compare_versions` call.
     pub compares: Mutex<Vec<Vec<VersionPair>>>,
 }
@@ -172,6 +189,7 @@ impl Default for MockBrew {
             kegs: BTreeMap::new(),
             orderings: BTreeMap::new(),
             compare_error: None,
+            host: None,
             compares: Mutex::new(Vec::new()),
         }
     }
@@ -235,6 +253,16 @@ impl Brew for ProcessBrew {
     fn keg_receipt(&self, name: &str, version: &str) -> Option<String> {
         let cellar = self.cellar()?;
         read_formula_receipt(&cellar, name, Some(version))
+    }
+
+    fn host_platform(&self) -> Option<HostPlatform> {
+        self.host
+            .get_or_init(|| {
+                let args = ["ruby".into(), "-e".into(), HOST_PLATFORM_RUBY.into()];
+                let output = self.run(&args).ok().filter(|o| o.status.success())?;
+                HostPlatform::parse(&String::from_utf8_lossy(&output.stdout))
+            })
+            .clone()
     }
 
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
@@ -513,6 +541,10 @@ impl Brew for MockBrew {
         self.kegs
             .get(&(name.to_string(), version.to_string()))
             .cloned()
+    }
+
+    fn host_platform(&self) -> Option<HostPlatform> {
+        self.host.clone()
     }
 
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
@@ -1243,7 +1275,7 @@ mod tests {
             ]
         );
         let version = |i: usize| {
-            crate::identity::parse_cask(&got[i].receipt_rb)
+            crate::identity::parse_cask(&got[i].receipt_rb, None)
                 .unwrap()
                 .version
         };
@@ -1618,6 +1650,42 @@ mod tests {
                 .ends_with("-- formula 3.6.5 3.5.9 cask 1.0 2.0"),
             "versions travel as argv, not Ruby source: {argv}"
         );
+    }
+
+    #[test]
+    fn host_platform_runs_brew_ruby_once_and_parses_the_output() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (script, log) = compare_script(
+            tmp.path(),
+            "tahoe 26\\nsequoia 15\\nbig_sur 11\\nHOST sequoia arm64\\n",
+            0,
+        );
+        let brew = ProcessBrew::new(script);
+        let host = brew.host_platform().expect("host");
+        assert_eq!(
+            (host.macos.as_str(), host.arch.as_str()),
+            ("sequoia", "arm64")
+        );
+        assert_eq!(host.macos_versions.len(), 3);
+        assert_eq!(brew.host_platform(), Some(host), "memoized");
+        let argv = std::fs::read_to_string(log).expect("log");
+        assert_eq!(argv.matches("ruby -e").count(), 1, "{argv}");
+        assert!(argv.contains("MacOSVersion::SYMBOLS"), "{argv}");
+    }
+
+    #[test]
+    fn host_platform_is_none_on_garbage_failure_or_no_host_line() {
+        for (stdout, status) in [
+            ("what\\n", 0),
+            ("", 0),
+            ("sequoia 15\\n", 0),
+            ("sequoia 15\\nHOST sequoia arm64\\n", 1),
+        ] {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let (script, _) = compare_script(tmp.path(), stdout, status);
+            let brew = ProcessBrew::new(script);
+            assert_eq!(brew.host_platform(), None, "{stdout:?} exit {status}");
+        }
     }
 
     #[test]
