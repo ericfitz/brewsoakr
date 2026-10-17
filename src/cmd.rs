@@ -2621,10 +2621,13 @@ fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
     }
 }
 
-/// `host` with the languages an installed cask was installed under, so every
-/// side of that cask picks the `language` block `brew upgrade` would. Any
-/// other package, or a cask whose saved config is unreadable, keeps the
-/// run-level languages.
+/// `host` with the languages `brew upgrade` evaluates a cask with, so every
+/// side of that cask picks the `language` block it would: a `--language` flag
+/// first (brew's args-explicit config), then the installed cask's saved
+/// `explicit` languages, then the live run-level list (`Cask::Config.new`:
+/// `HOMEBREW_CASK_OPTS` plus the system default), deduplicated, with those
+/// `Locale` cannot parse dropped. Saved `env` and `default` are not used:
+/// `Cask::Config#merge` discards them. Formulae keep the run-level host.
 fn host_for_pkg(
     brew: &impl Brew,
     kind: PkgKind,
@@ -2633,8 +2636,19 @@ fn host_for_pkg(
 ) -> Option<HostPlatform> {
     let mut host = host.cloned();
     if kind == PkgKind::Cask
-        && let (Some(h), Some(languages)) = (host.as_mut(), brew.cask_languages(name))
+        && let Some(h) = host.as_mut()
     {
+        let mut languages: Vec<String> = Vec::new();
+        for lang in brew
+            .cli_languages()
+            .into_iter()
+            .chain(brew.cask_languages(name).unwrap_or_default())
+            .chain(std::mem::take(&mut h.languages))
+        {
+            if identity::is_valid_language(&lang) && !languages.contains(&lang) {
+                languages.push(lang);
+            }
+        }
         h.languages = languages;
     }
     host
@@ -7938,6 +7952,80 @@ mod tests {
         );
         assert_eq!(report::identity_version(ja.head.as_ref().unwrap()), "0.2.0");
         assert_eq!(ja.action, DesiredAction::NoOpAlreadySoaked);
+    }
+
+    fn host_langs(brew: &MockBrew, name: &str, kind: PkgKind) -> Vec<String> {
+        host_for_pkg(brew, kind, name, brew.host_platform().as_ref())
+            .expect("host")
+            .languages
+    }
+
+    #[test]
+    fn host_for_pkg_puts_saved_explicit_before_the_live_run_languages() {
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US fr\n");
+        // Nothing saved for the cask: the run-level list.
+        assert_eq!(host_langs(&brew, "firefox", PkgKind::Cask), ["en-US", "fr"]);
+        // Saved `explicit` (all `read_cask_languages` returns) leads, then the
+        // live list, deduplicated, invalid dropped.
+        brew.cask_languages
+            .insert("firefox".into(), vec!["de".into(), "fr".into()]);
+        assert_eq!(
+            host_langs(&brew, "firefox", PkgKind::Cask),
+            ["de", "fr", "en-US"]
+        );
+        // A formula never takes cask languages.
+        brew.cask_languages.insert("wget".into(), vec!["de".into()]);
+        assert_eq!(host_langs(&brew, "wget", PkgKind::Formula), ["en-US", "fr"]);
+    }
+
+    #[test]
+    fn host_for_pkg_puts_the_language_flag_before_everything() {
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US\n");
+        brew.cli_languages = vec!["de".into(), "bad_one".into(), "fr".into()];
+        brew.cask_languages
+            .insert("firefox".into(), vec!["fr".into(), "ja".into()]);
+        assert_eq!(
+            host_langs(&brew, "firefox", PkgKind::Cask),
+            ["de", "fr", "ja", "en-US"]
+        );
+        // The flag applies to a cask with nothing saved too.
+        assert_eq!(
+            host_langs(&brew, "other", PkgKind::Cask),
+            ["de", "fr", "en-US"]
+        );
+    }
+
+    #[test]
+    fn a_saved_default_language_does_not_pick_the_block() {
+        // Saved config {"default":{"languages":["en-US"... fr]}} reads as no
+        // explicit languages, so the live run-level en-US picks the block.
+        let cave = include_str!("../tests/fixtures/cave-story.rb");
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/c/cave-story.rb", cave);
+        git.insert_blob("caskhead", "Casks/c/cave-story.rb", cave);
+        let receipt = crate::brew::version_only_cask_receipt("cave-story", "0.2.0");
+        let mut brew = MockBrew::new();
+        brew.host = HostPlatform::parse("sequoia 15\nHOST sequoia arm64\nLANG en-US\n");
+        let version = |brew: &MockBrew| {
+            let v = resolve_view(
+                brew,
+                &git,
+                &core_snaps(),
+                unused_cache(),
+                "homebrew/cask",
+                "cave-story",
+                PkgKind::Cask,
+                Some(&receipt),
+            )
+            .unwrap()
+            .expect("resolvable");
+            report::identity_version(v.cutoff.as_ref().unwrap())
+        };
+        assert_eq!(version(&brew), "0.1.0,2");
+        brew.cli_languages = vec!["ja".into()];
+        assert_eq!(version(&brew), "0.2.0");
     }
 
     #[test]

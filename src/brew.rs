@@ -94,13 +94,20 @@ pub trait Brew {
     fn host_platform(&self) -> Option<HostPlatform> {
         None
     }
-    /// The languages `Cask::Config#languages` gave the installed cask `token`
-    /// when it was installed, read from its saved config. `None` when it is
-    /// not installed or the config cannot be read; callers then use the
+    /// The `explicit` languages in the installed cask `token`'s saved config:
+    /// the only part `brew upgrade` carries over. `None` when it is not
+    /// installed or the config cannot be read. Callers put these before the
     /// run-level `host_platform().languages`. The default reports none.
     fn cask_languages(&self, _token: &str) -> Option<Vec<String>> {
         None
     }
+    /// The languages of a `--language=<list>` flag on this run, in order.
+    /// Brew treats the flag as explicit config over everything saved or live.
+    fn cli_languages(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Records the `--language` flag's languages for this run.
+    fn set_cli_languages(&self, _languages: Vec<String>) {}
     /// Homebrew's `Version.detect` of each source, one entry per source, from
     /// one `brew ruby` call. `None` when brew cannot tell (or the url holds a
     /// `#{` interpolation, which is never asked). The default answers `None`
@@ -120,6 +127,10 @@ pub struct ProcessBrew {
     cellar: std::cell::OnceCell<Option<PathBuf>>,
     /// `brew --caskroom`, asked once.
     caskroom: std::cell::OnceCell<Option<PathBuf>>,
+    /// `read_cask_languages` answers for this run, keyed by cask token.
+    languages: Mutex<HashMap<String, Option<Vec<String>>>>,
+    /// The `--language` flag's languages (`set_cli_languages`).
+    cli: Mutex<Vec<String>>,
     /// `compare_versions` answers for this run, keyed by `(kind, a, b)`.
     orderings: Mutex<HashMap<OrderKey, Ordering>>,
     /// Pairs whose batch failed, with the failure: a broken `brew ruby` costs
@@ -215,6 +226,8 @@ impl ProcessBrew {
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
             caskroom: std::cell::OnceCell::new(),
+            languages: Mutex::new(HashMap::new()),
+            cli: Mutex::new(Vec::new()),
             orderings: Mutex::new(HashMap::new()),
             ordering_failures: Mutex::new(HashMap::new()),
             detected: Mutex::new(HashMap::new()),
@@ -250,6 +263,8 @@ pub struct MockBrew {
     pub host: Option<HostPlatform>,
     /// What `cask_languages` reports per installed cask token.
     pub cask_languages: BTreeMap<String, Vec<String>>,
+    /// What `cli_languages` reports.
+    pub cli_languages: Vec<String>,
     /// The pairs of each `compare_versions` call.
     pub compares: Mutex<Vec<Vec<VersionPair>>>,
     /// Pairs `compare_versions` has answered: like `ProcessBrew`, a pair is
@@ -295,6 +310,7 @@ impl Default for MockBrew {
             compare_error: None,
             host: None,
             cask_languages: BTreeMap::new(),
+            cli_languages: Vec::new(),
             compares: Mutex::new(Vec::new()),
             compared: Mutex::new(std::collections::HashSet::new()),
             compare_spawns: Mutex::new(0),
@@ -380,11 +396,19 @@ impl Brew for ProcessBrew {
     }
 
     fn cask_languages(&self, token: &str) -> Option<Vec<String>> {
-        let caskroom = self
-            .caskroom
-            .get_or_init(|| self.brew_dir("--caskroom"))
-            .clone()?;
-        read_cask_languages(&caskroom, token)
+        let caskroom = self.caskroom()?;
+        let mut memo = self.languages.lock().unwrap_or_else(|e| e.into_inner());
+        memo.entry(token.to_string())
+            .or_insert_with(|| read_cask_languages(&caskroom, token))
+            .clone()
+    }
+
+    fn cli_languages(&self) -> Vec<String> {
+        self.cli.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn set_cli_languages(&self, languages: Vec<String>) {
+        *self.cli.lock().unwrap_or_else(|e| e.into_inner()) = languages;
     }
 
     fn compare_versions(&self, pairs: &[VersionPair]) -> Result<Vec<Ordering>, Error> {
@@ -516,7 +540,7 @@ impl Brew for ProcessBrew {
         }
         let json = String::from_utf8_lossy(&output.stdout);
         let cellar = self.cellar();
-        let caskroom = self.brew_dir("--caskroom");
+        let caskroom = self.caskroom();
         parse_installed_json(
             &json,
             |name, kind, version| match kind {
@@ -597,6 +621,13 @@ impl ProcessBrew {
     fn cellar(&self) -> Option<PathBuf> {
         self.cellar
             .get_or_init(|| self.brew_dir("--cellar"))
+            .clone()
+    }
+
+    /// `brew --caskroom`, asked once and shared by every reader.
+    fn caskroom(&self) -> Option<PathBuf> {
+        self.caskroom
+            .get_or_init(|| self.brew_dir("--caskroom"))
             .clone()
     }
 
@@ -744,6 +775,10 @@ impl Brew for MockBrew {
 
     fn cask_languages(&self, token: &str) -> Option<Vec<String>> {
         self.cask_languages.get(token).cloned()
+    }
+
+    fn cli_languages(&self) -> Vec<String> {
+        self.cli_languages.clone()
     }
 
     fn detect_versions(&self, sources: &[VersionSource]) -> Result<Vec<Option<String>>, Error> {
@@ -961,37 +996,32 @@ fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Opti
     walk_metadata_for_file(&metadata, &target)
 }
 
-/// The languages in `<caskroom>/<token>/.metadata/config.json`, in the order
-/// `Cask::Config#languages` gives them: `explicit`, then `env`, then
-/// `default`, deduplicated, with those `Locale` cannot parse dropped. `None`
-/// when the file is missing or unreadable, or a `languages` value is not an
-/// array of strings.
+/// The languages in `explicit` of `<caskroom>/<token>/.metadata/config.json`,
+/// deduplicated, with those `Locale` cannot parse dropped. Only `explicit`
+/// counts: `brew upgrade` rebuilds the config with `default_config.merge(saved)`,
+/// and `Cask::Config#merge` keeps nothing but `explicit`, so `env` and
+/// `default` are read live again (the run-level `host_platform().languages`).
+/// `None` when the file is missing or unreadable, has no `explicit` object, or
+/// its `languages` value is not an array of strings.
 fn read_cask_languages(caskroom: &Path, token: &str) -> Option<Vec<String>> {
     let path = caskroom.join(token).join(".metadata").join("config.json");
     let json = std::fs::read_to_string(path).ok()?;
     let b = json.as_bytes();
-    let mut seen_section = false;
+    let after = find_json_key(&json, "explicit")?;
+    let start = skip_ws(b, json.len() - after.len());
+    if b.get(start) != Some(&b'{') {
+        return None;
+    }
+    let obj = json.get(start..skip_delimited(b, start, b'{', b'}')?)?;
     let mut out: Vec<String> = Vec::new();
-    for section in ["explicit", "env", "default"] {
-        let Some(after) = find_json_key(&json, section) else {
-            continue;
-        };
-        let start = skip_ws(b, json.len() - after.len());
-        if b.get(start) != Some(&b'{') {
-            return None;
-        }
-        let obj = json.get(start..skip_delimited(b, start, b'{', b'}')?)?;
-        seen_section = true;
-        let Some(after) = find_json_key(obj, "languages") else {
-            continue;
-        };
+    if let Some(after) = find_json_key(obj, "languages") {
         for lang in json_string_array(after.trim_start())? {
             if crate::identity::is_valid_language(&lang) && !out.contains(&lang) {
                 out.push(lang);
             }
         }
     }
-    seen_section.then_some(out)
+    Some(out)
 }
 
 /// `["a", "b"]` at the start of `s`.
@@ -1162,17 +1192,40 @@ pub(crate) fn json_objects_in_array<'a>(json: &'a str, key: &str) -> Result<Vec<
     scan_array_objects(rest).ok_or_else(|| Error::Other(format!("json {key} array is malformed")))
 }
 
+/// The text after `"key":` for a key of the object `json` itself: a key of a
+/// nested object or array is skipped, as is `"key":` inside a string value.
+/// A text that does not start with `{` is read as the members of an object.
 pub(crate) fn find_json_key<'a>(json: &'a str, key: &str) -> Option<&'a str> {
-    let pat = format!("\"{key}\"");
-    let mut search = json;
-    loop {
-        let (_, after) = search.split_once(&pat)?;
-        let after = after.trim_start();
-        if let Some(rest) = after.strip_prefix(':') {
-            return Some(rest);
+    let b = json.as_bytes();
+    let top = if b.get(skip_ws(b, 0)) == Some(&b'{') {
+        1
+    } else {
+        0
+    };
+    let mut depth = 0;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth -= 1,
+            b'"' => {
+                let start = i + 1;
+                i = start;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                if depth == top && json.get(start..i) == Some(key) {
+                    let after = skip_ws(b, i + 1);
+                    if b.get(after) == Some(&b':') {
+                        return json.get(after + 1..);
+                    }
+                }
+            }
+            _ => {}
         }
-        search = after;
+        i += 1;
     }
+    None
 }
 
 pub(crate) fn scan_array_objects(s: &str) -> Option<Vec<&str>> {
@@ -2289,31 +2342,80 @@ mod tests {
     }
 
     #[test]
-    fn cask_languages_orders_explicit_env_default_and_dedups() {
+    fn cask_languages_reads_only_the_saved_explicit_list() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_cask_config(
             tmp.path(),
             "cave-story",
-            r#"{"default":{"languages":["en-US","ja"],"appdir":"/Applications"},"env":{"languages":["fr","ja"]},"explicit":{"languages":["ja","de"]}}"#,
+            r#"{"default":{"languages":["en-US","ja"],"appdir":"/Applications"},"env":{"languages":["fr","ja"]},"explicit":{"languages":["ja","de","ja"]}}"#,
         );
         assert_eq!(
             read_cask_languages(tmp.path(), "cave-story"),
-            Some(vec!["ja".into(), "de".into(), "fr".into(), "en-US".into()])
+            Some(vec!["ja".into(), "de".into()])
+        );
+        write_cask_config(
+            tmp.path(),
+            "fr-default",
+            r#"{"default":{"languages":["fr"]},"env":{},"explicit":{}}"#,
+        );
+        assert_eq!(
+            read_cask_languages(tmp.path(), "fr-default"),
+            Some(Vec::new())
         );
     }
 
     #[test]
-    fn cask_languages_explicit_ja_beats_default_en_us() {
+    fn find_json_key_matches_only_the_immediate_object_level() {
+        let obj = r#"{"extra":{"languages":["de"]},"languages":["fr"]}"#;
+        assert_eq!(
+            find_json_key(obj, "languages").map(str::trim_start),
+            Some(r#"["fr"]}"#)
+        );
+        assert_eq!(find_json_key(obj, "nope"), None);
+        // A key text inside a string value is not a key.
+        let tricky = r#"{"a":"\"languages\":[1]","languages":["x"]}"#;
+        assert_eq!(
+            find_json_key(tricky, "languages").map(str::trim_start),
+            Some(r#"["x"]}"#)
+        );
+        let cfg = r#"{"default":{"extra":{"languages":["de"]},"languages":["fr"]},"explicit":{"extra":{"languages":["de"]}}}"#;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_cask_config(tmp.path(), "n", cfg);
+        assert_eq!(read_cask_languages(tmp.path(), "n"), Some(Vec::new()));
+    }
+
+    #[test]
+    fn process_brew_memoizes_cask_languages_per_token() {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_cask_config(
             tmp.path(),
-            "cave-story",
-            r#"{"default":{"languages":["en-US"]},"env":{},"explicit":{"languages":["ja"]}}"#,
+            "a",
+            r#"{"default":{},"env":{},"explicit":{"languages":["ja"]}}"#,
+        );
+        let brew = ProcessBrew::new(PathBuf::from("/nonexistent/brew"));
+        let _ = brew.caskroom.set(Some(tmp.path().to_path_buf()));
+        assert_eq!(brew.cask_languages("a"), Some(vec!["ja".into()]));
+        write_cask_config(
+            tmp.path(),
+            "a",
+            r#"{"default":{},"env":{},"explicit":{"languages":["de"]}}"#,
         );
         assert_eq!(
-            read_cask_languages(tmp.path(), "cave-story"),
-            Some(vec!["ja".into(), "en-US".into()])
+            brew.cask_languages("a"),
+            Some(vec!["ja".into()]),
+            "second call must not re-read"
         );
+        assert_eq!(brew.cask_languages("missing"), None);
+        std::fs::remove_dir_all(tmp.path().join("a")).expect("rm");
+        assert_eq!(brew.cask_languages("a"), Some(vec!["ja".into()]));
+    }
+
+    #[test]
+    fn process_brew_shares_one_caskroom_lookup() {
+        let brew = ProcessBrew::new(PathBuf::from("/nonexistent/brew"));
+        let _ = brew.caskroom.set(Some(PathBuf::from("/cr")));
+        assert_eq!(brew.caskroom(), Some(PathBuf::from("/cr")));
+        assert_eq!(brew.caskroom(), Some(PathBuf::from("/cr")));
     }
 
     #[test]
@@ -2322,7 +2424,7 @@ mod tests {
         write_cask_config(
             tmp.path(),
             "a",
-            r#"{"default":{"languages":["en_US","ja-JP-mac","en-US"]},"env":{},"explicit":{}}"#,
+            r#"{"default":{},"env":{},"explicit":{"languages":["en_US","ja-JP-mac","en-US"]}}"#,
         );
         assert_eq!(
             read_cask_languages(tmp.path(), "a"),
@@ -2338,7 +2440,7 @@ mod tests {
         assert_eq!(read_cask_languages(tmp.path(), "nope"), None);
         write_cask_config(tmp.path(), "bad", "not json");
         assert_eq!(read_cask_languages(tmp.path(), "bad"), None);
-        write_cask_config(tmp.path(), "arr", r#"{"default":{"languages":"en"}}"#);
+        write_cask_config(tmp.path(), "arr", r#"{"explicit":{"languages":"en"}}"#);
         assert_eq!(read_cask_languages(tmp.path(), "arr"), None);
     }
 

@@ -909,11 +909,53 @@ fn first_ruby_symbol(s: &str) -> Option<String> {
     }
 }
 
+/// The text of the first `"..."` in `s`, raw. A backslash escapes the next
+/// character, and a `#{ ... }` interpolation (which may hold quotes and braces
+/// of its own) does not end the string. `None` when the string never closes.
 fn first_double_quoted(s: &str) -> Option<String> {
-    let start = s.find('"')?;
-    let after = &s[start + 1..];
-    let end = after.find('"')?;
-    Some(after[..end].to_string())
+    let start = s.find('"')? + 1;
+    let end = string_end(s, start)?;
+    Some(s[start..end].to_string())
+}
+
+/// The index of the quote closing the string whose body starts at `from`.
+fn string_end(s: &str, from: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'"' => return Some(i),
+            b'#' if b.get(i + 1) == Some(&b'{') => i = interpolation_end(s, i + 2)?,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The index of the `}` closing the interpolation whose body starts at
+/// `from`, skipping nested braces and the strings inside it.
+fn interpolation_end(s: &str, from: usize) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut depth = 1;
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'"' => i = string_end(s, i + 1)?,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 fn first_u32(rb: &str, key: &str) -> Option<u32> {
@@ -2108,5 +2150,25 @@ mod platform_tests {
     fn language_blocks_stay_opaque_without_a_default() {
         let rb = "cask \"x\" do\n  language \"en\" do\n    version \"1\"\n    sha256 \"aa\"\n    \"en\"\n  end\n  language \"ja\" do\n    version \"2\"\n    sha256 \"bb\"\n    \"ja\"\n  end\nend\n";
         assert!(parse_cask(rb, Some(&host_with(&["ja"]))).is_err());
+    }
+
+    #[test]
+    fn a_url_keeps_quotes_inside_interpolations() {
+        let rb = "cask \"x\" do\n  version \"1.0,2024-01-01-abc\"\n  sha256 :no_check\n\n  url \"https://ftp.example.org/#{version.csv.second.split(\"-\").first}/#{version.csv.second}-central#{\"-l10n\" if language != \"en-US\"}/x-#{version.csv.first}.dmg\"\n  name \"X\"\nend\n";
+        assert_eq!(
+            parse_cask(rb, None).unwrap().url.as_deref(),
+            Some(
+                "https://ftp.example.org/#{version.csv.second.split(\"-\").first}/#{version.csv.second}-central#{\"-l10n\" if language != \"en-US\"}/x-#{version.csv.first}.dmg"
+            )
+        );
+    }
+
+    #[test]
+    fn a_backslash_escaped_quote_does_not_end_a_string() {
+        assert_eq!(
+            first_double_quoted(r#"  "a\"b" c"#).as_deref(),
+            Some(r#"a\"b"#)
+        );
+        assert_eq!(first_double_quoted("\"open"), None);
     }
 }

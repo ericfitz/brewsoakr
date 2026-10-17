@@ -211,6 +211,24 @@ pub fn is_dry_run(flags: &[String]) -> bool {
         .any(|f| f == "--dry-run" || (is_short_cluster(f) && f[1..].contains('n')))
 }
 
+/// The languages of the `--language=<a,b>` flag (brew's `comma_array`; the last
+/// occurrence wins), empty when absent. `cli.rs` joins `--language x` to
+/// `--language=x`.
+pub fn language_list(flags: &[String]) -> Vec<String> {
+    flags
+        .iter()
+        .rev()
+        .find_map(|f| f.strip_prefix("--language="))
+        .map(|list| {
+            list.split(',')
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Which self-updating casks a bare `upgrade`/`outdated` may touch. brew's
 /// `--greedy` covers both kinds; the two long forms cover one each.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -282,6 +300,16 @@ pub fn dropped_note(verb: &str, dropped: &[String], context: &str) -> Option<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn language_list_reads_the_last_comma_separated_flag() {
+        assert_eq!(language_list(&f(&["-v"])), Vec::<String>::new());
+        assert_eq!(language_list(&f(&["--language=de"])), ["de"]);
+        assert_eq!(
+            language_list(&f(&["--language=de", "--language=fr, ja,,"])),
+            ["fr", "ja"]
+        );
+    }
+
     use super::*;
 
     fn f(v: &[&str]) -> Vec<String> {

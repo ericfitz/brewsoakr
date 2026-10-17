@@ -125,13 +125,17 @@ thunderbird had no sha256. With a known host, brewsoak now selects one
 language block per cask, as Homebrew's `Cask::DSL#language_eval` does, and
 reads that block as transparent. The other language blocks stay opaque.
 
-- Preferred languages come from brew. `brew::HOST_PLATFORM_RUBY` also prints
-  `Cask::Config.new.languages`, the list a cask load uses, on a `LANG` line.
-  An installed cask is evaluated with the languages in its saved
-  `<caskroom>/<token>/.metadata/config.json` (`explicit`, then `env`, then
-  `default`, deduplicated, as `Cask::Config#languages` orders them). That
-  list applies to all three sides of that cask, matching what `brew upgrade`
-  would pick.
+- Preferred languages come from brew, as `brew upgrade` evaluates a cask.
+  `brew::HOST_PLATFORM_RUBY` prints `Cask::Config.new.languages` (live
+  `HOMEBREW_CASK_OPTS` plus the live system default) on a `LANG` line. Upgrade
+  rebuilds the config as `default_config.merge(saved)` (`cask/upgrade.rb`),
+  and `Cask::Config#merge` keeps only the saved `explicit` hash, so saved
+  `env` and `default` are never used. A cask's languages are therefore, in
+  order: the languages of a `--language=<a,b>` flag on the brewsoak command
+  line (explicit in brew, over everything), the `explicit.languages` in its
+  saved `<caskroom>/<token>/.metadata/config.json`, then the run-level list;
+  deduplicated, with any `Locale` cannot parse dropped. That list applies to
+  all three sides of that cask. The config is read once per cask per run.
 - Selection follows Homebrew's `Locale` rules (`locale.rb`):
   - Each preferred language is taken in order.
   - The first block with a locale `eql?` to it wins; failing that, the first
