@@ -65,6 +65,14 @@ pub fn desired_action(
 ) -> DesiredAction {
     match status {
         UpstreamStatus::Yanked => DesiredAction::RefuseYanked,
+        // Nothing to install when the keg already is the cutoff or HEAD: leave
+        // it, and let the caller warn that it is deprecated.
+        UpstreamStatus::Deprecated if identities_match(installed, cutoff_id) => {
+            DesiredAction::NoOpAlreadySoaked
+        }
+        UpstreamStatus::Deprecated if identities_match(installed, head_id) => {
+            DesiredAction::LeaveAheadOfSoak
+        }
         UpstreamStatus::Deprecated => DesiredAction::RefuseDeprecated,
         UpstreamStatus::TooNew => DesiredAction::RefuseTooNew,
         UpstreamStatus::Eligible => {
@@ -179,6 +187,30 @@ end
         assert_eq!(status, UpstreamStatus::Deprecated);
         assert_eq!(
             desired_action(status, None, Some(&cutoff), Some(&head)),
+            DesiredAction::RefuseDeprecated
+        );
+    }
+
+    #[test]
+    fn deprecated_keg_already_at_cutoff_or_head_is_left_not_refused() {
+        let cutoff = formula_id(CUTOFF_RB);
+        let head = formula_id(DEPRECATED_HEAD_RB);
+        let old = formula_id(OLD_BOTTLE_RB);
+        let status = UpstreamStatus::Deprecated;
+        assert_eq!(
+            desired_action(status, Some(&cutoff), Some(&cutoff), Some(&head)),
+            DesiredAction::NoOpAlreadySoaked
+        );
+        assert_eq!(
+            desired_action(status, Some(&head), Some(&cutoff), Some(&head)),
+            DesiredAction::LeaveAheadOfSoak
+        );
+        assert_eq!(
+            desired_action(status, Some(&old), Some(&cutoff), Some(&head)),
+            DesiredAction::RefuseDeprecated
+        );
+        assert_eq!(
+            desired_action(status, Some(&old), None, Some(&head)),
             DesiredAction::RefuseDeprecated
         );
     }

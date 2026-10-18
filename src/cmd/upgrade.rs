@@ -213,6 +213,107 @@ mod tests {
         );
     }
 
+    fn deprecated_rb(name: &str, version: &str, sha: &str) -> String {
+        format!(
+            "{}\n  deprecate! date: \"2024-01-01\", because: :unmaintained\n",
+            formula_rb(name, version, sha).trim_end()
+        )
+    }
+
+    fn bare_upgrade(git: &InMemoryGit, brew: &MockBrew) -> (RunResult, String) {
+        let snaps = core_snaps();
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let result = upgrade(
+            brew,
+            git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        (result, String::from_utf8(out).expect("utf8"))
+    }
+
+    #[test]
+    fn upgrade_deprecated_but_current_warns_without_refusing() {
+        let tcl = deprecated_rb("tcl", "8.6.18", "tclsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/t/tcl.rb", tcl.clone());
+        git.insert_blob("headsha", "Formula/t/tcl.rb", tcl.clone());
+        let brew = MockBrew {
+            installed: vec![formula_pkg("tcl", tcl)],
+            ..MockBrew::new()
+        };
+        let (result, text) = bare_upgrade(&git, &brew);
+        assert!(!result.refused, "nothing to upgrade is not a refusal");
+        assert!(!text.contains("bypass brewsoak"), "{text}");
+        assert!(
+            text.contains("warning: tcl is deprecated upstream; consider replacing it"),
+            "{text}"
+        );
+        assert!(lock_runs(&brew).is_empty(), "must not invoke brew");
+    }
+
+    #[test]
+    fn upgrade_deprecated_ahead_of_soak_warns_without_refusing() {
+        let mid = formula_rb("tcl", "8.6.17", "midsha");
+        let head = deprecated_rb("tcl", "8.6.18", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/t/tcl.rb", mid);
+        git.insert_blob("headsha", "Formula/t/tcl.rb", head.clone());
+        let brew = MockBrew {
+            installed: vec![formula_pkg("tcl", head)],
+            ..MockBrew::new()
+        };
+        let (result, text) = bare_upgrade(&git, &brew);
+        assert!(!result.refused, "{text}");
+        assert!(text.contains(&ahead_message("tcl")), "{text}");
+        assert!(
+            text.contains("warning: tcl is deprecated upstream"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn upgrade_deprecated_and_outdated_is_still_refused() {
+        let old = formula_rb("tcl", "8.6.16", "oldsha");
+        let mid = deprecated_rb("tcl", "8.6.17", "midsha");
+        let head = deprecated_rb("tcl", "8.6.18", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/t/tcl.rb", mid);
+        git.insert_blob("headsha", "Formula/t/tcl.rb", head);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("tcl", old)],
+            ..MockBrew::new()
+        };
+        let (result, text) = bare_upgrade(&git, &brew);
+        assert!(result.refused, "{text}");
+        assert!(
+            text.contains(
+                "tcl is deprecated or disabled at HEAD; use `brew upgrade tcl` to bypass brewsoak."
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains("consider replacing"),
+            "the refusal already says why: {text}"
+        );
+        assert!(
+            !lock_runs(&brew)
+                .iter()
+                .any(|args| args.first().map(String::as_str) == Some("install")),
+            "must not install a deprecated package"
+        );
+    }
+
     #[test]
     fn upgrade_already_soaked_prints_when_verbose() {
         let wget_mid = formula_rb("wget", "1.1.0", "midsha");
