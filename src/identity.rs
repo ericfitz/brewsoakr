@@ -365,6 +365,26 @@ pub fn is_deprecated_or_disabled(rb: &str, today: &str, host: Option<&HostPlatfo
         .any(|flag| flag_in_effect(flag, today))
 }
 
+/// The lifecycle state in effect today, worded for a warning: `disabled` wins
+/// over `deprecated`. None when neither is in effect.
+pub fn lifecycle_in_effect(
+    rb: &str,
+    today: &str,
+    host: Option<&HostPlatform>,
+) -> Option<&'static str> {
+    let flags: Vec<LifecycleFlag> = lifecycle_flags(rb, host)
+        .into_iter()
+        .filter(|flag| flag_in_effect(flag, today))
+        .collect();
+    if flags.iter().any(|f| f.kind == LifecycleKind::Disabled) {
+        Some("disabled")
+    } else if flags.is_empty() {
+        None
+    } else {
+        Some("deprecated")
+    }
+}
+
 /// Deprecations more than a year out are not actionable; only warn about the
 /// ones close enough to plan around.
 pub fn upcoming_lifecycle_messages(
@@ -1949,6 +1969,31 @@ end
             "2026-08-13",
             None
         ));
+    }
+
+    #[test]
+    fn lifecycle_in_effect_names_the_strongest_state() {
+        let deprecated = "  deprecate! date: \"2024-01-01\", because: :unmaintained\n";
+        assert_eq!(
+            lifecycle_in_effect(deprecated, "2026-08-13", None),
+            Some("deprecated")
+        );
+        let both = "  deprecate! date: \"2024-01-01\", because: :x\n  disable! date: \"2025-01-01\", because: :x\n";
+        assert_eq!(
+            lifecycle_in_effect(both, "2026-08-13", None),
+            Some("disabled")
+        );
+        let later = "  deprecate! date: \"2024-01-01\", because: :x\n  disable! date: \"2030-01-01\", because: :x\n";
+        assert_eq!(
+            lifecycle_in_effect(later, "2026-08-13", None),
+            Some("deprecated")
+        );
+        let future = "  deprecate! date: \"2030-01-01\", because: :x\n";
+        assert_eq!(lifecycle_in_effect(future, "2026-08-13", None), None);
+        assert_eq!(
+            lifecycle_in_effect("class Foo < Formula\nend\n", "2026-08-13", None),
+            None
+        );
     }
 
     #[test]

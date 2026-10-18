@@ -295,13 +295,20 @@ pub(super) fn resolve_view_unordered(
         .head
         .as_deref()
         .and_then(|b| std::str::from_utf8(b).ok());
-    let warnings = match head_rb {
+    let mut warnings: Vec<String> = match head_rb {
         Some(rb) => identity::upcoming_lifecycle_messages(rb, &today, host)
             .into_iter()
             .map(|msg| format!("{name} {msg}"))
             .collect(),
         None => Vec::new(),
     };
+    // A refusal already says why; a keg left in place still deserves a nudge.
+    if status == eligibility::UpstreamStatus::Deprecated
+        && action != eligibility::DesiredAction::RefuseDeprecated
+        && let Some(word) = head_rb.and_then(|rb| identity::lifecycle_in_effect(rb, &today, host))
+    {
+        warnings.push(format!("{name} is {word} upstream; consider replacing it"));
+    }
     let auto_updates =
         kind == PkgKind::Cask && head_rb.is_some_and(|rb| identity::cask_auto_updates(rb, host));
     let latest = cutoff.as_ref().is_some_and(PkgIdentity::is_latest_cask);

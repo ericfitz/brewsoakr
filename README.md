@@ -207,7 +207,9 @@ after the counts line so they are not buried in the install scroll, and
 have been installed to ..." notices are dropped, anything telling you to run
 something is kept.
 
-Deprecations more than a year away are not reported.
+Deprecations more than a year away are not reported. A package that is
+deprecated or disabled upstream is never installed or upgraded, but one already
+at its cutoff (or ahead of soak) is left alone with a warning, not held.
 
 ## Example
 
