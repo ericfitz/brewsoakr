@@ -90,6 +90,23 @@ pub fn desired_action(
     }
 }
 
+/// Installed at the cutoff while HEAD has moved on to a different artifact
+/// that is still inside the soak window. Nothing is installed; the caller
+/// says so, because brew itself would call the package outdated. A
+/// deprecated HEAD is not soaking: it will never be installed.
+pub fn newer_soaking(
+    status: UpstreamStatus,
+    action: DesiredAction,
+    cutoff_id: Option<&PkgIdentity>,
+    head_id: Option<&PkgIdentity>,
+) -> bool {
+    status == UpstreamStatus::Eligible
+        && action == DesiredAction::NoOpAlreadySoaked
+        && cutoff_id.is_some()
+        && head_id.is_some()
+        && !identities_match(cutoff_id, head_id)
+}
+
 pub(crate) fn identities_match(a: Option<&PkgIdentity>, b: Option<&PkgIdentity>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a.same_artifact(b),
@@ -228,6 +245,34 @@ end
             upstream_status(cutoff, Some(head.as_bytes()), TODAY, None),
             UpstreamStatus::Deprecated
         );
+    }
+
+    #[test]
+    fn newer_soaking_only_when_head_differs_from_an_installed_cutoff() {
+        let cutoff = formula_id(CUTOFF_RB);
+        let head = formula_id(HEAD_RB);
+        let soaked = DesiredAction::NoOpAlreadySoaked;
+        let eligible = UpstreamStatus::Eligible;
+        assert!(newer_soaking(eligible, soaked, Some(&cutoff), Some(&head)));
+        assert!(!newer_soaking(
+            eligible,
+            soaked,
+            Some(&cutoff),
+            Some(&cutoff)
+        ));
+        assert!(!newer_soaking(eligible, soaked, Some(&cutoff), None));
+        assert!(!newer_soaking(
+            UpstreamStatus::Deprecated,
+            soaked,
+            Some(&cutoff),
+            Some(&head)
+        ));
+        assert!(!newer_soaking(
+            eligible,
+            DesiredAction::InstallCutoff,
+            Some(&cutoff),
+            Some(&head)
+        ));
     }
 
     #[test]

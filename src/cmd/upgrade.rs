@@ -169,6 +169,67 @@ mod tests {
         );
     }
 
+    /// Installed at the cutoff while HEAD is newer: brew calls it outdated,
+    /// so brewsoak must say a newer version is soaking instead of calling it
+    /// plain "already soaked".
+    fn soaking_upgrade(names: &[String]) -> String {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            names,
+            &[],
+            &mut out,
+        )
+        .expect("upgrade");
+        assert!(lock_runs(&brew).is_empty(), "soaking must not invoke brew");
+        String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn named_upgrade_says_a_newer_version_is_soaking() {
+        let text = soaking_upgrade(&["wget".to_string()]);
+        assert!(
+            text.contains("upgraded 0, already soaked 0, soaking 1, held 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "wget: 1.2.0 is still in the 24h soak window; installed 1.1.0 is the newest soaked version"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("already soaked: "), "{text}");
+    }
+
+    #[test]
+    fn bare_upgrade_names_soaking_packages_in_one_note() {
+        let text = soaking_upgrade(&[]);
+        assert!(text.contains("already soaked 0, soaking 1,"), "{text}");
+        assert!(
+            text.contains("still soaking (left at the cutoff): wget 1.2.0"),
+            "{text}"
+        );
+    }
+
     #[test]
     fn upgrade_already_soaked_is_silent_by_default() {
         let wget_mid = formula_rb("wget", "1.1.0", "midsha");

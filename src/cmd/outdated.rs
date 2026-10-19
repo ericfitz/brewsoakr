@@ -1,5 +1,5 @@
 use super::bare::{bare_action, latest_left, latest_note};
-use super::notes::{held_tap_note, hold_why, unsoakable_note, write_section_always};
+use super::notes::{held_tap_note, hold_why, unsoakable_note, write_section, write_section_always};
 use super::view::{prefetch_orderings, resolve_view, view_versions};
 use super::{RunResult, is_verbose};
 use crate::Error;
@@ -55,6 +55,7 @@ pub fn outdated(
     let mut ahead = Vec::new();
     let mut auto_updates = Vec::new();
     let mut pinned = Vec::new();
+    let mut soaking = Vec::new();
     let mut soaked = 0usize;
     let mut no_soak_names = Vec::new();
     prefetch_orderings(brew, git, snaps, cache, inv);
@@ -138,6 +139,7 @@ pub fn outdated(
                     view.installed.as_ref(),
                     view.cutoff.as_ref(),
                     view.head.as_ref(),
+                    view.newer_soaking(),
                     "classified for outdated",
                 )
             )?;
@@ -190,7 +192,13 @@ pub fn outdated(
                 };
                 auto_updates.push(compare_line(&pkg.name, &installed_ver, cmp, &cutoff_ver));
             }
-            DesiredAction::NoOpAlreadySoaked => soaked += 1,
+            DesiredAction::NoOpAlreadySoaked => match view.soaking_label() {
+                Some(label) => {
+                    let (installed_ver, _) = view_versions(&view);
+                    soaking.push(format!("{} ({installed_ver}) -> {label}", pkg.name));
+                }
+                None => soaked += 1,
+            },
         }
     }
     let brew_outdated = if no_soak_names.is_empty() {
@@ -206,6 +214,11 @@ pub fn outdated(
     write_section_always(out, "==> Outdated (will upgrade)", &upgrades)?;
     write_section_always(out, "==> No-soak (brew)", &no_soak)?;
     write_section_always(out, "==> Held", &held)?;
+    write_section(
+        out,
+        "==> Soaking (installed is the newest soaked version)",
+        &soaking,
+    )?;
     write_section_always(out, "==> Ahead of soak", &ahead)?;
     write_section_always(
         out,
@@ -365,6 +378,45 @@ mod tests {
             "unparseable pkg must be held, not abort: {text}"
         );
         assert!(!result.refused);
+    }
+
+    #[test]
+    fn outdated_lists_a_package_whose_newer_version_is_soaking() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        outdated(
+            &brew,
+            &git,
+            &snaps,
+            unused_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .expect("outdated");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(
+            text.contains(
+                "==> Soaking (installed is the newest soaked version)\nwget (1.1.0) -> 1.2.0\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("nothing outdated (already soaked: 0)"),
+            "{text}"
+        );
     }
 
     #[test]

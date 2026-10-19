@@ -47,6 +47,28 @@ pub fn identity_version(id: &PkgIdentity) -> String {
     }
 }
 
+/// What is soaking above an installed cutoff: HEAD's version, or a new build
+/// of the same version when only the artifact changed (a rebuilt bottle, a
+/// re-tagged source), so the note never reads `1.0.0 -> 1.0.0`.
+pub fn soaking_label(cutoff: &PkgIdentity, head: &PkgIdentity) -> String {
+    let (cut, hd) = (identity_version(cutoff), identity_version(head));
+    if latest_redefined(Some(&cut), Some(&hd)) {
+        "a new :latest definition".to_string()
+    } else if cut == hd {
+        format!("a new build of {hd}")
+    } else {
+        hd
+    }
+}
+
+/// A named package left at its cutoff while a newer artifact soaks.
+pub fn soaking_note(name: &str, installed: &str, label: &str, hours: SoakHours) -> String {
+    format!(
+        "{name}: {label} is still in the {}h soak window; installed {installed} is the newest soaked version",
+        hours.get()
+    )
+}
+
 /// A `:latest` cask has no version to order, so installed and cutoff both
 /// reading `:latest` while the action is to install means the cask definition
 /// (url or sha) changed, not that the installed one is "behind".
@@ -95,17 +117,28 @@ pub fn evaluate_line(
     installed: Option<&PkgIdentity>,
     cutoff: Option<&PkgIdentity>,
     head: Option<&PkgIdentity>,
+    soaking: bool,
     did: &str,
 ) -> String {
+    let soaking_head = match (soaking, cutoff, head) {
+        (true, Some(c), Some(h)) => Some(soaking_label(c, h)),
+        _ => None,
+    };
     let inst = installed.map(identity_version);
     let cut = cutoff.map(identity_version);
     let hd = head.map(identity_version);
     let (inst, cut, hd) = (inst.as_deref(), cut.as_deref(), hd.as_deref());
     let why = match action {
-        DesiredAction::NoOpAlreadySoaked => format!(
-            "up to date (soaked); installed {} matches cutoff; {did}",
-            inst.unwrap_or("?")
-        ),
+        DesiredAction::NoOpAlreadySoaked => match soaking_head {
+            Some(label) => format!(
+                "up to date (soaked); installed {} matches cutoff; HEAD {label} still soaking; {did}",
+                inst.unwrap_or("?")
+            ),
+            None => format!(
+                "up to date (soaked); installed {} matches cutoff; {did}",
+                inst.unwrap_or("?")
+            ),
+        },
         DesiredAction::InstallCutoff if latest_redefined(inst, cut) => {
             format!("installed :latest definition differs from cutoff; reinstalling; {did}")
         }
@@ -155,8 +188,13 @@ pub fn counts_line(c: &Counts) -> String {
     } else {
         "upgraded"
     };
+    let soaking = if c.soaking > 0 {
+        format!(", soaking {}", c.soaking)
+    } else {
+        String::new()
+    };
     let mut line = format!(
-        "{verb} {}, already soaked {}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
+        "{verb} {}, already soaked {}{soaking}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
         c.upgraded, c.soaked, c.held, c.ahead, c.pinned, c.skipped, c.no_soak
     );
     if c.auto_updates > 0 {
@@ -177,6 +215,8 @@ pub fn origin_line(name: &str, origin: &str, hours: SoakHours, class: PkgClass) 
 pub struct Counts {
     pub upgraded: usize,
     pub soaked: usize,
+    /// At the cutoff with a newer artifact still soaking; not in `soaked`.
+    pub soaking: usize,
     pub held: usize,
     pub ahead: usize,
     pub pinned: usize,
@@ -189,9 +229,11 @@ pub struct Counts {
 }
 
 impl Counts {
-    pub fn note(&mut self, action: DesiredAction) {
+    /// `soaking` is `eligibility::newer_soaking` for this package.
+    pub fn note(&mut self, action: DesiredAction, soaking: bool) {
         match action {
             DesiredAction::InstallCutoff => self.upgraded += 1,
+            DesiredAction::NoOpAlreadySoaked if soaking => self.soaking += 1,
             DesiredAction::NoOpAlreadySoaked => self.soaked += 1,
             DesiredAction::LeaveAheadOfSoak | DesiredAction::LeaveNewerThanCutoff => {
                 self.ahead += 1
@@ -223,6 +265,57 @@ mod tests {
         assert_eq!(
             counts_line(&c),
             "upgraded 1, already soaked 0, held 0, ahead 0, pinned 0, skipped 0, no-soak 2"
+        );
+    }
+
+    #[test]
+    fn counts_line_shows_soaking_only_when_some_are() {
+        let mut c = Counts::default();
+        c.note(DesiredAction::NoOpAlreadySoaked, false);
+        c.note(DesiredAction::NoOpAlreadySoaked, true);
+        assert_eq!(
+            counts_line(&c),
+            "upgraded 0, already soaked 1, soaking 1, held 0, ahead 0, pinned 0, skipped 0, no-soak 0"
+        );
+    }
+
+    #[test]
+    fn soaking_label_names_a_new_build_of_the_same_version() {
+        let cut = formula_id("1.0.0", 0);
+        assert_eq!(soaking_label(&cut, &formula_id("1.1.0", 0)), "1.1.0");
+        assert_eq!(
+            soaking_label(&cut, &formula_id("1.0.0", 0)),
+            "a new build of 1.0.0"
+        );
+        let latest = |url: &str| {
+            PkgIdentity::Cask(crate::identity::CaskIdentity {
+                version: ":latest".into(),
+                sha256: Some(":no_check".into()),
+                url: Some(url.into()),
+            })
+        };
+        assert_eq!(
+            soaking_label(&latest("https://a/1.dmg"), &latest("https://a/2.dmg")),
+            "a new :latest definition"
+        );
+    }
+
+    #[test]
+    fn evaluate_line_names_the_soaking_head() {
+        let cut = formula_id("14.0.0", 0);
+        let head = formula_id("15.0.0", 0);
+        let line = evaluate_line(
+            "cats",
+            DesiredAction::NoOpAlreadySoaked,
+            Some(&cut),
+            Some(&cut),
+            Some(&head),
+            true,
+            "left unchanged",
+        );
+        assert_eq!(
+            line,
+            "cats: up to date (soaked); installed 14.0.0 matches cutoff; HEAD 15.0.0 still soaking; left unchanged"
         );
     }
 
@@ -284,6 +377,7 @@ mod tests {
             None,
             Some(&cut),
             None,
+            false,
             "installing cutoff",
         );
         assert_eq!(
@@ -312,6 +406,7 @@ mod tests {
             Some(&inst),
             Some(&cut),
             None,
+            false,
             "installing cutoff",
         );
         assert_eq!(

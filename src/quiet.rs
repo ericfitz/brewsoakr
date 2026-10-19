@@ -205,7 +205,11 @@ impl Filter {
         if was_expecting_reinstall && t.trim_start().starts_with("brew reinstall ") {
             return None;
         }
-        if is_already_up_to_date(t) || is_outdated_preamble(t) {
+        if is_already_up_to_date(t)
+            || is_already_current(t)
+            || is_outdated_preamble(t)
+            || is_outdated_advice(t)
+        {
             return None;
         }
         if let Some(rest) = t.strip_prefix(CHECK) {
@@ -234,7 +238,12 @@ impl Filter {
             });
             return None;
         }
-        if rest.starts_with("Would ") {
+        // `brew update`'s list of what is outdated at HEAD. brewsoak upgrades
+        // to the cutoff, not HEAD, so the list contradicts it; drop it.
+        if rest.starts_with("Would ")
+            || rest.starts_with("Outdated Formulae")
+            || rest.starts_with("Outdated Casks")
+        {
             self.state = Some(State::SkipList);
             return None;
         }
@@ -330,6 +339,24 @@ const BEER: &str = "\u{1f37a}";
 /// brewsoak prints its own header for the same thing.
 fn is_outdated_preamble(t: &str) -> bool {
     t.contains("is already installed but outdated")
+}
+
+/// The advice `brew update` prints under its outdated list:
+/// `You have 2 outdated formulae installed.` /
+/// `You can upgrade them with brew upgrade` / `or list them with brew outdated.`
+fn is_outdated_advice(t: &str) -> bool {
+    (t.starts_with("You have ") && t.contains(" outdated ") && t.ends_with(" installed."))
+        || (t.starts_with("You can upgrade ") && t.ends_with(" with brew upgrade"))
+        || (t.starts_with("or list ") && t.ends_with(" with brew outdated."))
+}
+
+/// `Warning: user/tap/x 1.0.0 already installed`: newer brew's no-op answer
+/// to `brew upgrade` of a package that is already current. Exactly a token
+/// and a version before the phrase, so other warnings still show.
+fn is_already_current(t: &str) -> bool {
+    t.strip_prefix("Warning: ")
+        .and_then(|rest| rest.strip_suffix(" already installed"))
+        .is_some_and(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
 }
 
 fn is_already_up_to_date(t: &str) -> bool {
@@ -644,6 +671,60 @@ To install completions, run:
         let (_, f) = run(input);
         let text = f.caveat_report().join("\n");
         assert!(text.contains("To install completions"), "{text}");
+    }
+
+    #[test]
+    fn brew_update_outdated_list_and_advice_are_dropped() {
+        let input = "\
+Updated 2 taps (endava/tap and homebrew/cask).
+==> New Casks
+rew: Record, visualise and measure audio
+==> Outdated Formulae
+cats
+certifi
+==> Outdated Casks
+some-app
+
+You have 2 outdated formulae and 1 outdated cask installed.
+You can upgrade them with brew upgrade
+or list them with brew outdated.
+The 7.0.10 changelog can be found at:
+";
+        let (out, _) = run(input);
+        assert_eq!(
+            out,
+            vec![
+                "Updated 2 taps (endava/tap and homebrew/cask).",
+                "New Casks",
+                "rew: Record, visualise and measure audio",
+                "The 7.0.10 changelog can be found at:",
+            ]
+        );
+    }
+
+    #[test]
+    fn already_installed_no_op_warnings_are_dropped() {
+        let input = "\
+Warning: ericfitz/tap/agentbus 1.14.3 already installed
+Warning: python@3.15 3.15.0 already installed
+Warning: libx11 1.8.14 is already installed and up-to-date.
+Warning: foo is already installed but is not linked
+Warning: something else already installed elsewhere
+";
+        let (out, _) = run(input);
+        assert_eq!(
+            out,
+            vec![
+                "Warning: foo is already installed but is not linked",
+                "Warning: something else already installed elsewhere",
+            ]
+        );
+    }
+
+    #[test]
+    fn outdated_list_never_swallows_a_warning() {
+        let (out, _) = run("==> Outdated Formulae\ncats\nWarning: something\n");
+        assert_eq!(out, vec!["Warning: something"]);
     }
 
     #[test]

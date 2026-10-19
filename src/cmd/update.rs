@@ -18,12 +18,14 @@ use crate::snapshot::{self, Snapshots};
 use std::io::Write;
 use std::path::Path;
 
+/// name, action, installed, cutoff, HEAD, and `ResolvedView::newer_soaking`.
 pub(super) type Classified = (
     String,
     DesiredAction,
     Option<PkgIdentity>,
     Option<PkgIdentity>,
     Option<PkgIdentity>,
+    bool,
 );
 
 pub(super) fn classify_installed(
@@ -51,12 +53,14 @@ pub(super) fn classify_installed(
         };
         // `brew update` has no greedy mode; the summary reads like a bare run.
         view.action = bare_action(&view, flags::Greedy::default());
+        let soaking = view.newer_soaking();
         out.push((
             pkg.name.clone(),
             view.action,
             view.installed,
             view.cutoff,
             view.head,
+            soaking,
         ));
     }
     Ok(out)
@@ -76,17 +80,20 @@ pub(super) fn write_update_summary(
     let after = classify_installed(brew, git, cache, snaps, inv)?;
     let before_map: std::collections::HashMap<_, _> = before
         .iter()
-        .map(|(n, a, _, _, _)| (n.as_str(), *a))
+        .map(|(n, a, _, _, _, soaking)| (n.as_str(), (*a, *soaking)))
         .collect();
     let mut eligible = Vec::new();
     let mut soaking = Vec::new();
     let mut gone = Vec::new();
-    for (name, action, inst, cut, head) in &after {
+    for (name, action, inst, cut, head, newer_soaking) in &after {
         if verbose {
             let did = match action {
                 DesiredAction::InstallCutoff => "eligible after this update",
                 DesiredAction::RefuseTooNew => "still soaking",
                 DesiredAction::RefuseYanked => "gone at HEAD",
+                DesiredAction::NoOpAlreadySoaked if *newer_soaking => {
+                    "already at cutoff; newer still soaking"
+                }
                 DesiredAction::NoOpAlreadySoaked => "already at cutoff",
                 DesiredAction::LeaveAheadOfSoak => "ahead of soak",
                 DesiredAction::LeaveNewerThanCutoff => "newer than cutoff",
@@ -103,6 +110,7 @@ pub(super) fn write_update_summary(
                     inst.as_ref(),
                     cut.as_ref(),
                     head.as_ref(),
+                    *newer_soaking,
                     did
                 )
             )?;
@@ -110,11 +118,20 @@ pub(super) fn write_update_summary(
         match action {
             DesiredAction::InstallCutoff => {
                 let was = before_map.get(name.as_str());
-                if was.is_none() || matches!(was, Some(DesiredAction::RefuseTooNew)) {
+                // Newly eligible: unknown before, too new, or at the cutoff
+                // while this version soaked.
+                if was.is_none()
+                    || matches!(
+                        was,
+                        Some((DesiredAction::RefuseTooNew, _))
+                            | Some((DesiredAction::NoOpAlreadySoaked, true))
+                    )
+                {
                     eligible.push(name.clone());
                 }
             }
             DesiredAction::RefuseTooNew => soaking.push(name.clone()),
+            DesiredAction::NoOpAlreadySoaked if *newer_soaking => soaking.push(name.clone()),
             DesiredAction::RefuseYanked => gone.push(name.clone()),
             DesiredAction::NoOpAlreadySoaked
             | DesiredAction::LeaveAheadOfSoak
@@ -259,6 +276,81 @@ mod tests {
                     committer_time: now - Duration::hours(30),
                 },
             ],
+        }
+    }
+
+    #[test]
+    fn update_summary_lists_a_package_whose_newer_version_is_soaking() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let inv = inv_from(&brew, &cfg24());
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        write_update_summary(
+            &brew,
+            &git,
+            cache.path(),
+            &core_snaps(),
+            &inv,
+            &[],
+            false,
+            &mut out,
+        )
+        .expect("summary");
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("==> Still soaking\nwget\n"), "{text}");
+    }
+
+    #[test]
+    fn update_summary_says_a_soaked_newer_version_became_eligible() {
+        let wget_old = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_new.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_old)],
+            ..MockBrew::new()
+        };
+        let inv = inv_from(&brew, &cfg24());
+        let cache = tempfile::tempdir().unwrap();
+        for (was_soaking, listed) in [(true, true), (false, false)] {
+            let before = vec![(
+                "wget".to_string(),
+                DesiredAction::NoOpAlreadySoaked,
+                None,
+                None,
+                None,
+                was_soaking,
+            )];
+            let mut out = Vec::new();
+            write_update_summary(
+                &brew,
+                &git,
+                cache.path(),
+                &core_snaps(),
+                &inv,
+                &before,
+                false,
+                &mut out,
+            )
+            .expect("summary");
+            let text = String::from_utf8(out).unwrap();
+            assert_eq!(
+                text.contains("==> Became eligible\nwget\n"),
+                listed,
+                "was soaking {was_soaking}: {text}"
+            );
         }
     }
 

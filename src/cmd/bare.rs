@@ -186,6 +186,7 @@ mod tests {
             warnings: Vec::new(),
             auto_updates,
             latest,
+            soaking: false,
         }
     }
 
