@@ -144,6 +144,7 @@ pub fn info(
                     view.installed.as_ref(),
                     view.cutoff.as_ref(),
                     view.head.as_ref(),
+                    view.newer_soaking(),
                     "classified for info",
                 )
             )?;
@@ -190,15 +191,27 @@ pub fn info(
             if redefined {
                 writeln!(out, "action: would reinstall (latest definition changed)")?;
             } else {
-                writeln!(out, "action: {}", report::human_action(view.action))?;
+                let soaking = view
+                    .soaking_label()
+                    .map(|label| format!("; {label} soaking"))
+                    .unwrap_or_default();
+                writeln!(
+                    out,
+                    "action: {}{soaking}",
+                    report::human_action(view.action)
+                )?;
             }
             for warn in &view.warnings {
                 writeln!(out, "warning: {warn}")?;
             }
         } else {
+            let soaking = view
+                .soaking_label()
+                .map(|label| format!("; {label} soaking"))
+                .unwrap_or_default();
             writeln!(
                 out,
-                "{}",
+                "{}{soaking}",
                 report::compact_info_line(
                     raw,
                     view.installed.as_ref(),
@@ -223,10 +236,53 @@ mod tests {
     use crate::git::InMemoryGit;
 
     use crate::cmd::test_support::{
-        cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg_from, formula_rb,
-        inv_from, local_tap_world, many_detect_world, spawns, tap_cask_world, tap_snaps, tapped,
-        unused_cache, view_world,
+        cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_pkg_from,
+        formula_rb, inv_from, local_tap_world, many_detect_world, spawns, tap_cask_world,
+        tap_snaps, tapped, unused_cache, view_world,
     };
+
+    #[test]
+    fn info_says_a_newer_version_is_soaking() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let wget_new = formula_rb("wget", "1.2.0", "newsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob("headsha", "Formula/w/wget.rb", wget_new);
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let snaps = core_snaps();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        // Named: the long form. Bare: one compact line per package.
+        for (names, want) in [
+            (
+                vec!["wget".to_string()],
+                "action: up to date (soaked); 1.2.0 soaking",
+            ),
+            (
+                Vec::new(),
+                "wget  1.1.0  up to date (soaked); 1.2.0 soaking",
+            ),
+        ] {
+            let mut out = Vec::new();
+            info(
+                &brew,
+                &git,
+                &snaps,
+                unused_cache(),
+                &inv,
+                &cfg,
+                &names,
+                &[],
+                &mut out,
+            )
+            .expect("info");
+            let text = String::from_utf8(out).expect("utf8");
+            assert!(text.contains(want), "{names:?}: {text}");
+        }
+    }
 
     #[test]
     fn info_mentions_cutoff_version_and_install_cutoff() {

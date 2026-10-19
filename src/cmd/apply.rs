@@ -70,6 +70,7 @@ pub fn reinstall(
         done: BTreeMap::new(),
         counted_deps: HashSet::new(),
         deferred: Vec::new(),
+        soaking: Vec::new(),
         nosoak: Vec::new(),
         origins: OriginRecords::load(cache),
         plan_total,
@@ -208,6 +209,7 @@ pub(super) fn apply_many(
         done: BTreeMap::new(),
         counted_deps: HashSet::new(),
         deferred: Vec::new(),
+        soaking: Vec::new(),
         nosoak: Vec::new(),
         origins: OriginRecords::load(cache),
         plan_total,
@@ -282,6 +284,9 @@ pub(super) struct ApplySession<'a, B, G, W> {
     /// Holds, skips, and warnings, printed as one block at the end so they
     /// are not lost in the middle of the install scroll.
     deferred: Vec<String>,
+    /// `name version` of each package a bare run left at its cutoff while a
+    /// newer artifact soaks; one note names them all.
+    soaking: Vec<String>,
     /// No-soak packages collected for the single brew step after soaked work.
     nosoak: Vec<nosoak::Target>,
     /// Where each tap-staged keg came from; saved after every real install.
@@ -379,6 +384,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// went for anyone who wants the detail we filtered out.
     fn write_tail(&mut self) -> Result<(), Error> {
         writeln!(self.out, "{}", report::counts_line(&self.counts))?;
+        if !self.soaking.is_empty() {
+            let names = self.soaking.join(", ");
+            self.deferred
+                .insert(0, format!("still soaking (left at the cutoff): {names}"));
+        }
         let report = self.brew.session_report();
         if report.added_bytes > 0 || report.freed_bytes > 0 {
             writeln!(
@@ -613,11 +623,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     view.installed.as_ref(),
                     view.cutoff.as_ref(),
                     view.head.as_ref(),
+                    view.newer_soaking(),
                     did,
                 )
             )?;
         }
-        self.counts.note(view.action);
+        self.counts.note(view.action, view.newer_soaking());
         let token = nosoak::brew_token(&r.origin, &name);
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
@@ -627,6 +638,16 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 if leaves_latest {
                     // brew would reinstall it under --greedy; say why we did not.
                     self.defer(latest_note(&name));
+                }
+                // brew calls it outdated; say why nothing was installed.
+                if let Some(label) = view.soaking_label() {
+                    if self.bare_run {
+                        self.soaking.push(format!("{name} {label}"));
+                    } else {
+                        let (installed_ver, _) = view_versions(&view);
+                        let hours = self.cfg.effective_hours(&r.origin);
+                        self.defer(report::soaking_note(&name, &installed_ver, &label, hours));
+                    }
                 }
             }
             // Silent, as brew is: the app updates itself. `-v` shows the line.

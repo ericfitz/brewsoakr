@@ -94,6 +94,25 @@ pub(super) struct ResolvedView {
     /// HEAD: the cutoff is what brewsoak would install, and a cask whose
     /// cutoff moved from `:latest` to a number soaks like any other.
     pub(super) latest: bool,
+    /// At the cutoff, with a newer HEAD artifact still inside the soak window
+    /// (`eligibility::newer_soaking`). Read it through `newer_soaking()`.
+    pub(super) soaking: bool,
+}
+
+impl ResolvedView {
+    /// Still at the cutoff with a newer artifact soaking, after any later
+    /// re-classification of the action.
+    pub(super) fn newer_soaking(&self) -> bool {
+        self.soaking && self.action == DesiredAction::NoOpAlreadySoaked
+    }
+
+    /// What is soaking, when `newer_soaking()`.
+    pub(super) fn soaking_label(&self) -> Option<String> {
+        match (self.newer_soaking(), &self.cutoff, &self.head) {
+            (true, Some(c), Some(h)) => Some(report::soaking_label(c, h)),
+            _ => None,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -312,6 +331,7 @@ pub(super) fn resolve_view_unordered(
     let auto_updates =
         kind == PkgKind::Cask && head_rb.is_some_and(|rb| identity::cask_auto_updates(rb, host));
     let latest = cutoff.as_ref().is_some_and(PkgIdentity::is_latest_cask);
+    let soaking = eligibility::newer_soaking(status, action, cutoff.as_ref(), head.as_ref());
     Ok(Some(ResolvedView {
         installed,
         cutoff,
@@ -321,6 +341,7 @@ pub(super) fn resolve_view_unordered(
         warnings,
         auto_updates,
         latest,
+        soaking,
     }))
 }
 
@@ -601,6 +622,7 @@ mod tests {
             warnings: Vec::new(),
             auto_updates: false,
             latest: false,
+            soaking: false,
         }
     }
 
