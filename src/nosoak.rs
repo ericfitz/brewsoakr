@@ -183,6 +183,7 @@ pub fn run_step(
     let dry_run = is_dry_run(&flags);
     let ctx = quiet::RunContext {
         mode: quiet::RunMode::NoSoak,
+        ..quiet::RunContext::default()
     };
     let mut section = Section::new(&mut *out, nosoak_header(verb_kind, dry_run));
     // Everything brew said across the section's runs, for the per-package verdicts.
@@ -824,7 +825,8 @@ mod tests {
         assert_eq!(
             ctx,
             Some(quiet::RunContext {
-                mode: quiet::RunMode::NoSoak
+                mode: quiet::RunMode::NoSoak,
+                ..quiet::RunContext::default()
             })
         );
     }
@@ -959,6 +961,7 @@ mod tests {
         let mut f = quiet::Filter::new();
         f.start_run(&quiet::RunContext {
             mode: quiet::RunMode::NoSoak,
+            ..quiet::RunContext::default()
         });
         let mut out = Vec::new();
         {

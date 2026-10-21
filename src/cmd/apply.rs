@@ -753,7 +753,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let install_flags = self.staged_install_flags();
         let args = tap::brew_install_args(&pkg, &path, &install_flags);
         self.note_dropped_flags("install", &install_flags, "staged installs");
-        match self.record_staged_install(origin_tap, name, kind, &args)? {
+        let installing = view.cutoff.as_ref().map(report::identity_version);
+        match self.record_staged_install(origin_tap, name, kind, installing, &args)? {
             StagedRun::Ran { failed } => {
                 // Counted as upgraded when it was announced; brew failed.
                 if failed {
@@ -872,7 +873,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let args = tap::brew_install_args(&pkg, &path, &install_flags);
         // A dep that brew cannot load is held by name; the target is still
         // attempted and brew reports the missing dependency.
-        match self.record_staged_install(dep_origin, dep, kind, &args)? {
+        let installing = want.as_ref().map(report::identity_version);
+        match self.record_staged_install(dep_origin, dep, kind, installing, &args)? {
             StagedRun::Ran { failed } => {
                 if failed && counted_here && self.counted_deps.remove(dep) {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
@@ -1051,9 +1053,19 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         origin_tap: &str,
         name: &str,
         kind: PkgKind,
+        installing: Option<String>,
         args: &[String],
     ) -> Result<StagedRun, Error> {
-        let output = self.brew.run_visible(args, &mut self.out)?;
+        // The version being installed is on purpose; brew's "newer version is
+        // available" warning about it is noise.
+        let ctx = quiet::RunContext {
+            expected: installing
+                .into_iter()
+                .map(|v| (name.to_ascii_lowercase(), v))
+                .collect(),
+            ..quiet::RunContext::default()
+        };
+        let output = self.brew.run_visible_in(args, &mut self.out, &ctx)?;
         let text = String::from_utf8_lossy(&output.stdout);
         if !output.status.success() && !origin::is_core_or_cask(origin_tap) {
             if let Some(tap) = taps::untrusted_tap(&text) {
@@ -1788,6 +1800,28 @@ mod tests {
             text.contains("upgrading node 26.10.0_1 -> 26.10.0_2"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn soaked_install_tells_the_filter_which_version_it_installs() {
+        let rb = |rev: u32, sha: &str| {
+            format!(
+                "class X < Formula\n  url \"https://example.com/node-26.10.0.tar.gz\"\n  sha256 \"{sha}\"\n  revision {rev}\nend\n"
+            )
+        };
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/n/node.rb", rb(2, "midsha"));
+        git.insert_blob("headsha", "Formula/n/node.rb", rb(2, "midsha"));
+        let brew = MockBrew {
+            installed: vec![formula_pkg("node", rb(1, "oldsha"))],
+            ..MockBrew::new()
+        };
+        let text = upgrade_names(&brew, &git, &["node".to_string()]);
+        assert!(text.contains("-> 26.10.0_2"), "{text}");
+        let ctx = brew.last_ctx.lock().unwrap().clone().expect("a brew run");
+        let want: std::collections::BTreeMap<String, String> =
+            [("node".to_string(), "26.10.0_2".to_string())].into();
+        assert_eq!(ctx.expected, want);
     }
 
     #[test]

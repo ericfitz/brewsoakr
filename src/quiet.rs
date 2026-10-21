@@ -73,12 +73,16 @@ pub enum RunMode {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunContext {
     pub mode: RunMode,
+    /// Soaked: package (lowercase, no tap prefix) -> the version this run
+    /// installs, so brew's "newer version is available" warning for it can go.
+    pub expected: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Default)]
 pub struct Filter {
     state: Option<State>,
     mode: RunMode,
+    expected: BTreeMap<String, String>,
     /// No-soak: package named by `==> Upgrading x` whose `upgrading` line is
     /// not shown yet (a cask has no version line to complete it).
     pending_upgrade: Option<String>,
@@ -110,6 +114,7 @@ impl Filter {
     pub fn start_run(&mut self, ctx: &RunContext) {
         self.state = Some(State::Normal);
         self.mode = ctx.mode;
+        self.expected = ctx.expected.clone();
         self.pending_upgrade = None;
         self.expect_version_line = false;
         self.expect_reinstall_cmd = false;
@@ -287,6 +292,9 @@ impl Filter {
         ) {
             return None;
         }
+        if self.is_expected_more_recent(t) {
+            return None;
+        }
         if is_already_up_to_date(t)
             || is_already_current(t)
             || is_outdated_preamble(t)
@@ -304,6 +312,17 @@ impl Filter {
             return Some(t.to_string());
         };
         self.section_line(rest)
+    }
+
+    /// `Warning: cats 15.0.3 is available and more recent than version
+    /// 15.0.0.` about the very version this run installs: brewsoak chose that
+    /// version on purpose. Any other package or version still shows.
+    fn is_expected_more_recent(&self, t: &str) -> bool {
+        let Some((token, installing)) = more_recent_warning(t) else {
+            return false;
+        };
+        let name = token.rsplit('/').next().unwrap_or(token).to_lowercase();
+        self.expected.get(&name).is_some_and(|v| v == installing)
     }
 
     fn section_line(&mut self, rest: &str) -> Option<String> {
@@ -498,6 +517,19 @@ fn is_outdated_advice(t: &str) -> bool {
         || (t.starts_with("or list ") && t.ends_with(" with brew outdated."))
 }
 
+/// The `<token>` and `<c>` of `Warning: <token> <v> is available and more
+/// recent than version <c>.`; nothing else matches.
+fn more_recent_warning(t: &str) -> Option<(&str, &str)> {
+    let rest = t.strip_prefix("Warning: ")?.strip_suffix('.')?;
+    let (head, installing) = rest.split_once(" is available and more recent than version ")?;
+    let mut words = head.split(' ');
+    let (token, newer, None) = (words.next()?, words.next()?, words.next()) else {
+        return None;
+    };
+    let plain = |w: &str| !w.is_empty() && !w.contains(char::is_whitespace);
+    (plain(token) && plain(newer) && plain(installing)).then_some((token, installing))
+}
+
 /// `Warning: user/tap/x 1.0.0 already installed`: newer brew's no-op answer
 /// to `brew upgrade` of a package that is already current. Exactly a token
 /// and a version before the phrase, so other warnings still show.
@@ -689,10 +721,75 @@ mod tests {
         (out, f)
     }
 
+    fn run_expecting(input: &str, expected: &[(&str, &str)]) -> Vec<String> {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            expected: expected
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            ..RunContext::default()
+        });
+        input.lines().filter_map(|l| f.line(l)).collect()
+    }
+
+    const CATS_WARNING: &str =
+        "Warning: cats 15.0.3 is available and more recent than version 15.0.0.";
+
+    #[test]
+    fn drops_more_recent_for_expected_version() {
+        assert!(run_expecting(CATS_WARNING, &[("cats", "15.0.0")]).is_empty());
+    }
+
+    #[test]
+    fn keeps_more_recent_for_dependency() {
+        let line = "Warning: ca-certificates 2026.10.19 is available and more recent than version 2026.10.18.";
+        assert_eq!(run_expecting(line, &[("cats", "15.0.0")]), vec![line]);
+    }
+
+    #[test]
+    fn keeps_more_recent_when_version_differs() {
+        assert_eq!(
+            run_expecting(CATS_WARNING, &[("cats", "14.0.0")]),
+            vec![CATS_WARNING]
+        );
+    }
+
+    #[test]
+    fn drops_more_recent_with_tap_prefix_match() {
+        // The tap-qualified token still names the expected package: dropped.
+        let line =
+            "Warning: endava/tap/Cats 15.0.3 is available and more recent than version 15.0.0.";
+        assert!(run_expecting(line, &[("cats", "15.0.0")]).is_empty());
+    }
+
+    #[test]
+    fn keeps_more_recent_with_different_wording() {
+        for line in [
+            "Warning: cats 15.0.3 is available and more recent than version 15.0.0",
+            "Warning: cats 15.0.3 is available and newer than version 15.0.0.",
+            "Warning: cats 15.0.3 is available and more recent than version 15.0.0. Extra",
+            "Warning: cats is available and more recent than version 15.0.0.",
+            "Warning: cats 15.0.3 is available and more recent than version 15.0.0.0.",
+        ] {
+            assert_eq!(
+                run_expecting(line, &[("cats", "15.0.0")]),
+                vec![line],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_recent_is_kept_without_an_expected_version() {
+        assert_eq!(run(CATS_WARNING).0, vec![CATS_WARNING]);
+    }
+
     fn run_nosoak(input: &str) -> Vec<String> {
         let mut f = Filter::new();
         f.start_run(&RunContext {
             mode: RunMode::NoSoak,
+            ..RunContext::default()
         });
         input.lines().filter_map(|l| f.line(l)).collect()
     }
@@ -778,6 +875,7 @@ mod tests {
         let mut f = Filter::new();
         f.start_run(&RunContext {
             mode: RunMode::NoSoak,
+            ..RunContext::default()
         });
         assert_eq!(f.line("==> Upgrading foo"), None);
         assert_eq!(f.finish_run().as_deref(), Some("upgrading foo"));
