@@ -326,7 +326,11 @@ impl Filter {
         let Some((token, installing)) = more_recent_warning(t) else {
             return false;
         };
-        let name = token.rsplit('/').next().unwrap_or(token).to_lowercase();
+        let name = token
+            .rsplit('/')
+            .next()
+            .unwrap_or(token)
+            .to_ascii_lowercase();
         self.expected.get(&name).is_some_and(|v| v == installing)
     }
 
