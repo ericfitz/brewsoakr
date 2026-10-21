@@ -19,6 +19,7 @@ pub mod prune;
 pub mod quiet;
 pub mod report;
 pub mod resolve;
+pub mod section;
 pub mod settings;
 pub mod snapshot;
 pub mod tap;
@@ -760,8 +761,8 @@ mod tests {
         let (result, out) = dispatch_captured(&s(&["update"]), &world);
         assert!(matches!(result, Ok(Dispatch::Exit(0))), "{result:?}");
         let text = String::from_utf8(out).unwrap();
-        let before = text.find("no-soak packages installed; updating brew\n");
-        let brew_line = text.find("\nupdate\n");
+        let before = text.find("Updating Homebrew\n");
+        let brew_line = text.find("\n  update\n");
         let after = text.find("snapshots refreshed\n");
         assert!(
             matches!((before, brew_line, after), (Some(a), Some(b), Some(c)) if a < b && b < c),

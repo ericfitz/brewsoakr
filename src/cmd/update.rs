@@ -14,6 +14,7 @@ use crate::inventory::Inventory;
 use crate::lock::RunLock;
 use crate::prune;
 use crate::report::{self};
+use crate::section::Section;
 use crate::snapshot::{self, Snapshots};
 use std::io::Write;
 use std::path::Path;
@@ -226,8 +227,10 @@ pub fn update(
     prefetch_installed(git, cache, inv, &snaps);
     write_update_summary(brew, git, cache, &snaps, inv, &before, verbose, out)?;
     if inv.any_no_soak() {
-        writeln!(out, "no-soak packages installed; updating brew")?;
-        let output = brew.run_visible(&["update".to_string()], &mut *out)?;
+        let mut updating = Section::new(&mut *out, "Updating Homebrew");
+        updating.open()?;
+        let output = brew.run_visible(&["update".to_string()], &mut updating)?;
+        drop(updating);
         write_session_tail(&brew.session_report(), out)?;
         if !output.status.success() {
             let status = output.status.code().unwrap_or(1);
@@ -377,7 +380,7 @@ mod tests {
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("thirtyh"), "{text}");
         assert!(text.contains("headsha"), "{text}");
-        assert!(text.contains("fetching Homebrew/homebrew-core"), "{text}");
+        assert!(text.contains("\n  Homebrew/homebrew-core\n"), "{text}");
         assert!(text.contains("soak window 24h"), "{text}");
         assert!(
             dir.path().join("state.toml").is_file(),
@@ -444,7 +447,11 @@ mod tests {
             .filter(|a| a == &&vec!["update".to_string()])
             .count();
         assert_eq!(updates, 1);
-        assert!(String::from_utf8(out).unwrap().contains("updating brew"));
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Updating Homebrew\n")
+        );
     }
 
     #[test]

@@ -74,6 +74,7 @@ use crate::flags::{dropped_note, filter_for_verb, is_dry_run};
 use crate::origin;
 use crate::quiet;
 use crate::resolve::PkgKind;
+use crate::section::Section;
 use crate::tap::is_stripped_flag;
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -150,8 +151,10 @@ pub fn run_step(
         .collect();
     let token_of = |t: &Target| brew_token(&t.origin, &t.name);
 
-    writeln!(out, "no-soak: updating brew")?;
-    let update = brew.run_visible(&["update".to_string()], &mut *out)?;
+    let mut updating = Section::new(&mut *out, "Updating Homebrew");
+    updating.open()?;
+    let update = brew.run_visible(&["update".to_string()], &mut updating)?;
+    drop(updating);
     if !update.status.success() {
         let code = update.status.code().unwrap_or(1);
         result.notes.push(format!(
@@ -397,7 +400,7 @@ mod tests {
         assert!(
             String::from_utf8(out)
                 .unwrap()
-                .contains("no-soak: updating brew")
+                .contains("Updating Homebrew\n")
         );
     }
 

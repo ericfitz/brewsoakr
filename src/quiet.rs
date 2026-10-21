@@ -205,6 +205,13 @@ impl Filter {
         if was_expecting_reinstall && t.trim_start().starts_with("brew reinstall ") {
             return None;
         }
+        // brewsoak prints its own "Updating Homebrew" header.
+        if matches!(
+            t.trim(),
+            "==> Updating Homebrew..." | "Updating Homebrew..."
+        ) {
+            return None;
+        }
         if is_already_up_to_date(t)
             || is_already_current(t)
             || is_outdated_preamble(t)
@@ -534,6 +541,12 @@ mod tests {
         f.start_run();
         let out = input.lines().filter_map(|l| f.line(l)).collect();
         (out, f)
+    }
+
+    #[test]
+    fn drops_updating_homebrew_banner() {
+        let (out, _) = run("==> Updating Homebrew...\nAlready up-to-date.\n");
+        assert_eq!(out, vec!["Already up-to-date.".to_string()]);
     }
 
     #[test]

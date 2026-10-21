@@ -1,6 +1,7 @@
 use crate::git::{GitStore, REF_CUTOFF, REF_HEAD};
 use crate::github::{GithubApi, cutoff_instant};
 use crate::lock::RunLock;
+use crate::section::Section;
 use crate::taps;
 use crate::{Error, SoakHours};
 use std::collections::BTreeMap;
@@ -149,7 +150,8 @@ pub fn refresh_with(
     progress: &mut impl Write,
 ) -> Result<Snapshots, Error> {
     std::fs::create_dir_all(cache)?;
-    writeln!(progress, "fetching {CORE_REPO}…")?;
+    let mut fetching = Section::new(&mut *progress, "Fetching Homebrew history");
+    writeln!(fetching, "{CORE_REPO}")?;
     let core = refresh_core_tap(
         git,
         gh,
@@ -158,7 +160,7 @@ pub fn refresh_with(
         CORE_REPO,
         cutoff_instant(now, plan.core_hours),
     )?;
-    writeln!(progress, "fetching {CASK_REPO}…")?;
+    writeln!(fetching, "{CASK_REPO}")?;
     let cask = refresh_core_tap(
         git,
         gh,
@@ -167,6 +169,7 @@ pub fn refresh_with(
         CASK_REPO,
         cutoff_instant(now, plan.cask_hours),
     )?;
+    drop(fetching);
     let mut snaps = Snapshots {
         core,
         cask,
@@ -209,9 +212,10 @@ pub fn refresh_taps(
     now: OffsetDateTime,
     progress: &mut impl Write,
 ) -> Result<(), Error> {
+    let mut fetching = Section::new(&mut *progress, "Fetching tap history");
     for tap in taps {
         let name = tap.name.to_ascii_lowercase();
-        writeln!(progress, "fetching {name}…")?;
+        writeln!(fetching, "{name}")?;
         match refresh_tap(git, cache, tap, now) {
             Ok(state) => {
                 snaps.held_taps.remove(&name);
@@ -692,8 +696,66 @@ mod tests {
         let held = snaps.held_taps.get("hashicorp/tap").expect("held");
         assert!(held.contains("fetching history"), "{held}");
         let text = String::from_utf8(progress).unwrap();
-        assert!(text.contains("fetching hashicorp/tap"), "{text}");
-        assert!(text.contains("fetching cyclonedx/cyclonedx"), "{text}");
+        assert!(text.contains("\n  hashicorp/tap\n"), "{text}");
+        assert!(text.contains("\n  cyclonedx/cyclonedx\n"), "{text}");
+    }
+
+    #[test]
+    fn fetch_sections_have_headers() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let plan = RefreshPlan {
+            taps: vec![
+                tap_plan(
+                    "hashicorp/tap",
+                    "https://github.com/hashicorp/homebrew-tap",
+                    72,
+                ),
+                tap_plan(
+                    "cyclonedx/cyclonedx",
+                    "https://github.com/cyclonedx/homebrew-cyclonedx",
+                    24,
+                ),
+            ],
+            ..RefreshPlan::uniform(SoakHours::new(24).unwrap())
+        };
+        let mut progress = Vec::new();
+        refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &plan,
+            now(),
+            &mut progress,
+        )
+        .expect("refresh");
+        assert_eq!(
+            String::from_utf8(progress).unwrap(),
+            "Fetching Homebrew history\n  Homebrew/homebrew-core\n  Homebrew/homebrew-cask\n\
+             Fetching tap history\n  hashicorp/tap\n  cyclonedx/cyclonedx\n"
+        );
+    }
+
+    #[test]
+    fn no_taps_no_tap_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = tap_git(now());
+        let mut progress = Vec::new();
+        refresh_with(
+            &RunLock::for_tests(),
+            &git,
+            &fixture_gh(),
+            dir.path(),
+            &RefreshPlan::uniform(SoakHours::new(24).unwrap()),
+            now(),
+            &mut progress,
+        )
+        .expect("refresh");
+        assert_eq!(
+            String::from_utf8(progress).unwrap(),
+            "Fetching Homebrew history\n  Homebrew/homebrew-core\n  Homebrew/homebrew-cask\n"
+        );
     }
 
     /// `StaticGithub` whose commit lookups for `fail_repo` fail, like an
