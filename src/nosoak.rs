@@ -380,12 +380,24 @@ enum Verdict {
     NoResult,
 }
 
+/// brew's cask summary, `<badge>  <token> was successfully upgraded!` (or
+/// `installed`; Homebrew's `Cask::Installer#summary`), when it names the
+/// target. Casks pour no keg, so this line is their proof of a finished
+/// install in a run that failed on another package. `l` is lowercase.
+fn cask_success_for(l: &str, is_me: impl Fn(&str) -> bool) -> bool {
+    let Some((head, tail)) = l.trim_end().split_once(" was successfully ") else {
+        return false;
+    };
+    matches!(tail, "upgraded!" | "installed!") && head.split_whitespace().last().is_some_and(is_me)
+}
+
 /// What brew's output says about one target, matching its token or its last
 /// `/` segment case-insensitively. An upgrade outranks an already-current
 /// warning. `cellar` holds the lowercase names of the kegs brew poured. A bare
 /// `name a -> b` line counts only on a dry run: in a real run it is brew's
 /// plan, and the upgrade can still fail. When the run failed (`ok` false),
-/// only a poured keg proves an upgrade: brew's plan and `==> Upgrading` lines
+/// only a poured keg or a cask's `was successfully upgraded!` line proves an
+/// upgrade: brew's plan and `==> Upgrading` lines
 /// come before the failure.
 fn verdict(said: &str, cellar: &[String], token: &str, dry_run: bool, ok: bool) -> Verdict {
     let token = token.to_ascii_lowercase();
@@ -425,10 +437,11 @@ fn verdict(said: &str, cellar: &[String], token: &str, dry_run: bool, ok: bool) 
             }
         } else if l.trim().is_empty() {
             in_would = false;
-        } else if ok
-            && !l.starts_with(' ')
-            && is_me(first)
-            && (in_would || (dry_run && l.contains(" -> ")))
+        } else if cask_success_for(l, is_me)
+            || (ok
+                && !l.starts_with(' ')
+                && is_me(first)
+                && (in_would || (dry_run && l.contains(" -> "))))
         {
             return Verdict::Upgraded;
         } else if crate::cmd::already_installed_line(l) && l.split_whitespace().any(is_me) {
@@ -988,6 +1001,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!((r.upgraded, r.current, r.no_result), (0, 0, 1));
+    }
+
+    const CASK_A_OK_FORMULA_B_FAILED: &[u8] = "\
+==> Upgrading 2 outdated packages:\n\
+cask-a 1.0 -> 2.0\n\
+formula-b 1.0 -> 2.0\n\
+==> Upgrading cask cask-a\n\
+\u{1f37a}  cask-a was successfully upgraded!\n\
+==> Upgrading formula-b\n\
+Error: formula-b: boom\n"
+        .as_bytes();
+
+    #[test]
+    fn failed_run_counts_a_cask_with_its_success_line() {
+        let brew = mock_with(vec![(0, b""), (1, CASK_A_OK_FORMULA_B_FAILED)]);
+        let mut out = Vec::new();
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[
+                t("homebrew/cask", "cask-a"),
+                t("homebrew/core", "formula-b"),
+            ],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 1));
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("formula-b\n    brew failed"), "{text}");
+        assert!(!text.contains("cask-a\n    brew failed"), "{text}");
+    }
+
+    #[test]
+    fn success_line_for_another_cask_does_not_count() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                1,
+                "\u{1f37a}  cask-a was successfully upgraded!\nError: boom\n".as_bytes(),
+            ),
+        ]);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/cask", "cask-ab")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (0, 0, 1));
+    }
+
+    #[test]
+    fn successful_cask_run_is_unchanged() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                0,
+                "==> Upgrading cask cask-a\n\u{1f37a}  cask-a was successfully upgraded!\n"
+                    .as_bytes(),
+            ),
+        ]);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/cask", "cask-a")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 0));
     }
 
     #[test]
