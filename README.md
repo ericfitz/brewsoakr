@@ -237,7 +237,7 @@ Fetching Homebrew history
 Fetching tap history
   anthropics/tap
   hashicorp/tap
-Would upgrade soaked packages (0 of 179)
+Would upgrade soaked packages (0 of 177)
 Updating Homebrew
   Already up-to-date.
 Would upgrade no-soak packages (brew decides)
@@ -291,7 +291,7 @@ by version alone.
 An `upgrade` with work to do looks like:
 
 ```
-Upgrading soaked packages (26 of 150)
+Upgrading soaked packages (26 of 153)
   [1/26] upgrading aws-c-auth 0.10.5 -> 1.0.0
     downloading aws-c-common 1.0.0
     installing aws-c-common 1.0.0
