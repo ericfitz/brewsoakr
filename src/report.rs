@@ -319,10 +319,6 @@ impl Counts {
             | DesiredAction::HoldUnordered => self.held += 1,
         }
     }
-
-    pub fn nothing_to_do(&self) -> bool {
-        self.upgraded == 0 && self.held == 0 && self.no_soak == 0
-    }
 }
 
 #[cfg(test)]

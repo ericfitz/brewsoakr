@@ -22,10 +22,6 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
     ))
 }
 
-pub fn ahead_message(name: &str) -> String {
-    format!("{name} is ahead of soak; leaving installed artifact unchanged")
-}
-
 pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
     format!(
         "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed it)"

@@ -19,7 +19,7 @@ pub use apply::reinstall;
 pub(crate) use apply::{already_installed_line, max_status, merge_status};
 pub use info::info;
 pub use install::install;
-pub use notes::{ahead_message, newer_than_cutoff_note, refusal_message};
+pub use notes::{newer_than_cutoff_note, refusal_message};
 pub use outdated::outdated;
 pub use snapshots::{ensure_snapshots, refresh_plan};
 pub use update::{prefetch_installed, update};
