@@ -1427,6 +1427,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn forward_run_flushes_a_pending_nosoak_upgrade_at_eof() {
+        let mut sink = Sink::default();
+        let mut terminal = Vec::new();
+        let ctx = quiet::RunContext {
+            mode: quiet::RunMode::NoSoak,
+            ..quiet::RunContext::default()
+        };
+        let src = std::io::Cursor::new(b"==> Upgrading foo\n".to_vec());
+        let captured = forward_run(src, &mut sink, &mut terminal, &[], false, &ctx);
+        assert_eq!(captured, b"==> Upgrading foo\n");
+        assert_eq!(String::from_utf8(terminal).unwrap(), "upgrading foo\n");
+    }
+
+    #[test]
     fn mock_outdated_names() {
         let brew = MockBrew {
             outdated: vec!["brewsoak".into()],
