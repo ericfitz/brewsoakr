@@ -76,6 +76,9 @@ pub struct RunContext {
     /// Soaked: package (lowercase, no tap prefix) -> the version this run
     /// installs, so brew's "newer version is available" warning for it can go.
     pub expected: BTreeMap<String, String>,
+    /// No-soak: the caller already printed a result line per package, so brew's
+    /// own `==> Reinstalling x` must not add a second one.
+    pub parent_announced: bool,
 }
 
 #[derive(Debug, Default)]
@@ -83,6 +86,7 @@ pub struct Filter {
     state: Option<State>,
     mode: RunMode,
     expected: BTreeMap<String, String>,
+    parent_announced: bool,
     /// No-soak: package named by `==> Upgrading x` whose `upgrading` line is
     /// not shown yet (a cask has no version line to complete it).
     pending_upgrade: Option<String>,
@@ -115,6 +119,7 @@ impl Filter {
         self.state = Some(State::Normal);
         self.mode = ctx.mode;
         self.expected = ctx.expected.clone();
+        self.parent_announced = ctx.parent_announced;
         self.pending_upgrade = None;
         self.expect_version_line = false;
         self.expect_reinstall_cmd = false;
@@ -387,6 +392,8 @@ impl Filter {
             if self.mode == RunMode::NoSoak {
                 if rest.starts_with("Upgrading ") {
                     self.pending_upgrade = Some(name.to_string());
+                } else if rest.starts_with("Reinstalling ") && self.parent_announced {
+                    // The caller's own line already stands for this package.
                 } else {
                     let verb = if rest.starts_with("Installing ") {
                         "installing"
@@ -881,6 +888,22 @@ mod tests {
         f.start_run(&RunContext::default());
         f.line("==> Upgrading foo");
         assert_eq!(f.finish_run(), None, "soaked runs print their own line");
+    }
+
+    #[test]
+    fn announced_parent_suppresses_the_reinstalling_line_only() {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::NoSoak,
+            parent_announced: true,
+            ..RunContext::default()
+        });
+        let out: Vec<String> =
+            "==> Reinstalling tree\n==> Pouring tree--2.1.arm64_sequoia.bottle.tar.gz\n"
+                .lines()
+                .filter_map(|l| f.line(l))
+                .collect();
+        assert_eq!(out, vec!["  installing tree 2.1"]);
     }
 
     #[test]

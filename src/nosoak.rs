@@ -263,7 +263,12 @@ pub fn run_step(
                 token_of(t)
             )?;
         }
-        let output = brew.run_visible_in(&args, &mut section, &ctx)?;
+        // The "reinstalling X (moving ...)" line above is this package's line.
+        let switch_ctx = quiet::RunContext {
+            parent_announced: true,
+            ..ctx.clone()
+        };
+        let output = brew.run_visible_in(&args, &mut section, &switch_ctx)?;
         runs.push(RunSaid::new(&switch, &output));
         // Only Cellar lines are evidence of a written keg; casks have none, so
         // for them (and formulae alike) success means exit 0 with no
@@ -602,6 +607,8 @@ mod tests {
         assert_eq!(r.status, Some(0));
         assert_eq!(r.installed.get("vault").map(String::as_str), Some("1.2.0"));
         assert!(r.notes.is_empty(), "{:?}", r.notes);
+        let ctx = brew.last_ctx.lock().unwrap().clone().unwrap();
+        assert!(ctx.parent_announced, "the switch run has its own line");
     }
 
     #[test]
