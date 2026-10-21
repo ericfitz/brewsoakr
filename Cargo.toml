@@ -1,6 +1,6 @@
 [package]
 name = "brewsoak"
-version = "1.5.2"
+version = "1.6.0"
 edition = "2024"
 rust-version = "1.89"
 description = "Homebrew wrapper that soaks formula and cask updates"
