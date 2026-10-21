@@ -2,6 +2,7 @@ use crate::SoakHours;
 use crate::eligibility::DesiredAction;
 use crate::identity::PkgIdentity;
 use crate::inventory::PkgClass;
+use crate::quiet;
 use crate::snapshot::TapSnapshot;
 use time::OffsetDateTime;
 
@@ -182,25 +183,94 @@ pub fn evaluate_line(
     format!("{name}: {why}")
 }
 
-pub fn counts_line(c: &Counts) -> String {
-    let verb = if c.dry_run {
+/// What a run is doing to its packages; picks the section header wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verb {
+    Upgrade,
+    Install,
+    Reinstall,
+}
+
+impl Verb {
+    pub fn parse(s: &str) -> Option<Verb> {
+        match s {
+            "upgrade" => Some(Verb::Upgrade),
+            "install" => Some(Verb::Install),
+            "reinstall" => Some(Verb::Reinstall),
+            _ => None,
+        }
+    }
+
+    /// `Upgrading`, or `Would upgrade` on a dry run.
+    fn heading(self, dry_run: bool) -> &'static str {
+        match (self, dry_run) {
+            (Verb::Upgrade, false) => "Upgrading",
+            (Verb::Install, false) => "Installing",
+            (Verb::Reinstall, false) => "Reinstalling",
+            (Verb::Upgrade, true) => "Would upgrade",
+            (Verb::Install, true) => "Would install",
+            (Verb::Reinstall, true) => "Would reinstall",
+        }
+    }
+}
+
+/// `Upgrading soaked packages (2 of 179)`; the count is for a bare upgrade.
+pub fn soaked_header(verb: Verb, dry_run: bool, plan: Option<(usize, usize)>) -> String {
+    let head = verb.heading(dry_run);
+    match plan {
+        Some((n, of)) => format!("{head} soaked packages ({n} of {of})"),
+        None => format!("{head} soaked packages"),
+    }
+}
+
+pub fn nosoak_header(verb: Verb, dry_run: bool) -> String {
+    format!("{} no-soak packages (brew decides)", verb.heading(dry_run))
+}
+
+/// One `label  value` row per count, values right-aligned in one column and
+/// zero rows kept. The caller's `Section` supplies the indent.
+pub fn summary_lines(c: &Counts, added_bytes: u64, freed_bytes: u64) -> Vec<String> {
+    let upgraded = if c.dry_run {
         "would upgrade"
     } else {
         "upgraded"
     };
-    let soaking = if c.soaking > 0 {
-        format!(", soaking {}", c.soaking)
-    } else {
-        String::new()
-    };
-    let mut line = format!(
-        "{verb} {}, already soaked {}{soaking}, held {}, ahead {}, pinned {}, skipped {}, no-soak {}",
-        c.upgraded, c.soaked, c.held, c.ahead, c.pinned, c.skipped, c.no_soak
-    );
-    if c.auto_updates > 0 {
-        line.push_str(&format!(", auto-updates {}", c.auto_updates));
-    }
-    line
+    let mut rows: Vec<(&str, String)> = vec![
+        (upgraded, c.upgraded.to_string()),
+        ("already soaked", c.soaked.to_string()),
+        ("soaking", c.soaking.to_string()),
+        ("held", c.held.to_string()),
+        ("ahead", c.ahead.to_string()),
+        ("pinned", c.pinned.to_string()),
+        ("skipped", c.skipped.to_string()),
+        ("no-soak", c.no_soak.to_string()),
+        ("auto-updates", c.auto_updates.to_string()),
+        ("installed", quiet::human_size(added_bytes)),
+        ("freed", quiet::human_size(freed_bytes)),
+    ];
+    let lw = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    let vw = rows.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
+    rows.drain(..)
+        .map(|(label, value)| {
+            let mut line = format!("{label:<lw$} {value:>vw$}");
+            if label == "no-soak" && c.no_soak > 0 {
+                let did = if c.dry_run {
+                    "would upgrade"
+                } else {
+                    "upgraded"
+                };
+                line.push_str(&format!(
+                    "  ({} {did}, {} already up-to-date",
+                    c.no_soak_upgraded, c.no_soak_current
+                ));
+                if c.no_soak_no_result > 0 {
+                    line.push_str(&format!(", {} no result", c.no_soak_no_result));
+                }
+                line.push(')');
+            }
+            line
+        })
+        .collect()
 }
 
 pub fn origin_line(name: &str, origin: &str, hours: SoakHours, class: PkgClass) -> String {
@@ -222,6 +292,10 @@ pub struct Counts {
     pub pinned: usize,
     pub skipped: usize,
     pub no_soak: usize,
+    /// Of `no_soak`, how brew's single pass came out for each package.
+    pub no_soak_upgraded: usize,
+    pub no_soak_current: usize,
+    pub no_soak_no_result: usize,
     /// Self-updating casks a bare run left to the app (brew's `--greedy` skip).
     pub auto_updates: usize,
     /// A dry run: nothing was upgraded, so `upgraded` reads "would upgrade".
@@ -255,28 +329,104 @@ impl Counts {
 mod tests {
     use super::*;
 
-    #[test]
-    fn counts_line_ends_with_no_soak() {
-        let c = Counts {
-            upgraded: 1,
-            no_soak: 2,
+    fn sample_counts() -> Counts {
+        Counts {
+            upgraded: 2,
+            soaked: 162,
+            soaking: 8,
+            ahead: 1,
+            no_soak: 4,
+            no_soak_upgraded: 1,
+            no_soak_current: 3,
+            auto_updates: 2,
             ..Counts::default()
-        };
-        assert_eq!(
-            counts_line(&c),
-            "upgraded 1, already soaked 0, held 0, ahead 0, pinned 0, skipped 0, no-soak 2"
+        }
+    }
+
+    #[test]
+    fn summary_lines_table() {
+        let mb = 1024 * 1024;
+        let got = summary_lines(&sample_counts(), 31 * mb + mb / 5, 28 * mb + mb / 2);
+        let want = [
+            "upgraded            2",
+            "already soaked    162",
+            "soaking             8",
+            "held                0",
+            "ahead               1",
+            "pinned              0",
+            "skipped             0",
+            "no-soak             4  (1 upgraded, 3 already up-to-date)",
+            "auto-updates        2",
+            "installed      31.2MB",
+            "freed          28.5MB",
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn summary_no_soak_suffix_variants() {
+        let mut c = sample_counts();
+        c.no_soak_no_result = 1;
+        assert!(
+            summary_lines(&c, 0, 0)[7]
+                .ends_with("  (1 upgraded, 3 already up-to-date, 1 no result)")
+        );
+        c.dry_run = true;
+        let lines = summary_lines(&c, 0, 0);
+        assert!(lines[0].starts_with("would upgrade"), "{lines:?}");
+        assert!(lines[7].contains("(1 would upgrade, "), "{lines:?}");
+        c.no_soak = 0;
+        assert!(
+            summary_lines(&c, 0, 0)[7].ends_with("0"),
+            "no suffix at zero"
         );
     }
 
     #[test]
-    fn counts_line_shows_soaking_only_when_some_are() {
-        let mut c = Counts::default();
-        c.note(DesiredAction::NoOpAlreadySoaked, false);
-        c.note(DesiredAction::NoOpAlreadySoaked, true);
-        assert_eq!(
-            counts_line(&c),
-            "upgraded 0, already soaked 1, soaking 1, held 0, ahead 0, pinned 0, skipped 0, no-soak 0"
+    fn summary_keeps_zero_rows() {
+        let got = summary_lines(&Counts::default(), 0, 0);
+        assert_eq!(got.len(), 11, "{got:?}");
+        assert!(
+            got[9].starts_with("installed") && got[9].ends_with(" 0B"),
+            "{got:?}"
         );
+        assert!(
+            got[10].starts_with("freed") && got[10].ends_with(" 0B"),
+            "{got:?}"
+        );
+    }
+
+    #[test]
+    fn headers_by_verb() {
+        assert_eq!(
+            soaked_header(Verb::Upgrade, false, Some((2, 179))),
+            "Upgrading soaked packages (2 of 179)"
+        );
+        assert_eq!(
+            soaked_header(Verb::Install, true, None),
+            "Would install soaked packages"
+        );
+        assert_eq!(
+            soaked_header(Verb::Reinstall, false, None),
+            "Reinstalling soaked packages"
+        );
+        assert_eq!(
+            nosoak_header(Verb::Reinstall, false),
+            "Reinstalling no-soak packages (brew decides)"
+        );
+        assert_eq!(
+            nosoak_header(Verb::Upgrade, true),
+            "Would upgrade no-soak packages (brew decides)"
+        );
+    }
+
+    #[test]
+    fn verb_parse_rejects_unknown() {
+        assert_eq!(Verb::parse("upgrade"), Some(Verb::Upgrade));
+        assert_eq!(Verb::parse("install"), Some(Verb::Install));
+        assert_eq!(Verb::parse("reinstall"), Some(Verb::Reinstall));
+        assert_eq!(Verb::parse("frobnicate"), None);
+        assert_eq!(Verb::parse(""), None);
     }
 
     #[test]

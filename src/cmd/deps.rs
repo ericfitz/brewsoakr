@@ -207,6 +207,7 @@ mod tests {
     use super::*;
     use crate::SoakHours;
     use crate::brew::{InstalledPkg, MockBrew};
+    use crate::cmd::test_support::summary_has;
     use crate::flags;
     use std::collections::BTreeMap;
 
@@ -488,8 +489,11 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("held 1"), "the target is held once: {text}");
-        assert!(text.contains("upgraded 0,"), "{text}");
+        assert!(
+            summary_has(&text, "held", "1"),
+            "the target is held once: {text}"
+        );
+        assert!(summary_has(&text, "upgraded", "0"), "{text}");
     }
 
     #[test]
@@ -734,7 +738,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("upgraded 0, already soaked 0, held 1"),
+            summary_has(&text, "upgraded", "0") && summary_has(&text, "held", "1"),
             "a held dependency holds the target, it does not upgrade it: {text}"
         );
     }
@@ -967,7 +971,7 @@ mod tests {
             lock_runs(brew)
         );
         assert!(
-            text.contains("upgraded 0, already soaked 0, held 1"),
+            summary_has(text, "upgraded", "0") && summary_has(text, "held", "1"),
             "a dep refusal holds the target, it does not upgrade it: {text}"
         );
     }
@@ -1119,7 +1123,8 @@ mod tests {
             text.contains("cannot install terraform: a dependency name is ambiguous")
                 && text.contains("Formulae found in multiple taps")
                 && text.contains("a/tap/cats")
-                && text.contains("upgraded 0, already soaked 0, held 1"),
+                && summary_has(&text, "upgraded", "0")
+                && summary_has(&text, "held", "1"),
             "{text}"
         );
         assert!(

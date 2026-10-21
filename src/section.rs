@@ -34,6 +34,12 @@ impl<W: Write> Section<W> {
         self.started
     }
 
+    /// The wrapped writer, for output that belongs outside the section. Write
+    /// whole lines only, so the section's next line still starts on a fresh one.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
     pub fn into_inner(self) -> W {
         self.inner
     }

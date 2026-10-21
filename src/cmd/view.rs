@@ -588,6 +588,7 @@ pub(super) fn detect_versions_of(brew: &impl Brew, ids: &mut [&mut identity::For
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::summary_has;
 
     use crate::brew::MockBrew;
 
@@ -659,10 +660,13 @@ mod tests {
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         let runs = lock_runs(&brew);
         assert!(!run_is_soaked_install(&runs, "openssl@3"), "{text}");
-        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (0 of 1)"),
+            "{text}"
+        );
         assert!(text.contains(OPENSSL_NOTE), "{text}");
-        assert!(text.contains("ahead 1"), "{text}");
-        assert!(text.contains("upgraded 0"), "{text}");
+        assert!(summary_has(&text, "ahead", "1"), "{text}");
+        assert!(summary_has(&text, "upgraded", "0"), "{text}");
     }
 
     #[test]
@@ -732,7 +736,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("held 1"), "{text}");
+        assert!(summary_has(&text, "held", "1"), "{text}");
         let text = greedy_outdated(&brew, &git, &snaps, &[]);
         assert!(section_lines(&text, OUTDATED_HEADER).is_empty(), "{text}");
         assert_eq!(section_lines(&text, "==> Held").len(), 1, "{text}");

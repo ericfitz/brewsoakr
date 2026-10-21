@@ -129,6 +129,7 @@ pub(super) fn latest_note(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::summary_has;
     use crate::identity::PkgIdentity;
 
     use crate::brew::MockBrew;
@@ -165,7 +166,10 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (0 of 1)"),
+            "{text}"
+        );
     }
 
     /// A hand-built view for the pure functions. `latest` makes the cutoff
@@ -194,7 +198,10 @@ mod tests {
     fn bare_upgrade_of_greedy_world_is_unchanged() {
         let (brew, git, snaps) = greedy_world();
         let text = greedy_upgrade(&brew, &git, &snaps, &["-v"]);
-        assert!(text.contains("upgrading 2 of 5 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (2 of 5)"),
+            "{text}"
+        );
         let runs = lock_runs(&brew);
         assert!(run_is_soaked_install(&runs, "wget"), "{text}");
         assert!(
@@ -208,7 +215,7 @@ mod tests {
             !text.contains("cannot be soaked"),
             "bare run says nothing about :latest: {text}"
         );
-        assert!(text.contains("auto-updates 2"), "{text}");
+        assert!(summary_has(&text, "auto-updates", "2"), "{text}");
     }
 
     #[test]
@@ -230,7 +237,10 @@ mod tests {
     fn greedy_upgrades_self_updating_casks_and_notes_latest_casks() {
         let (brew, git, snaps) = greedy_world();
         let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy", "-v"]);
-        assert!(text.contains("upgrading 4 of 5 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (4 of 5)"),
+            "{text}"
+        );
         let runs = lock_runs(&brew);
         assert!(run_is_soaked_install(&runs, "alt-tab"), "{text}");
         assert!(run_is_soaked_install(&runs, "self-latest"), "{text}");
@@ -244,16 +254,17 @@ mod tests {
             text.contains("nightly: up to date (soaked); installed :latest matches cutoff; left unchanged; its contents cannot be soaked"),
             "{text}"
         );
-        assert!(text.contains("notes:\n"), "{text}");
+        assert!(text.contains("\nNotes\n"), "{text}");
         assert!(
             text.contains(&format!("\n  {}\n", latest_note("nightly"))),
             "the note is a line of the notes block: {text}"
         );
         assert!(
-            !text.contains("auto-updates"),
+            summary_has(&text, "auto-updates", "0"),
             "no cask was left to the app: {text}"
         );
-        assert!(text.contains("upgraded 4, already soaked 1,"), "{text}");
+        assert!(summary_has(&text, "upgraded", "4"), "{text}");
+        assert!(summary_has(&text, "already soaked", "1"), "{text}");
         for args in &runs {
             assert!(
                 !args.iter().any(|a| a.starts_with("--greedy")),
@@ -266,7 +277,10 @@ mod tests {
     fn greedy_auto_updates_upgrades_self_updating_casks_only() {
         let (brew, git, snaps) = greedy_world();
         let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy-auto-updates"]);
-        assert!(text.contains("upgrading 4 of 5 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (4 of 5)"),
+            "{text}"
+        );
         let runs = lock_runs(&brew);
         assert!(run_is_soaked_install(&runs, "alt-tab"), "{text}");
         assert!(run_is_soaked_install(&runs, "self-latest"), "{text}");
@@ -278,7 +292,10 @@ mod tests {
     fn greedy_latest_leaves_self_updating_casks_and_notes_latest() {
         let (brew, git, snaps) = greedy_world();
         let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy-latest", "-v"]);
-        assert!(text.contains("upgrading 2 of 5 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (2 of 5)"),
+            "{text}"
+        );
         let runs = lock_runs(&brew);
         assert!(!run_is_soaked_install(&runs, "alt-tab"), "{text}");
         assert!(
@@ -291,7 +308,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains(&latest_note("nightly")), "{text}");
-        assert!(text.contains("auto-updates 2"), "{text}");
+        assert!(summary_has(&text, "auto-updates", "2"), "{text}");
     }
 
     #[test]
@@ -302,7 +319,10 @@ mod tests {
             text.contains("alt-tab: installing cutoff"),
             "-vg is brewsoak-verbose: {text}"
         );
-        assert!(text.contains("upgrading 4 of 5 packages"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (4 of 5)"),
+            "{text}"
+        );
         let installs: Vec<Vec<String>> = lock_runs(&brew)
             .into_iter()
             .filter(|a| a.first().map(String::as_str) == Some("install"))
@@ -357,9 +377,9 @@ mod tests {
         let (brew, git, snaps) = greedy_world();
         let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy-latest"]);
         let notes = text
-            .split("notes:\n")
+            .split("\nNotes\n")
             .nth(1)
-            .unwrap_or_else(|| panic!("no notes: block: {text}"));
+            .unwrap_or_else(|| panic!("no Notes section: {text}"));
         assert!(notes.contains("nightly"), "{text}");
         assert!(notes.contains("cannot be soaked"), "{text}");
     }
@@ -388,9 +408,12 @@ mod tests {
             !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
             "{text}"
         );
-        assert!(text.contains("upgrading 0 of 1 packages"), "{text}");
-        assert!(text.contains("ahead 0"), "{text}");
-        assert!(text.contains("auto-updates 1"), "{text}");
+        assert!(
+            text.contains("Upgrading soaked packages (0 of 1)"),
+            "{text}"
+        );
+        assert!(summary_has(&text, "ahead", "0"), "{text}");
+        assert!(summary_has(&text, "auto-updates", "1"), "{text}");
         assert!(!text.contains(ALT_TAB_NOTE), "{text}");
         let text = greedy_outdated(&brew, &git, &snaps, &[]);
         assert!(section_lines(&text, OUTDATED_HEADER).is_empty(), "{text}");
@@ -405,8 +428,8 @@ mod tests {
         );
         for argv in [&["--greedy"][..], &["--greedy-auto-updates"][..]] {
             let text = greedy_upgrade(&brew, &git, &snaps, argv);
-            assert!(text.contains("ahead 1"), "{argv:?}: {text}");
-            assert!(!text.contains("auto-updates"), "{argv:?}: {text}");
+            assert!(summary_has(&text, "ahead", "1"), "{argv:?}: {text}");
+            assert!(summary_has(&text, "auto-updates", "0"), "{argv:?}: {text}");
             assert!(text.contains(ALT_TAB_NOTE), "{argv:?}: {text}");
             let text = greedy_outdated(&brew, &git, &snaps, argv);
             assert_eq!(
@@ -430,8 +453,11 @@ mod tests {
             !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
             "{text}"
         );
-        assert!(text.contains("held 0"), "not held on a bare run: {text}");
-        assert!(text.contains("auto-updates 1"), "{text}");
+        assert!(
+            summary_has(&text, "held", "0"),
+            "not held on a bare run: {text}"
+        );
+        assert!(summary_has(&text, "auto-updates", "1"), "{text}");
         let text = greedy_outdated(&brew, &git, &snaps, &[]);
         assert!(section_lines(&text, "==> Held").is_empty(), "{text}");
         assert_eq!(
@@ -440,7 +466,7 @@ mod tests {
             "{text}"
         );
         let text = greedy_upgrade(&brew, &git, &snaps, &["--greedy"]);
-        assert!(text.contains("held 1"), "{text}");
+        assert!(summary_has(&text, "held", "1"), "{text}");
     }
 
     /// Pins the claim in `plan_size`'s comment: the pre-run total, the
@@ -478,12 +504,12 @@ mod tests {
 
             let text = greedy_upgrade(&brew, &git, &snaps, argv);
             assert!(
-                text.contains(&format!("upgrading {want} of 6 packages")),
+                text.contains(&format!("Upgrading soaked packages ({want} of 6)")),
                 "{argv:?}: {text}"
             );
             let announced = text
                 .lines()
-                .filter(|l| l.starts_with('[') && l.contains(&format!("/{want}] ")))
+                .filter(|l| l.trim_start().starts_with('[') && l.contains(&format!("/{want}] ")))
                 .count();
             assert_eq!(announced, want, "announced {argv:?}: {text}");
 
@@ -646,10 +672,18 @@ mod tests {
             text.contains("alt-tab: auto-updates; installed 7.38.1 is left to the app"),
             "{text}"
         );
-        assert!(
-            text.contains("upgraded 0, already soaked 0, held 0, ahead 0, pinned 0, skipped 0, no-soak 0, auto-updates 1"),
-            "{text}"
-        );
+        for (label, value) in [
+            ("upgraded", "0"),
+            ("already soaked", "0"),
+            ("held", "0"),
+            ("ahead", "0"),
+            ("pinned", "0"),
+            ("skipped", "0"),
+            ("no-soak", "0"),
+            ("auto-updates", "1"),
+        ] {
+            assert!(summary_has(&text, label, value), "{label}: {text}");
+        }
 
         let mut out = Vec::new();
         upgrade(
