@@ -171,6 +171,7 @@ pub fn run_step(
             tokens.join(", ")
         ));
         result.status = Some(code);
+        result.no_result = targets.len();
         return Ok(result);
     }
 
@@ -305,10 +306,30 @@ pub fn run_step(
         max_status(&mut result.status, code);
     }
 
-    // A dry run never reached the staged-keg targets, so they have no verdict.
+    // A dry run never reaches the staged-keg targets (reinstall has no dry
+    // run); report them as the reinstall they would get.
+    if dry_run {
+        for t in &switch {
+            writeln!(
+                section,
+                "would reinstall {} (moving staged keg to its tap)",
+                token_of(t)
+            )?;
+            result.upgraded += 1;
+        }
+    }
     let judged = plain.iter().chain(if dry_run { &[] } else { &switch[..] });
+    let beer_lines: String = said
+        .lines()
+        .filter(|l| l.trim_start().starts_with('\u{1f37a}'))
+        .flat_map(|l| [l, "\n"])
+        .collect();
+    let cellar: Vec<String> = quiet::cellar_installed_from_output(beer_lines.as_bytes())
+        .into_keys()
+        .map(|k| k.to_ascii_lowercase())
+        .collect();
     for t in judged {
-        match verdict(&said, t) {
+        match verdict(&said, &cellar, &token_of(t), dry_run) {
             Verdict::Upgraded => result.upgraded += 1,
             Verdict::Current => result.current += 1,
             Verdict::NoResult => {
@@ -332,34 +353,49 @@ enum Verdict {
 
 /// What brew's output says about one target, matching its token or its last
 /// `/` segment case-insensitively. An upgrade outranks an already-current
-/// warning.
-fn verdict(said: &str, t: &Target) -> Verdict {
-    let token = brew_token(&t.origin, &t.name).to_ascii_lowercase();
+/// warning. `cellar` holds the lowercase names of the kegs brew poured. A bare
+/// `name a -> b` line counts only on a dry run: in a real run it is brew's
+/// plan, and the upgrade can still fail.
+fn verdict(said: &str, cellar: &[String], token: &str, dry_run: bool) -> Verdict {
+    let token = token.to_ascii_lowercase();
     let name = token.rsplit('/').next().unwrap_or(&token).to_string();
     let is_me = |w: &str| {
         let w = w.trim_matches(|c: char| c == '\'' || c == '"' || c == ',' || c == '.');
         w == token || w == name
     };
+    if cellar.iter().any(|c| is_me(c)) {
+        return Verdict::Upgraded;
+    }
     let mut current = false;
+    // Inside a `==> Would install|upgrade ...` target list (dry run).
+    let mut in_would = false;
     for line in said.lines() {
         let l = line.to_ascii_lowercase();
         let l = l.trim_end();
         let first = l.split_whitespace().next().unwrap_or("");
-        if let Some(rest) = l.strip_prefix("==> upgrading ") {
-            if rest.split_whitespace().next().is_some_and(is_me) {
+        if let Some(rest) = l.strip_prefix("==> ") {
+            in_would = dry_run && quiet::would_list_verb(&line["==> ".len()..]).is_some();
+            let action = rest
+                .strip_prefix("upgrading ")
+                .or_else(|| rest.strip_prefix("installing "))
+                .or_else(|| rest.strip_prefix("reinstalling "))
+                .map(|r| r.strip_prefix("cask ").unwrap_or(r));
+            if let Some(r) = action
+                && r.split_whitespace().next().is_some_and(is_me)
+            {
                 return Verdict::Upgraded;
             }
-        } else if let Some(file) = l.strip_prefix("==> pouring ") {
-            if file.split("--").next().is_some_and(is_me) {
+            if let Some(file) = rest.strip_prefix("pouring ")
+                && file.split("--").next().is_some_and(is_me)
+            {
                 return Verdict::Upgraded;
             }
-        } else if l.contains("/cellar/") {
-            let path = l.split_once("/cellar/").map_or("", |(_, r)| r);
-            if path.split('/').next().is_some_and(is_me) {
-                return Verdict::Upgraded;
-            }
-        } else if !l.starts_with(' ') && l.contains(" -> ") && is_me(first) {
-            // `name a -> b` under brew's upgrade or dry-run list.
+        } else if l.trim().is_empty() {
+            in_would = false;
+        } else if !l.starts_with(' ')
+            && is_me(first)
+            && (in_would || (dry_run && l.contains(" -> ")))
+        {
             return Verdict::Upgraded;
         } else if crate::cmd::already_installed_line(l) && l.split_whitespace().any(is_me) {
             current = true;
@@ -806,6 +842,146 @@ mod tests {
         .expect_err("unknown verb");
         assert!(err.to_string().contains("frobnicate"), "{err}");
         assert!(runs(&brew).is_empty(), "no brew command may run");
+    }
+
+    #[test]
+    fn dry_run_switch_target_is_reported_and_counted() {
+        let brew = MockBrew::new();
+        let mut out = Vec::new();
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &["--dry-run".to_string()],
+            &switch_target("hashicorp/tap", "packer"),
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 0));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "Would upgrade no-soak packages (brew decides)\n  would reinstall hashicorp/tap/packer (moving staged keg to its tap)\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn failed_update_counts_every_target_as_no_result() {
+        let brew = mock_with(vec![(3, b"Error: no network\n")]);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("ericfitz/tap", "a"), t("homebrew/core", "b")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (0, 0, 2));
+    }
+
+    #[test]
+    fn real_run_outdated_list_alone_is_not_an_upgrade() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                1,
+                b"==> Upgrading 1 outdated package:\nfoo 1.0 -> 2.0\nError: boom\n",
+            ),
+        ]);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "foo")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (0, 0, 1));
+    }
+
+    #[test]
+    fn cellar_path_in_an_error_line_is_not_an_upgrade() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                1,
+                b"Error: Could not symlink /opt/homebrew/Cellar/foo/1.0/bin/foo\n",
+            ),
+        ]);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "foo")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (0, 0, 1));
+    }
+
+    #[test]
+    fn install_verdicts_cover_real_and_dry_runs() {
+        let brew = mock_with(vec![(0, b""), (0, b"==> Installing cowsay\n")]);
+        let r = run_step(
+            &brew,
+            "install",
+            &[],
+            &[t("homebrew/core", "cowsay")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 0));
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                0,
+                b"==> Would install 1 formula:\ncowsay 3.8.4\n==> Would install 1 dependency for cowsay:\nperl\n",
+            ),
+        ]);
+        let r = run_step(
+            &brew,
+            "install",
+            &["--dry-run".to_string()],
+            &[t("homebrew/core", "cowsay"), t("homebrew/core", "perl")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (r.upgraded, r.current, r.no_result),
+            (1, 0, 1),
+            "dependency list is not a target verdict"
+        );
+    }
+
+    #[test]
+    fn output_nests_under_the_header_as_designed() {
+        let mut f = quiet::Filter::new();
+        f.start_run(&quiet::RunContext {
+            mode: quiet::RunMode::NoSoak,
+        });
+        let mut out = Vec::new();
+        {
+            let mut s = Section::new(&mut out, nosoak_header(Verb::Upgrade, false));
+            for l in [
+                "Warning: ericfitz/tap/brewsoak 1.5.2 already installed",
+                "==> Upgrading ericfitz/tap/agentbus",
+                "  1.15.0 -> 1.16.0",
+                "==> Pouring agentbus--1.16.0.arm64_sequoia.bottle.tar.gz",
+                "==> Upgrading foo",
+            ] {
+                if let Some(o) = f.line(l) {
+                    writeln!(s, "{o}").unwrap();
+                }
+            }
+            if let Some(o) = f.finish_run() {
+                writeln!(s, "{o}").unwrap();
+            }
+        }
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "Upgrading no-soak packages (brew decides)\n  ericfitz/tap/brewsoak 1.5.2\n    Already up-to-date.\n  upgrading ericfitz/tap/agentbus 1.15.0 -> 1.16.0\n    installing agentbus 1.16.0\n  upgrading foo\n"
+        );
     }
 
     fn typed(origin: &str, name: &str, kind: PkgKind) -> Target {

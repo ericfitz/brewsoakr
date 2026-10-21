@@ -9,8 +9,8 @@ enum State {
     Normal,
     /// Inside the bare-name list under `==> Would install/upgrade ...`.
     SkipList,
-    /// Inside a no-soak dry run's `==> Would upgrade N formulae/casks:` list.
-    WouldList,
+    /// Inside a no-soak dry run's `==> Would upgrade|install ...` list.
+    WouldList(&'static str),
     /// Inside `==> Cleanup` and its `Removing:` lines.
     Cleanup,
     /// Inside `==> Caveats` to the end of the run.
@@ -116,6 +116,13 @@ impl Filter {
         self.last_shown = None;
     }
 
+    /// End of a brew run: the `upgrading` line still waiting for a version.
+    pub fn finish_run(&mut self) -> Option<String> {
+        self.pending_upgrade
+            .take()
+            .map(|name| format!("upgrading {name}"))
+    }
+
     /// Cellar versions of packages brew installed, including transitive deps.
     pub fn installed(&self) -> &BTreeMap<String, String> {
         &self.installed
@@ -150,7 +157,7 @@ impl Filter {
             State::Caveats => self.caveat_line(t),
             State::Cleanup => self.cleanup_line(t),
             State::SkipList => self.skip_list_line(t),
-            State::WouldList => self.would_list_line(t),
+            State::WouldList(verb) => self.would_list_line(t, verb),
             State::Normal => self.normal_line(t),
         }
     }
@@ -207,8 +214,9 @@ impl Filter {
         None
     }
 
-    /// Dry-run list lines `name a -> b` become `would upgrade name a -> b`.
-    fn would_list_line(&mut self, t: &str) -> Option<String> {
+    /// Dry-run list lines become `would upgrade name a -> b` (the aligned
+    /// columns squeezed, brew's size dropped) or `would install name [ver]`.
+    fn would_list_line(&mut self, t: &str, verb: &str) -> Option<String> {
         if t.trim().is_empty()
             || t.starts_with("==> ")
             || t.starts_with(CHECK)
@@ -218,8 +226,14 @@ impl Filter {
             self.state = Some(State::Normal);
             return self.normal_line(t);
         }
-        t.contains(" -> ")
-            .then(|| format!("would upgrade {}", t.trim()))
+        let words: Vec<&str> = t
+            .split_whitespace()
+            .take_while(|w| !w.starts_with('('))
+            .collect();
+        if verb == "upgrade" && !t.contains(" -> ") {
+            return None;
+        }
+        (!words.is_empty()).then(|| format!("would {verb} {}", words.join(" ")))
     }
 
     fn normal_line(&mut self, t: &str) -> Option<String> {
@@ -308,8 +322,10 @@ impl Filter {
         }
         // `brew update`'s list of what is outdated at HEAD. brewsoak upgrades
         // to the cutoff, not HEAD, so the list contradicts it; drop it.
-        if self.mode == RunMode::NoSoak && is_would_upgrade_list(rest) {
-            self.state = Some(State::WouldList);
+        if self.mode == RunMode::NoSoak
+            && let Some(verb) = would_list_verb(rest)
+        {
+            self.state = Some(State::WouldList(verb));
             return None;
         }
         // No-soak: `Upgrading 2 outdated packages:` and its name list; each
@@ -346,10 +362,20 @@ impl Filter {
             .or_else(|| rest.strip_prefix("Installing "))
             .or_else(|| rest.strip_prefix("Reinstalling "))
         {
-            self.last_pkg = Some(name.trim().to_string());
+            let name = name.trim().strip_prefix("Cask ").unwrap_or(name.trim());
+            self.last_pkg = Some(name.to_string());
             self.expect_version_line = true;
-            if self.mode == RunMode::NoSoak && rest.starts_with("Upgrading ") {
-                self.pending_upgrade = Some(name.trim().to_string());
+            if self.mode == RunMode::NoSoak {
+                if rest.starts_with("Upgrading ") {
+                    self.pending_upgrade = Some(name.to_string());
+                } else {
+                    let verb = if rest.starts_with("Installing ") {
+                        "installing"
+                    } else {
+                        "reinstalling"
+                    };
+                    return Some(format!("{verb} {name}"));
+                }
             }
             return None;
         }
@@ -416,16 +442,25 @@ impl Filter {
 const CHECK: &str = "\u{2714}\u{fe0e}";
 const BEER: &str = "\u{1f37a}";
 
-/// `Would upgrade 1 formula:` / `Would upgrade 2 casks:`; the `dependencies`
-/// lists under it stay dropped.
-fn is_would_upgrade_list(rest: &str) -> bool {
+/// `Would upgrade 1 formula:` / `Would install 2 casks:` / `Would upgrade 10
+/// outdated packages` name a list of targets; the verb is `upgrade` or
+/// `install`. The `dependencies` lists under them stay dropped.
+pub(crate) fn would_list_verb(rest: &str) -> Option<&'static str> {
     let mut words = rest.split_whitespace();
-    words.next() == Some("Would")
-        && words.next() == Some("upgrade")
-        && words.next().is_some_and(|n| n.parse::<u32>().is_ok())
-        && words
-            .next()
-            .is_some_and(|w| w.starts_with("formula") || w.starts_with("cask"))
+    if words.next() != Some("Would") {
+        return None;
+    }
+    let verb = match words.next()? {
+        "upgrade" => "upgrade",
+        "install" => "install",
+        _ => return None,
+    };
+    words.next()?.parse::<u32>().ok()?;
+    let kind = words.next()?;
+    let is_list = kind.starts_with("formula")
+        || kind.starts_with("cask")
+        || (kind == "outdated" && verb == "upgrade");
+    is_list.then_some(verb)
 }
 
 /// `Upgrading 2 outdated packages:` (not `Upgrading x`).
@@ -438,17 +473,14 @@ fn is_outdated_packages_header(rest: &str) -> bool {
 
 /// The `<token> <version>` of either already-installed warning form.
 fn already_current_pair(t: &str) -> Option<String> {
-    let head = if is_already_current(t) {
-        t.strip_prefix("Warning: ")?
-            .strip_suffix(" already installed")?
-    } else if is_already_up_to_date(t) {
-        let rest = t.strip_prefix("Warning: ")?;
-        let mut parts = rest.split_whitespace();
-        return Some(format!("{} {}", parts.next()?, parts.next()?));
-    } else {
+    if let Some(head) = already_current_head(t) {
+        return Some(head.to_string());
+    }
+    if !is_already_up_to_date(t) {
         return None;
-    };
-    Some(head.to_string())
+    }
+    let mut parts = t.strip_prefix("Warning: ")?.split_whitespace();
+    Some(format!("{} {}", parts.next()?, parts.next()?))
 }
 
 /// `x 1.0 is already installed but outdated (so it will be upgraded).` —
@@ -470,9 +502,14 @@ fn is_outdated_advice(t: &str) -> bool {
 /// to `brew upgrade` of a package that is already current. Exactly a token
 /// and a version before the phrase, so other warnings still show.
 fn is_already_current(t: &str) -> bool {
+    already_current_head(t).is_some()
+}
+
+/// The `<token> <version>` of `Warning: <token> <version> already installed`.
+fn already_current_head(t: &str) -> Option<&str> {
     t.strip_prefix("Warning: ")
         .and_then(|rest| rest.strip_suffix(" already installed"))
-        .is_some_and(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
+        .filter(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
 }
 
 fn is_already_up_to_date(t: &str) -> bool {
@@ -734,6 +771,70 @@ mod tests {
     fn soaked_mode_keeps_dropping_would_lists() {
         let (out, _) = run("==> Would upgrade 1 formula:\ncertifi 1 -> 2\n");
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn nosoak_pending_upgrade_is_flushed_at_the_end_of_the_run() {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::NoSoak,
+        });
+        assert_eq!(f.line("==> Upgrading foo"), None);
+        assert_eq!(f.finish_run().as_deref(), Some("upgrading foo"));
+        assert_eq!(f.finish_run(), None);
+        f.start_run(&RunContext::default());
+        f.line("==> Upgrading foo");
+        assert_eq!(f.finish_run(), None, "soaked runs print their own line");
+    }
+
+    #[test]
+    fn nosoak_install_and_reinstall_get_a_parent_line() {
+        let out = run_nosoak(
+            "==> Installing cowsay\n\
+             ==> Pouring cowsay--3.8.4.arm64_sequoia.bottle.tar.gz\n\
+             ==> Reinstalling tree\n\
+             ==> Installing Cask foo\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "installing cowsay",
+                "  installing cowsay 3.8.4",
+                "reinstalling tree",
+                "installing foo"
+            ]
+        );
+    }
+
+    #[test]
+    fn nosoak_would_install_lists() {
+        let out = run_nosoak(
+            "==> Would install 1 formula:\ncowsay 3.8.4\n\
+             ==> Would install 2 dependencies for cowsay:\nperl\nlibx\n\
+             ==> Would install 1 cask:\nrectangle\n",
+        );
+        assert_eq!(
+            out,
+            vec!["would install cowsay 3.8.4", "would install rectangle"]
+        );
+    }
+
+    #[test]
+    fn nosoak_would_upgrade_outdated_packages_columns() {
+        let out = run_nosoak(
+            "==> Downloading bottle manifests\n\
+             \u{2714}\u{fe0e} Bottle Manifest gh (2.102.1)\n\
+             ==> Would upgrade 2 outdated packages\n\
+             endava/tap/cats     15.0.0     -> 15.0.3\n\
+             go                  1.27.2     -> 1.27.3      (67.7MB)\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "would upgrade endava/tap/cats 15.0.0 -> 15.0.3",
+                "would upgrade go 1.27.2 -> 1.27.3"
+            ]
+        );
     }
 
     #[test]

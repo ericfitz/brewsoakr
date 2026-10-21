@@ -778,6 +778,9 @@ fn forward_run(
         }
         let _ = stdout.flush();
     }
+    if !raw && let Some(out) = sink.filter.finish_run() {
+        let _ = writeln!(stdout, "{out}");
+    }
     let _ = stdout.flush();
     captured
 }
