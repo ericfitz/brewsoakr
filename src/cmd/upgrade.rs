@@ -28,14 +28,6 @@ pub fn upgrade(
     // how many will actually change and count them off as they go.
     let plan_total = (names.is_empty())
         .then(|| plan_size(brew, git, snaps, cache, inv, flags::greedy_mode(user_flags)));
-    if let Some(total) = plan_total {
-        let doing = if flags::is_dry_run(user_flags) {
-            "would upgrade"
-        } else {
-            "upgrading"
-        };
-        writeln!(out, "{doing} {total} of {} packages", inv.pkgs.len())?;
-    }
     apply_many(
         brew,
         git,
@@ -58,6 +50,7 @@ pub fn upgrade(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::summary_has;
 
     use crate::brew::MockBrew;
 
@@ -67,8 +60,6 @@ mod tests {
     use crate::resolve::PkgKind;
 
     use std::path::Path;
-
-    use crate::cmd::notes::ahead_message;
 
     use crate::cmd::test_support::{
         cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_pkg_from,
@@ -164,8 +155,10 @@ mod tests {
             "ahead of soak must not install: {runs:?}"
         );
         assert!(
-            text.contains(&ahead_message("ahead")),
-            "missing ahead message: {text}"
+            text.contains(
+                "\nNotes\n  Ahead of soak (installed artifact left unchanged):\n    ahead\n"
+            ),
+            "missing ahead entry: {text}"
         );
     }
 
@@ -207,10 +200,8 @@ mod tests {
     #[test]
     fn named_upgrade_says_a_newer_version_is_soaking() {
         let text = soaking_upgrade(&["wget".to_string()]);
-        assert!(
-            text.contains("upgraded 0, already soaked 0, soaking 1, held 0"),
-            "{text}"
-        );
+        assert!(summary_has(&text, "soaking", "1"), "{text}");
+        assert!(summary_has(&text, "already soaked", "0"), "{text}");
         assert!(
             text.contains(
                 "wget: 1.2.0 is still in the 24h soak window; installed 1.1.0 is the newest soaked version"
@@ -221,11 +212,27 @@ mod tests {
     }
 
     #[test]
+    fn bare_upgrade_zero_plan_prints_header() {
+        let text = soaking_upgrade(&[]);
+        assert!(
+            text.starts_with("Upgrading soaked packages (0 of 1)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn named_run_nothing_to_do_no_soaked_header() {
+        let text = soaking_upgrade(&["wget".to_string()]);
+        assert!(!text.contains("soaked packages"), "{text}");
+        assert!(text.starts_with("Summary\n"), "{text}");
+    }
+
+    #[test]
     fn bare_upgrade_names_soaking_packages_in_one_note() {
         let text = soaking_upgrade(&[]);
-        assert!(text.contains("already soaked 0, soaking 1,"), "{text}");
+        assert!(summary_has(&text, "soaking", "1"), "{text}");
         assert!(
-            text.contains("still soaking (left at the cutoff): wget 1.2.0"),
+            text.contains("\nNotes\n  Still soaking (left at the cutoff):\n    wget 1.2.0\n"),
             "{text}"
         );
     }
@@ -336,7 +343,10 @@ mod tests {
         };
         let (result, text) = bare_upgrade(&git, &brew);
         assert!(!result.refused, "{text}");
-        assert!(text.contains(&ahead_message("tcl")), "{text}");
+        assert!(
+            text.contains("Ahead of soak (installed artifact left unchanged):\n    tcl\n"),
+            "{text}"
+        );
         assert!(
             text.contains("warning: tcl is deprecated upstream"),
             "{text}"
@@ -866,7 +876,7 @@ mod tests {
         let header = text
             .lines()
             .find_map(|l| {
-                l.strip_prefix("upgrading ")?
+                l.strip_prefix("Upgrading soaked packages (")?
                     .split(' ')
                     .next()?
                     .parse::<usize>()
@@ -875,7 +885,7 @@ mod tests {
             .expect("header");
         let announced = text
             .lines()
-            .filter(|l| l.starts_with('[') && l.contains(&format!("/{header}] ")))
+            .filter(|l| l.trim_start().starts_with('[') && l.contains(&format!("/{header}] ")))
             .count();
         assert_eq!(header, 4, "{text}");
         assert_eq!(announced, header, "{text}");
@@ -1127,8 +1137,8 @@ mod tests {
             got, want,
             "upgrade summary changed; rerun with BREWSOAK_BLESS=1 if intended"
         );
-        assert!(got.contains("no-soak 1"), "{got}");
-        assert!(got.contains("notes:"), "{got}");
+        assert!(summary_has(&got, "no-soak", "1"), "{got}");
+        assert!(got.contains("\nNotes\n"), "{got}");
         assert!(
             got.contains("thing: tap local/tap has no HTTPS remote"),
             "{got}"

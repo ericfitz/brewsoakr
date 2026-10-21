@@ -17,6 +17,17 @@ use crate::taps::TapInfo;
 use std::path::Path;
 use time::OffsetDateTime;
 
+/// True when the Summary has a `label  value` row (value ignoring any suffix).
+pub(super) fn summary_has(text: &str, label: &str, value: &str) -> bool {
+    text.lines().any(|l| {
+        l.strip_prefix("  ")
+            .and_then(|l| l.strip_prefix(label))
+            .is_some_and(|rest| {
+                rest.starts_with(' ') && rest.split_whitespace().next() == Some(value)
+            })
+    })
+}
+
 pub(super) fn cfg24() -> Config {
     Config::uniform(SoakHours::new(24).expect("hours >= 1"))
 }

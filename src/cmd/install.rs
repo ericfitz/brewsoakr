@@ -49,6 +49,7 @@ pub fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::summary_has;
 
     use crate::brew::MockBrew;
 
@@ -170,8 +171,8 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(!cache.path().join("origins.toml").exists());
-        assert!(text.contains("would upgrade 1,"), "{text}");
-        assert!(!text.contains("upgraded 1"), "{text}");
+        assert!(summary_has(&text, "would upgrade", "1"), "{text}");
+        assert!(!summary_has(&text, "upgraded", "1"), "{text}");
     }
 
     #[test]
@@ -313,7 +314,7 @@ mod tests {
             ),
             "{text}"
         );
-        assert!(text.contains("held 1"), "{text}");
+        assert!(summary_has(&text, "held", "1"), "{text}");
         assert_eq!(
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
             None
@@ -367,7 +368,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("upgraded 0,") && text.contains("held 1"),
+            summary_has(&text, "upgraded", "0") && summary_has(&text, "held", "1"),
             "{text}"
         );
         let all: Vec<Vec<String>> = lock_runs(&brew)
@@ -391,8 +392,11 @@ mod tests {
         };
         let (r, text) = install_packer(&brew, &git, &snaps);
         assert_eq!(r.brew_status, Some(1), "{text}");
-        assert!(text.contains("upgraded 0,"), "{text}");
-        assert!(!text.contains("held 1"), "a failure is not a hold: {text}");
+        assert!(summary_has(&text, "upgraded", "0"), "{text}");
+        assert!(
+            !summary_has(&text, "held", "1"),
+            "a failure is not a hold: {text}"
+        );
     }
 
     #[test]
@@ -424,7 +428,7 @@ mod tests {
         .expect("reinstall");
         let text = String::from_utf8(out).unwrap();
         assert_eq!(result.brew_status, Some(1), "{text}");
-        assert!(text.contains("upgraded 0,"), "{text}");
+        assert!(summary_has(&text, "upgraded", "0"), "{text}");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::Error;
 use crate::eligibility::DesiredAction;
+use crate::section::Section;
 use std::io::Write;
 
 pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Option<String> {
@@ -19,10 +20,6 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
     Some(format!(
         "{why}; use `brew {brew_verb} {name}` to bypass brewsoak."
     ))
-}
-
-pub fn ahead_message(name: &str) -> String {
-    format!("{name} is ahead of soak; leaving installed artifact unchanged")
 }
 
 pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
@@ -77,6 +74,60 @@ pub(super) fn hold_why(action: DesiredAction) -> Option<&'static str> {
     }
 }
 
+/// Where a deferred note sorts in the `Notes` section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NoteKind {
+    /// A package brewsoak refused or could not act on.
+    Held,
+    /// Everything else, listed with no sub-heading.
+    Other,
+}
+
+/// A note on its own lines: continuation lines sit two spaces deeper.
+fn write_note(out: &mut impl Write, indent: &str, note: &str) -> Result<(), Error> {
+    for (i, line) in note.lines().enumerate() {
+        if i == 0 {
+            writeln!(out, "{indent}{line}")?;
+        } else {
+            writeln!(out, "{indent}  {}", line.trim_start())?;
+        }
+    }
+    Ok(())
+}
+
+/// The `Notes` section: one entry per line, grouped by kind. Empty groups,
+/// and the whole section when nothing is in it, are omitted.
+pub(super) fn write_notes(
+    out: &mut impl Write,
+    soaking: &[String],
+    ahead: &[String],
+    notes: &[(NoteKind, String)],
+) -> Result<(), Error> {
+    let mut sec = Section::new(out, "Notes");
+    if !soaking.is_empty() {
+        writeln!(sec, "Still soaking (left at the cutoff):")?;
+        for entry in soaking {
+            writeln!(sec, "  {entry}")?;
+        }
+    }
+    if !ahead.is_empty() {
+        writeln!(sec, "Ahead of soak (installed artifact left unchanged):")?;
+        for name in ahead {
+            writeln!(sec, "  {name}")?;
+        }
+    }
+    if notes.iter().any(|(k, _)| *k == NoteKind::Held) {
+        writeln!(sec, "Held:")?;
+        for (_, note) in notes.iter().filter(|(k, _)| *k == NoteKind::Held) {
+            write_note(&mut sec, "  ", note)?;
+        }
+    }
+    for (_, note) in notes.iter().filter(|(k, _)| *k == NoteKind::Other) {
+        write_note(&mut sec, "", note)?;
+    }
+    Ok(())
+}
+
 pub(super) fn write_section(
     out: &mut impl Write,
     header: &str,
@@ -93,11 +144,13 @@ pub(super) fn write_session_tail(
     report: &crate::brew::SessionReport,
     out: &mut impl Write,
 ) -> Result<(), Error> {
+    let mut caveats = Section::new(&mut *out, "Caveats");
     for line in &report.caveats {
-        writeln!(out, "{line}")?;
+        writeln!(caveats, "{line}")?;
     }
+    drop(caveats);
     if let Some(path) = &report.log_path {
-        writeln!(out, "full brew log: {}", path.display())?;
+        writeln!(out, "Full brew log: {}", path.display())?;
     }
     Ok(())
 }
@@ -134,6 +187,69 @@ mod tests {
             !msg.contains("--now"),
             "{action:?} must not mention --now: {msg}"
         );
+    }
+
+    #[test]
+    fn session_tail_prints_caveats_section_and_log_path() {
+        let report = crate::brew::SessionReport {
+            caveats: vec![
+                "git-lfs:".to_string(),
+                "  Update your git config to finish installation:".to_string(),
+                "    $ git lfs install".to_string(),
+            ],
+            added_bytes: 0,
+            freed_bytes: 0,
+            log_path: Some(std::path::PathBuf::from("/tmp/brewsoak-1.log")),
+        };
+        let mut out = Vec::new();
+        write_session_tail(&report, &mut out).unwrap();
+        let want = "\
+Caveats
+  git-lfs:
+    Update your git config to finish installation:
+      $ git lfs install
+Full brew log: /tmp/brewsoak-1.log
+";
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
+    fn notes_grouped_one_per_line() {
+        let soaking = ["awscli 2.38.3".to_string(), "c-ares 1.34.9".to_string()];
+        let ahead = ["uv".to_string()];
+        let notes = [
+            (NoteKind::Other, "plain note".to_string()),
+            (
+                NoteKind::Held,
+                "foo: too new; use `brew upgrade foo`.".to_string(),
+            ),
+            (
+                NoteKind::Other,
+                "bar: tap x/y could not be refreshed.\n  git failed\n  fatal".to_string(),
+            ),
+            (NoteKind::Held, "baz: held".to_string()),
+        ];
+        let mut out = Vec::new();
+        write_notes(&mut out, &soaking, &ahead, &notes).unwrap();
+        let want = "\
+Notes
+  Still soaking (left at the cutoff):
+    awscli 2.38.3
+    c-ares 1.34.9
+  Ahead of soak (installed artifact left unchanged):
+    uv
+  Held:
+    foo: too new; use `brew upgrade foo`.
+    baz: held
+  plain note
+  bar: tap x/y could not be refreshed.
+    git failed
+    fatal
+";
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+        let mut empty = Vec::new();
+        write_notes(&mut empty, &[], &[], &[]).unwrap();
+        assert!(empty.is_empty());
     }
 
     #[test]

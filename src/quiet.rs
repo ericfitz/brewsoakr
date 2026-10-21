@@ -9,6 +9,8 @@ enum State {
     Normal,
     /// Inside the bare-name list under `==> Would install/upgrade ...`.
     SkipList,
+    /// Inside a no-soak dry run's `==> Would upgrade|install ...` list.
+    WouldList(&'static str),
     /// Inside `==> Cleanup` and its `Removing:` lines.
     Cleanup,
     /// Inside `==> Caveats` to the end of the run.
@@ -57,9 +59,37 @@ const SECTION_WORDS: [&str; 9] = [
     "Would",
 ];
 
+/// What a brew run is for; the no-soak run shows brew's own verdicts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RunMode {
+    /// brewsoak prints its own line per package and drops brew's.
+    #[default]
+    Soaked,
+    /// brew decides: upgrades, already-current packages and dry-run lists show.
+    NoSoak,
+}
+
+/// Per-run facts the output filter needs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunContext {
+    pub mode: RunMode,
+    /// Soaked: package (lowercase, no tap prefix) -> the version this run
+    /// installs, so brew's "newer version is available" warning for it can go.
+    pub expected: BTreeMap<String, String>,
+    /// No-soak: the caller already printed a result line per package, so brew's
+    /// own `==> Reinstalling x` must not add a second one.
+    pub parent_announced: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct Filter {
     state: Option<State>,
+    mode: RunMode,
+    expected: BTreeMap<String, String>,
+    parent_announced: bool,
+    /// No-soak: package named by `==> Upgrading x` whose `upgrading` line is
+    /// not shown yet (a cask has no version line to complete it).
+    pending_upgrade: Option<String>,
     /// The last line shown in this brew run, for dropping an immediate repeat.
     last_shown: Option<String>,
     /// Package most recently seen installing; names an unlabeled caveats block.
@@ -85,11 +115,22 @@ impl Filter {
 
     /// Reset per-run line state. Caveats, byte tallies, and the installed map
     /// accumulate across every brew run in the session.
-    pub fn start_run(&mut self) {
+    pub fn start_run(&mut self, ctx: &RunContext) {
         self.state = Some(State::Normal);
+        self.mode = ctx.mode;
+        self.expected = ctx.expected.clone();
+        self.parent_announced = ctx.parent_announced;
+        self.pending_upgrade = None;
         self.expect_version_line = false;
         self.expect_reinstall_cmd = false;
         self.last_shown = None;
+    }
+
+    /// End of a brew run: the `upgrading` line still waiting for a version.
+    pub fn finish_run(&mut self) -> Option<String> {
+        self.pending_upgrade
+            .take()
+            .map(|name| format!("upgrading {name}"))
     }
 
     /// Cellar versions of packages brew installed, including transitive deps.
@@ -126,6 +167,7 @@ impl Filter {
             State::Caveats => self.caveat_line(t),
             State::Cleanup => self.cleanup_line(t),
             State::SkipList => self.skip_list_line(t),
+            State::WouldList(verb) => self.would_list_line(t, verb),
             State::Normal => self.normal_line(t),
         }
     }
@@ -182,7 +224,42 @@ impl Filter {
         None
     }
 
+    /// Dry-run list lines become `would upgrade name a -> b` (the aligned
+    /// columns squeezed, brew's size dropped) or `would install name [ver]`.
+    fn would_list_line(&mut self, t: &str, verb: &str) -> Option<String> {
+        if t.trim().is_empty()
+            || t.starts_with("==> ")
+            || t.starts_with(CHECK)
+            || t.starts_with("Warning: ")
+            || t.starts_with("Error: ")
+        {
+            self.state = Some(State::Normal);
+            return self.normal_line(t);
+        }
+        let words: Vec<&str> = t
+            .split_whitespace()
+            .take_while(|w| !w.starts_with('('))
+            .collect();
+        if verb == "upgrade" && !t.contains(" -> ") {
+            return None;
+        }
+        (!words.is_empty()).then(|| format!("would {verb} {}", words.join(" ")))
+    }
+
     fn normal_line(&mut self, t: &str) -> Option<String> {
+        // No-soak: a cask upgrade has no version line, so the `upgrading`
+        // line is completed by whatever non-blank line comes next.
+        if self.mode == RunMode::NoSoak
+            && !t.trim().is_empty()
+            && !(self.expect_version_line && t.starts_with(' ') && t.contains("->"))
+            && let Some(name) = self.pending_upgrade.take()
+        {
+            let head = format!("upgrading {name}");
+            return Some(match self.normal_line(t) {
+                Some(rest) => format!("{head}\n{rest}"),
+                None => head,
+            });
+        }
         let was_expecting_version = self.expect_version_line;
         self.expect_version_line = false;
         let was_expecting_reinstall = self.expect_reinstall_cmd;
@@ -193,7 +270,15 @@ impl Filter {
         }
         // `  0.10.5 -> 1.0.0` under `==> Upgrading x`: we said this already.
         if was_expecting_version && t.starts_with(' ') && t.contains("->") {
-            return None;
+            return self
+                .pending_upgrade
+                .take()
+                .map(|name| format!("upgrading {name} {}", t.trim()));
+        }
+        if self.mode == RunMode::NoSoak
+            && let Some(shown) = already_current_pair(t)
+        {
+            return Some(format!("{shown}\n  Already up-to-date."));
         }
         // `To reinstall 1.0.0, run:` / `  brew reinstall x` add nothing. The
         // command is dropped only directly after the hint: brew's rebuild
@@ -203,6 +288,16 @@ impl Filter {
             return None;
         }
         if was_expecting_reinstall && t.trim_start().starts_with("brew reinstall ") {
+            return None;
+        }
+        // brewsoak prints its own "Updating Homebrew" header.
+        if matches!(
+            t.trim(),
+            "==> Updating Homebrew..." | "Updating Homebrew..."
+        ) {
+            return None;
+        }
+        if self.is_expected_more_recent(t) {
             return None;
         }
         if is_already_up_to_date(t)
@@ -224,6 +319,21 @@ impl Filter {
         self.section_line(rest)
     }
 
+    /// `Warning: cats 15.0.3 is available and more recent than version
+    /// 15.0.0.` about the very version this run installs: brewsoak chose that
+    /// version on purpose. Any other package or version still shows.
+    fn is_expected_more_recent(&self, t: &str) -> bool {
+        let Some((token, installing)) = more_recent_warning(t) else {
+            return false;
+        };
+        let name = token
+            .rsplit('/')
+            .next()
+            .unwrap_or(token)
+            .to_ascii_lowercase();
+        self.expected.get(&name).is_some_and(|v| v == installing)
+    }
+
     fn section_line(&mut self, rest: &str) -> Option<String> {
         if rest == "Cleanup" {
             self.state = Some(State::Cleanup);
@@ -240,9 +350,22 @@ impl Filter {
         }
         // `brew update`'s list of what is outdated at HEAD. brewsoak upgrades
         // to the cutoff, not HEAD, so the list contradicts it; drop it.
+        if self.mode == RunMode::NoSoak
+            && let Some(verb) = would_list_verb(rest)
+        {
+            self.state = Some(State::WouldList(verb));
+            return None;
+        }
+        // No-soak: `Upgrading 2 outdated packages:` and its name list; each
+        // package's own `==> Upgrading x` line follows.
+        if self.mode == RunMode::NoSoak && is_outdated_packages_header(rest) {
+            self.state = Some(State::SkipList);
+            return None;
+        }
         if rest.starts_with("Would ")
             || rest.starts_with("Outdated Formulae")
             || rest.starts_with("Outdated Casks")
+            || is_update_news_header(rest)
         {
             self.state = Some(State::SkipList);
             return None;
@@ -268,8 +391,23 @@ impl Filter {
             .or_else(|| rest.strip_prefix("Installing "))
             .or_else(|| rest.strip_prefix("Reinstalling "))
         {
-            self.last_pkg = Some(name.trim().to_string());
+            let name = name.trim().strip_prefix("Cask ").unwrap_or(name.trim());
+            self.last_pkg = Some(name.to_string());
             self.expect_version_line = true;
+            if self.mode == RunMode::NoSoak {
+                if rest.starts_with("Upgrading ") {
+                    self.pending_upgrade = Some(name.to_string());
+                } else if rest.starts_with("Reinstalling ") && self.parent_announced {
+                    // The caller's own line already stands for this package.
+                } else {
+                    let verb = if rest.starts_with("Installing ") {
+                        "installing"
+                    } else {
+                        "reinstalling"
+                    };
+                    return Some(format!("{verb} {name}"));
+                }
+            }
             return None;
         }
         Some(rest.to_string())
@@ -300,9 +438,10 @@ impl Filter {
         Some(format!("  installed to {path} ({tail})"))
     }
 
-    /// Caveat block for the end of the run: package name, then the lines worth
-    /// keeping. Blocks that only announced already-installed shell completions
-    /// are dropped; blocks telling the user how to install completions stay.
+    /// Caveat lines for the end of the run, unindented (the `Caveats` section
+    /// indents them): package name, then the lines worth keeping, one level in.
+    /// Blocks that only announced already-installed shell completions are
+    /// dropped; blocks telling the user how to install completions stay.
     pub fn caveat_report(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut last_name = String::new();
@@ -318,15 +457,12 @@ impl Filter {
             };
             // brew emits `==> Caveats` then `==> <pkg>` for the same package.
             if name != last_name {
-                out.push(format!("  {name}:"));
+                out.push(format!("{name}:"));
                 last_name = name.to_string();
             }
             for line in kept {
-                out.push(format!("    {}", line.trim_end()));
+                out.push(format!("  {line}").trim_end().to_string());
             }
-        }
-        if !out.is_empty() {
-            out.insert(0, "caveats:".to_string());
         }
         out
     }
@@ -334,6 +470,60 @@ impl Filter {
 
 const CHECK: &str = "\u{2714}\u{fe0e}";
 const BEER: &str = "\u{1f37a}";
+
+/// `Would upgrade 1 formula:` / `Would install 2 casks:` / `Would upgrade 10
+/// outdated packages` name a list of targets; the verb is `upgrade` or
+/// `install`. The `dependencies` lists under them stay dropped.
+pub(crate) fn would_list_verb(rest: &str) -> Option<&'static str> {
+    let mut words = rest.split_whitespace();
+    if words.next() != Some("Would") {
+        return None;
+    }
+    let verb = match words.next()? {
+        "upgrade" => "upgrade",
+        "install" => "install",
+        _ => return None,
+    };
+    words.next()?.parse::<u32>().ok()?;
+    let kind = words.next()?;
+    let is_list = kind.starts_with("formula")
+        || kind.starts_with("cask")
+        || (kind == "outdated" && verb == "upgrade");
+    is_list.then_some(verb)
+}
+
+/// The package-name lists `brew update` prints after its tap summary: `New
+/// Formulae`, `New Casks`, and `Deleted Installed Formulae|Casks` (plus the
+/// `Renamed` and `Deleted` forms older brews used). They are news about the
+/// taps, not about this run.
+fn is_update_news_header(rest: &str) -> bool {
+    ["New ", "Renamed ", "Deleted "].iter().any(|p| {
+        rest.strip_prefix(p).is_some_and(|r| {
+            let r = r.strip_prefix("Installed ").unwrap_or(r);
+            r.starts_with("Formulae") || r.starts_with("Casks")
+        })
+    })
+}
+
+/// `Upgrading 2 outdated packages:` (not `Upgrading x`).
+fn is_outdated_packages_header(rest: &str) -> bool {
+    let mut words = rest.split_whitespace();
+    words.next() == Some("Upgrading")
+        && words.next().is_some_and(|n| n.parse::<u32>().is_ok())
+        && words.next() == Some("outdated")
+}
+
+/// The `<token> <version>` of either already-installed warning form.
+fn already_current_pair(t: &str) -> Option<String> {
+    if let Some(head) = already_current_head(t) {
+        return Some(head.to_string());
+    }
+    if !is_already_up_to_date(t) {
+        return None;
+    }
+    let mut parts = t.strip_prefix("Warning: ")?.split_whitespace();
+    Some(format!("{} {}", parts.next()?, parts.next()?))
+}
 
 /// `x 1.0 is already installed but outdated (so it will be upgraded).` —
 /// brewsoak prints its own header for the same thing.
@@ -350,13 +540,31 @@ fn is_outdated_advice(t: &str) -> bool {
         || (t.starts_with("or list ") && t.ends_with(" with brew outdated."))
 }
 
+/// The `<token>` and `<c>` of `Warning: <token> <v> is available and more
+/// recent than version <c>.`; nothing else matches.
+fn more_recent_warning(t: &str) -> Option<(&str, &str)> {
+    let rest = t.strip_prefix("Warning: ")?.strip_suffix('.')?;
+    let (head, installing) = rest.split_once(" is available and more recent than version ")?;
+    let mut words = head.split(' ');
+    let (token, newer, None) = (words.next()?, words.next()?, words.next()) else {
+        return None;
+    };
+    let plain = |w: &str| !w.is_empty() && !w.contains(char::is_whitespace);
+    (plain(token) && plain(newer) && plain(installing)).then_some((token, installing))
+}
+
 /// `Warning: user/tap/x 1.0.0 already installed`: newer brew's no-op answer
 /// to `brew upgrade` of a package that is already current. Exactly a token
 /// and a version before the phrase, so other warnings still show.
 fn is_already_current(t: &str) -> bool {
+    already_current_head(t).is_some()
+}
+
+/// The `<token> <version>` of `Warning: <token> <version> already installed`.
+fn already_current_head(t: &str) -> Option<&str> {
     t.strip_prefix("Warning: ")
         .and_then(|rest| rest.strip_suffix(" already installed"))
-        .is_some_and(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
+        .filter(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
 }
 
 fn is_already_up_to_date(t: &str) -> bool {
@@ -531,9 +739,245 @@ mod tests {
 
     fn run(input: &str) -> (Vec<String>, Filter) {
         let mut f = Filter::new();
-        f.start_run();
+        f.start_run(&RunContext::default());
         let out = input.lines().filter_map(|l| f.line(l)).collect();
         (out, f)
+    }
+
+    fn run_expecting(input: &str, expected: &[(&str, &str)]) -> Vec<String> {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            expected: expected
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect(),
+            ..RunContext::default()
+        });
+        input.lines().filter_map(|l| f.line(l)).collect()
+    }
+
+    const CATS_WARNING: &str =
+        "Warning: cats 15.0.3 is available and more recent than version 15.0.0.";
+
+    #[test]
+    fn drops_more_recent_for_expected_version() {
+        assert!(run_expecting(CATS_WARNING, &[("cats", "15.0.0")]).is_empty());
+    }
+
+    #[test]
+    fn keeps_more_recent_for_dependency() {
+        let line = "Warning: ca-certificates 2026.10.19 is available and more recent than version 2026.10.18.";
+        assert_eq!(run_expecting(line, &[("cats", "15.0.0")]), vec![line]);
+    }
+
+    #[test]
+    fn keeps_more_recent_when_version_differs() {
+        assert_eq!(
+            run_expecting(CATS_WARNING, &[("cats", "14.0.0")]),
+            vec![CATS_WARNING]
+        );
+    }
+
+    #[test]
+    fn drops_more_recent_with_tap_prefix_match() {
+        // The tap-qualified token still names the expected package: dropped.
+        let line =
+            "Warning: endava/tap/Cats 15.0.3 is available and more recent than version 15.0.0.";
+        assert!(run_expecting(line, &[("cats", "15.0.0")]).is_empty());
+    }
+
+    #[test]
+    fn keeps_more_recent_with_different_wording() {
+        for line in [
+            "Warning: cats 15.0.3 is available and more recent than version 15.0.0",
+            "Warning: cats 15.0.3 is available and newer than version 15.0.0.",
+            "Warning: cats 15.0.3 is available and more recent than version 15.0.0. Extra",
+            "Warning: cats is available and more recent than version 15.0.0.",
+            "Warning: cats 15.0.3 is available and more recent than version 15.0.0.0.",
+        ] {
+            assert_eq!(
+                run_expecting(line, &[("cats", "15.0.0")]),
+                vec![line],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_recent_is_kept_without_an_expected_version() {
+        assert_eq!(run(CATS_WARNING).0, vec![CATS_WARNING]);
+    }
+
+    fn run_nosoak(input: &str) -> Vec<String> {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::NoSoak,
+            ..RunContext::default()
+        });
+        input.lines().filter_map(|l| f.line(l)).collect()
+    }
+
+    #[test]
+    fn nosoak_already_installed_reported() {
+        let out = run_nosoak(
+            "Warning: ericfitz/tap/brewsoak 1.5.2 already installed\n\
+             Warning: sqdist 0.6.0 is already installed and up-to-date.\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "ericfitz/tap/brewsoak 1.5.2\n  Already up-to-date.",
+                "sqdist 0.6.0\n  Already up-to-date."
+            ]
+        );
+    }
+
+    #[test]
+    fn soaked_mode_still_drops_already_installed() {
+        let (out, _) = run("Warning: ericfitz/tap/brewsoak 1.5.2 already installed\n\
+             Warning: sqdist 0.6.0 is already installed and up-to-date.\n");
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn nosoak_upgrade_line() {
+        let out = run_nosoak(
+            "==> Upgrading ericfitz/tap/agentbus\n  1.15.0 -> 1.16.0\n\
+             ==> Pouring agentbus--1.16.0.arm64_sequoia.bottle.tar.gz\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "upgrading ericfitz/tap/agentbus 1.15.0 -> 1.16.0",
+                "  installing agentbus 1.16.0"
+            ]
+        );
+    }
+
+    #[test]
+    fn nosoak_cask_upgrade_without_version_line() {
+        let out = run_nosoak("==> Upgrading foo\n==> Downloading https://x/y\nsome note\n");
+        assert_eq!(out, vec!["upgrading foo", "some note"]);
+    }
+
+    #[test]
+    fn nosoak_drops_outdated_package_summary_list() {
+        let out = run_nosoak(
+            "==> Upgrading 1 outdated package:\nericfitz/tap/agentbus 1.15.0 -> 1.16.0\n\
+             ==> Upgrading ericfitz/tap/agentbus\n  1.15.0 -> 1.16.0\n",
+        );
+        assert_eq!(
+            out,
+            vec!["upgrading ericfitz/tap/agentbus 1.15.0 -> 1.16.0"]
+        );
+    }
+
+    #[test]
+    fn nosoak_dry_run_list() {
+        let out = run_nosoak(
+            "==> Would upgrade 1 formula:\ncertifi 2026.7.22_1 -> 2026.10.18\n\
+             ==> Would upgrade 1 dependency for certifi:\nca-certificates 2026-09-25 -> 2026-10-20\n",
+        );
+        assert_eq!(out, vec!["would upgrade certifi 2026.7.22_1 -> 2026.10.18"]);
+    }
+
+    #[test]
+    fn nosoak_dry_run_cask_list() {
+        let out = run_nosoak("==> Would upgrade 1 cask:\nfoo 1.0 -> 2.0\n");
+        assert_eq!(out, vec!["would upgrade foo 1.0 -> 2.0"]);
+    }
+
+    #[test]
+    fn soaked_mode_keeps_dropping_would_lists() {
+        let (out, _) = run("==> Would upgrade 1 formula:\ncertifi 1 -> 2\n");
+        assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn nosoak_pending_upgrade_is_flushed_at_the_end_of_the_run() {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::NoSoak,
+            ..RunContext::default()
+        });
+        assert_eq!(f.line("==> Upgrading foo"), None);
+        assert_eq!(f.finish_run().as_deref(), Some("upgrading foo"));
+        assert_eq!(f.finish_run(), None);
+        f.start_run(&RunContext::default());
+        f.line("==> Upgrading foo");
+        assert_eq!(f.finish_run(), None, "soaked runs print their own line");
+    }
+
+    #[test]
+    fn announced_parent_suppresses_the_reinstalling_line_only() {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::NoSoak,
+            parent_announced: true,
+            ..RunContext::default()
+        });
+        let out: Vec<String> =
+            "==> Reinstalling tree\n==> Pouring tree--2.1.arm64_sequoia.bottle.tar.gz\n"
+                .lines()
+                .filter_map(|l| f.line(l))
+                .collect();
+        assert_eq!(out, vec!["  installing tree 2.1"]);
+    }
+
+    #[test]
+    fn nosoak_install_and_reinstall_get_a_parent_line() {
+        let out = run_nosoak(
+            "==> Installing cowsay\n\
+             ==> Pouring cowsay--3.8.4.arm64_sequoia.bottle.tar.gz\n\
+             ==> Reinstalling tree\n\
+             ==> Installing Cask foo\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "installing cowsay",
+                "  installing cowsay 3.8.4",
+                "reinstalling tree",
+                "installing foo"
+            ]
+        );
+    }
+
+    #[test]
+    fn nosoak_would_install_lists() {
+        let out = run_nosoak(
+            "==> Would install 1 formula:\ncowsay 3.8.4\n\
+             ==> Would install 2 dependencies for cowsay:\nperl\nlibx\n\
+             ==> Would install 1 cask:\nrectangle\n",
+        );
+        assert_eq!(
+            out,
+            vec!["would install cowsay 3.8.4", "would install rectangle"]
+        );
+    }
+
+    #[test]
+    fn nosoak_would_upgrade_outdated_packages_columns() {
+        let out = run_nosoak(
+            "==> Downloading bottle manifests\n\
+             \u{2714}\u{fe0e} Bottle Manifest gh (2.102.1)\n\
+             ==> Would upgrade 2 outdated packages\n\
+             endava/tap/cats     15.0.0     -> 15.0.3\n\
+             go                  1.27.2     -> 1.27.3      (67.7MB)\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "would upgrade endava/tap/cats 15.0.0 -> 15.0.3",
+                "would upgrade go 1.27.2 -> 1.27.3"
+            ]
+        );
+    }
+
+    #[test]
+    fn drops_updating_homebrew_banner() {
+        let (out, _) = run("==> Updating Homebrew...\nAlready up-to-date.\n");
+        assert_eq!(out, vec!["Already up-to-date.".to_string()]);
     }
 
     #[test]
@@ -643,7 +1087,15 @@ Update your git config to finish installation:
   $ git lfs install";
         let (_, f) = run(input);
         let report = f.caveat_report();
-        assert_eq!(report[0], "caveats:");
+        assert_eq!(
+            report,
+            vec![
+                "git-lfs:",
+                "  Update your git config to finish installation:",
+                "",
+                "    $ git lfs install"
+            ]
+        );
         let text = report.join("\n");
         assert!(!text.contains("site-functions"), "{text}");
         assert!(text.contains("git-lfs:"), "{text}");
@@ -695,8 +1147,6 @@ The 7.0.10 changelog can be found at:
             out,
             vec![
                 "Updated 2 taps (endava/tap and homebrew/cask).",
-                "New Casks",
-                "rew: Record, visualise and measure audio",
                 "The 7.0.10 changelog can be found at:",
             ]
         );
@@ -719,6 +1169,47 @@ Warning: something else already installed elsewhere
                 "Warning: something else already installed elsewhere",
             ]
         );
+    }
+
+    #[test]
+    fn brew_update_news_lists_are_dropped() {
+        let (out, _) =
+            run("Updated 1 tap (homebrew/cask).\n==> New Casks\nfont-mengshen-handwritten\n");
+        assert_eq!(out, vec!["Updated 1 tap (homebrew/cask)."]);
+    }
+
+    #[test]
+    fn brew_update_news_sections_end_at_the_next_header_or_blank() {
+        let input = "\
+Updated 2 taps (homebrew/core and homebrew/cask).
+==> New Formulae
+foo: A tool
+bar
+==> New Casks
+font-x
+==> Deleted Installed Formulae
+old-formula
+==> Deleted Installed Casks
+old-cask
+
+Already up-to-date.
+";
+        let (out, _) = run(input);
+        assert_eq!(
+            out,
+            vec![
+                "Updated 2 taps (homebrew/core and homebrew/cask).",
+                "Already up-to-date."
+            ]
+        );
+    }
+
+    #[test]
+    fn brew_update_news_never_swallows_a_warning() {
+        let (out, _) = run(
+            "==> New Casks\nfont-x\nWarning: tap is slow\n==> Renamed Formulae\na -> b\nError: boom\n",
+        );
+        assert_eq!(out, vec!["Warning: tap is slow", "Error: boom"]);
     }
 
     #[test]
@@ -759,10 +1250,10 @@ Warning: something else already installed elsewhere
     #[test]
     fn a_new_run_may_repeat_the_previous_runs_last_line() {
         let mut f = Filter::new();
-        f.start_run();
+        f.start_run(&RunContext::default());
         assert!(f.line("same").is_some());
         assert!(f.line("same").is_none());
-        f.start_run();
+        f.start_run(&RunContext::default());
         assert!(f.line("same").is_some());
     }
 

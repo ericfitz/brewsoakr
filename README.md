@@ -94,8 +94,8 @@ names in both.
 | `hashicorp/tap/terraform` | that one package from that tap |
 
 Matching is case-insensitive. Invalid entries are skipped and reported under
-`-v`; `brewsoak settings repair` removes them. A `NO_SOAK` key inside a `[[TAP]]` table is ignored, with a warning on
-stderr every run.
+`-v`; `brewsoak settings repair` removes them. A `NO_SOAK` key inside a
+`[[TAP]]` table is ignored, with a warning on stderr every run.
 
 `--soak-hours N` edits only the `SOAK_HOURS` key; `[[TAP]]`, `NO_SOAK`, and
 comments are kept, and the previous file is backed up as described under
@@ -201,9 +201,15 @@ up-to-date` notices are dropped from the terminal.
 Nothing is lost. Every byte `brew` writes is appended to a per-run log under
 `$TMPDIR`, and the path is printed at the end of the run.
 
-Holds, skips, and deprecation warnings are collected into a `notes:` block
-after the counts line so they are not buried in the install scroll, and
-`caveats:` follows with the caveats worth reading — brew's "shell completions
+A run prints headed sections (`Fetching Homebrew history`, `Fetching tap
+history`, `Upgrading soaked packages`, `Updating Homebrew`, `Upgrading no-soak
+packages (brew decides)`) with their lines indented beneath. A section with
+nothing in it is omitted, except the soaked section of a bare `upgrade`,
+which always prints with `(N of M)`. A dry run reads `Would upgrade …`.
+Holds, skips, and deprecation warnings are collected into a `Notes` section
+after the `Summary` table, grouped by kind with one package per line, so they
+are not buried in the install scroll, and a `Caveats` section follows with the
+caveats worth reading — brew's "shell completions
 have been installed to ..." notices are dropped, anything telling you to run
 something is kept.
 
@@ -221,21 +227,54 @@ brewsoak info wget
 brewsoak upgrade -v
 ```
 
-A typical `upgrade` with nothing to do prints a counts line such as:
+A typical `upgrade` with nothing to do (a dry run here, taken from a real
+run and trimmed) prints:
 
 ```
-upgraded 0, already soaked 137, held 0, ahead 0, pinned 0, skipped 0
-already soaked: 137 formulae and casks
+Fetching Homebrew history
+  Homebrew/homebrew-core
+  Homebrew/homebrew-cask
+Fetching tap history
+  anthropics/tap
+  hashicorp/tap
+Would upgrade soaked packages (0 of 177)
+Updating Homebrew
+  Already up-to-date.
+Would upgrade no-soak packages (brew decides)
+  ericfitz/tap/brewsoak 1.5.2
+    Already up-to-date.
+  ericfitz/tap/sqdist 0.6.0
+    Already up-to-date.
+Summary
+  would upgrade    0
+  already soaked 162
+  soaking         10
+  held             0
+  ahead            1
+  pinned           0
+  skipped          0
+  no-soak          2  (0 would upgrade, 2 already up-to-date)
+  auto-updates     2
+  installed       0B
+  freed           0B
+Notes
+  Still soaking (left at the cutoff):
+    awscli 2.38.3
+    cats 15.0.3
+  Ahead of soak (installed artifact left unchanged):
+    uv
+Full brew log: /var/folders/…/T/brewsoak-12345.log
 ```
 
 A package already at its cutoff while a newer version is still inside the
 soak window is counted as `soaking N` instead of `already soaked`. A bare
-`upgrade` names them in one note (`still soaking (left at the cutoff): cats
-15.0.0`). A named one (`brewsoak upgrade cats`) says which version is soaking
-and for how long. `outdated` lists them under `==> Soaking`, and `info` shows
+`upgrade` lists them under `Still soaking (left at the cutoff)` in `Notes`. A
+named one (`brewsoak upgrade cats`) says which version is soaking and for how
+long. `outdated` lists them under `==> Soaking`, and `info` shows
 `up to date (soaked); 15.0.0 soaking`. brew's own "Outdated Formulae" list from
-`brew update` is dropped, because it counts versions that are still soaking.
-It stays in `--raw` output and the brew log.
+`brew update` is dropped, because it counts versions that are still soaking,
+and so are its New and Deleted package lists. All of them stay in `--raw`
+output and the brew log.
 
 Casks that update themselves (`auto_updates true`) are left to the app on a
 bare `upgrade`, as `brew upgrade` leaves them without `--greedy`; they are
@@ -254,21 +293,38 @@ by version alone.
 An `upgrade` with work to do looks like:
 
 ```
-upgrading 26 of 150 packages
-[1/26] upgrading aws-c-auth 0.10.5 -> 1.0.0
-  downloading aws-c-common 1.0.0
-  installing aws-c-common 1.0.0
-  installed to /opt/homebrew/Cellar/aws-c-common/1.0.0 (109 files, 1MB)
-  ...
-upgraded 26, already soaked 124, held 0, ahead 0, pinned 0, skipped 1
-installed 989.3MB, freed 1.2GB
-notes:
+Upgrading soaked packages (26 of 153)
+  [1/26] upgrading aws-c-auth 0.10.5 -> 1.0.0
+    downloading aws-c-common 1.0.0
+    installing aws-c-common 1.0.0
+    installed to /opt/homebrew/Cellar/aws-c-common/1.0.0 (109 files, 1MB)
+    ...
+Updating Homebrew
+  Already up-to-date.
+Upgrading no-soak packages (brew decides)
+  upgrading ericfitz/tap/agentbus 1.15.0 -> 1.16.0
+    installing agentbus 1.16.0
+  ericfitz/tap/brewsoak 1.5.2
+    Already up-to-date.
+Summary
+  upgraded            26
+  already soaked     124
+  soaking              0
+  held                 0
+  ahead                0
+  pinned               0
+  skipped              1
+  no-soak              2  (1 upgraded, 1 already up-to-date)
+  auto-updates         0
+  installed      989.3MB
+  freed            1.2GB
+Notes
   bash: unparseable identity; skipping
-caveats:
+Caveats
   git-lfs:
     Update your git config to finish installation:
       $ git lfs install
-full brew log: /var/folders/.../brewsoak-53417.log
+Full brew log: /var/folders/…/T/brewsoak-53417.log
 ```
 
 Refusals tell you to run `brew upgrade <name>` (or install/reinstall) to
