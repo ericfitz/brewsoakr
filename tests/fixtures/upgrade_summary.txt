@@ -1,7 +1,9 @@
 Upgrading soaked packages (1 of 5)
   [1/1] upgrading alpha 1.0.0 -> 1.1.0
 Updating Homebrew
-no-soak: brew upgrade ericfitz/tap/brewsoak
+Upgrading no-soak packages (brew decides)
+  ericfitz/tap/brewsoak
+    no result from brew; see the full log
 Summary
   upgraded        1
   already soaked  0
@@ -10,7 +12,7 @@ Summary
   ahead           0
   pinned          1
   skipped         0
-  no-soak         1  (0 upgraded, 0 already up-to-date)
+  no-soak         1  (0 upgraded, 0 already up-to-date, 1 no result)
   auto-updates    0
   installed      0B
   freed          0B

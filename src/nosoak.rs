@@ -73,6 +73,7 @@ use crate::cmd::{max_status, merge_status};
 use crate::flags::{dropped_note, filter_for_verb, is_dry_run};
 use crate::origin;
 use crate::quiet;
+use crate::report::{Verb, nosoak_header};
 use crate::resolve::PkgKind;
 use crate::section::Section;
 use crate::tap::is_stripped_flag;
@@ -100,6 +101,12 @@ pub struct StepResult {
     pub installed: BTreeMap<String, String>,
     /// Tap-switch targets brew replaced; their staged-keg origin record is stale.
     pub switched: Vec<Target>,
+    /// Targets brew upgraded, installed or (dry run) listed as upgradable.
+    pub upgraded: usize,
+    /// Targets brew said were already installed and current.
+    pub current: usize,
+    /// Targets brew said nothing about.
+    pub no_result: usize,
 }
 
 /// The targets as `(kind flag, group)` runs: one unflagged group, or when
@@ -140,6 +147,8 @@ pub fn run_step(
     targets: &[Target],
     out: &mut impl Write,
 ) -> Result<StepResult, Error> {
+    let verb_kind = Verb::parse(verb)
+        .ok_or_else(|| Error::Usage(format!("no-soak: unknown brew verb {verb:?}")))?;
     let mut result = StepResult::default();
     if targets.is_empty() {
         return Ok(result);
@@ -170,6 +179,13 @@ pub fn run_step(
         .filter(|f| !is_stripped_flag(f))
         .cloned()
         .collect();
+    let dry_run = is_dry_run(&flags);
+    let ctx = quiet::RunContext {
+        mode: quiet::RunMode::NoSoak,
+    };
+    let mut section = Section::new(&mut *out, nosoak_header(verb_kind, dry_run));
+    // Everything brew said across the section's runs, for the per-package verdicts.
+    let mut said = String::new();
     let (switch, plain): (Vec<&Target>, Vec<&Target>) = targets
         .iter()
         .partition(|t| t.switch_tap && verb == "upgrade");
@@ -192,8 +208,8 @@ pub fn run_step(
         args.extend(plain_flags.kept.iter().cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(group.iter().map(|t| token_of(t)));
-        writeln!(out, "no-soak: brew {}", args.join(" "))?;
-        let output = brew.run_visible(&args, &mut *out)?;
+        let output = brew.run_visible_in(&args, &mut section, &ctx)?;
+        said.push_str(&String::from_utf8_lossy(&output.stdout));
         result
             .installed
             .extend(quiet::installed_from_output(&output.stdout));
@@ -203,7 +219,6 @@ pub fn run_step(
     // brew install says "already installed" and leaves a staged keg alone;
     // reinstall replaces it, and the receipt then carries the real tap.
     // reinstall has no dry run, so a dry run must not reach it.
-    let dry_run = is_dry_run(&flags);
     if dry_run && !switch.is_empty() {
         result.notes.push(format!(
             "no-soak: skipped moving staged kegs to their tap for a dry run: {}",
@@ -239,12 +254,15 @@ pub fn run_step(
         args.extend(switch_flags.kept.iter().cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(switch.iter().map(|t| token_of(t)));
-        writeln!(
-            out,
-            "no-soak: brew {} (moving staged kegs to their tap)",
-            args.join(" ")
-        )?;
-        let output = brew.run_visible(&args, &mut *out)?;
+        for t in &switch {
+            writeln!(
+                section,
+                "reinstalling {} (moving staged keg to its tap)",
+                token_of(t)
+            )?;
+        }
+        let output = brew.run_visible_in(&args, &mut section, &ctx)?;
+        said.push_str(&String::from_utf8_lossy(&output.stdout));
         // Only Cellar lines are evidence of a written keg; casks have none, so
         // for them (and formulae alike) success means exit 0 with no
         // already-installed message for the target.
@@ -286,7 +304,72 @@ pub fn run_step(
         result.installed.extend(installed);
         max_status(&mut result.status, code);
     }
+
+    // A dry run never reached the staged-keg targets, so they have no verdict.
+    let judged = plain.iter().chain(if dry_run { &[] } else { &switch[..] });
+    for t in judged {
+        match verdict(&said, t) {
+            Verdict::Upgraded => result.upgraded += 1,
+            Verdict::Current => result.current += 1,
+            Verdict::NoResult => {
+                result.no_result += 1;
+                writeln!(
+                    section,
+                    "{}\n  no result from brew; see the full log",
+                    token_of(t)
+                )?;
+            }
+        }
+    }
     Ok(result)
+}
+
+enum Verdict {
+    Upgraded,
+    Current,
+    NoResult,
+}
+
+/// What brew's output says about one target, matching its token or its last
+/// `/` segment case-insensitively. An upgrade outranks an already-current
+/// warning.
+fn verdict(said: &str, t: &Target) -> Verdict {
+    let token = brew_token(&t.origin, &t.name).to_ascii_lowercase();
+    let name = token.rsplit('/').next().unwrap_or(&token).to_string();
+    let is_me = |w: &str| {
+        let w = w.trim_matches(|c: char| c == '\'' || c == '"' || c == ',' || c == '.');
+        w == token || w == name
+    };
+    let mut current = false;
+    for line in said.lines() {
+        let l = line.to_ascii_lowercase();
+        let l = l.trim_end();
+        let first = l.split_whitespace().next().unwrap_or("");
+        if let Some(rest) = l.strip_prefix("==> upgrading ") {
+            if rest.split_whitespace().next().is_some_and(is_me) {
+                return Verdict::Upgraded;
+            }
+        } else if let Some(file) = l.strip_prefix("==> pouring ") {
+            if file.split("--").next().is_some_and(is_me) {
+                return Verdict::Upgraded;
+            }
+        } else if l.contains("/cellar/") {
+            let path = l.split_once("/cellar/").map_or("", |(_, r)| r);
+            if path.split('/').next().is_some_and(is_me) {
+                return Verdict::Upgraded;
+            }
+        } else if !l.starts_with(' ') && l.contains(" -> ") && is_me(first) {
+            // `name a -> b` under brew's upgrade or dry-run list.
+            return Verdict::Upgraded;
+        } else if crate::cmd::already_installed_line(l) && l.split_whitespace().any(is_me) {
+            current = true;
+        }
+    }
+    if current {
+        Verdict::Current
+    } else {
+        Verdict::NoResult
+    }
 }
 
 #[cfg(test)]
@@ -550,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn switch_message_names_reinstall_and_flags_reinstall_rejects_are_dropped() {
+    fn switch_line_per_package_and_flags_reinstall_rejects_are_dropped() {
         let brew = MockBrew::new();
         let mut out = Vec::new();
         let flags = [
@@ -571,11 +654,10 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            text.contains(
-                "no-soak: brew reinstall --verbose hashicorp/tap/packer (moving staged kegs to their tap)"
-            ),
+            text.contains("reinstalling hashicorp/tap/packer (moving staged keg to its tap)"),
             "{text}"
         );
+        assert!(!text.contains("no-soak: brew"), "{text}");
         assert_eq!(
             runs(&brew)[1],
             vec!["reinstall", "--verbose", "hashicorp/tap/packer"]
@@ -612,6 +694,118 @@ mod tests {
             .unwrap();
             assert_eq!(runs(&brew)[1], vec!["upgrade", flag, "foo"]);
         }
+    }
+
+    fn mock_with(outs: Vec<(i32, &[u8])>) -> MockBrew {
+        MockBrew {
+            next_outputs: std::sync::Mutex::new(
+                outs.into_iter().map(|(c, o)| (c, o.to_vec())).collect(),
+            ),
+            ..MockBrew::new()
+        }
+    }
+
+    #[test]
+    fn classifies_upgraded_current_and_no_result() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                0,
+                b"Warning: ericfitz/tap/brewsoak 1.5.2 already installed\n\
+                  ==> Upgrading ericfitz/tap/agentbus\n  1.15.0 -> 1.16.0\n",
+            ),
+        ]);
+        let targets = [
+            t("ericfitz/tap", "agentbus"),
+            t("ericfitz/tap", "brewsoak"),
+            t("ericfitz/tap", "sqdist"),
+        ];
+        let mut out = Vec::new();
+        let r = run_step(&brew, "upgrade", &[], &targets, &mut out).unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 1, 1));
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(
+            text,
+            "Updating Homebrew\nUpgrading no-soak packages (brew decides)\n  ericfitz/tap/sqdist\n    no result from brew; see the full log\n"
+        );
+    }
+
+    #[test]
+    fn classifies_by_last_segment_and_ignores_case() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (
+                0,
+                b"==> Pouring AgentBus--1.16.0.arm64_sequoia.bottle.tar.gz\n",
+            ),
+        ]);
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("ericfitz/tap", "agentbus")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 0));
+    }
+
+    #[test]
+    fn dry_run_list_counts_as_upgraded_and_header_says_would() {
+        let brew = mock_with(vec![
+            (0, b""),
+            (0, b"==> Would upgrade 1 formula:\ncertifi 1 -> 2\n"),
+        ]);
+        let mut out = Vec::new();
+        let r = run_step(
+            &brew,
+            "upgrade",
+            &["--dry-run".to_string()],
+            &[t("homebrew/core", "certifi"), t("homebrew/core", "other")],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 1));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("\nWould upgrade no-soak packages (brew decides)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn runs_in_nosoak_mode() {
+        let brew = MockBrew::new();
+        run_step(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget")],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let ctx = brew.last_ctx.lock().unwrap().clone();
+        assert_eq!(
+            ctx,
+            Some(quiet::RunContext {
+                mode: quiet::RunMode::NoSoak
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_verb_is_rejected() {
+        let brew = MockBrew::new();
+        let err = run_step(
+            &brew,
+            "frobnicate",
+            &[],
+            &[t("homebrew/core", "wget")],
+            &mut Vec::new(),
+        )
+        .expect_err("unknown verb");
+        assert!(err.to_string().contains("frobnicate"), "{err}");
+        assert!(runs(&brew).is_empty(), "no brew command may run");
     }
 
     fn typed(origin: &str, name: &str, kind: PkgKind) -> Target {

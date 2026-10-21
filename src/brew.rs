@@ -65,7 +65,16 @@ pub trait Brew {
     /// Live stdout/stderr for install/upgrade/reinstall and brew passthrough.
     /// The summarized lines go to `terminal`: callers pass the writer they
     /// write their own lines to, so the two streams cannot split or reorder.
-    fn run_visible(&self, args: &[String], terminal: &mut dyn Write) -> Result<Output, Error>;
+    fn run_visible_in(
+        &self,
+        args: &[String],
+        terminal: &mut dyn Write,
+        ctx: &quiet::RunContext,
+    ) -> Result<Output, Error>;
+    /// `run_visible_in` for a soaked run (the default `RunContext`).
+    fn run_visible(&self, args: &[String], terminal: &mut dyn Write) -> Result<Output, Error> {
+        self.run_visible_in(args, terminal, &quiet::RunContext::default())
+    }
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
@@ -249,6 +258,8 @@ pub struct MockBrew {
     pub taps: Vec<TapInfo>,
     pub runs: Mutex<Vec<Vec<String>>>,
     pub visible_runs: Mutex<Vec<Vec<String>>>,
+    /// The `RunContext` of the latest `run_visible_in` call.
+    pub last_ctx: Mutex<Option<quiet::RunContext>>,
     pub next_status: i32,
     pub next_stdout: Vec<u8>,
     pub next_stderr: Vec<u8>,
@@ -308,6 +319,7 @@ impl Default for MockBrew {
             taps: Vec::new(),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
+            last_ctx: Mutex::new(None),
             next_status: 0,
             next_stdout: Vec::new(),
             next_stderr: Vec::new(),
@@ -371,8 +383,13 @@ impl Brew for ProcessBrew {
         self.spawn_brew(args, None)
     }
 
-    fn run_visible(&self, args: &[String], terminal: &mut dyn Write) -> Result<Output, Error> {
-        self.spawn_brew(args, Some(terminal))
+    fn run_visible_in(
+        &self,
+        args: &[String],
+        terminal: &mut dyn Write,
+        ctx: &quiet::RunContext,
+    ) -> Result<Output, Error> {
+        self.spawn_brew(args, Some((terminal, ctx)))
     }
 
     fn set_raw(&self, raw: bool) {
@@ -680,12 +697,12 @@ impl ProcessBrew {
     fn spawn_brew(
         &self,
         args: &[String],
-        terminal: Option<&mut dyn Write>,
+        terminal: Option<(&mut dyn Write, &quiet::RunContext)>,
     ) -> Result<Output, Error> {
         let mut cmd = Command::new(&self.bin);
         cmd.args(args);
         apply_brewsoak_brew_env(&mut cmd);
-        let Some(terminal) = terminal else {
+        let Some((terminal, ctx)) = terminal else {
             return match cmd.output() {
                 Ok(output) => Ok(output),
                 Err(e) if e.kind() == ErrorKind::NotFound => {
@@ -713,7 +730,7 @@ impl ProcessBrew {
         drop(cmd);
         let raw = self.raw.get();
         let mut sink = self.sink.lock().unwrap_or_else(|e| e.into_inner());
-        let captured = forward_run(reader, &mut sink, terminal, args, raw);
+        let captured = forward_run(reader, &mut sink, terminal, args, raw, ctx);
         drop(sink);
         let status = child.wait()?;
         Ok(Output {
@@ -732,13 +749,14 @@ fn forward_run(
     stdout: &mut dyn Write,
     args: &[String],
     raw: bool,
+    ctx: &quiet::RunContext,
 ) -> Vec<u8> {
     let mut reader = std::io::BufReader::new(src);
     let mut captured = Vec::new();
     if let Some(log) = sink.log() {
         let _ = writeln!(log, "\n$ brew {}", args.join(" "));
     }
-    sink.filter.start_run();
+    sink.filter.start_run(ctx);
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -774,9 +792,15 @@ impl Brew for MockBrew {
         Ok(self.mock_output())
     }
 
-    fn run_visible(&self, args: &[String], _terminal: &mut dyn Write) -> Result<Output, Error> {
+    fn run_visible_in(
+        &self,
+        args: &[String],
+        _terminal: &mut dyn Write,
+        ctx: &quiet::RunContext,
+    ) -> Result<Output, Error> {
         self.record(args);
         self.record_visible(args);
+        *self.last_ctx.lock().unwrap_or_else(|e| e.into_inner()) = Some(ctx.clone());
         let queued = self
             .next_outputs
             .lock()

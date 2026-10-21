@@ -6,7 +6,7 @@
 //! does). `brew_stream` drops the brewsoak-origin lines and starts a new run
 //! at each package, which is how ProcessBrew drives the filter for real.
 
-use brewsoak::quiet::{Filter, human_size};
+use brewsoak::quiet::{Filter, RunContext, human_size};
 use std::path::Path;
 
 fn is_brewsoak_line(line: &str) -> bool {
@@ -28,7 +28,7 @@ fn noisy_upgrade_transcript_collapses() {
     let input = std::fs::read_to_string(dir.join("noisy_upgrade.txt")).unwrap();
 
     let mut filter = Filter::new();
-    filter.start_run();
+    filter.start_run(&RunContext::default());
     let mut lines = Vec::new();
     for line in input.lines() {
         if is_brewsoak_line(line) {
@@ -36,7 +36,7 @@ fn noisy_upgrade_transcript_collapses() {
         }
         // brew prints this first for each package brewsoak hands it.
         if line.contains("is already installed but outdated") {
-            filter.start_run();
+            filter.start_run(&RunContext::default());
         }
         if let Some(out) = filter.line(line) {
             lines.push(out);

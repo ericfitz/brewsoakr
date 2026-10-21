@@ -1098,6 +1098,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.out.get_mut(),
         )?;
         self.counts.no_soak += step.count;
+        self.counts.no_soak_upgraded += step.upgraded;
+        self.counts.no_soak_current += step.current;
+        self.counts.no_soak_no_result += step.no_result;
         self.done.extend(step.installed);
         // The receipt now names the tap, so a staged-keg record is stale.
         for t in step.switched.iter().filter(|_| !self.counts.dry_run) {

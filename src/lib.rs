@@ -676,12 +676,13 @@ mod tests {
         fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
             self.mock.run(a)
         }
-        fn run_visible(
+        fn run_visible_in(
             &self,
             a: &[String],
             terminal: &mut dyn Write,
+            ctx: &quiet::RunContext,
         ) -> Result<std::process::Output, Error> {
-            self.real.run_visible(a, terminal)
+            self.real.run_visible_in(a, terminal, ctx)
         }
         fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
             self.mock.installed_packages()
