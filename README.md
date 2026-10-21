@@ -268,12 +268,13 @@ Full brew log: /var/folders/…/T/brewsoak-12345.log
 
 A package already at its cutoff while a newer version is still inside the
 soak window is counted as `soaking N` instead of `already soaked`. A bare
-`upgrade` lists them under `Still soaking (left at the cutoff)` in `Notes`. A named one (`brewsoak upgrade cats`) says which version is soaking
-and for how long. `outdated` lists them under `==> Soaking`, and `info` shows
+`upgrade` lists them under `Still soaking (left at the cutoff)` in `Notes`. A
+named one (`brewsoak upgrade cats`) says which version is soaking and for how
+long. `outdated` lists them under `==> Soaking`, and `info` shows
 `up to date (soaked); 15.0.0 soaking`. brew's own "Outdated Formulae" list from
-`brew update` is dropped, because it counts versions that are still soaking.
-The New and Deleted package lists from `brew update` are dropped too.
-It stays in `--raw` output and the brew log.
+`brew update` is dropped, because it counts versions that are still soaking,
+and so are its New and Deleted package lists. All of them stay in `--raw`
+output and the brew log.
 
 Casks that update themselves (`auto_updates true`) are left to the app on a
 bare `upgrade`, as `brew upgrade` leaves them without `--greedy`; they are

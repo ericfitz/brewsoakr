@@ -270,19 +270,24 @@ pub fn run_step(
         };
         let output = brew.run_visible_in(&args, &mut section, &switch_ctx)?;
         runs.push(RunSaid::new(&switch, &output));
-        // Only Cellar lines are evidence of a written keg; casks have none, so
-        // for them (and formulae alike) success means exit 0 with no
-        // already-installed message for the target.
+        // A Cellar line or a cask's success line proves that target's keg was
+        // replaced even when the run as a whole failed. Without that proof,
+        // success means exit 0 with no already-installed message for it.
         let installed = quiet::cellar_installed_from_output(&output.stdout);
         let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
         let mut code = output.status.code().unwrap_or(1);
         let mut failed = Vec::new();
+        let mut proven = Vec::new();
         for t in &switch {
             let name = t.name.to_ascii_lowercase();
             let said_installed = text
                 .lines()
                 .any(|l| crate::cmd::already_installed_line(l) && l.contains(&name));
-            if code != 0 || said_installed {
+            let replaced = installed.contains_key(&name)
+                || text.lines().any(|l| cask_success_for(l, |w| w == name));
+            if replaced && !said_installed {
+                proven.push(*t);
+            } else if code != 0 || said_installed {
                 let cask = if t.kind == Some(PkgKind::Cask) {
                     " --cask"
                 } else {
@@ -298,16 +303,14 @@ pub fn run_step(
                 failed.push(*t);
             }
         }
-        // When the run failed as a whole, which kegs it replaced is unknown;
-        // their records stay and the next run tries again.
-        if code == 0 {
-            result.switched.extend(
-                switch
-                    .iter()
-                    .filter(|t| !failed.contains(t))
-                    .map(|t| (*t).clone()),
-            );
-        }
+        // When the run failed as a whole, only proven kegs count as replaced;
+        // the rest keep their records and the next run tries again.
+        result.switched.extend(
+            switch
+                .iter()
+                .filter(|t| proven.contains(t) || (code == 0 && !failed.contains(t)))
+                .map(|t| (*t).clone()),
+        );
         result.installed.extend(installed);
         max_status(&mut result.status, code);
     }
@@ -397,8 +400,7 @@ fn cask_success_for(l: &str, is_me: impl Fn(&str) -> bool) -> bool {
 /// `name a -> b` line counts only on a dry run: in a real run it is brew's
 /// plan, and the upgrade can still fail. When the run failed (`ok` false),
 /// only a poured keg or a cask's `was successfully upgraded!` line proves an
-/// upgrade: brew's plan and `==> Upgrading` lines
-/// come before the failure.
+/// upgrade: brew's plan and `==> Upgrading` lines come before the failure.
 fn verdict(said: &str, cellar: &[String], token: &str, dry_run: bool, ok: bool) -> Verdict {
     let token = token.to_ascii_lowercase();
     let name = token.rsplit('/').next().unwrap_or(&token).to_string();
@@ -1306,6 +1308,34 @@ Error: formula-b: boom\n"
         );
         assert_eq!((r.upgraded, r.current, r.no_result), (0, 0, 1));
         assert!(r.switched.is_empty());
+    }
+
+    #[test]
+    fn failed_tap_switch_keeps_a_proven_cask_and_holds_the_rest() {
+        let targets = [
+            switch_target("acme/tap", "foo")[0].clone(),
+            switch_target("acme/tap", "bar")[0].clone(),
+        ];
+        let r = switch_with(
+            (
+                1,
+                b"==> Installing Cask foo\n\xf0\x9f\x8d\xba  foo was successfully installed!\nError: bar: boom\n",
+            ),
+            &targets,
+        );
+        assert_eq!((r.upgraded, r.current, r.no_result), (1, 0, 1));
+        let switched: Vec<&str> = r.switched.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(switched, ["foo"]);
+        assert!(
+            r.notes.iter().all(|n| !n.starts_with("foo:")),
+            "{:?}",
+            r.notes
+        );
+        assert!(
+            r.notes.iter().any(|n| n.starts_with("bar:")),
+            "{:?}",
+            r.notes
+        );
     }
 
     #[test]
