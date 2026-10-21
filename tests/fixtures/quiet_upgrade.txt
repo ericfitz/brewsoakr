@@ -73,38 +73,37 @@
   downloading uv 0.12.7
   installing uv 0.12.7
   installed to /opt/homebrew/Cellar/uv/0.12.7 (17 files, 44.4MB)
-caveats:
-  awscli:
-    The "examples" directory has been installed to:
-      /opt/homebrew/share/awscli/examples
-  cmake:
-    Emacs Lisp files have been installed to:
-      /opt/homebrew/share/emacs/site-lisp/cmake
-    To install the CMake documentation, run:
-      brew install cmake-docs
-  git-lfs:
-    Update your git config to finish installation:
-    
-      # Update global git config
-      $ git lfs install
-    
-      # Update system git config
-      $ git lfs install --system
-  kubernetes-cli:
-    The following kubernetes-cli executables are shadowed by other commands earlier in your PATH:
-      kubectl (shadowed by /Applications/Docker.app/Contents/Resources/bin/kubectl)
-    Running these by name will not invoke the version provided by Homebrew.
-  node:
-    Single Executable Application is disabled as it doesn't work with shared libnode.
-    Temporal support is disabled as it doesn't work with shared ICU library.
-    
-    The following node executables are shadowed by other commands earlier in your PATH:
-      node (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/node)
-      npm (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npm)
-      npx (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npx)
-    Running these by name will not invoke the version provided by Homebrew.
-  nss:
-    The following nss executables are shadowed by other commands earlier in your PATH:
-      derdump (shadowed by /Users/efitz/Scripts/derdump)
-    Running these by name will not invoke the version provided by Homebrew.
+awscli:
+  The "examples" directory has been installed to:
+    /opt/homebrew/share/awscli/examples
+cmake:
+  Emacs Lisp files have been installed to:
+    /opt/homebrew/share/emacs/site-lisp/cmake
+  To install the CMake documentation, run:
+    brew install cmake-docs
+git-lfs:
+  Update your git config to finish installation:
+
+    # Update global git config
+    $ git lfs install
+
+    # Update system git config
+    $ git lfs install --system
+kubernetes-cli:
+  The following kubernetes-cli executables are shadowed by other commands earlier in your PATH:
+    kubectl (shadowed by /Applications/Docker.app/Contents/Resources/bin/kubectl)
+  Running these by name will not invoke the version provided by Homebrew.
+node:
+  Single Executable Application is disabled as it doesn't work with shared libnode.
+  Temporal support is disabled as it doesn't work with shared ICU library.
+
+  The following node executables are shadowed by other commands earlier in your PATH:
+    node (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/node)
+    npm (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npm)
+    npx (shadowed by /Users/efitz/.nvm/versions/node/v22.23.1/bin/npx)
+  Running these by name will not invoke the version provided by Homebrew.
+nss:
+  The following nss executables are shadowed by other commands earlier in your PATH:
+    derdump (shadowed by /Users/efitz/Scripts/derdump)
+  Running these by name will not invoke the version provided by Homebrew.
 installed 989.3MB, freed 1.2GB

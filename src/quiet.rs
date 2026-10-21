@@ -426,9 +426,10 @@ impl Filter {
         Some(format!("  installed to {path} ({tail})"))
     }
 
-    /// Caveat block for the end of the run: package name, then the lines worth
-    /// keeping. Blocks that only announced already-installed shell completions
-    /// are dropped; blocks telling the user how to install completions stay.
+    /// Caveat lines for the end of the run, unindented (the `Caveats` section
+    /// indents them): package name, then the lines worth keeping, one level in.
+    /// Blocks that only announced already-installed shell completions are
+    /// dropped; blocks telling the user how to install completions stay.
     pub fn caveat_report(&self) -> Vec<String> {
         let mut out = Vec::new();
         let mut last_name = String::new();
@@ -444,15 +445,12 @@ impl Filter {
             };
             // brew emits `==> Caveats` then `==> <pkg>` for the same package.
             if name != last_name {
-                out.push(format!("  {name}:"));
+                out.push(format!("{name}:"));
                 last_name = name.to_string();
             }
             for line in kept {
-                out.push(format!("    {}", line.trim_end()));
+                out.push(format!("  {line}").trim_end().to_string());
             }
-        }
-        if !out.is_empty() {
-            out.insert(0, "caveats:".to_string());
         }
         out
     }
@@ -1048,7 +1046,15 @@ Update your git config to finish installation:
   $ git lfs install";
         let (_, f) = run(input);
         let report = f.caveat_report();
-        assert_eq!(report[0], "caveats:");
+        assert_eq!(
+            report,
+            vec![
+                "git-lfs:",
+                "  Update your git config to finish installation:",
+                "",
+                "    $ git lfs install"
+            ]
+        );
         let text = report.join("\n");
         assert!(!text.contains("site-functions"), "{text}");
         assert!(text.contains("git-lfs:"), "{text}");

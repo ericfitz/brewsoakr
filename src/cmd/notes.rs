@@ -194,6 +194,30 @@ mod tests {
     }
 
     #[test]
+    fn session_tail_prints_caveats_section_and_log_path() {
+        let report = crate::brew::SessionReport {
+            caveats: vec![
+                "git-lfs:".to_string(),
+                "  Update your git config to finish installation:".to_string(),
+                "    $ git lfs install".to_string(),
+            ],
+            added_bytes: 0,
+            freed_bytes: 0,
+            log_path: Some(std::path::PathBuf::from("/tmp/brewsoak-1.log")),
+        };
+        let mut out = Vec::new();
+        write_session_tail(&report, &mut out).unwrap();
+        let want = "\
+Caveats
+  git-lfs:
+    Update your git config to finish installation:
+      $ git lfs install
+Full brew log: /tmp/brewsoak-1.log
+";
+        assert_eq!(String::from_utf8(out).unwrap(), want);
+    }
+
+    #[test]
     fn notes_grouped_one_per_line() {
         let soaking = ["awscli 2.38.3".to_string(), "c-ares 1.34.9".to_string()];
         let ahead = ["uv".to_string()];

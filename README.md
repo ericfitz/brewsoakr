@@ -94,8 +94,8 @@ names in both.
 | `hashicorp/tap/terraform` | that one package from that tap |
 
 Matching is case-insensitive. Invalid entries are skipped and reported under
-`-v`; `brewsoak settings repair` removes them. A `NO_SOAK` key inside a `[[TAP]]` table is ignored, with a warning on
-stderr every run.
+`-v`; `brewsoak settings repair` removes them. A `NO_SOAK` key inside a
+`[[TAP]]` table is ignored, with a warning on stderr every run.
 
 `--soak-hours N` edits only the `SOAK_HOURS` key; `[[TAP]]`, `NO_SOAK`, and
 comments are kept, and the previous file is backed up as described under
@@ -305,17 +305,17 @@ Upgrading no-soak packages (brew decides)
   ericfitz/tap/brewsoak 1.5.2
     Already up-to-date.
 Summary
-  upgraded          26
-  already soaked   124
-  soaking            0
-  held               0
-  ahead              0
-  pinned             0
-  skipped            1
-  no-soak            2  (1 upgraded, 1 already up-to-date)
-  auto-updates       0
-  installed     989.3MB
-  freed           1.2GB
+  upgraded            26
+  already soaked     124
+  soaking              0
+  held                 0
+  ahead                0
+  pinned               0
+  skipped              1
+  no-soak              2  (1 upgraded, 1 already up-to-date)
+  auto-updates         0
+  installed      989.3MB
+  freed            1.2GB
 Notes
   bash: unparseable identity; skipping
 Caveats
