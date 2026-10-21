@@ -272,6 +272,7 @@ soak window is counted as `soaking N` instead of `already soaked`. A bare
 and for how long. `outdated` lists them under `==> Soaking`, and `info` shows
 `up to date (soaked); 15.0.0 soaking`. brew's own "Outdated Formulae" list from
 `brew update` is dropped, because it counts versions that are still soaking.
+The New and Deleted package lists from `brew update` are dropped too.
 It stays in `--raw` output and the brew log.
 
 Casks that update themselves (`auto_updates true`) are left to the app on a

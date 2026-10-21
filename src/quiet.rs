@@ -365,6 +365,7 @@ impl Filter {
         if rest.starts_with("Would ")
             || rest.starts_with("Outdated Formulae")
             || rest.starts_with("Outdated Casks")
+            || is_update_news_header(rest)
         {
             self.state = Some(State::SkipList);
             return None;
@@ -489,6 +490,19 @@ pub(crate) fn would_list_verb(rest: &str) -> Option<&'static str> {
         || kind.starts_with("cask")
         || (kind == "outdated" && verb == "upgrade");
     is_list.then_some(verb)
+}
+
+/// The package-name lists `brew update` prints after its tap summary: `New
+/// Formulae`, `New Casks`, and `Deleted Installed Formulae|Casks` (plus the
+/// `Renamed` and `Deleted` forms older brews used). They are news about the
+/// taps, not about this run.
+fn is_update_news_header(rest: &str) -> bool {
+    ["New ", "Renamed ", "Deleted "].iter().any(|p| {
+        rest.strip_prefix(p).is_some_and(|r| {
+            let r = r.strip_prefix("Installed ").unwrap_or(r);
+            r.starts_with("Formulae") || r.starts_with("Casks")
+        })
+    })
 }
 
 /// `Upgrading 2 outdated packages:` (not `Upgrading x`).
@@ -1133,8 +1147,6 @@ The 7.0.10 changelog can be found at:
             out,
             vec![
                 "Updated 2 taps (endava/tap and homebrew/cask).",
-                "New Casks",
-                "rew: Record, visualise and measure audio",
                 "The 7.0.10 changelog can be found at:",
             ]
         );
@@ -1157,6 +1169,47 @@ Warning: something else already installed elsewhere
                 "Warning: something else already installed elsewhere",
             ]
         );
+    }
+
+    #[test]
+    fn brew_update_news_lists_are_dropped() {
+        let (out, _) =
+            run("Updated 1 tap (homebrew/cask).\n==> New Casks\nfont-mengshen-handwritten\n");
+        assert_eq!(out, vec!["Updated 1 tap (homebrew/cask)."]);
+    }
+
+    #[test]
+    fn brew_update_news_sections_end_at_the_next_header_or_blank() {
+        let input = "\
+Updated 2 taps (homebrew/core and homebrew/cask).
+==> New Formulae
+foo: A tool
+bar
+==> New Casks
+font-x
+==> Deleted Installed Formulae
+old-formula
+==> Deleted Installed Casks
+old-cask
+
+Already up-to-date.
+";
+        let (out, _) = run(input);
+        assert_eq!(
+            out,
+            vec![
+                "Updated 2 taps (homebrew/core and homebrew/cask).",
+                "Already up-to-date."
+            ]
+        );
+    }
+
+    #[test]
+    fn brew_update_news_never_swallows_a_warning() {
+        let (out, _) = run(
+            "==> New Casks\nfont-x\nWarning: tap is slow\n==> Renamed Formulae\na -> b\nError: boom\n",
+        );
+        assert_eq!(out, vec!["Warning: tap is slow", "Error: boom"]);
     }
 
     #[test]
