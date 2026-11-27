@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::digest::sha256_hex;
 use crate::eligibility::DesiredAction;
 use crate::git::GitStore;
+use crate::identity::{self, PkgIdentity};
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
 use crate::origin::{self};
 use crate::resolve::PkgKind;
@@ -26,6 +27,9 @@ pub(super) struct HeldDep {
 pub(super) enum NameWhy {
     /// brew's own definition of the name is not the soaked cutoff.
     NotCutoff { brew_version: String },
+    /// brew's current version is the cutoff's version but the file differs:
+    /// the change has not soaked yet. `what` is `formula` or `cask`.
+    ChangedSinceCutoff { what: &'static str, version: String },
     /// A bare install would load the name from another tap.
     OtherTap { tap: String, origin: String },
     /// brew's loaders could not describe the name (first line of its text).
@@ -37,12 +41,20 @@ pub(super) enum NameWhy {
 }
 
 impl NameWhy {
+    /// True when the hold waits on issue #17; a changed file waits on its soak.
+    pub(super) fn waits_on_issue_17(&self) -> bool {
+        !matches!(self, Self::ChangedSinceCutoff { .. })
+    }
+
     /// The reason as it reads in a hold line and a note.
     pub(super) fn text(&self) -> String {
         match self {
             Self::NotCutoff { brew_version } => {
                 format!("brew would install {brew_version}, which is not the soaked cutoff")
             }
+            Self::ChangedSinceCutoff { what, version } => format!(
+                "brew's {version} {what} changed since the soaked cutoff; it installs once the change soaks"
+            ),
             Self::OtherTap { tap, origin } => {
                 format!("brew resolves the name to {tap}, not {origin}")
             }
@@ -109,6 +121,18 @@ pub(super) struct CutoffDepWalk<'a, B, G> {
     pub(super) out: Vec<(String, String, PkgKind)>,
     pub(super) held: Option<HeldDep>,
     pub(super) by_name: Option<NameHold>,
+}
+
+/// The cutoff blob's version as brew names it (`1.0.0_2` with a revision),
+/// for comparing with brew's own answer. None when the blob is missing or
+/// does not parse.
+fn cutoff_version(kind: PkgKind, blob: Option<&[u8]>) -> Option<String> {
+    let rb = std::str::from_utf8(blob?).ok()?;
+    let id = match kind {
+        PkgKind::Formula => PkgIdentity::Formula(identity::parse_formula(rb, None).ok()?),
+        PkgKind::Cask => PkgIdentity::Cask(identity::parse_cask(rb, None).ok()?),
+    };
+    Some(crate::report::identity_version(&id))
 }
 
 /// First line of brew's text, for a hold line.
@@ -194,6 +218,16 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 }
             } else if !has_cutoff {
                 NameWhy::NoCutoff
+            } else if cutoff_version(kind, blobs.cutoff.as_deref()).as_deref()
+                == Some(answer.version.as_str())
+            {
+                NameWhy::ChangedSinceCutoff {
+                    what: match kind {
+                        PkgKind::Formula => "formula",
+                        PkgKind::Cask => "cask",
+                    },
+                    version: answer.version,
+                }
             } else {
                 NameWhy::NotCutoff {
                     brew_version: answer.version,
@@ -2003,6 +2037,77 @@ mod gate_tests {
         assert!(installs(&brew).is_empty(), "{:?}", installs(&brew));
         assert!(summary(&text, "held", "1"), "{text}");
         assert!(summary(&text, "upgraded", "0"), "{text}");
+    }
+
+    #[test]
+    fn same_version_changed_file_says_the_change_must_soak() {
+        let git = core_git(&["alpha"]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert("alpha".to_string(), Ok(answer(CORE, "1.1.0", false, false)));
+        let brew = MockBrew {
+            installed: vec![outdated("alpha")],
+            by_name,
+            ..MockBrew::new()
+        };
+        let (r, text) = run(&brew, &git, &["alpha"], &[]);
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains(
+                "held alpha: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "alpha: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks; use `brew upgrade alpha` to bypass brewsoak."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("issue #17"), "{text}");
+        assert!(!text.contains("not the soaked cutoff"), "{text}");
+        assert!(installs(&brew).is_empty(), "{:?}", installs(&brew));
+    }
+
+    #[test]
+    fn same_version_changed_dep_file_keeps_the_dependency_prefix() {
+        let git = core_git(&["alpha", "libx"]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.1.0", false, false)));
+        let brew = MockBrew {
+            installed: vec![outdated("alpha")],
+            deps: deps_of(&[("alpha", &["libx"])]),
+            by_name,
+            ..MockBrew::new()
+        };
+        let (_, text) = run(&brew, &git, &["alpha"], &[]);
+        assert!(
+            text.contains(
+                "alpha: dependency libx: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks; use `brew upgrade alpha` to bypass brewsoak."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("issue #17"), "{text}");
+    }
+
+    #[test]
+    fn different_version_keeps_the_issue_17_text() {
+        let git = core_git(&["alpha"]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert(
+            "alpha".to_string(),
+            Ok(answer(CORE, "1.1.0_1", false, false)),
+        );
+        let brew = MockBrew {
+            installed: vec![outdated("alpha")],
+            by_name,
+            ..MockBrew::new()
+        };
+        let (_, text) = run(&brew, &git, &["alpha"], &[]);
+        assert!(
+            text.contains("brew would install 1.1.0_1, which is not the soaked cutoff"),
+            "{text}"
+        );
+        assert!(text.contains("until issue #17 is fixed"), "{text}");
     }
 
     #[test]

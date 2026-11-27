@@ -45,6 +45,18 @@ to be changed without the maintainer's approval.
 - **Gate strictness: exact file bytes** (2026-11-27). The SHA-256 of the
   cutoff blob must equal brew's `ruby_source_checksum`. Version and revision
   alone are not enough.
+- **A changed file at the same version is a soak wait, not issue #17**
+  (2026-11-27, amends the hold text above). When the gate holds a member whose
+  brew-current version equals the cutoff version while the file bytes differ,
+  the hold says `brew's <version> formula changed since the soaked cutoff; it
+  installs once the change soaks` (inline, and in the note with `; use ...
+  to bypass brewsoak.` and no issue #17 clause). Versions are compared as the
+  identity strings brewsoak already has; when the cutoff blob does not parse,
+  or the versions differ, the existing issue #17 text stays. Every hold that
+  truly waits on #17 (different version, other tap, lookup or deps failure,
+  no cutoff) keeps its text. No remaining-time hint: the walk has neither the
+  change's commit time nor the soak clock at that point, and the decision
+  forbids new git or brew calls for it.
 - **A run with soaked work runs `brew update` once, before that work**
   (2026-11-27). This amends the 2026-10-05 decision that `brew update` runs
   only when a no-soak package is involved. See "`brew update` before soaked
@@ -167,9 +179,13 @@ it (see "Tap trust").
 
 Nothing else in the `Brew` trait takes a path. `info`, `outdated`, `update`,
 the no-soak step (`nosoak::run_step`) and the `reinstall` true repair already
-use names. `brew::brewsoak_brew_env_pairs` sets `HOMEBREW_DEVELOPER=1` and
-unsets `HOMEBREW_FORBID_PACKAGES_FROM_PATHS` for path installs; both are now
-inert and are left for the long-term design to remove.
+use names. `brew::brewsoak_brew_env_pairs(verb)` sets `HOMEBREW_DEVELOPER=1`
+and unsets `HOMEBREW_FORBID_PACKAGES_FROM_PATHS` for path installs; neither
+enables path loading now and both are left for the long-term design to remove.
+`HOMEBREW_DEVELOPER` is not inert, though: with it set, `brew update` follows
+`main` instead of the latest stable tag (Homebrew `cmd/update.sh`), so an
+`update` child does not get it and inherits the user's own value (2026-11-27
+fix); `brew ruby` and the other children keep it.
 
 ### The by-name gate
 
@@ -270,6 +286,11 @@ hold of that target; git and I/O errors stay fatal as today. A held target keeps
 `<token>` is `nosoak::brew_token(origin, name)`. `<why>` is one of:
 
 - `brew would install <brew version>, which is not the soaked cutoff`
+- `brew's <version> <formula|cask> changed since the soaked cutoff; it
+  installs once the change soaks`: brew's current version equals the cutoff's
+  version but the file bytes differ (2026-11-27 human decision, below). Its
+  note omits the issue #17 clause, because the hold ends when the change
+  soaks, not when Homebrew is fixed.
 - `brew resolves the name to <tap>, not <origin>`
 - `brew could not describe it by name (<first line of brew's error>)`
 - `brew could not read its dependencies (<first line of brew's error>)`
@@ -331,7 +352,8 @@ long-term fix does not have to re-thread it. Kept for the long-term fix: the
   After the run's `brew update` that means the definition has not changed
   since the cutoff. A package that changed again inside the soak window is
   held until that change has soaked, so one that changes more often than the
-  soak time is held until issue #17 is fixed.
+  soak time is held until issue #17 is fixed (when the version is unchanged,
+  the hold says the change must soak instead).
 - When the run's `brew update` fails, brew's data may be older than the
   cutoff and more packages are held; the note says so.
 - The closure rule can hold more than brew would change: a target is held

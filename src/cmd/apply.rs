@@ -971,7 +971,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         target_token: &str,
         hold: &NameHold,
     ) -> Result<(), Error> {
-        let why = match &hold.why {
+        let (why, issue_17) = match &hold.why {
             NameFail::Untrusted(tap) => {
                 match &hold.dep {
                     Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
@@ -979,7 +979,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 }
                 return Ok(());
             }
-            NameFail::Why(why) => why.text(),
+            NameFail::Why(why) => (why.text(), why.waits_on_issue_17()),
         };
         self.hold_target_for_dep();
         match &hold.dep {
@@ -990,6 +990,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             target,
             hold.dep.as_deref(),
             &why,
+            issue_17,
             self.brew_verb,
             target_token,
         ));

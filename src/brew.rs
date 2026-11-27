@@ -124,8 +124,9 @@ pub(crate) struct Loaded {
 /// One name's `BY_NAME_RUBY` answer, or brew's reason it has none.
 type LoadedAnswer = Result<Loaded, String>;
 
-/// One answer per `asked` `(kind, name)` from `BY_NAME_RUBY` output. Rows
-/// are matched by `kind name`, never by position: a missing or duplicated
+/// One answer per `asked` `(kind, name)` from `BY_NAME_RUBY` output. The
+/// `asked` entries must be unique: a row is consumed by the first entry that
+/// asks for it, so a repeated entry gets "no answer". Rows are matched by `kind name`, never by position: a missing or duplicated
 /// row is that name's `Err`, and lines that are not a row for an asked name
 /// (a stray brew message, a row for another name) are never assigned.
 pub(crate) fn parse_by_name_lines(
@@ -914,12 +915,18 @@ fn greedy_args(greedy: crate::flags::Greedy) -> Vec<String> {
 
 /// Env for brewsoak-driven `brew` children.
 /// `HOMEBREW_DEVELOPER` and the `FORBID_PACKAGES_FROM_PATHS` removal no longer
-/// enable anything (soaked installs go by bare name); they stay until the
-/// long-term fix decides.
+/// enable path loading (soaked installs go by bare name). `brew ruby` still
+/// needs `HOMEBREW_DEVELOPER`. An `update` child must not get it: with it set,
+/// `brew update` moves Homebrew to `main` instead of the latest stable tag, so
+/// that child inherits the user's own value untouched.
 /// `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` stops brew from upgrading
 /// dependents of a cutoff install to HEAD.
 fn apply_brewsoak_brew_env(cmd: &mut Command) {
-    for (key, value) in brewsoak_brew_env_pairs() {
+    let verb = cmd
+        .get_args()
+        .next()
+        .map(|a| a.to_string_lossy().into_owned());
+    for (key, value) in brewsoak_brew_env_pairs(verb.as_deref().unwrap_or("")) {
         match value {
             Some(v) => {
                 cmd.env(key, v);
@@ -931,16 +938,20 @@ fn apply_brewsoak_brew_env(cmd: &mut Command) {
     }
 }
 
-fn brewsoak_brew_env_pairs() -> Vec<(&'static str, Option<&'static str>)> {
-    vec![
+/// The env changes for a `brew <verb>` child; a key not listed is inherited.
+fn brewsoak_brew_env_pairs(verb: &str) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut pairs = vec![
         ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
         ("HOMEBREW_NO_COLOR", Some("1")),
         ("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", Some("1")),
-        ("HOMEBREW_DEVELOPER", Some("1")),
         ("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", None),
         // brew's loaders must read the taps as they are, not refetch the API.
         ("HOMEBREW_FORCE_API_AUTO_UPDATE", None),
-    ]
+    ];
+    if verb != "update" {
+        pairs.push(("HOMEBREW_DEVELOPER", Some("1")));
+    }
+    pairs
 }
 
 impl ProcessBrew {
@@ -1821,12 +1832,12 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         let brew = ProcessBrew::new(script);
-        let got = brew.deps(PkgKind::Formula, "/x/packer.rb").expect("deps");
+        let got = brew.deps(PkgKind::Formula, "packer").expect("deps");
         assert_eq!(got, ["hashicorp/tap/terraform", "wget"]);
         brew.deps(PkgKind::Cask, "alt-tab").expect("cask deps");
         assert_eq!(
             std::fs::read_to_string(&log).expect("log"),
-            "deps --1 --full-name --formula /x/packer.rb\ndeps --1 --full-name --cask alt-tab\n"
+            "deps --1 --full-name --formula packer\ndeps --1 --full-name --cask alt-tab\n"
         );
     }
 
@@ -2405,8 +2416,8 @@ mod tests {
     }
 
     #[test]
-    fn brewsoak_brew_env_enables_path_installs() {
-        let pairs = brewsoak_brew_env_pairs();
+    fn brewsoak_brew_env_keeps_developer_and_forbid_removal_for_install() {
+        let pairs = brewsoak_brew_env_pairs("install");
         assert!(
             pairs
                 .iter()
@@ -2654,9 +2665,51 @@ mod tests {
         }
     }
 
+    fn env_of(verb: &str) -> Vec<(String, Option<String>)> {
+        let mut cmd = Command::new("brew");
+        cmd.arg(verb);
+        apply_brewsoak_brew_env(&mut cmd);
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn update_child_never_sets_homebrew_developer() {
+        // With HOMEBREW_DEVELOPER set, brew update moves Homebrew to main
+        // instead of the latest stable tag. The child must inherit the user's
+        // own value, not gain one: no entry means the parent env passes
+        // through untouched (set stays set, unset stays unset).
+        let env = env_of("update");
+        assert!(
+            !env.iter().any(|(k, _)| k == "HOMEBREW_DEVELOPER"),
+            "{env:?}"
+        );
+        assert!(
+            env.contains(&("HOMEBREW_NO_AUTO_UPDATE".into(), Some("1".into()))),
+            "{env:?}"
+        );
+    }
+
+    #[test]
+    fn other_children_still_set_homebrew_developer() {
+        for verb in ["install", "upgrade", "ruby", "deps", "info", "outdated"] {
+            let env = env_of(verb);
+            assert!(
+                env.contains(&("HOMEBREW_DEVELOPER".into(), Some("1".into()))),
+                "{verb}: {env:?}"
+            );
+        }
+    }
+
     #[test]
     fn brewsoak_brew_env_turns_brew_colour_off() {
-        let pairs = brewsoak_brew_env_pairs();
+        let pairs = brewsoak_brew_env_pairs("install");
         assert!(
             pairs
                 .iter()
@@ -2669,7 +2722,7 @@ mod tests {
         // brewsoak never trusts a tap on the user's behalf (2026-10-05 human
         // decision), so it must not switch Homebrew's tap-trust check off
         // either. The removed brewsoakr/soaked fallback used to set this.
-        let pairs = brewsoak_brew_env_pairs();
+        let pairs = brewsoak_brew_env_pairs("install");
         assert!(
             !pairs
                 .iter()
@@ -3329,7 +3382,7 @@ esac
     #[test]
     fn brew_children_never_force_api_auto_update() {
         assert!(
-            brewsoak_brew_env_pairs().contains(&("HOMEBREW_FORCE_API_AUTO_UPDATE", None)),
+            brewsoak_brew_env_pairs("update").contains(&("HOMEBREW_FORCE_API_AUTO_UPDATE", None)),
             "a stale FORCE_API_AUTO_UPDATE would make the loaders refetch"
         );
     }
