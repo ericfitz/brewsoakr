@@ -416,6 +416,8 @@ pub struct MockBrew {
     pub deps: BTreeMap<String, Vec<String>>,
     /// Makes `deps` for this token fail with brew's stderr text.
     pub deps_errors: BTreeMap<String, String>,
+    /// Every `deps` call, in order.
+    pub deps_calls: Mutex<Vec<(PkgKind, String)>>,
     /// What `by_name` reports per bare name; an unscripted name is the
     /// query's own origin tap, same source, not installed-current.
     pub by_name: BTreeMap<String, Result<ByName, String>>,
@@ -482,6 +484,7 @@ impl Default for MockBrew {
             installed: Vec::new(),
             deps: BTreeMap::new(),
             deps_errors: BTreeMap::new(),
+            deps_calls: Mutex::new(Vec::new()),
             by_name: BTreeMap::new(),
             by_name_queries: Mutex::new(Vec::new()),
             taps: Vec::new(),
@@ -1236,7 +1239,11 @@ impl Brew for MockBrew {
             .collect())
     }
 
-    fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+    fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+        self.deps_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((kind, token.to_string()));
         if let Some(message) = self.deps_errors.get(token) {
             return Err(Error::Brew {
                 status: 1,

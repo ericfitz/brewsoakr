@@ -239,6 +239,12 @@ pub(super) fn assert_no_path_args(brew: &MockBrew) {
             );
         }
     }
+    for (kind, token) in brew.deps_calls.lock().expect("deps calls").iter() {
+        assert!(
+            !token.starts_with('/') && !token.ends_with(".rb") && !token.contains('/'),
+            "path or full token {token:?} handed to deps ({kind:?})"
+        );
+    }
     for q in brew.by_name_queries.lock().expect("queries").iter() {
         assert!(!q.name.contains('/'), "full token in by_name query {q:?}");
     }
