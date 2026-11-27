@@ -578,7 +578,7 @@ mod tests {
     use crate::cmd::test_support::{
         OUTDATED_HEADER, cask_rb, cfg24, core_snaps, formula_pkg, formula_rb, greedy_outdated,
         greedy_upgrade, greedy_world, inv_from, lock_runs, many_detect_world, openssl_is_newer,
-        openssl_repoint_world, run_is_soaked_install, section_lines, spawns, unused_cache,
+        openssl_repoint_world, run_is_name_install, section_lines, spawns, unused_cache,
         upgrade_names,
     };
     use crate::cmd::upgrade::upgrade;
@@ -636,7 +636,7 @@ mod tests {
         openssl_is_newer(&mut brew);
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         let runs = lock_runs(&brew);
-        assert!(!run_is_soaked_install(&runs, "openssl@3"), "{text}");
+        assert!(!run_is_name_install(&runs, "openssl@3"), "{text}");
         assert!(
             text.contains("Upgrading soaked packages (0 of 1)"),
             "{text}"
@@ -693,7 +693,7 @@ mod tests {
         assert!(r.refused, "{text}");
         assert!(text.contains("reinstall would downgrade"), "{text}");
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            !run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
     }
@@ -704,7 +704,7 @@ mod tests {
         brew.compare_error = Some("brew ruby exploded".into());
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            !run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
         assert!(
@@ -730,7 +730,7 @@ mod tests {
         openssl_is_newer(&mut brew);
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            !run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
         assert!(text.contains(OPENSSL_NOTE), "{text}");
@@ -745,7 +745,7 @@ mod tests {
         )];
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
         assert!(
@@ -842,7 +842,7 @@ mod tests {
             "{pairs:?}"
         );
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "stockfish"),
+            run_is_name_install(&lock_runs(&brew), "stockfish"),
             "{text}"
         );
     }

@@ -17,7 +17,7 @@ pub fn upgrade(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    _tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -33,7 +33,7 @@ pub fn upgrade(
         git,
         snaps,
         cache,
-        tap_root,
+        _tap_root,
         inv,
         cfg,
         names,
@@ -64,8 +64,32 @@ mod tests {
     use crate::cmd::test_support::{
         cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_pkg_from,
         formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs, run_has_token,
-        run_is_soaked_install, tap_cask_world, tap_snaps, tapped, unused_cache,
+        run_is_name_install, tap_cask_world, tap_snaps, tapped, unused_cache,
     };
+
+    #[test]
+    fn upgrade_installs_the_cutoff_by_name() {
+        let (brew, git) = crate::cmd::test_support::local_tap_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alpha".to_string()],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert_eq!(visible, vec![vec!["install", "--formula", "alpha"]]);
+    }
 
     #[test]
     fn upgrade_mixed_applies_eligible_and_refuses_too_new() {
@@ -104,7 +128,7 @@ mod tests {
         .expect("upgrade");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "ok"),
+            run_is_name_install(&runs, "ok"),
             "expected soaked path install of ok without --ignore-dependencies: {runs:?}"
         );
         assert!(
@@ -459,7 +483,7 @@ mod tests {
         .expect("upgrade");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "ok"),
+            run_is_name_install(&runs, "ok"),
             "parse failure must not abort remaining upgrades: {runs:?}"
         );
         assert!(
@@ -511,7 +535,7 @@ mod tests {
         .expect("upgrade");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "ok"),
+            run_is_name_install(&runs, "ok"),
             "unpinned must still upgrade: {runs:?}"
         );
         assert!(
@@ -571,7 +595,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "terraform"),
+            run_is_name_install(&lock_runs(&brew), "terraform"),
             "{:?}",
             lock_runs(&brew)
         );
@@ -583,7 +607,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_tap_upgrade_records_origin_despite_outdated_notice() {
+    fn tap_upgrade_by_name_leaves_no_origin_record_despite_outdated_notice() {
         let git = InMemoryGit::new();
         git.insert_blob(
             "tapcut",
@@ -630,7 +654,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
-            Some("hashicorp/tap")
+            None,
+            "a by-name install writes a receipt that names the tap"
         );
     }
 
@@ -662,11 +687,15 @@ mod tests {
         );
         assert!(text.contains("upgrading ant 1.37.0 -> 1.38.0"), "{text}");
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "ant"), "{runs:?}");
+        assert!(run_is_name_install(&runs, "ant"), "{runs:?}");
         assert!(
-            runs.iter().any(|a| a.iter().any(|x| x == "--cask")
-                && a.iter().any(|x| x.ends_with("/Casks/ant.rb"))),
-            "staged from the tap's Casks/ path: {runs:?}"
+            runs.contains(&vec![
+                "install".to_string(),
+                "--cask".to_string(),
+                "-v".to_string(),
+                "ant".to_string()
+            ]),
+            "installed by bare name: {runs:?}"
         );
         assert!(!r.refused);
     }
@@ -750,16 +779,20 @@ mod tests {
             .collect();
         assert_eq!(installs.len(), 2, "{runs:?}");
         assert!(
-            installs.iter().any(|a| a.iter().any(|x| x == "--cask")
-                && a.iter().any(|x| x.ends_with("/Casks/vacuum.rb"))),
-            "cask staged from the tap's Casks/ path: {runs:?}"
+            installs.contains(&&vec![
+                "install".to_string(),
+                "--cask".to_string(),
+                "vacuum".to_string()
+            ]),
+            "cask installed by bare name: {runs:?}"
         );
         assert!(
-            installs
-                .iter()
-                .any(|a| !a.iter().any(|x| x == "--cask")
-                    && a.iter().any(|x| x.ends_with("/vacuum.rb"))),
-            "formula staged: {runs:?}"
+            installs.contains(&&vec![
+                "install".to_string(),
+                "--formula".to_string(),
+                "vacuum".to_string()
+            ]),
+            "formula installed by bare name: {runs:?}"
         );
     }
 
@@ -993,7 +1026,7 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "alpha"),
+            run_is_name_install(&lock_runs(&brew), "alpha"),
             "core package still upgraded"
         );
         assert!(r.refused);
@@ -1212,7 +1245,7 @@ mod tests {
             "{text}"
         );
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "gamma"), "{runs:?}");
-        assert!(!run_is_soaked_install(&runs, "alpha"), "{runs:?}");
+        assert!(run_is_name_install(&runs, "gamma"), "{runs:?}");
+        assert!(!run_is_name_install(&runs, "alpha"), "{runs:?}");
     }
 }

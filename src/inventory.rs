@@ -299,6 +299,25 @@ mod tests {
         assert!(inv.any_no_soak());
     }
 
+    #[test]
+    fn by_name_keg_classifies_by_its_receipt_tap_ahead_of_a_stale_record() {
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "terraform", "ericfitz/tap");
+        let inv = Inventory::build(
+            vec![installed(
+                "terraform",
+                PkgKind::Formula,
+                Some("hashicorp/tap"),
+            )],
+            &taps(),
+            &origins,
+            &cfg("[]"),
+        );
+        let pkg = inv.find("terraform").unwrap();
+        assert_eq!(pkg.origin, "hashicorp/tap");
+        assert_eq!(pkg.class, PkgClass::Soaked);
+    }
+
     fn staged(name: &str, path: &str) -> InstalledPkg {
         InstalledPkg {
             staged_path: Some(path.into()),

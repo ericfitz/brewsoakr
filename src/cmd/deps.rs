@@ -379,7 +379,7 @@ mod tests {
 
     use crate::cmd::test_support::{
         PACKER_REFUSAL, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_rb,
-        hashicorp_tap, inv_from, lock_runs, packer_world, run_has_token, run_is_soaked_install,
+        hashicorp_tap, inv_from, lock_runs, packer_world, run_has_token, run_is_name_install,
         tap_snaps, tapped, unused_cache,
     };
 
@@ -432,7 +432,6 @@ mod tests {
             formula_rb("zlib", "1.3", "z1"),
         );
         let tap = tempfile::tempdir().unwrap();
-        let staged = |p: &str| tap.path().join(p).to_string_lossy().into_owned();
         let mut deps = BTreeMap::new();
         deps.insert(
             "terraform".to_string(),
@@ -488,21 +487,13 @@ mod tests {
             .collect();
         assert_eq!(
             installs,
-            vec![
-                staged("taps/acme/tools/Formula/widget.rb"),
-                staged("taps/hashicorp/tap/Formula/helper.rb"),
-                staged("Formula/zlib.rb"),
-                staged("taps/hashicorp/tap/Formula/terraform.rb"),
-            ],
-            "deps first, each from its own origin's staging dir: {runs:?}"
+            vec!["widget", "helper", "zlib", "terraform"],
+            "deps first, each by bare name: {runs:?}"
         );
         let records = OriginRecords::load(cache.path());
-        assert_eq!(records.get(PkgKind::Formula, "widget"), Some("acme/tools"));
-        assert_eq!(
-            records.get(PkgKind::Formula, "helper"),
-            Some("hashicorp/tap")
-        );
-        assert_eq!(records.get(PkgKind::Formula, "zlib"), None);
+        for name in ["widget", "helper", "zlib", "terraform"] {
+            assert_eq!(records.get(PkgKind::Formula, name), None, "{name}");
+        }
     }
 
     #[test]
@@ -975,10 +966,10 @@ mod tests {
             "{text}"
         );
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "alpha"),
+            run_is_name_install(&lock_runs(&brew), "alpha"),
             "run continued"
         );
-        assert!(!run_is_soaked_install(&lock_runs(&brew), "terraform"));
+        assert!(!run_is_name_install(&lock_runs(&brew), "terraform"));
     }
 
     #[test]
@@ -1207,10 +1198,7 @@ mod tests {
             .map(|a| a.last().unwrap().clone())
             .collect();
         assert_eq!(installs.len(), 2, "{installs:?}");
-        assert!(
-            installs[0].ends_with("zlib.rb") && !installs[0].contains("taps/hashicorp"),
-            "the bare dep is core's: {installs:?}"
-        );
+        assert_eq!(installs, ["zlib", "terraform"], "the bare dep is core's");
     }
 
     #[test]
@@ -1331,7 +1319,7 @@ mod tests {
         )
         .unwrap();
         assert!(!r.refused);
-        assert!(run_is_soaked_install(&lock_runs(&brew), "terraform"));
+        assert!(run_is_name_install(&lock_runs(&brew), "terraform"));
     }
 
     #[test]
@@ -1394,10 +1382,7 @@ mod tests {
             .map(|a| a.last().unwrap().clone())
             .collect();
         assert_eq!(installs.len(), 2, "{installs:?}");
-        assert!(
-            installs[0].ends_with("helper.rb") && installs[1].ends_with("terraform.rb"),
-            "{installs:?}"
-        );
+        assert_eq!(installs, ["helper", "terraform"]);
     }
 
     #[test]
@@ -1446,11 +1431,67 @@ mod tests {
         assert!(result.refused, "missing yanked dep refuses the target");
     }
 
+    #[test]
+    fn missing_dep_is_installed_by_name_before_the_target() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/f/fresh.rb",
+            formula_rb("fresh", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/f/fresh.rb",
+            formula_rb("fresh", "1.2.0", "newsha"),
+        );
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/lib/lib.rb",
+            formula_rb("lib", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/lib/lib.rb",
+            formula_rb("lib", "1.2.0", "newsha"),
+        );
+        let mut deps = std::collections::BTreeMap::new();
+        deps.insert("fresh".into(), vec!["lib".into()]);
+        let brew = MockBrew {
+            deps,
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().expect("tap");
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["fresh".to_string()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .expect("install");
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert_eq!(
+            visible,
+            vec![
+                vec!["install", "--formula", "lib"],
+                vec!["install", "--formula", "fresh"]
+            ]
+        );
+    }
+
     fn run_is_soaked_dep_install(runs: &[Vec<String>], name: &str, kind_flag: &str) -> bool {
-        let suffix = format!("/{name}.rb");
         runs.iter().any(|args| {
             args.first().map(String::as_str) == Some("install")
-                && args.iter().any(|a| a.ends_with(&suffix))
+                && args.last().map(String::as_str) == Some(name)
                 && args.iter().any(|a| a == kind_flag)
                 && !args.iter().any(|a| a == "--ignore-dependencies")
         })
@@ -1543,7 +1584,7 @@ mod tests {
             "cutoff dep lib must be installed from tap: {runs:?}"
         );
         assert!(
-            run_is_soaked_install(&runs, "fresh"),
+            run_is_name_install(&runs, "fresh"),
             "target must still install: {runs:?}"
         );
         assert!(
@@ -1599,7 +1640,7 @@ mod tests {
             "cask must soak-install formula dep: {runs:?}"
         );
         assert!(
-            run_is_soaked_install(&runs, "app"),
+            run_is_name_install(&runs, "app"),
             "cask target must path-install without --ignore-dependencies: {runs:?}"
         );
         assert!(!result.refused);
@@ -1670,7 +1711,7 @@ mod gate_tests {
     use crate::cmd::install::install;
     use crate::cmd::test_support::{
         cask_rb, cfg24, core_snaps, formula_pkg, formula_pkg_from, formula_rb, inv_from, lock_runs,
-        run_is_soaked_install, tap_snaps, tapped, unused_cache,
+        run_is_name_install, tap_snaps, tapped, unused_cache,
     };
     use crate::cmd::upgrade::upgrade;
     use crate::digest::sha256_hex;
@@ -1906,8 +1947,8 @@ mod gate_tests {
             "{text}"
         );
         assert!(text.contains("issue #17"), "{text}");
-        assert!(run_is_soaked_install(&lock_runs(&brew), "delta"), "{text}");
-        assert!(!run_is_soaked_install(&lock_runs(&brew), "alpha"), "{text}");
+        assert!(run_is_name_install(&lock_runs(&brew), "delta"), "{text}");
+        assert!(!run_is_name_install(&lock_runs(&brew), "alpha"), "{text}");
         assert!(summary(&text, "held", "1"), "{text}");
         assert!(summary(&text, "upgraded", "1"), "{text}");
     }
@@ -1934,7 +1975,7 @@ mod gate_tests {
             "{text}"
         );
         assert!(!text.contains("more detail"), "{text}");
-        assert!(run_is_soaked_install(&lock_runs(&brew), "delta"), "{text}");
+        assert!(run_is_name_install(&lock_runs(&brew), "delta"), "{text}");
         assert!(summary(&text, "held", "1"), "{text}");
     }
 
@@ -2016,9 +2057,9 @@ mod gate_tests {
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(!r.refused, "{text}");
-        assert!(run_is_soaked_install(&lock_runs(&brew), "alpha"), "{text}");
+        assert!(run_is_name_install(&lock_runs(&brew), "alpha"), "{text}");
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "libx"),
+            !run_is_name_install(&lock_runs(&brew), "libx"),
             "an installed dependency brew leaves alone is never installed: {text}"
         );
     }
@@ -2232,11 +2273,11 @@ mod gate_tests {
         );
         assert!(!text.contains("read its dependencies"), "{text}");
         assert!(
-            run_is_soaked_install(&lock_runs(&brew.inner), "delta"),
+            run_is_name_install(&lock_runs(&brew.inner), "delta"),
             "{text}"
         );
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew.inner), "alpha"),
+            !run_is_name_install(&lock_runs(&brew.inner), "alpha"),
             "{text}"
         );
     }
@@ -2275,8 +2316,8 @@ mod gate_tests {
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(!r.refused, "{text}");
-        assert!(run_is_soaked_install(&lock_runs(&brew), "alpha"), "{text}");
-        assert!(!run_is_soaked_install(&lock_runs(&brew), "libx"), "{text}");
+        assert!(run_is_name_install(&lock_runs(&brew), "alpha"), "{text}");
+        assert!(!run_is_name_install(&lock_runs(&brew), "libx"), "{text}");
     }
 
     #[test]

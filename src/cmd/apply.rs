@@ -31,7 +31,7 @@ use crate::tap;
 use crate::taps;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub fn reinstall(
@@ -39,7 +39,7 @@ pub fn reinstall(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    _tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -57,7 +57,6 @@ pub fn reinstall(
         git,
         snaps,
         cache,
-        tap_root,
         user_flags,
         inv,
         cfg,
@@ -181,7 +180,7 @@ pub(super) fn apply_many(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    _tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -205,7 +204,6 @@ pub(super) fn apply_many(
         git,
         snaps,
         cache,
-        tap_root,
         user_flags,
         inv,
         cfg,
@@ -272,7 +270,6 @@ pub(super) struct ApplySession<'a, B, G, W: Write> {
     git: &'a G,
     snaps: &'a Snapshots,
     cache: &'a Path,
-    tap_root: &'a Path,
     user_flags: &'a [String],
     inv: &'a Inventory,
     cfg: &'a Config,
@@ -334,7 +331,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
     }
 
-    /// What a staged `brew install` may see. On an upgrade the greedy flags
+    /// What a soaked `brew install` may see. On an upgrade the greedy flags
     /// are brewsoak's (read by `bare_action`), so they are neither forwarded
     /// nor reported as dropped; `-g` would otherwise reach brew install as
     /// `--git`. The install table filter still applies in `brew_install_args`.
@@ -719,11 +716,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             name: name.to_string(),
             kind,
         };
-        let blob = view.cutoff_blob.as_deref().ok_or_else(|| {
-            Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
-        })?;
-        let path = tap::write_blob(&staging_dir(self.tap_root, origin_tap), &pkg, blob)?;
-
         let token = nosoak::brew_token(origin_tap, name);
         let walked = match self.collect_cutoff_deps(origin_tap, name, kind) {
             Ok(w) => w,
@@ -762,18 +754,17 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
 
         let install_flags = self.staged_install_flags();
-        let args = tap::brew_install_args(&pkg, &path, &install_flags);
-        self.note_dropped_flags("install", &install_flags, "staged installs");
+        let args = tap::brew_install_args(&pkg, name, &install_flags);
+        self.note_dropped_flags("install", &install_flags, "soaked installs");
         let installing = view.cutoff.as_ref().map(report::identity_version);
-        match self.record_staged_install(origin_tap, name, kind, installing, &args)? {
-            StagedRun::Ran { failed } => {
+        match self.record_name_install(origin_tap, name, kind, installing, &args)? {
+            NameRun::Ran { failed } => {
                 // Counted as upgraded when it was announced; brew failed.
                 if failed {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
             }
-            StagedRun::LoadFailure => self.hold_target_staged_copy(name),
-            StagedRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
+            NameRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
         }
         Ok(())
     }
@@ -854,9 +845,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if self.already_done(dep, kind, want.as_ref()) {
             return Ok(true);
         }
-        let blob = blobs.cutoff.as_deref().ok_or_else(|| {
-            Error::Other(format!("{dep} is eligible but the cutoff blob is missing"))
-        })?;
         let pkg = PkgRef {
             name: dep.to_string(),
             kind,
@@ -880,32 +868,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
         }
-        let path = tap::write_blob(&staging_dir(self.tap_root, dep_origin), &pkg, blob)?;
         let install_flags = self.staged_install_flags();
-        let args = tap::brew_install_args(&pkg, &path, &install_flags);
-        // A dep that brew cannot load is held by name; the target is still
-        // attempted and brew reports the missing dependency.
+        let args = tap::brew_install_args(&pkg, dep, &install_flags);
         let installing = want.as_ref().map(report::identity_version);
-        match self.record_staged_install(dep_origin, dep, kind, installing, &args)? {
-            StagedRun::Ran { failed } => {
+        match self.record_name_install(dep_origin, dep, kind, installing, &args)? {
+            NameRun::Ran { failed } => {
                 if failed && counted_here && self.counted_deps.remove(dep) {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
             }
-            StagedRun::LoadFailure => {
-                // The dep was announced and counted; it is held instead.
-                if counted_here {
-                    self.uncount_dep(dep);
-                    writeln!(
-                        self.out,
-                        "held {dep} (dependency of {target}): cannot be installed from a staged copy"
-                    )?;
-                }
-                self.hold_staged_copy(dep);
-            }
             // The target cannot install without this dep: hold the target once
             // (one line, one count) rather than the dep and then the target.
-            StagedRun::Untrusted(tap) => {
+            NameRun::Untrusted(tap) => {
                 if counted_here {
                     self.uncount_dep(dep);
                     writeln!(
@@ -1030,22 +1004,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.refused = true;
     }
 
-    /// brew could not load a tap package from its staged copy.
-    fn hold_staged_copy(&mut self, name: &str) {
-        self.defer(format!(
-            "{name}: cannot be installed from a staged copy; use brew, or add it to NO_SOAK"
-        ));
-        self.counts.held += 1;
-        self.refused = true;
-    }
-
-    /// The target was counted as upgraded when it was announced; it is held
-    /// instead, so take that count back.
-    fn hold_target_staged_copy(&mut self, name: &str) {
-        self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
-        self.hold_staged_copy(name);
-    }
-
     /// brew refuses to load a package from a tap the user has not trusted.
     /// Trusting a third-party tap is the user's decision, never brewsoak's.
     fn hold_untrusted(&mut self, name: &str, tap: &str) {
@@ -1073,34 +1031,17 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.hold_untrusted(name, tap);
     }
 
-    /// Tap packages are remembered by origin; core and cask need no record.
-    fn record_origin(&mut self, origin_tap: &str, name: &str, kind: PkgKind) -> Result<(), Error> {
-        // A dry run installs nothing, so it proves nothing about origin.
-        if self.counts.dry_run {
-            return Ok(());
-        }
-        let want = (!origin::is_core_or_cask(origin_tap)).then(|| origin_tap.to_ascii_lowercase());
-        if self.origins.get(kind, name) == want.as_deref() {
-            return Ok(());
-        }
-        match want {
-            Some(tap) => self.origins.set(kind, name, &tap),
-            None => self.origins.remove(kind, name),
-        }
-        self.origins.save(self.cache)
-    }
-
-    /// Runs one staged install and records where the keg came from.
-    /// A tap package brew could not load or would not trust is reported
-    /// without brew's status, so the caller holds it instead.
-    fn record_staged_install(
+    /// Runs one by-name install. A real install writes a receipt that names
+    /// the tap, so any origin record is dropped. A tap package brew would not
+    /// trust is reported without brew's status, so the caller holds it.
+    fn record_name_install(
         &mut self,
         origin_tap: &str,
         name: &str,
         kind: PkgKind,
         installing: Option<String>,
         args: &[String],
-    ) -> Result<StagedRun, Error> {
+    ) -> Result<NameRun, Error> {
         // The version being installed is on purpose; brew's "newer version is
         // available" warning about it is noise.
         let ctx = quiet::RunContext {
@@ -1112,25 +1053,23 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         };
         let output = self.brew.run_visible_in(args, &mut self.out, &ctx)?;
         let text = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() && !origin::is_core_or_cask(origin_tap) {
-            if let Some(tap) = taps::untrusted_tap(&text) {
-                return Ok(StagedRun::Untrusted(tap));
-            }
-            if taps::staged_load_failure(&text) {
-                return Ok(StagedRun::LoadFailure);
-            }
+        if !output.status.success()
+            && !origin::is_core_or_cask(origin_tap)
+            && let Some(tap) = taps::untrusted_tap(&text)
+        {
+            return Ok(NameRun::Untrusted(tap));
         }
         self.done
             .extend(quiet::installed_from_output(&output.stdout));
-        // Only a real install proves the keg came from this origin; brew's
-        // "already installed" answer says nothing about where the keg came from.
+        // Only a real install writes a receipt; brew's "already installed"
+        // answer changes nothing.
         let installed_now = output.status.success() && !already_installed_message(&output);
         let failed = brew_failed(&output);
         merge_status(&mut self.brew_status, output);
         if installed_now {
-            self.record_origin(origin_tap, name, kind)?;
+            self.forget_origin(kind, name)?;
         }
-        Ok(StagedRun::Ran { failed })
+        Ok(NameRun::Ran { failed })
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1213,12 +1152,10 @@ pub(super) fn brew_failed(output: &std::process::Output) -> bool {
     !output.status.success() && !already_installed_message(output)
 }
 
-/// What one staged `brew install` came to.
-pub(super) enum StagedRun {
+/// What one by-name `brew install` came to.
+pub(super) enum NameRun {
     /// brew ran; `failed` when it exited non-zero for a reason of its own.
     Ran { failed: bool },
-    /// brew could not load the tap package's staged copy.
-    LoadFailure,
     /// brew does not trust this tap (lowercase `user/repo`).
     Untrusted(String),
 }
@@ -1243,12 +1180,6 @@ pub(crate) fn already_installed_line(line: &str) -> bool {
     line.contains("already installed") && !line.contains("already installed but outdated")
 }
 
-/// Where `dir`'s staged `.rb` files live for this origin; tap names are
-/// lowercase everywhere they are compared or used as paths.
-pub(super) fn staging_dir(tap_root: &Path, origin_tap: &str) -> PathBuf {
-    taps::staging_root(tap_root, &origin_tap.to_ascii_lowercase())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,7 +1199,7 @@ mod tests {
     use crate::cmd::test_support::{
         call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg,
         formula_pkg_from, formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs,
-        run_has_token, run_is_soaked_install, tapped, unused_cache, upgrade_names,
+        run_has_token, run_is_name_install, tapped, unused_cache, upgrade_names,
         upgrade_names_flags,
     };
     use crate::cmd::upgrade::upgrade;
@@ -1507,14 +1438,7 @@ mod tests {
             .expect("visible")
             .iter()
             .filter(|a| a.first().map(String::as_str) == Some("install"))
-            .filter_map(|a| a.last())
-            .map(|p| {
-                Path::new(p)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(p)
-                    .to_string()
-            })
+            .filter_map(|a| a.last().cloned())
             .collect()
     }
 
@@ -1618,20 +1542,18 @@ mod tests {
     }
 
     #[test]
-    fn dependency_brew_cannot_load_is_reported_held_and_not_counted_upgraded() {
+    fn dependency_brew_load_error_is_brews_failure_and_not_counted_upgraded() {
         let (text, _) = node_with_tap_dep_world("Error: cannot load such file -- helper\n");
         assert!(
             text.contains("upgrading widget 1.0.0 -> 1.1.0 (dependency of node)"),
             "{text}"
         );
-        assert!(
-            text.contains(
-                "held widget (dependency of node): cannot be installed from a staged copy"
-            ),
-            "{text}"
-        );
+        assert!(!text.contains("staged copy"), "{text}");
         assert!(!summary_has(&text, "upgraded", "2"), "{text}");
-        assert!(summary_has(&text, "held", "1"), "{text}");
+        assert!(
+            summary_has(&text, "held", "0"),
+            "a brew failure is not a hold: {text}"
+        );
     }
 
     #[test]
@@ -1730,9 +1652,9 @@ mod tests {
         let text = upgrade_names(&brew, &git, &[]);
         assert!(!text.contains("dependency of"), "{text}");
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "app"), "{text}");
+        assert!(run_is_name_install(&runs, "app"), "{text}");
         assert!(
-            run_is_soaked_install(&runs, "helper"),
+            run_is_name_install(&runs, "helper"),
             "helper upgrades at its own plan entry: {text}"
         );
         assert!(summary_has(&text, "upgraded", "2"), "{text}");
@@ -1821,7 +1743,7 @@ mod tests {
             assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
         }
         // `--greedy` is brewsoak's on an upgrade, so it is not "dropped".
-        let note = "brew install does not accept --ignore-pinned; dropped from staged installs";
+        let note = "brew install does not accept --ignore-pinned; dropped from soaked installs";
         assert_eq!(text.matches(note).count(), 1, "{text}");
         assert!(!text.contains("does not accept --greedy"), "{text}");
     }
@@ -2005,7 +1927,7 @@ mod tests {
         .unwrap();
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs[..1], "alpha"),
+            run_is_name_install(&runs[..1], "alpha"),
             "soaked first: {runs:?}"
         );
         assert_eq!(runs[1], vec!["update".to_string()]);

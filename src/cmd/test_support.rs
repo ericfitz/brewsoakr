@@ -212,11 +212,10 @@ pub(super) fn run_has_token(runs: &[Vec<String>], token: &str) -> bool {
     runs.iter().any(|args| args.iter().any(|a| a == token))
 }
 
-pub(super) fn run_is_soaked_install(runs: &[Vec<String>], name: &str) -> bool {
-    let suffix = format!("/{name}.rb");
+pub(super) fn run_is_name_install(runs: &[Vec<String>], name: &str) -> bool {
     runs.iter().any(|args| {
         args.first().map(String::as_str) == Some("install")
-            && args.iter().any(|a| a.ends_with(&suffix))
+            && args.last().map(String::as_str) == Some(name)
             && !args.iter().any(|a| a == "--ignore-dependencies")
     })
 }
