@@ -1503,8 +1503,8 @@ mod tests {
     }
 
     /// Core `node` depends on `widget`, installed from `hashicorp/tap` at
-    /// 1.0.0 behind a 1.1.0 cutoff. `refusal` is brew's answer to the staged
-    /// `widget` install. Returns the output and the run's brew.
+    /// 1.0.0 behind a 1.1.0 cutoff. `refusal` is brew's answer to the by-name
+    /// `widget` install. Returns the output, the brew and the run's result.
     fn node_with_tap_dep_world(refusal: &str) -> (String, MockBrew, super::super::RunResult) {
         let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
         brew.installed[1] = formula_pkg_from(
@@ -2211,7 +2211,7 @@ mod tests {
             .find("brew update failed (exit 1)")
             .expect("update failure note");
         assert!(
-            text.find("Notes").is_some_and(|n| n < note),
+            text.find("\nNotes\n").is_some_and(|n| n < note),
             "the note belongs in the Notes block: {text}"
         );
         assert!(!text.contains("Held:"), "{text}");
@@ -2224,8 +2224,8 @@ mod tests {
     fn failed_brew_update_then_failing_install_keeps_the_max_status() {
         let (brew, _text, r) = named_left_run(
             vec![
-                (1, b"Error: offline".to_vec()),
-                (3, b"Error: boom".to_vec()),
+                (3, b"Error: offline".to_vec()),
+                (1, b"Error: boom".to_vec()),
             ],
             &[],
         );

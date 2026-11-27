@@ -635,7 +635,7 @@ mod tests {
     }
 
     #[test]
-    fn deps_failure_on_staged_tap_formula_holds_with_note() {
+    fn deps_failure_on_tap_formula_holds_with_note() {
         struct FailDepsBrew(MockBrew);
         impl Brew for FailDepsBrew {
             fn brew_bin(&self) -> &Path {

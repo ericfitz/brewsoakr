@@ -1718,6 +1718,8 @@ fn parse_json_string(s: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn mock_deps_keys_by_exact_token() {
         let mut brew = MockBrew::new();
@@ -1735,8 +1737,6 @@ mod tests {
         );
         assert!(brew.deps(PkgKind::Formula, "python").unwrap().is_empty());
     }
-
-    use super::*;
 
     #[test]
     fn forward_run_flushes_a_pending_nosoak_upgrade_at_eof() {

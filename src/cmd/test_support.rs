@@ -626,3 +626,73 @@ pub(super) fn spawns(brew: &MockBrew) -> (usize, usize) {
 pub(super) fn git_empty() -> InMemoryGit {
     InMemoryGit::new()
 }
+
+#[cfg(test)]
+mod assert_no_path_args_tests {
+    use super::*;
+    use crate::brew::NameQuery;
+
+    fn visible(brew: &MockBrew, args: &[&str]) {
+        brew.visible_runs
+            .lock()
+            .unwrap()
+            .push(args.iter().map(|a| a.to_string()).collect());
+    }
+
+    #[test]
+    #[should_panic(expected = "path argument")]
+    fn flags_a_slash_prefixed_argument() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "/tmp/staging/x"]);
+        assert_no_path_args(&brew);
+    }
+
+    #[test]
+    #[should_panic(expected = "path argument")]
+    fn flags_an_rb_argument() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "x.rb"]);
+        assert_no_path_args(&brew);
+    }
+
+    #[test]
+    #[should_panic(expected = "full token")]
+    fn flags_a_full_token_on_an_install_run() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "--formula", "user/repo/name"]);
+        assert_no_path_args(&brew);
+    }
+
+    #[test]
+    #[should_panic(expected = "handed to deps")]
+    fn flags_a_full_token_in_deps_calls() {
+        let brew = MockBrew::new();
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "user/repo/name".to_string()));
+        assert_no_path_args(&brew);
+    }
+
+    #[test]
+    #[should_panic(expected = "by_name query")]
+    fn flags_a_full_token_in_by_name_queries() {
+        let brew = MockBrew::new();
+        brew.by_name_queries.lock().unwrap().push(NameQuery {
+            kind: PkgKind::Formula,
+            name: "user/repo/name".to_string(),
+            origin: "user/repo".to_string(),
+            cutoff_sha256: None,
+        });
+        assert_no_path_args(&brew);
+    }
+
+    #[test]
+    fn does_not_flag_no_soak_or_repair_full_tokens() {
+        let brew = MockBrew::new();
+        visible(&brew, &["upgrade", "--formula", "user/repo/name"]);
+        visible(&brew, &["reinstall", "user/repo/name"]);
+        visible(&brew, &["install", "--formula", "name"]);
+        assert_no_path_args(&brew);
+    }
+}
