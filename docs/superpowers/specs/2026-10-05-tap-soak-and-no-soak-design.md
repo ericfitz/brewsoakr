@@ -293,6 +293,12 @@ at HEAD with no `deprecate!`/`disable!`).
   staging is unchanged.
 - Install with the existing path-install invocation and env.
 - On success, write the origin record.
+  *Superseded 2026-11-26 (stopgap, issue #17; see
+  [2026-11-26-path-install-stopgap.md](2026-11-26-path-install-stopgap.md)):
+  nothing is staged. A soaked tap package is installed by its bare name when
+  brew resolves that name to the tap and brew's current file is the cutoff
+  file; the receipt then names the tap, so the origin record is removed, not
+  written. Kegs staged earlier are still classified as described here.*
 - Dependency closure: walk deps across origins. A dep reported as
   `user/tap/dep` resolves to that tap. A bare dep name resolves to the
   dependent's own tap first, then core. Each dep is staged from its own
