@@ -17,7 +17,7 @@ pub fn upgrade(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    _tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -33,7 +33,7 @@ pub fn upgrade(
         git,
         snaps,
         cache,
-        tap_root,
+        _tap_root,
         inv,
         cfg,
         names,
@@ -64,8 +64,35 @@ mod tests {
     use crate::cmd::test_support::{
         cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_pkg_from,
         formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs, run_has_token,
-        run_is_soaked_install, tap_cask_world, tap_snaps, tapped, unused_cache,
+        run_is_name_install, tap_cask_world, tap_snaps, tapped, unused_cache,
     };
+
+    #[test]
+    fn upgrade_installs_the_cutoff_by_name() {
+        let (brew, git) = crate::cmd::test_support::local_tap_world();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let cache = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alpha".to_string()],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert_eq!(
+            visible,
+            vec![vec!["update"], vec!["install", "--formula", "alpha"]]
+        );
+    }
 
     #[test]
     fn upgrade_mixed_applies_eligible_and_refuses_too_new() {
@@ -104,8 +131,8 @@ mod tests {
         .expect("upgrade");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "ok"),
-            "expected soaked path install of ok without --ignore-dependencies: {runs:?}"
+            run_is_name_install(&runs, "ok"),
+            "expected soaked by-name install of ok without --ignore-dependencies: {runs:?}"
         );
         assert!(
             !run_has_token(&runs, "new") && !run_has_token(&runs, "brewsoakr/soaked/new"),
@@ -193,7 +220,18 @@ mod tests {
             &mut out,
         )
         .expect("upgrade");
-        assert!(lock_runs(&brew).is_empty(), "soaking must not invoke brew");
+        // A bare run with an empty plan has no soaked work; a named run of a
+        // soaked package updates once and runs nothing else.
+        let expected: Vec<Vec<String>> = if names.is_empty() {
+            Vec::new()
+        } else {
+            vec![vec!["update".to_string()]]
+        };
+        assert_eq!(
+            lock_runs(&brew),
+            expected,
+            "soaking runs at most the update"
+        );
         String::from_utf8(out).expect("utf8")
     }
 
@@ -224,7 +262,7 @@ mod tests {
     fn named_run_nothing_to_do_no_soaked_header() {
         let text = soaking_upgrade(&["wget".to_string()]);
         assert!(!text.contains("soaked packages"), "{text}");
-        assert!(text.starts_with("Summary\n"), "{text}");
+        assert!(text.starts_with("Updating Homebrew\nSummary\n"), "{text}");
     }
 
     #[test]
@@ -459,7 +497,7 @@ mod tests {
         .expect("upgrade");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "ok"),
+            run_is_name_install(&runs, "ok"),
             "parse failure must not abort remaining upgrades: {runs:?}"
         );
         assert!(
@@ -511,7 +549,7 @@ mod tests {
         .expect("upgrade");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "ok"),
+            run_is_name_install(&runs, "ok"),
             "unpinned must still upgrade: {runs:?}"
         );
         assert!(
@@ -571,7 +609,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "terraform"),
+            run_is_name_install(&lock_runs(&brew), "terraform"),
             "{:?}",
             lock_runs(&brew)
         );
@@ -583,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_tap_upgrade_records_origin_despite_outdated_notice() {
+    fn tap_upgrade_by_name_leaves_no_origin_record_despite_outdated_notice() {
         let git = InMemoryGit::new();
         git.insert_blob(
             "tapcut",
@@ -630,7 +668,8 @@ mod tests {
         .unwrap();
         assert_eq!(
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
-            Some("hashicorp/tap")
+            None,
+            "a by-name install writes a receipt that names the tap"
         );
     }
 
@@ -662,11 +701,15 @@ mod tests {
         );
         assert!(text.contains("upgrading ant 1.37.0 -> 1.38.0"), "{text}");
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "ant"), "{runs:?}");
+        assert!(run_is_name_install(&runs, "ant"), "{runs:?}");
         assert!(
-            runs.iter().any(|a| a.iter().any(|x| x == "--cask")
-                && a.iter().any(|x| x.ends_with("/Casks/ant.rb"))),
-            "staged from the tap's Casks/ path: {runs:?}"
+            runs.contains(&vec![
+                "install".to_string(),
+                "--cask".to_string(),
+                "-v".to_string(),
+                "ant".to_string()
+            ]),
+            "installed by bare name: {runs:?}"
         );
         assert!(!r.refused);
     }
@@ -750,16 +793,20 @@ mod tests {
             .collect();
         assert_eq!(installs.len(), 2, "{runs:?}");
         assert!(
-            installs.iter().any(|a| a.iter().any(|x| x == "--cask")
-                && a.iter().any(|x| x.ends_with("/Casks/vacuum.rb"))),
-            "cask staged from the tap's Casks/ path: {runs:?}"
+            installs.contains(&&vec![
+                "install".to_string(),
+                "--cask".to_string(),
+                "vacuum".to_string()
+            ]),
+            "cask installed by bare name: {runs:?}"
         );
         assert!(
-            installs
-                .iter()
-                .any(|a| !a.iter().any(|x| x == "--cask")
-                    && a.iter().any(|x| x.ends_with("/vacuum.rb"))),
-            "formula staged: {runs:?}"
+            installs.contains(&&vec![
+                "install".to_string(),
+                "--formula".to_string(),
+                "vacuum".to_string()
+            ]),
+            "formula installed by bare name: {runs:?}"
         );
     }
 
@@ -993,7 +1040,7 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "alpha"),
+            run_is_name_install(&lock_runs(&brew), "alpha"),
             "core package still upgraded"
         );
         assert!(r.refused);
@@ -1147,5 +1194,72 @@ mod tests {
             got.contains("terraform: tap hashicorp/tap could not be refreshed"),
             "{got}"
         );
+    }
+
+    #[test]
+    fn target_not_at_brew_current_is_held_and_the_next_package_installs() {
+        let git = InMemoryGit::new();
+        for name in ["alpha", "gamma"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "cutoffsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.2.0", "newsha"),
+            );
+        }
+        let mut by_name = std::collections::BTreeMap::new();
+        by_name.insert(
+            "alpha".to_string(),
+            Ok(crate::brew::ByName {
+                tap: "homebrew/core".into(),
+                version: "1.2.0".into(),
+                same_source: false,
+                installed_current: false,
+            }),
+        );
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("alpha", formula_rb("alpha", "1.0.0", "oldsha")),
+                formula_pkg("gamma", formula_rb("gamma", "1.0.0", "oldsha")),
+            ],
+            by_name,
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("a held target must not fail the run");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains("held alpha: brew would install 1.2.0, which is not the soaked cutoff"),
+            "{text}"
+        );
+        assert!(text.contains("issue #17"), "{text}");
+        assert!(
+            text.contains("use `brew upgrade alpha` to bypass brewsoak."),
+            "{text}"
+        );
+        let runs = lock_runs(&brew);
+        assert!(run_is_name_install(&runs, "gamma"), "{runs:?}");
+        assert!(!run_is_name_install(&runs, "alpha"), "{runs:?}");
     }
 }

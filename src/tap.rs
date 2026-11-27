@@ -38,7 +38,8 @@ pub fn sanitize_unofficial(rb: &str) -> String {
     out
 }
 
-pub fn brew_install_args(pkg: &PkgRef, path: &Path, user_flags: &[String]) -> Vec<String> {
+/// `brew install --formula|--cask [flags] <token>`; soaked installs pass the bare name.
+pub fn brew_install_args(pkg: &PkgRef, token: &str, user_flags: &[String]) -> Vec<String> {
     let mut args = vec!["install".to_string()];
     args.push(match pkg.kind {
         PkgKind::Formula => "--formula".into(),
@@ -51,7 +52,7 @@ pub fn brew_install_args(pkg: &PkgRef, path: &Path, user_flags: &[String]) -> Ve
         .cloned()
         .collect();
     args.extend(crate::flags::filter_for_verb("install", &wanted).kept);
-    args.push(path.to_string_lossy().into_owned());
+    args.push(token.to_string());
     args
 }
 
@@ -105,37 +106,20 @@ mod tests {
     }
 
     #[test]
-    fn brew_install_args_formula_path_install_omits_ignore_deps() {
-        let path = Path::new("/tmp/staging/Formula/wget.rb");
-        let args = brew_install_args(&formula("wget"), path, &[]);
-        assert!(
-            !args.iter().any(|a| a == "--ignore-dependencies"),
-            "Homebrew treats --ignore-dependencies as an unsupported developer option: {args:?}"
-        );
-        assert!(args.iter().any(|a| a == path.to_str().unwrap()), "{args:?}");
-        assert_eq!(args[0], "install");
-        assert!(args.iter().any(|a| a == "--formula"), "{args:?}");
-        assert!(
-            !args.iter().any(|a| a.contains("brewsoakr/soaked")),
-            "path install must not use a tap token: {args:?}"
-        );
+    fn brew_install_args_ends_with_the_bare_name() {
+        let args = brew_install_args(&formula("wget"), "wget", &[]);
+        assert_eq!(args, vec!["install", "--formula", "wget"]);
     }
 
     #[test]
     fn brew_install_args_strips_user_ignore_dependencies() {
-        let path = Path::new("/tmp/staging/Formula/wget.rb");
         let flags = ["--ignore-dependencies".to_string(), "--verbose".to_string()];
-        let args = brew_install_args(&formula("wget"), path, &flags);
-        assert!(
-            !args.iter().any(|a| a == "--ignore-dependencies"),
-            "{args:?}"
-        );
-        assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
+        let args = brew_install_args(&formula("wget"), "wget", &flags);
+        assert_eq!(args, vec!["install", "--formula", "--verbose", "wget"]);
     }
 
     #[test]
     fn brew_install_args_drops_flags_install_rejects() {
-        let path = Path::new("/tmp/staging/Formula/wget.rb");
         let flags = [
             "--greedy",
             "--greedy-latest",
@@ -145,33 +129,18 @@ mod tests {
             "--verbose",
         ]
         .map(String::from);
-        let args = brew_install_args(&formula("wget"), path, &flags);
+        let args = brew_install_args(&formula("wget"), "wget", &flags);
         assert_eq!(
             args,
-            vec![
-                "install",
-                "--formula",
-                "-vg",
-                "--verbose",
-                "/tmp/staging/Formula/wget.rb"
-            ]
+            vec!["install", "--formula", "-vg", "--verbose", "wget"]
         );
     }
 
     #[test]
     fn brew_install_args_cask_forwards_user_flags_without_subcommand() {
-        let path = Path::new("/tmp/staging/Casks/firefox.rb");
         let flags = ["install".to_string(), "--appdir=/Apps".to_string()];
-        let args = brew_install_args(&cask("firefox"), path, &flags);
-        assert_eq!(
-            args,
-            vec![
-                "install",
-                "--cask",
-                "--appdir=/Apps",
-                "/tmp/staging/Casks/firefox.rb",
-            ]
-        );
+        let args = brew_install_args(&cask("firefox"), "firefox", &flags);
+        assert_eq!(args, vec!["install", "--cask", "--appdir=/Apps", "firefox"]);
     }
 
     #[test]

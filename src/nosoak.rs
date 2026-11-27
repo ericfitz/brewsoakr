@@ -138,6 +138,20 @@ pub fn brew_token(origin_tap: &str, name: &str) -> String {
     }
 }
 
+/// Runs `brew update` under the `Updating Homebrew` header.
+/// `None` when it succeeded, else brew's exit code.
+pub fn brew_update(brew: &impl Brew, out: &mut impl Write) -> Result<Option<i32>, Error> {
+    let mut updating = Section::new(&mut *out, "Updating Homebrew");
+    updating.open()?;
+    let update = brew.run_visible(&["update".to_string()], &mut updating)?;
+    drop(updating);
+    if update.status.success() {
+        Ok(None)
+    } else {
+        Ok(Some(update.status.code().unwrap_or(1)))
+    }
+}
+
 /// Spec "No-soak packages": one `brew update`, then one `brew <verb>` with
 /// full tokens; tap-switch targets go through `brew reinstall` on `upgrade`.
 pub fn run_step(
@@ -145,6 +159,18 @@ pub fn run_step(
     verb: &str,
     user_flags: &[String],
     targets: &[Target],
+    out: &mut impl Write,
+) -> Result<StepResult, Error> {
+    run_step_after(brew, verb, user_flags, targets, false, out)
+}
+
+/// `run_step`, skipping its own update (and header) when `updated`.
+pub fn run_step_after(
+    brew: &impl Brew,
+    verb: &str,
+    user_flags: &[String],
+    targets: &[Target],
+    updated: bool,
     out: &mut impl Write,
 ) -> Result<StepResult, Error> {
     let verb_kind = Verb::parse(verb)
@@ -160,12 +186,7 @@ pub fn run_step(
         .collect();
     let token_of = |t: &Target| brew_token(&t.origin, &t.name);
 
-    let mut updating = Section::new(&mut *out, "Updating Homebrew");
-    updating.open()?;
-    let update = brew.run_visible(&["update".to_string()], &mut updating)?;
-    drop(updating);
-    if !update.status.success() {
-        let code = update.status.code().unwrap_or(1);
+    if !updated && let Some(code) = brew_update(brew, out)? {
         result.notes.push(format!(
             "no-soak: brew update failed (exit {code}); not {verb}d: {}",
             tokens.join(", ")
@@ -589,6 +610,46 @@ mod tests {
         .unwrap();
         let got = runs(&brew);
         assert_eq!(got[1], vec!["install", "--cask", "firefox"]);
+    }
+
+    #[test]
+    fn brew_update_returns_the_exit_code_on_failure() {
+        let ok = MockBrew::new();
+        let mut out = Vec::new();
+        assert_eq!(brew_update(&ok, &mut out).unwrap(), None);
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("Updating Homebrew")
+        );
+        let bad = MockBrew {
+            next_status: 3,
+            ..MockBrew::new()
+        };
+        assert_eq!(brew_update(&bad, &mut Vec::new()).unwrap(), Some(3));
+        assert_eq!(runs(&bad), vec![vec!["update"]]);
+    }
+
+    #[test]
+    fn run_step_after_an_update_runs_no_brew_update_and_prints_no_header() {
+        let brew = MockBrew::new();
+        let mut out = Vec::new();
+        let r = run_step_after(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget")],
+            true,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(runs(&brew), vec![vec!["upgrade", "wget"]]);
+        assert!(
+            !String::from_utf8(out)
+                .unwrap()
+                .contains("Updating Homebrew")
+        );
+        assert_eq!(r.status, Some(0));
     }
 
     #[test]

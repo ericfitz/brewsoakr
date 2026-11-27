@@ -15,7 +15,7 @@ pub fn install(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    _tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -32,7 +32,7 @@ pub fn install(
         git,
         snaps,
         cache,
-        tap_root,
+        _tap_root,
         inv,
         cfg,
         names,
@@ -65,67 +65,62 @@ mod tests {
     use crate::cmd::test_support::{
         PACKER_REFUSAL, call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps,
         formula_pkg, formula_pkg_from, formula_rb, git_empty, hashicorp_tap, inv_from, lock_runs,
-        packer_world, run_has_token, run_is_soaked_install, tap_snaps, tapped, unused_cache,
+        packer_world, run_has_token, run_is_name_install, tap_snaps, tapped, unused_cache,
     };
 
     #[test]
-    fn soaked_tap_install_stages_under_tap_dir_and_writes_origin_record() {
-        let git = InMemoryGit::new();
-        git.insert_blob(
-            "tapcut",
-            "Formula/terraform.rb",
-            formula_rb("terraform", "1.1.0", "midsha"),
-        );
-        git.insert_blob(
-            "taphead",
-            "Formula/terraform.rb",
-            formula_rb("terraform", "1.2.0", "newsha"),
-        );
+    fn tap_formula_installs_by_bare_name_and_its_origin_record_is_removed() {
+        let (git, snaps) = packer_world();
         let brew = MockBrew {
-            taps: vec![tapped(
-                "hashicorp/tap",
-                Some("https://github.com/hashicorp/homebrew-tap"),
-            )],
+            taps: hashicorp_tap(),
             ..MockBrew::new()
         };
-        let cfg = cfg24();
-        let inv = inv_from(&brew, &cfg);
-        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
         let cache = tempfile::tempdir().unwrap();
-        let tap = tempfile::tempdir().unwrap();
-        let mut out = Vec::new();
-        install(
-            &brew,
-            &git,
-            &snaps,
-            cache.path(),
-            tap.path(),
-            &inv,
-            &cfg,
-            &["hashicorp/tap/terraform".into()],
-            false,
-            false,
-            &[],
-            &mut out,
-        )
-        .unwrap();
-        let staged = tap.path().join("taps/hashicorp/tap/Formula/terraform.rb");
-        assert!(staged.exists(), "staged under the per-tap directory");
-        assert!(
-            !tap.path().join("Formula/terraform.rb").exists(),
-            "never under the core staging root"
-        );
-        let runs = lock_runs(&brew);
-        assert!(
-            runs.iter()
-                .any(|a| a.iter().any(|x| x == staged.to_str().unwrap())),
-            "{runs:?}"
-        );
-        let records = OriginRecords::load(cache.path());
+        let mut records = OriginRecords::default();
+        records.set(PkgKind::Formula, "packer", "hashicorp/tap");
+        records.save(cache.path()).unwrap();
+        let (_, text) = install_packer_in(&brew, &git, &snaps, cache.path(), &[]);
+        let visible = brew.visible_runs.lock().unwrap().clone();
         assert_eq!(
-            records.get(PkgKind::Formula, "terraform"),
-            Some("hashicorp/tap")
+            visible.last().unwrap(),
+            &["install", "--formula", "packer"],
+            "{visible:?} {text}"
         );
+        assert!(
+            !run_has_token(&visible, "hashicorp/tap/packer"),
+            "{visible:?}"
+        );
+        assert_eq!(
+            OriginRecords::load(cache.path()).get(PkgKind::Formula, "packer"),
+            None,
+            "the receipt names the tap now, so the record is stale"
+        );
+    }
+
+    #[test]
+    fn dry_run_and_already_installed_keep_the_origin_record() {
+        for (flags, status, stdout) in [
+            (vec!["--dry-run".to_string()], 0, ""),
+            (vec![], 1, "Warning: packer 1.16.1 is already installed\n"),
+        ] {
+            let (git, snaps) = packer_world();
+            let brew = MockBrew {
+                taps: hashicorp_tap(),
+                next_status: status,
+                next_stdout: stdout.as_bytes().to_vec(),
+                ..MockBrew::new()
+            };
+            let cache = tempfile::tempdir().unwrap();
+            let mut records = OriginRecords::default();
+            records.set(PkgKind::Formula, "packer", "hashicorp/tap");
+            records.save(cache.path()).unwrap();
+            install_packer_in(&brew, &git, &snaps, cache.path(), &flags);
+            assert_eq!(
+                OriginRecords::load(cache.path()).get(PkgKind::Formula, "packer"),
+                Some("hashicorp/tap"),
+                "{flags:?}"
+            );
+        }
     }
 
     #[test]
@@ -260,42 +255,49 @@ mod tests {
     }
 
     #[test]
-    fn staged_load_failure_holds_with_note_and_does_not_fail_the_run() {
+    fn brew_load_error_by_name_is_brews_failure_and_the_run_continues() {
         let git = InMemoryGit::new();
-        git.insert_blob(
-            "tapcut",
-            "Formula/terraform.rb",
-            formula_rb("terraform", "1.1.0", "midsha"),
-        );
-        git.insert_blob(
-            "taphead",
-            "Formula/terraform.rb",
-            formula_rb("terraform", "1.2.0", "newsha"),
-        );
+        for (name, v) in [("packer", "1.16.1"), ("terraform", "1.1.0")] {
+            git.insert_blob(
+                "tapcut",
+                &format!("Formula/{name}.rb"),
+                formula_rb(name, v, "midsha"),
+            );
+            git.insert_blob(
+                "taphead",
+                &format!("Formula/{name}.rb"),
+                formula_rb(name, "9.9.9", "newsha"),
+            );
+        }
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Formula/packer.rb", "Formula/terraform.rb"]);
+        git.insert_tree("taphead", &["Formula/packer.rb", "Formula/terraform.rb"]);
         let brew = MockBrew {
-            taps: vec![tapped(
-                "hashicorp/tap",
-                Some("https://github.com/hashicorp/homebrew-tap"),
-            )],
-            next_status: 1,
-            next_stdout: b"Error: cannot load such file -- ../lib/helper\n".to_vec(),
+            taps: hashicorp_tap(),
             ..MockBrew::new()
         };
+        // The run's `brew update` takes the first queued answer.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
+        brew.next_outputs.lock().unwrap().push_back((
+            1,
+            b"Error: cannot load such file -- ../lib/helper\n".to_vec(),
+        ));
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
-        let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
             &brew,
             &git,
             &snaps,
-            cache.path(),
+            unused_cache(),
             tap.path(),
             &inv,
             &cfg,
-            &["hashicorp/tap/terraform".into()],
+            &[
+                "hashicorp/tap/packer".into(),
+                "hashicorp/tap/terraform".into(),
+            ],
             false,
             false,
             &[],
@@ -303,22 +305,18 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(r.refused);
-        assert_eq!(
-            r.brew_status, None,
-            "a staged-load hold is not a brew failure"
-        );
-        assert!(
-            text.contains(
-                "terraform: cannot be installed from a staged copy; use brew, or add it to NO_SOAK"
-            ),
-            "{text}"
-        );
-        assert!(summary_has(&text, "held", "1"), "{text}");
-        assert_eq!(
-            OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
-            None
-        );
+        assert_eq!(r.brew_status, Some(1), "brew's exit code is kept: {text}");
+        assert!(!r.refused, "a brew failure is not a hold: {text}");
+        assert!(!text.contains("staged copy"), "{text}");
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        let installs: Vec<&str> = visible
+            .iter()
+            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .map(|a| a.last().unwrap().as_str())
+            .collect();
+        assert_eq!(installs, ["packer", "terraform"], "the next package runs");
+        assert!(summary_has(&text, "upgraded", "1"), "{text}");
+        assert!(summary_has(&text, "held", "0"), "{text}");
     }
 
     fn install_packer(
@@ -326,23 +324,33 @@ mod tests {
         git: &InMemoryGit,
         snaps: &Snapshots,
     ) -> (RunResult, String) {
+        let cache = tempfile::tempdir().unwrap();
+        install_packer_in(brew, git, snaps, cache.path(), &[])
+    }
+
+    fn install_packer_in(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        snaps: &Snapshots,
+        cache: &std::path::Path,
+        flags: &[String],
+    ) -> (RunResult, String) {
         let cfg = cfg24();
         let inv = inv_from(brew, &cfg);
-        let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
             brew,
             git,
             snaps,
-            cache.path(),
+            cache,
             tap.path(),
             &inv,
             &cfg,
             &["hashicorp/tap/packer".into()],
             false,
             false,
-            &[],
+            flags,
             &mut out,
         )
         .unwrap();
@@ -358,6 +366,8 @@ mod tests {
             next_stdout: PACKER_REFUSAL.to_vec(),
             ..MockBrew::new()
         };
+        // The run's `brew update` succeeds; the install after it is refused.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
         let (r, text) = install_packer(&brew, &git, &snaps);
         assert!(r.refused);
         assert_eq!(r.brew_status, None, "a trust hold is not a brew failure");
@@ -375,6 +385,11 @@ mod tests {
             .into_iter()
             .chain(brew.visible_runs.lock().unwrap().clone())
             .collect();
+        assert!(
+            all.iter()
+                .any(|a| a.as_slice() == ["install", "--formula", "packer"]),
+            "the refused install was by bare name: {all:?}"
+        );
         assert!(
             !all.iter().any(|a| a.iter().any(|x| x == "trust")),
             "brewsoak must never trust a third-party tap: {all:?}"
@@ -464,7 +479,7 @@ mod tests {
         .expect("install");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "fresh"),
+            run_is_name_install(&runs, "fresh"),
             "expected soaked install of fresh: {runs:?}"
         );
         assert!(!result.refused, "eligible fresh install must not refuse");
@@ -684,9 +699,10 @@ mod tests {
         let result =
             call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out).expect("reinstall");
         let runs = lock_runs(&brew);
-        assert!(
-            runs.is_empty(),
-            "already soaked must not brew reinstall or install: {runs:?}"
+        assert_eq!(
+            runs,
+            vec![vec!["update".to_string()]],
+            "already soaked must only update, not reinstall or install"
         );
         assert!(!result.refused, "already soaked is not a refusal");
     }
@@ -713,8 +729,12 @@ mod tests {
             call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out).expect("reinstall");
         let runs = lock_runs(&brew);
         assert!(
-            run_is_soaked_install(&runs, "wget"),
-            "behind reinstall must path-install cutoff without --ignore-dependencies: {runs:?}"
+            runs.contains(&vec![
+                "install".to_string(),
+                "--formula".to_string(),
+                "wget".to_string()
+            ]),
+            "behind reinstall must install the cutoff by bare name: {runs:?}"
         );
         assert!(
             !runs
@@ -723,6 +743,68 @@ mod tests {
             "behind reinstall must not brew reinstall HEAD: {runs:?}"
         );
         assert!(!result.refused, "eligible behind reinstall must not refuse");
+    }
+
+    #[test]
+    fn install_and_reinstall_update_before_soaked_work() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.2.0", "newsha"),
+        );
+        // `install` of a package that is not installed yet.
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().expect("tap");
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["wget".to_string()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .expect("install");
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[0], vec!["update".to_string()], "{runs:?}");
+        assert_eq!(
+            runs.iter().filter(|a| a.as_slice() == ["update"]).count(),
+            1
+        );
+        assert!(run_is_name_install(&runs[1..], "wget"), "{runs:?}");
+        // A cutoff `reinstall` of a package installed behind the cutoff.
+        let old = formula_rb("wget", "1.0.0", "oldsha");
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", old)],
+            ..MockBrew::new()
+        };
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["wget".to_string()],
+            &mut out,
+        )
+        .expect("reinstall");
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[0], vec!["update".to_string()], "{runs:?}");
+        assert_eq!(
+            runs.iter().filter(|a| a.as_slice() == ["update"]).count(),
+            1
+        );
+        assert!(run_is_name_install(&runs[1..], "wget"), "{runs:?}");
     }
 
     #[test]
@@ -742,9 +824,10 @@ mod tests {
         let err = call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out)
             .expect_err("missing reinstall must refuse");
         let runs = lock_runs(&brew);
-        assert!(
-            runs.is_empty(),
-            "missing reinstall must not run brew: {runs:?}"
+        assert_eq!(
+            runs,
+            vec![vec!["update".to_string()]],
+            "missing reinstall must only update"
         );
         match err {
             Error::Refusal(msg) => {
@@ -758,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn install_uses_file_path_not_tap_token() {
+    fn install_and_reinstall_install_by_name() {
         let fresh_mid = formula_rb("fresh", "1.1.0", "midsha");
         let fresh_new = formula_rb("fresh", "1.2.0", "newsha");
         let git = InMemoryGit::new();
@@ -788,12 +871,47 @@ mod tests {
         .expect("install");
         let runs = lock_runs(&brew);
         assert!(
-            runs.iter().any(|args| {
-                args.first().map(String::as_str) == Some("install")
-                    && args.iter().any(|a| a.ends_with("/fresh.rb"))
-                    && !args.iter().any(|a| a.contains("brewsoakr/soaked"))
-            }),
-            "install must use a file path, not a tap token: {runs:?}"
+            runs.contains(&vec![
+                "install".to_string(),
+                "--formula".to_string(),
+                "fresh".to_string()
+            ]),
+            "install must pass the bare name: {runs:?}"
+        );
+    }
+
+    #[test]
+    fn cask_installs_by_name_with_cask_flag() {
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/f/firefox.rb", cask_rb("firefox", "1.0"));
+        git.insert_blob("caskhead", "Casks/f/firefox.rb", cask_rb("firefox", "1.1"));
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().unwrap();
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["firefox".into()],
+            true,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert!(
+            runs.contains(&vec![
+                "install".to_string(),
+                "--cask".to_string(),
+                "firefox".to_string()
+            ]),
+            "{runs:?}"
         );
     }
 
@@ -831,7 +949,7 @@ mod tests {
             visible
                 .iter()
                 .any(|args| args.first().map(String::as_str) == Some("install")
-                    && args.iter().any(|a| a.ends_with("/fresh.rb"))),
+                    && args.last().map(String::as_str) == Some("fresh")),
             "soaked install must use run_visible: {visible:?}"
         );
     }
@@ -848,6 +966,8 @@ mod tests {
             next_stderr: b"Error: fresh 1.1.0 is already installed\n".to_vec(),
             ..MockBrew::new()
         };
+        // The run's `brew update` succeeds; the install after it answers.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
@@ -922,7 +1042,7 @@ mod tests {
         )
         .unwrap();
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "terraform"), "{runs:?}");
+        assert!(run_is_name_install(&runs, "terraform"), "{runs:?}");
         assert!(!run_has_token(&runs, "hashicorp/tap/terraform"), "{runs:?}");
     }
 
@@ -1062,10 +1182,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             lock_runs(&brew),
-            vec![vec![
-                "reinstall".to_string(),
-                "hashicorp/tap/terraform".to_string()
-            ]]
+            vec![
+                vec!["update".to_string()],
+                vec![
+                    "reinstall".to_string(),
+                    "hashicorp/tap/terraform".to_string()
+                ]
+            ]
         );
     }
 
@@ -1245,7 +1368,8 @@ mod tests {
         assert!(String::from_utf8(out).unwrap().contains(
             "terraform is installed from homebrew/core; brewsoak does not switch taps; use brew"
         ));
-        assert!(lock_runs(&brew).is_empty());
+        // Soaked work still updates; the refusal runs nothing else.
+        assert_eq!(lock_runs(&brew), vec![vec!["update".to_string()]]);
         assert_eq!(
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
             None

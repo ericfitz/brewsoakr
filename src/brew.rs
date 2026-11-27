@@ -58,6 +58,150 @@ const HOST_PLATFORM_RUBY: &str = r##"puts MacOSVersion::SYMBOLS.map { |k, v| "#{
 puts "HOST #{MacOS.version.to_sym} #{Hardware::CPU.arch}"
 puts "LANG #{Cask::Config.new.languages.join(" ")}".strip"##;
 
+/// Runs under `brew ruby -e`: ARGV holds `kind name` pairs, and each prints
+/// one tab-separated row: `OK kind name tap version source_sha256
+/// installed_current`, or `ERR kind name class message` when brew's own
+/// loader refuses the name. The leading `kind name` lets the parser match a
+/// row to its query rather than trust its position. Names arrive as
+/// arguments, never as Ruby source.
+const BY_NAME_RUBY: &str = r#"ARGV.each_slice(2) do |kind, name|
+  begin
+    if kind == "cask"
+      c = Cask::CaskLoader.load(name)
+      sum = c.ruby_source_checksum
+      puts ["OK", kind, name, c.tap&.name, c.version, sum && sum[:sha256], c.installed_version.to_s == c.version.to_s].join("\t")
+    else
+      f = Formulary.factory(name)
+      puts ["OK", kind, name, f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?].join("\t")
+    end
+  rescue StandardError, ScriptError => e
+    puts ["ERR", kind, name, e.class, e.message.lines.first.to_s.strip].join("\t")
+  end
+end"#;
+
+/// One question for `Brew::by_name`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameQuery {
+    pub kind: PkgKind,
+    /// Bare name or cask token: what brewsoak would hand to `brew install`.
+    pub name: String,
+    /// Lowercase `user/repo` brewsoak expects the name to resolve to.
+    pub origin: String,
+    /// SHA-256 of the raw cutoff blob; `None` when there is no cutoff.
+    pub cutoff_sha256: Option<String>,
+}
+
+/// What brew's own data says a bare name is right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ByName {
+    /// Lowercase `user/repo` the name resolves to.
+    pub tap: String,
+    /// Formula: `pkg_version` (`1.5.2_3`). Cask: `version`.
+    pub version: String,
+    /// brew's `ruby_source_checksum` equals the query's `cutoff_sha256`.
+    pub same_source: bool,
+    /// brew's `latest_version_installed?` (cask: installed at `version`).
+    pub installed_current: bool,
+}
+
+impl ByName {
+    /// A by-name install would load exactly the soaked cutoff of `origin`:
+    /// `same_source`, and `tap` is `origin` (case-insensitive).
+    pub fn installs_cutoff(&self, origin: &str) -> bool {
+        self.same_source && self.tap.eq_ignore_ascii_case(origin)
+    }
+}
+
+/// One parsed `BY_NAME_RUBY` row, before it is judged against a query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Loaded {
+    tap: String,
+    version: String,
+    source_sha256: Option<String>,
+    installed_current: bool,
+}
+
+/// One name's `BY_NAME_RUBY` answer, or brew's reason it has none.
+type LoadedAnswer = Result<Loaded, String>;
+
+/// One answer per `asked` `(kind, name)` from `BY_NAME_RUBY` output. The
+/// `asked` entries must be unique: a row is consumed by the first entry that
+/// asks for it, so a repeated entry gets "no answer". Rows are matched by `kind name`, never by position: a missing or duplicated
+/// row is that name's `Err`, and lines that are not a row for an asked name
+/// (a stray brew message, a row for another name) are never assigned.
+pub(crate) fn parse_by_name_lines(
+    stdout: &str,
+    asked: &[(PkgKind, String)],
+) -> Vec<Result<Loaded, String>> {
+    let mut rows: HashMap<(&str, &str), Vec<Result<Loaded, String>>> = HashMap::new();
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 3 && matches!(fields[0], "OK" | "ERR") {
+            rows.entry((fields[1], fields[2]))
+                .or_default()
+                .push(parse_by_name_row(&fields));
+        }
+    }
+    asked
+        .iter()
+        .map(
+            |(kind, name)| match rows.remove(&(kind_tag(*kind), name.as_str())) {
+                None => Err("brew ruby gave no answer for this name".to_string()),
+                Some(mut found) if found.len() == 1 => found.remove(0),
+                Some(_) => Err("brew ruby answered this name more than once".to_string()),
+            },
+        )
+        .collect()
+}
+
+fn parse_by_name_row(fields: &[&str]) -> Result<Loaded, String> {
+    match fields {
+        ["OK", _, _, tap, version, sum, installed] => {
+            let tap = tap.trim().to_lowercase();
+            if tap.is_empty() {
+                return Err("brew reports no tap for this name".to_string());
+            }
+            let installed_current = match installed.trim() {
+                "true" => true,
+                "false" => false,
+                other => return Err(format!("unparseable installed flag from brew: {other:?}")),
+            };
+            Ok(Loaded {
+                tap,
+                version: version.trim().to_string(),
+                source_sha256: Some(sum.trim().to_lowercase()).filter(|v| !v.is_empty()),
+                installed_current,
+            })
+        }
+        ["ERR", _, _, class, message] => {
+            let message = message.trim();
+            Err(if message.is_empty() {
+                class.trim().to_string()
+            } else {
+                message.to_string()
+            })
+        }
+        _ => Err(format!(
+            "unparseable brew loader row: {}",
+            fields.join("\t").trim()
+        )),
+    }
+}
+
+/// Compare one loaded answer with what the query expects.
+pub(crate) fn judge(loaded: &Loaded, q: &NameQuery) -> ByName {
+    let same_source = match (&loaded.source_sha256, &q.cutoff_sha256) {
+        (Some(have), Some(want)) => have.eq_ignore_ascii_case(want),
+        _ => false,
+    };
+    ByName {
+        tap: loaded.tap.clone(),
+        version: loaded.version.clone(),
+        same_source,
+        installed_current: loaded.installed_current,
+    }
+}
+
 pub trait Brew {
     fn brew_bin(&self) -> &Path;
     /// Capturing run for JSON (`info`, `outdated`, `tap-info`), `deps`, `--cellar` and `--caskroom`.
@@ -77,6 +221,10 @@ pub trait Brew {
     }
     fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error>;
     fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error>;
+    /// One answer per query, in order. `Err(text)` is brew's own failure for
+    /// that name (unknown name, untrusted tap, a script brewsoak could not
+    /// read). The outer `Err` is only "brew not found".
+    fn by_name(&self, queries: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error>;
     /// Every installed tap, as `brew tap-info --json --installed` reports it.
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error>;
     /// Names brew itself considers outdated right now (no `brew update`),
@@ -154,6 +302,16 @@ pub struct ProcessBrew {
     detect_failures: Mutex<HashMap<VersionSource, (i32, String)>>,
     /// `host_platform`, asked once: the host never changes during a run.
     host: std::cell::OnceCell<Option<HostPlatform>>,
+    /// `BY_NAME_RUBY` answers, failures included, keyed by `(kind, name)`.
+    /// Cleared by `brew update`.
+    loaded: Mutex<HashMap<(&'static str, String), LoadedAnswer>>,
+    /// Installed packages seen by `installed_packages`.
+    installed_names: Mutex<Vec<(PkgKind, String)>>,
+    /// The installed names went along with an earlier `by_name` spawn.
+    installed_asked: Mutex<bool>,
+    /// Successful `deps` answers, keyed by `(kind, token)`. Cleared by
+    /// `brew update`.
+    deps_memo: Mutex<HashMap<(&'static str, String), Vec<String>>>,
     sink: Mutex<Sink>,
 }
 
@@ -245,6 +403,10 @@ impl ProcessBrew {
             detected: Mutex::new(HashMap::new()),
             detect_failures: Mutex::new(HashMap::new()),
             host: std::cell::OnceCell::new(),
+            loaded: Mutex::new(HashMap::new()),
+            installed_names: Mutex::new(Vec::new()),
+            installed_asked: Mutex::new(false),
+            deps_memo: Mutex::new(HashMap::new()),
             sink: Mutex::new(Sink::default()),
         }
     }
@@ -255,6 +417,13 @@ pub struct MockBrew {
     pub deps: BTreeMap<String, Vec<String>>,
     /// Makes `deps` for this token fail with brew's stderr text.
     pub deps_errors: BTreeMap<String, String>,
+    /// Every `deps` call, in order.
+    pub deps_calls: Mutex<Vec<(PkgKind, String)>>,
+    /// What `by_name` reports per bare name; an unscripted name is the
+    /// query's own origin tap, same source, not installed-current.
+    pub by_name: BTreeMap<String, Result<ByName, String>>,
+    /// Every query `by_name` was asked, in order.
+    pub by_name_queries: Mutex<Vec<NameQuery>>,
     pub taps: Vec<TapInfo>,
     pub runs: Mutex<Vec<Vec<String>>>,
     pub visible_runs: Mutex<Vec<Vec<String>>>,
@@ -316,6 +485,9 @@ impl Default for MockBrew {
             installed: Vec::new(),
             deps: BTreeMap::new(),
             deps_errors: BTreeMap::new(),
+            deps_calls: Mutex::new(Vec::new()),
+            by_name: BTreeMap::new(),
+            by_name_queries: Mutex::new(Vec::new()),
             taps: Vec::new(),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
@@ -389,7 +561,23 @@ impl Brew for ProcessBrew {
         terminal: &mut dyn Write,
         ctx: &quiet::RunContext,
     ) -> Result<Output, Error> {
-        self.spawn_brew(args, Some((terminal, ctx)))
+        let output = self.spawn_brew(args, Some((terminal, ctx)));
+        if args.first().map(String::as_str) == Some("update") {
+            // Whatever the exit status, brew may have moved its taps.
+            self.loaded
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            self.deps_memo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
+            *self
+                .installed_asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = false;
+        }
+        output
     }
 
     fn set_raw(&self, raw: bool) {
@@ -567,7 +755,7 @@ impl Brew for ProcessBrew {
         let json = String::from_utf8_lossy(&output.stdout);
         let cellar = self.cellar();
         let caskroom = self.caskroom();
-        parse_installed_json(
+        let installed = parse_installed_json(
             &json,
             |name, kind, version| match kind {
                 PkgKind::Formula => cellar
@@ -583,7 +771,81 @@ impl Brew for ProcessBrew {
                     .map(|dir| read_formula_receipt_source(dir, name, version))
                     .unwrap_or_default()
             },
-        )
+        )?;
+        *self
+            .installed_names
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            installed.iter().map(|p| (p.kind, p.name.clone())).collect();
+        Ok(installed)
+    }
+
+    fn by_name(&self, queries: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error> {
+        let mut asking: Vec<(PkgKind, String)> = Vec::new();
+        let mut with_installed = false;
+        {
+            let loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+            let asked = *self
+                .installed_asked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut want: Vec<(PkgKind, String)> =
+                queries.iter().map(|q| (q.kind, q.name.clone())).collect();
+            if !asked {
+                let installed = self
+                    .installed_names
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                want.extend(installed.iter().cloned());
+                with_installed = !installed.is_empty();
+            }
+            for (kind, name) in want {
+                let key = (kind_tag(kind), name.clone());
+                if !loaded.contains_key(&key) && !asking.contains(&(kind, name.clone())) {
+                    asking.push((kind, name));
+                }
+            }
+        }
+        if !asking.is_empty() {
+            let mut args = vec![
+                "ruby".to_string(),
+                "-e".to_string(),
+                BY_NAME_RUBY.to_string(),
+                "--".to_string(),
+            ];
+            for (kind, name) in &asking {
+                args.extend([kind_tag(*kind).to_string(), name.clone()]);
+            }
+            let output = self.run(&args)?;
+            if output.status.success() && with_installed {
+                *self
+                    .installed_asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = true;
+            }
+            let answers: Vec<Result<Loaded, String>> = if output.status.success() {
+                parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), &asking)
+            } else {
+                let text = match brew_fail(&output) {
+                    Error::Brew { message, .. } => message,
+                    other => other.to_string(),
+                };
+                vec![Err(text); asking.len()]
+            };
+            let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+            for ((kind, name), answer) in asking.into_iter().zip(answers) {
+                loaded.insert((kind_tag(kind), name), answer);
+            }
+        }
+        let loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(queries
+            .iter()
+            .map(|q| match loaded.get(&(kind_tag(q.kind), q.name.clone())) {
+                Some(Ok(l)) => Ok(judge(l, q)),
+                Some(Err(e)) => Err(e.clone()),
+                None => Err("brew loader gave no answer".to_string()),
+            })
+            .collect())
     }
 
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
@@ -609,6 +871,15 @@ impl Brew for ProcessBrew {
             PkgKind::Formula => "--formula",
             PkgKind::Cask => "--cask",
         };
+        let key = (kind_tag(kind), token.to_string());
+        if let Some(memo) = self
+            .deps_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(memo.clone());
+        }
         // `--full-name` makes brew resolve bare dep names itself (core first,
         // then a unique installed tap) and print `user/repo/name` for tap
         // packages. It is accepted for casks too, where it changes nothing.
@@ -622,7 +893,12 @@ impl Brew for ProcessBrew {
         if !output.status.success() {
             return Err(brew_fail(&output));
         }
-        Ok(parse_deps_stdout(&output.stdout))
+        let deps = parse_deps_stdout(&output.stdout);
+        self.deps_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, deps.clone());
+        Ok(deps)
     }
 }
 
@@ -638,12 +914,19 @@ fn greedy_args(greedy: crate::flags::Greedy) -> Vec<String> {
 }
 
 /// Env for brewsoak-driven `brew` children.
-/// `HOMEBREW_DEVELOPER` allows path installs (`brew install ./foo.rb`).
-/// Unset FORBID so a user-level forbid cannot block us.
+/// `HOMEBREW_DEVELOPER` and the `FORBID_PACKAGES_FROM_PATHS` removal no longer
+/// enable path loading (soaked installs go by bare name). `brew ruby` still
+/// needs `HOMEBREW_DEVELOPER`. An `update` child must not get it: with it set,
+/// `brew update` moves Homebrew to `main` instead of the latest stable tag, so
+/// that child inherits the user's own value untouched.
 /// `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` stops brew from upgrading
 /// dependents of a cutoff install to HEAD.
 fn apply_brewsoak_brew_env(cmd: &mut Command) {
-    for (key, value) in brewsoak_brew_env_pairs() {
+    let verb = cmd
+        .get_args()
+        .next()
+        .map(|a| a.to_string_lossy().into_owned());
+    for (key, value) in brewsoak_brew_env_pairs(verb.as_deref().unwrap_or("")) {
         match value {
             Some(v) => {
                 cmd.env(key, v);
@@ -655,14 +938,20 @@ fn apply_brewsoak_brew_env(cmd: &mut Command) {
     }
 }
 
-fn brewsoak_brew_env_pairs() -> Vec<(&'static str, Option<&'static str>)> {
-    vec![
+/// The env changes for a `brew <verb>` child; a key not listed is inherited.
+fn brewsoak_brew_env_pairs(verb: &str) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut pairs = vec![
         ("HOMEBREW_NO_AUTO_UPDATE", Some("1")),
         ("HOMEBREW_NO_COLOR", Some("1")),
         ("HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK", Some("1")),
-        ("HOMEBREW_DEVELOPER", Some("1")),
         ("HOMEBREW_FORBID_PACKAGES_FROM_PATHS", None),
-    ]
+        // brew's loaders must read the taps as they are, not refetch the API.
+        ("HOMEBREW_FORCE_API_AUTO_UPDATE", None),
+    ];
+    if verb != "update" {
+        pairs.push(("HOMEBREW_DEVELOPER", Some("1")));
+    }
+    pairs
 }
 
 impl ProcessBrew {
@@ -940,23 +1229,39 @@ impl Brew for MockBrew {
             .collect())
     }
 
-    fn deps(&self, _kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+    fn by_name(&self, queries: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error> {
+        let mut seen = self
+            .by_name_queries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        seen.extend(queries.iter().cloned());
+        Ok(queries
+            .iter()
+            .map(|q| {
+                self.by_name.get(&q.name).cloned().unwrap_or_else(|| {
+                    Ok(ByName {
+                        tap: q.origin.clone(),
+                        version: String::new(),
+                        same_source: true,
+                        installed_current: false,
+                    })
+                })
+            })
+            .collect())
+    }
+
+    fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+        self.deps_calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push((kind, token.to_string()));
         if let Some(message) = self.deps_errors.get(token) {
             return Err(Error::Brew {
                 status: 1,
                 message: message.clone(),
             });
         }
-        let stem = Path::new(token)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(token);
-        Ok(self
-            .deps
-            .get(token)
-            .or_else(|| self.deps.get(stem))
-            .cloned()
-            .unwrap_or_default())
+        Ok(self.deps.get(token).cloned().unwrap_or_default())
     }
 }
 
@@ -1427,6 +1732,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mock_deps_keys_by_exact_token() {
+        let mut brew = MockBrew::new();
+        brew.deps
+            .insert("python@3.13".to_string(), vec!["openssl@3".to_string()]);
+        assert_eq!(
+            brew.deps(PkgKind::Formula, "python@3.13").unwrap(),
+            ["openssl@3"]
+        );
+        // A different spelling of the same package is a different key.
+        assert!(
+            brew.deps(PkgKind::Formula, "tap/x/python@3.13")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(brew.deps(PkgKind::Formula, "python").unwrap().is_empty());
+    }
+
+    #[test]
     fn forward_run_flushes_a_pending_nosoak_upgrade_at_eof() {
         let mut sink = Sink::default();
         let mut terminal = Vec::new();
@@ -1509,12 +1832,12 @@ mod tests {
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
             .expect("chmod");
         let brew = ProcessBrew::new(script);
-        let got = brew.deps(PkgKind::Formula, "/x/packer.rb").expect("deps");
+        let got = brew.deps(PkgKind::Formula, "packer").expect("deps");
         assert_eq!(got, ["hashicorp/tap/terraform", "wget"]);
         brew.deps(PkgKind::Cask, "alt-tab").expect("cask deps");
         assert_eq!(
             std::fs::read_to_string(&log).expect("log"),
-            "deps --1 --full-name --formula /x/packer.rb\ndeps --1 --full-name --cask alt-tab\n"
+            "deps --1 --full-name --formula packer\ndeps --1 --full-name --cask alt-tab\n"
         );
     }
 
@@ -2093,8 +2416,8 @@ mod tests {
     }
 
     #[test]
-    fn brewsoak_brew_env_enables_path_installs() {
-        let pairs = brewsoak_brew_env_pairs();
+    fn brewsoak_brew_env_keeps_developer_and_forbid_removal_for_install() {
+        let pairs = brewsoak_brew_env_pairs("install");
         assert!(
             pairs
                 .iter()
@@ -2342,9 +2665,51 @@ mod tests {
         }
     }
 
+    fn env_of(verb: &str) -> Vec<(String, Option<String>)> {
+        let mut cmd = Command::new("brew");
+        cmd.arg(verb);
+        apply_brewsoak_brew_env(&mut cmd);
+        cmd.get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn update_child_never_sets_homebrew_developer() {
+        // With HOMEBREW_DEVELOPER set, brew update moves Homebrew to main
+        // instead of the latest stable tag. The child must inherit the user's
+        // own value, not gain one: no entry means the parent env passes
+        // through untouched (set stays set, unset stays unset).
+        let env = env_of("update");
+        assert!(
+            !env.iter().any(|(k, _)| k == "HOMEBREW_DEVELOPER"),
+            "{env:?}"
+        );
+        assert!(
+            env.contains(&("HOMEBREW_NO_AUTO_UPDATE".into(), Some("1".into()))),
+            "{env:?}"
+        );
+    }
+
+    #[test]
+    fn other_children_still_set_homebrew_developer() {
+        for verb in ["install", "upgrade", "ruby", "deps", "info", "outdated"] {
+            let env = env_of(verb);
+            assert!(
+                env.contains(&("HOMEBREW_DEVELOPER".into(), Some("1".into()))),
+                "{verb}: {env:?}"
+            );
+        }
+    }
+
     #[test]
     fn brewsoak_brew_env_turns_brew_colour_off() {
-        let pairs = brewsoak_brew_env_pairs();
+        let pairs = brewsoak_brew_env_pairs("install");
         assert!(
             pairs
                 .iter()
@@ -2357,7 +2722,7 @@ mod tests {
         // brewsoak never trusts a tap on the user's behalf (2026-10-05 human
         // decision), so it must not switch Homebrew's tap-trust check off
         // either. The removed brewsoakr/soaked fallback used to set this.
-        let pairs = brewsoak_brew_env_pairs();
+        let pairs = brewsoak_brew_env_pairs("install");
         assert!(
             !pairs
                 .iter()
@@ -2618,5 +2983,449 @@ mod tests {
             .insert("cave-story".into(), vec!["ja".into()]);
         assert_eq!(brew.cask_languages("cave-story"), Some(vec!["ja".into()]));
         assert_eq!(brew.cask_languages("other"), None);
+    }
+
+    fn loaded(tap: &str, sum: Option<&str>) -> Loaded {
+        Loaded {
+            tap: tap.into(),
+            version: "1.0".into(),
+            source_sha256: sum.map(str::to_string),
+            installed_current: false,
+        }
+    }
+
+    fn query(name: &str, origin: &str, sum: Option<&str>) -> NameQuery {
+        NameQuery {
+            kind: PkgKind::Formula,
+            name: name.into(),
+            origin: origin.into(),
+            cutoff_sha256: sum.map(str::to_string),
+        }
+    }
+
+    fn asked(names: &[&str]) -> Vec<(PkgKind, String)> {
+        names
+            .iter()
+            .map(|n| (PkgKind::Formula, n.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_by_name_lines_reads_ok_and_err_rows() {
+        let out = "OK\tformula\ta\thomebrew/core\t1.5.2_3\tAbC123\ttrue\n\
+                   OK\tcask\tb\tHomebrew/Cask\t4.0\tdef456\tfalse\n\
+                   OK\tformula\tc\thomebrew/core\t1.0\t\tfalse\n\
+                   OK\tformula\td\t\t1.0\tabc\tfalse\n\
+                   ERR\tformula\te\tFormulaUnavailableError\tNo available formula with the name \"x\".\n\
+                   OK\tformula\tf\thomebrew/core\t1.0\tabc\tmaybe\n\
+                   OK\tformula\tg\ttoo\tfew\n";
+        let q = vec![
+            (PkgKind::Formula, "a".to_string()),
+            (PkgKind::Cask, "b".to_string()),
+            (PkgKind::Formula, "c".to_string()),
+            (PkgKind::Formula, "d".to_string()),
+            (PkgKind::Formula, "e".to_string()),
+            (PkgKind::Formula, "f".to_string()),
+            (PkgKind::Formula, "g".to_string()),
+        ];
+        let got = parse_by_name_lines(out, &q);
+        assert_eq!(
+            got[0],
+            Ok(Loaded {
+                tap: "homebrew/core".into(),
+                version: "1.5.2_3".into(),
+                source_sha256: Some("abc123".into()),
+                installed_current: true,
+            })
+        );
+        let cask = got[1].as_ref().expect("cask row");
+        assert_eq!(cask.tap, "homebrew/cask");
+        assert!(!cask.installed_current);
+        assert_eq!(got[2].as_ref().expect("empty sum").source_sha256, None);
+        assert!(got[3].is_err(), "an empty tap is not an answer");
+        assert!(
+            got[4]
+                .as_ref()
+                .unwrap_err()
+                .contains("No available formula")
+        );
+        assert!(
+            got[5].as_ref().unwrap_err().contains("unparseable"),
+            "installed must be true or false"
+        );
+        assert!(got[6].is_err(), "a short row is malformed");
+    }
+
+    #[test]
+    fn parse_by_name_lines_short_output_is_err_for_the_missing_names() {
+        let got = parse_by_name_lines(
+            "OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n",
+            &asked(&["a", "b", "c"]),
+        );
+        assert_eq!(got.len(), 3);
+        assert!(got[0].is_ok());
+        assert!(got[1].is_err() && got[2].is_err());
+    }
+
+    #[test]
+    fn parse_by_name_lines_ignores_a_stray_line_before_the_rows() {
+        let out = "Warning: something brew printed\n\
+                   OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n\
+                   OK\tformula\tb\tother/tap\t2\tdef\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a", "b"]));
+        assert_eq!(got[0].as_ref().unwrap().tap, "homebrew/core");
+        assert_eq!(got[1].as_ref().unwrap().tap, "other/tap");
+    }
+
+    #[test]
+    fn parse_by_name_lines_matches_rows_by_name_not_position() {
+        let out = "OK\tformula\tb\tother/tap\t2\tdef\tfalse\n\
+                   OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a", "b"]));
+        assert_eq!(got[0].as_ref().unwrap().tap, "homebrew/core");
+        assert_eq!(got[1].as_ref().unwrap().tap, "other/tap");
+    }
+
+    #[test]
+    fn parse_by_name_lines_never_assigns_a_row_for_an_unasked_name() {
+        let out = "OK\tformula\tzzz\thomebrew/core\t1\tabc\tfalse\n\
+                   OK\tcask\ta\thomebrew/cask\t1\tabc\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a"]));
+        assert!(got[0].is_err(), "a cask row is not the formula's answer");
+    }
+
+    #[test]
+    fn parse_by_name_lines_duplicate_rows_are_err() {
+        let out = "OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n\
+                   OK\tformula\ta\tother/tap\t1\tabc\tfalse\n\
+                   OK\tformula\tb\thomebrew/core\t1\tabc\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a", "b"]));
+        assert!(got[0].is_err());
+        assert!(got[1].is_ok());
+    }
+
+    #[test]
+    fn judge_same_source_needs_equal_checksum() {
+        let l = loaded("homebrew/core", Some("abc"));
+        assert!(judge(&l, &query("x", "homebrew/core", Some("abc"))).same_source);
+        assert!(judge(&l, &query("x", "homebrew/core", Some("ABC"))).same_source);
+        assert!(!judge(&l, &query("x", "homebrew/core", Some("abd"))).same_source);
+        let none = loaded("homebrew/core", None);
+        assert!(!judge(&none, &query("x", "homebrew/core", Some("abc"))).same_source);
+    }
+
+    #[test]
+    fn judge_no_cutoff_is_never_same_source() {
+        let l = loaded("homebrew/core", Some("abc"));
+        assert!(!judge(&l, &query("x", "homebrew/core", None)).same_source);
+        let none = loaded("homebrew/core", None);
+        assert!(!judge(&none, &query("x", "homebrew/core", None)).same_source);
+    }
+
+    #[test]
+    fn installs_cutoff_needs_the_origin_tap() {
+        let l = loaded("homebrew/core", Some("abc"));
+        let by = judge(
+            &l,
+            &query("cyclonedx-gomod", "cyclonedx/cyclonedx", Some("abc")),
+        );
+        assert!(by.same_source);
+        assert!(!by.installs_cutoff("cyclonedx/cyclonedx"));
+        assert!(by.installs_cutoff("homebrew/core"));
+        assert!(by.installs_cutoff("Homebrew/Core"));
+        let diff = judge(&l, &query("x", "homebrew/core", Some("zzz")));
+        assert!(!diff.installs_cutoff("homebrew/core"));
+    }
+
+    /// A fake brew: `info` lists one installed cask (`alt-tab`), `ruby` logs
+    /// its names and answers one OK row each, `deps` logs and prints a name.
+    /// `ruby_exit` is the exit status of the `ruby` call.
+    fn fake_loader_brew(tmp: &Path, ruby_exit: i32) -> (ProcessBrew, PathBuf) {
+        let log = tmp.join("log");
+        let script = tmp.join("brew.sh");
+        let body = format!(
+            r#"#!/bin/sh
+case "$1" in
+  info)
+    echo "$1 $2 $3" >> {log}
+    echo '{{"formulae": [], "casks": [{{"token": "alt-tab", "tap": "homebrew/cask", "installed": "1.0"}}]}}'
+    ;;
+  ruby)
+    shift 4
+    echo "ruby $*" >> {log}
+    if [ {ruby_exit} -ne 0 ]; then echo "boom" >&2; exit {ruby_exit}; fi
+    while [ $# -gt 0 ]; do
+      printf 'OK\t%s\t%s\thomebrew/core\t1.0\tabc\tfalse\n' "$1" "$2"
+      shift 2
+    done
+    ;;
+  deps)
+    echo "$@" >> {log}
+    echo wget
+    ;;
+  update)
+    echo "$@" >> {log}
+    if [ -e {marker} ]; then exit 1; fi
+    ;;
+  *)
+    echo "$@" >> {log}
+    ;;
+esac
+"#,
+            log = log.display(),
+            marker = tmp.join("update_fails").display(),
+            ruby_exit = ruby_exit
+        );
+        std::fs::write(&script, body).expect("script");
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("chmod");
+        (ProcessBrew::new(script), log)
+    }
+
+    fn log_lines(log: &Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn process_brew_by_name_asks_about_every_installed_package_in_its_first_call() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        brew.installed_packages().expect("installed");
+        let got = brew
+            .by_name(&[query("wget", "homebrew/core", Some("abc"))])
+            .expect("by_name");
+        assert!(
+            got[0]
+                .as_ref()
+                .expect("wget")
+                .installs_cutoff("homebrew/core")
+        );
+        let rubies: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .collect();
+        assert_eq!(rubies, ["ruby formula wget cask alt-tab"]);
+        let cask = NameQuery {
+            kind: PkgKind::Cask,
+            ..query("alt-tab", "homebrew/cask", None)
+        };
+        brew.by_name(&[cask]).expect("installed name");
+        let rubies = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .count();
+        assert_eq!(rubies, 1, "an installed name was already answered");
+    }
+
+    #[test]
+    fn process_brew_by_name_asks_once_per_uninstalled_name() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        let q = query("wget", "homebrew/core", Some("abc"));
+        brew.by_name(std::slice::from_ref(&q)).expect("first");
+        brew.by_name(std::slice::from_ref(&q)).expect("again");
+        brew.by_name(&[q.clone(), query("curl", "homebrew/core", Some("abc"))])
+            .expect("one new");
+        let rubies: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .collect();
+        assert_eq!(rubies, ["ruby formula wget", "ruby formula curl"]);
+    }
+
+    #[test]
+    fn process_brew_by_name_script_failure_is_err_for_every_query() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 1);
+        let qs = [
+            query("wget", "homebrew/core", Some("abc")),
+            query("curl", "homebrew/core", Some("abc")),
+        ];
+        let got = brew.by_name(&qs).expect("never an outer Err");
+        assert_eq!(got.len(), 2);
+        assert!(got[0].as_ref().unwrap_err().contains("boom"));
+        assert!(got[1].is_err());
+        brew.by_name(&qs).expect("remembered");
+        let rubies = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .count();
+        assert_eq!(rubies, 1, "a failure is remembered like a success");
+    }
+
+    #[test]
+    fn process_brew_by_name_never_runs_brew_info() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        brew.installed_packages().expect("installed");
+        brew.by_name(&[query("wget", "homebrew/core", Some("abc"))])
+            .expect("by_name");
+        let infos: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("info"))
+            .collect();
+        assert_eq!(infos, ["info --json=v2 --installed"]);
+    }
+
+    #[test]
+    fn process_brew_deps_asks_once_per_token() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        assert_eq!(brew.deps(PkgKind::Formula, "wget").expect("1"), ["wget"]);
+        assert_eq!(brew.deps(PkgKind::Formula, "wget").expect("2"), ["wget"]);
+        let deps = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("deps"))
+            .count();
+        assert_eq!(deps, 1);
+    }
+
+    #[test]
+    fn process_brew_forgets_loader_and_deps_answers_after_brew_update() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        let q = query("wget", "homebrew/core", Some("abc"));
+        brew.by_name(std::slice::from_ref(&q)).expect("by_name");
+        brew.deps(PkgKind::Formula, "wget").expect("deps");
+        let mut term = Vec::new();
+        brew.run_visible(&["update".to_string()], &mut term)
+            .expect("update");
+        brew.by_name(std::slice::from_ref(&q)).expect("by_name 2");
+        brew.deps(PkgKind::Formula, "wget").expect("deps 2");
+        let lines = log_lines(&log);
+        let count = |p: &str| lines.iter().filter(|l| l.starts_with(p)).count();
+        assert_eq!((count("ruby"), count("deps")), (2, 2), "{lines:?}");
+    }
+
+    #[test]
+    fn process_brew_by_name_without_a_brew_binary_is_the_outer_err() {
+        let brew = ProcessBrew::new(PathBuf::from("/nonexistent/brew-for-tests"));
+        assert!(
+            brew.by_name(&[query("wget", "homebrew/core", None)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn process_brew_by_name_asks_a_duplicate_name_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        let q = query("wget", "homebrew/core", Some("abc"));
+        let got = brew.by_name(&[q.clone(), q]).expect("by_name");
+        assert!(got[0].is_ok() && got[1].is_ok());
+        let rubies: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .collect();
+        assert_eq!(rubies, ["ruby formula wget"]);
+    }
+
+    #[test]
+    fn process_brew_by_name_before_installed_packages_still_batches_installed_names_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        brew.by_name(&[query("wget", "homebrew/core", Some("abc"))])
+            .expect("early");
+        brew.installed_packages().expect("installed");
+        brew.by_name(&[query("curl", "homebrew/core", Some("abc"))])
+            .expect("later");
+        brew.by_name(&[query("jq", "homebrew/core", Some("abc"))])
+            .expect("again");
+        let rubies: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .collect();
+        assert_eq!(
+            rubies,
+            [
+                "ruby formula wget",
+                "ruby formula curl cask alt-tab",
+                "ruby formula jq"
+            ]
+        );
+    }
+
+    #[test]
+    fn process_brew_by_name_failed_spawn_does_not_use_up_the_installed_batch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, _log) = fake_loader_brew(tmp.path(), 1);
+        brew.installed_packages().expect("installed");
+        brew.by_name(&[query("wget", "homebrew/core", None)])
+            .expect("failed spawn is per-name Err");
+        assert!(!*brew.installed_asked.lock().unwrap());
+    }
+
+    #[test]
+    fn process_brew_failing_update_still_clears_both_memos() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        std::fs::write(tmp.path().join("update_fails"), "").expect("marker");
+        let q = query("wget", "homebrew/core", Some("abc"));
+        brew.by_name(std::slice::from_ref(&q)).expect("by_name");
+        brew.deps(PkgKind::Formula, "wget").expect("deps");
+        let mut term = Vec::new();
+        let out = brew
+            .run_visible(&["update".to_string()], &mut term)
+            .expect("update runs");
+        assert!(!out.status.success());
+        brew.by_name(std::slice::from_ref(&q)).expect("by_name 2");
+        brew.deps(PkgKind::Formula, "wget").expect("deps 2");
+        let lines = log_lines(&log);
+        let count = |p: &str| lines.iter().filter(|l| l.starts_with(p)).count();
+        assert_eq!((count("ruby"), count("deps")), (2, 2), "{lines:?}");
+    }
+
+    #[test]
+    fn brew_children_never_force_api_auto_update() {
+        assert!(
+            brewsoak_brew_env_pairs("update").contains(&("HOMEBREW_FORCE_API_AUTO_UPDATE", None)),
+            "a stale FORCE_API_AUTO_UPDATE would make the loaders refetch"
+        );
+    }
+
+    #[test]
+    fn mock_by_name_defaults_to_same_source() {
+        let brew = MockBrew::new();
+        let q = query("wget", "homebrew/core", Some("abc"));
+        let got = brew.by_name(std::slice::from_ref(&q)).expect("mock");
+        assert_eq!(
+            got,
+            vec![Ok(ByName {
+                tap: "homebrew/core".into(),
+                version: String::new(),
+                same_source: true,
+                installed_current: false,
+            })]
+        );
+        assert_eq!(*brew.by_name_queries.lock().unwrap(), vec![q]);
+    }
+
+    #[test]
+    fn mock_by_name_honors_scripted_answers() {
+        let mut brew = MockBrew::new();
+        brew.by_name.insert("wget".into(), Err("untrusted".into()));
+        brew.by_name.insert(
+            "curl".into(),
+            Ok(ByName {
+                tap: "other/tap".into(),
+                version: "2".into(),
+                same_source: false,
+                installed_current: true,
+            }),
+        );
+        let got = brew
+            .by_name(&[
+                query("wget", "homebrew/core", None),
+                query("curl", "homebrew/core", None),
+                query("jq", "homebrew/core", None),
+            ])
+            .expect("mock");
+        assert_eq!(got[0], Err("untrusted".into()));
+        assert_eq!(got[1].as_ref().unwrap().tap, "other/tap");
+        assert!(got[2].as_ref().unwrap().same_source);
     }
 }

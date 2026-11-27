@@ -161,8 +161,9 @@ brewsoak notes its packages and leaves them to `brew`, unless they are in
 `NO_SOAK`.
 
 No-soak packages are installed by `brew` itself from their real tap after all
-soaked work: one `brew update`, then one `brew upgrade` (or `install` /
-`reinstall`) naming every no-soak package. `brew upgrade` also upgrades a
+soaked work: one `brew upgrade` (or `install` / `reinstall`) naming every
+no-soak package, preceded by a `brew update` unless one already succeeded
+earlier in the run. `brew upgrade` also upgrades a
 no-soak package's outdated dependencies to brew's latest, so no-soak extends
 to its dependencies. Soaked dependents of a no-soak package are not upgraded
 by that step.
@@ -190,6 +191,34 @@ line for every package evaluated (what happened and why).
 
 `--raw` turns off output summarizing and forwards `brew`'s output byte for
 byte.
+
+### Homebrew 7.0.14 and later (issue #17)
+
+Homebrew 7.0.14 stopped loading formulae from file paths, which is how
+brewsoak used to install a soaked version. Until
+[issue #17](https://github.com/ericfitz/brewsoakr/issues/17) is fixed,
+brewsoak installs a soaked package by name, and only when brew's own current
+definition of that package is byte-for-byte the soaked cutoff. The same holds
+for every member of its dependency closure that brew might install or upgrade;
+an installed dependency that brew already has at its current version passes.
+Otherwise that package is held, nothing is
+installed for it, the run continues with the next package, and the run exits
+1. The `Notes` section says why:
+
+```
+<name>: [dependency <dep>: ]<reason>; brewsoak cannot install a soaked copy until issue #17 is fixed; use `brew <verb> <token>` to bypass brewsoak.
+```
+
+When brew's current version of the package is the cutoff's version but the
+file changed, the reason reads `brew's <version> formula changed since the
+soaked cutoff; it installs once the change soaks` and the issue #17 clause is
+left out: the package installs on a later run, once the change has soaked.
+
+Run the printed `brew` command to install brew's current version without the
+soak. `upgrade`, `install` and `reinstall` run `brew update` once before any
+soaked work, also on a dry run, so brew's data is fresh when brewsoak compares
+it. A failed `brew update` is reported in `Notes` and fails the exit code, but
+does not hold anything.
 
 ## Output
 

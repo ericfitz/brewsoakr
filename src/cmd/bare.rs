@@ -140,7 +140,7 @@ mod tests {
     use crate::cmd::test_support::{
         AUTO_UPDATES_HEADER, OUTDATED_HEADER, auto_updates_world, cask_rb, cfg24, formula_pkg,
         formula_pkg_from, formula_rb, greedy, greedy_outdated, greedy_upgrade, greedy_world,
-        inv_from, lock_runs, openssl_is_newer, run_is_soaked_install, section_lines, tap_snaps,
+        inv_from, lock_runs, openssl_is_newer, run_is_name_install, section_lines, tap_snaps,
         tapped, unused_cache,
     };
     use crate::cmd::upgrade::upgrade;
@@ -203,14 +203,14 @@ mod tests {
             "{text}"
         );
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "wget"), "{text}");
+        assert!(run_is_name_install(&runs, "wget"), "{text}");
         assert!(
-            run_is_soaked_install(&runs, "moved"),
+            run_is_name_install(&runs, "moved"),
             "a changed :latest definition reinstalls: {text}"
         );
-        assert!(!run_is_soaked_install(&runs, "alt-tab"), "{text}");
-        assert!(!run_is_soaked_install(&runs, "self-latest"), "{text}");
-        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(!run_is_name_install(&runs, "alt-tab"), "{text}");
+        assert!(!run_is_name_install(&runs, "self-latest"), "{text}");
+        assert!(!run_is_name_install(&runs, "nightly"), "{text}");
         assert!(
             !text.contains("cannot be soaked"),
             "bare run says nothing about :latest: {text}"
@@ -242,10 +242,10 @@ mod tests {
             "{text}"
         );
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "alt-tab"), "{text}");
-        assert!(run_is_soaked_install(&runs, "self-latest"), "{text}");
-        assert!(run_is_soaked_install(&runs, "moved"), "{text}");
-        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(run_is_name_install(&runs, "alt-tab"), "{text}");
+        assert!(run_is_name_install(&runs, "self-latest"), "{text}");
+        assert!(run_is_name_install(&runs, "moved"), "{text}");
+        assert!(!run_is_name_install(&runs, "nightly"), "{text}");
         assert!(
             text.contains("alt-tab: installing cutoff 11.8.0; installed 7.38.1 is behind soak; installing cutoff"),
             "{text}"
@@ -282,9 +282,9 @@ mod tests {
             "{text}"
         );
         let runs = lock_runs(&brew);
-        assert!(run_is_soaked_install(&runs, "alt-tab"), "{text}");
-        assert!(run_is_soaked_install(&runs, "self-latest"), "{text}");
-        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(run_is_name_install(&runs, "alt-tab"), "{text}");
+        assert!(run_is_name_install(&runs, "self-latest"), "{text}");
+        assert!(!run_is_name_install(&runs, "nightly"), "{text}");
         assert!(!text.contains("cannot be soaked"), "{text}");
     }
 
@@ -297,12 +297,12 @@ mod tests {
             "{text}"
         );
         let runs = lock_runs(&brew);
-        assert!(!run_is_soaked_install(&runs, "alt-tab"), "{text}");
+        assert!(!run_is_name_install(&runs, "alt-tab"), "{text}");
         assert!(
-            !run_is_soaked_install(&runs, "self-latest"),
+            !run_is_name_install(&runs, "self-latest"),
             "both :latest and self-updating: the auto-updates leave stands: {text}"
         );
-        assert!(run_is_soaked_install(&runs, "moved"), "{text}");
+        assert!(run_is_name_install(&runs, "moved"), "{text}");
         assert!(
             text.contains("self-latest: auto-updates; installed :latest is left to the app"),
             "{text}"
@@ -363,9 +363,9 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         let runs = lock_runs(&brew);
-        assert!(!run_is_soaked_install(&runs, "nightly"), "{text}");
+        assert!(!run_is_name_install(&runs, "nightly"), "{text}");
         assert!(
-            run_is_soaked_install(&runs, "alt-tab"),
+            run_is_name_install(&runs, "alt-tab"),
             "named: upgraded regardless of greedy: {text}"
         );
         assert!(!text.contains("cannot be soaked"), "{text}");
@@ -404,10 +404,7 @@ mod tests {
             std::cmp::Ordering::Greater,
         );
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
-        assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
-            "{text}"
-        );
+        assert!(!run_is_name_install(&lock_runs(&brew), "alt-tab"), "{text}");
         assert!(
             text.contains("Upgrading soaked packages (0 of 1)"),
             "{text}"
@@ -449,10 +446,7 @@ mod tests {
         let (mut brew, git, snaps) = auto_updates_ahead_world();
         brew.compare_error = Some("brew ruby exploded".into());
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
-        assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
-            "{text}"
-        );
+        assert!(!run_is_name_install(&lock_runs(&brew), "alt-tab"), "{text}");
         assert!(
             summary_has(&text, "held", "0"),
             "not held on a bare run: {text}"
@@ -665,7 +659,7 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            !run_is_name_install(&lock_runs(&brew), "alt-tab"),
             "bare run must not reinstall a self-updating app: {text}"
         );
         assert!(
@@ -705,7 +699,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "alt-tab"),
+            run_is_name_install(&lock_runs(&brew), "alt-tab"),
             "named explicitly, it upgrades like `brew upgrade alt-tab`: {text}"
         );
     }

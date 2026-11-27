@@ -1,4 +1,3 @@
-use super::apply::staging_dir;
 use super::bare::snapshotted_pkgs;
 use crate::Error;
 use crate::brew::Brew;
@@ -11,7 +10,6 @@ use crate::origin::{self};
 use crate::report::{self};
 use crate::resolve::{self, PkgKind, PkgRef};
 use crate::snapshot::Snapshots;
-use crate::tap;
 use crate::taps;
 use std::path::{Path, PathBuf};
 
@@ -436,27 +434,6 @@ pub(super) fn natural_kind(
     }
 }
 
-pub(super) fn write_cutoff_blob(
-    git: &impl GitStore,
-    snaps: &Snapshots,
-    cache: &Path,
-    tap_root: &Path,
-    origin_tap: &str,
-    name: &str,
-    kind: PkgKind,
-) -> Result<(), Error> {
-    let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
-    let blob = blobs.cutoff.as_deref().ok_or_else(|| {
-        Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
-    })?;
-    let pkg = PkgRef {
-        name: name.to_string(),
-        kind,
-    };
-    tap::write_blob(&staging_dir(tap_root, origin_tap), &pkg, blob)?;
-    Ok(())
-}
-
 pub(super) fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {
     match kind {
         PkgKind::Formula => cache.join("core.git"),
@@ -601,7 +578,7 @@ mod tests {
     use crate::cmd::test_support::{
         OUTDATED_HEADER, cask_rb, cfg24, core_snaps, formula_pkg, formula_rb, greedy_outdated,
         greedy_upgrade, greedy_world, inv_from, lock_runs, many_detect_world, openssl_is_newer,
-        openssl_repoint_world, run_is_soaked_install, section_lines, spawns, unused_cache,
+        openssl_repoint_world, run_is_name_install, section_lines, spawns, unused_cache,
         upgrade_names,
     };
     use crate::cmd::upgrade::upgrade;
@@ -659,7 +636,7 @@ mod tests {
         openssl_is_newer(&mut brew);
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         let runs = lock_runs(&brew);
-        assert!(!run_is_soaked_install(&runs, "openssl@3"), "{text}");
+        assert!(!run_is_name_install(&runs, "openssl@3"), "{text}");
         assert!(
             text.contains("Upgrading soaked packages (0 of 1)"),
             "{text}"
@@ -716,7 +693,7 @@ mod tests {
         assert!(r.refused, "{text}");
         assert!(text.contains("reinstall would downgrade"), "{text}");
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            !run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
     }
@@ -727,7 +704,7 @@ mod tests {
         brew.compare_error = Some("brew ruby exploded".into());
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            !run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
         assert!(
@@ -753,7 +730,7 @@ mod tests {
         openssl_is_newer(&mut brew);
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         assert!(
-            !run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            !run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
         assert!(text.contains(OPENSSL_NOTE), "{text}");
@@ -768,7 +745,7 @@ mod tests {
         )];
         let text = greedy_upgrade(&brew, &git, &snaps, &[]);
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "openssl@3"),
+            run_is_name_install(&lock_runs(&brew), "openssl@3"),
             "{text}"
         );
         assert!(
@@ -865,7 +842,7 @@ mod tests {
             "{pairs:?}"
         );
         assert!(
-            run_is_soaked_install(&lock_runs(&brew), "stockfish"),
+            run_is_name_install(&lock_runs(&brew), "stockfish"),
             "{text}"
         );
     }

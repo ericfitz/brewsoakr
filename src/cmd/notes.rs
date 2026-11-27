@@ -22,6 +22,26 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
     ))
 }
 
+/// Why the target is held by the by-name gate. `issue_17` is false when the
+/// hold waits only on a changed file soaking, so the note does not blame
+/// Homebrew.
+pub(super) fn by_name_note(
+    name: &str,
+    dep: Option<&str>,
+    why: &str,
+    issue_17: bool,
+    brew_verb: &str,
+    token: &str,
+) -> String {
+    let dep = dep.map(|d| format!("dependency {d}: ")).unwrap_or_default();
+    let wait = if issue_17 {
+        "; brewsoak cannot install a soaked copy until issue #17 is fixed"
+    } else {
+        ""
+    };
+    format!("{name}: {dep}{why}{wait}; use `brew {brew_verb} {token}` to bypass brewsoak.")
+}
+
 pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
     format!(
         "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed it)"

@@ -1,6 +1,6 @@
+Updating Homebrew
 Upgrading soaked packages (1 of 5)
   [1/1] upgrading alpha 1.0.0 -> 1.1.0
-Updating Homebrew
 Upgrading no-soak packages (brew decides)
   ericfitz/tap/brewsoak
     no result from brew; see the full log
