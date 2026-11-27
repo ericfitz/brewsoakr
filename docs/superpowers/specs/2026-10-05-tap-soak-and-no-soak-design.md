@@ -36,7 +36,12 @@ design review. They are not to be changed without the maintainer's approval.
 - **Supersedes the 2026-08-12 lock** "Updating the Homebrew tool itself is
   out of scope", narrowly: brewsoak runs `brew update` once per run, and only
   when a no-soak package is involved, so no-soak packages get the true
-  latest.
+  latest. *Amended 2026-11-27 (Eric, issue #17 stopgap; see
+  [2026-11-26-path-install-stopgap.md](2026-11-26-path-install-stopgap.md)):
+  a run with soaked work also runs `brew update`, once, before that work, so
+  brew's own data is at or past the cutoff when brewsoak asks what brew would
+  install by name. It is still one update per run: the no-soak step does not
+  repeat an update that succeeded.*
 - **brewsoak never trusts a third-party tap on the user's behalf**
   (decided 2026-10-05, after Homebrew 7.0.8 refused a staged
   `hashicorp/tap/packer`). When brew refuses a staged copy because its tap is
@@ -325,6 +330,8 @@ For mutating commands (`upgrade`, `install`, `reinstall`):
 2. If any no-soak package is involved, run `brew update` once (output to the
    run log via the summarizer). `brewsoak update` also runs it when any
    installed package is no-soak.
+   *Amended 2026-11-27 (Eric, issue #17 stopgap): skipped when the run
+   already ran `brew update` successfully before its soaked work.*
 3. Run one `brew upgrade` (or `install` / `reinstall`) with every no-soak
    package as a full token: `name` for core and cask, `user/repo/name` for
    tap packages. `HOMEBREW_NO_AUTO_UPDATE=1` stays set (brew was just

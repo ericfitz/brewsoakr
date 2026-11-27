@@ -21,61 +21,62 @@ On a core formula the first `brew deps` failure falls through
 
 ## Human decisions (made by the maintainer, 2026-11-26)
 
-This is an architectural decision made by the human maintainer. It is not to
-be changed without the maintainer's approval.
+These are architectural decisions made by the human maintainer. They are not
+to be changed without the maintainer's approval.
 
 - **Ship a stopgap now and design the long-term replacement separately**
-  (the maintainer's "option 3", chosen 2026-11-26 from the options raised for
-  issue #17). The long-term mechanism (for example a local tap, or brew's new
+  (2026-11-26; the maintainer's "option 3" from the options raised for issue
+  #17). The long-term mechanism (for example a local tap, or brew's new
   explicit private-source loading) is out of scope here and stays tracked in
   issue #17.
+- **The stopgap gate** (reviewed by the maintainer 2026-11-27). A soaked package
+  is installed by name, and only when what brew would install by name is the
+  soaked cutoff; the same holds for every dependency brew might install or
+  upgrade with it. Otherwise the package is held. A hold is never fatal: the
+  held package gets a note that says it cannot be soaked until issue #17 is
+  fixed and how to bypass brewsoak, and every other package proceeds.
+  `upgrade`, `install`, `reinstall`, casks and `--dry-run` are all covered.
+- **Tokens: the bare name, never `user/repo/name`** (2026-11-27, confirmed
+  after a second look). A package goes to brew by its bare name, and only
+  when brew's loader resolves that name to the package's own tap. A name that
+  resolves elsewhere (a tap package whose name also exists in core) is held.
+  brew records no trust for a bare name, so the 2026-10-05 trust decision
+  stands unchanged.
+- **Gate strictness: exact file bytes** (2026-11-27). The SHA-256 of the
+  cutoff blob must equal brew's `ruby_source_checksum`. Version and revision
+  alone are not enough.
+- **A run with soaked work runs `brew update` once, before that work**
+  (2026-11-27). This amends the 2026-10-05 decision that `brew update` runs
+  only when a no-soak package is involved. See "`brew update` before soaked
+  work" for where it runs and what a failure does.
 
-What follows from it, recorded here so the older specs can point at it: while
-the stopgap is in place it supersedes the 2026-08-13 path-install decision
-(recorded 2026-10-06, issue #4). Nothing is staged and no file path is passed
-to brew.
+What follows from these, recorded here so the older specs can point at it:
+while the stopgap is in place it supersedes the 2026-08-13 path-install
+decision (recorded 2026-10-06, issue #4). Nothing is staged and no file path
+is passed to brew.
 
 Earlier locks this design leaves alone: the soak clock starts on any file
 change (2026-08-12); brewsoak never runs `brew trust` and never trusts a tap
-on the user's behalf (2026-10-05, amended 2026-10-06); `brew update` runs only
-for no-soak packages (2026-10-05); `--ignore-dependencies` is never passed
-(2026-08-12, step 5); the `reinstall` true repair and the no-soak step are
-untouched.
+on the user's behalf (2026-10-05, amended 2026-10-06); `--ignore-dependencies`
+is never passed (2026-08-12, step 5); the `reinstall` true repair and the
+no-soak step keep their full tokens (issue #18).
 
-## Stopgap requirements (from the session brief, 2026-11-26)
+## Design choices in this spec (by Claude)
 
-Proposed by the orchestrating Claude session and taken as the design's
-requirements; the maintainer has not reviewed them one by one.
+Choices 1 and 2 were confirmed by the maintainer on 2026-11-27 and are
+recorded above. Choices 3 to 7 are Claude's; the maintainer has seen them in
+the session report but has not ruled on them one by one.
 
-- A soaked package is installed by name, and only when what brew would
-  install by name is the soaked cutoff. The same holds for every dependency
-  brew might install or upgrade with it. Otherwise the package is held.
-- A hold is never fatal. The held package gets a note that says it cannot be
-  soaked until issue #17 is fixed and how to bypass brewsoak; every other
-  package in the run proceeds.
-- `upgrade`, `install`, `reinstall`, casks and `--dry-run` are all covered.
-- brew's tap-trust refusal still holds the package; brewsoak never runs
-  `brew trust`.
-
-## Design choices in this spec (by Claude, 2026-11-26; not yet confirmed by the maintainer)
-
-Each differs from, or adds to, the session brief. Choices 1, 2 and 6 are
-also listed under Open questions.
-
-1. **The gate compares file bytes, not version and revision.** The brief
-   proposed "brew's stable version + revision equals the cutoff's". That
-   cannot see a bottle rebuild, a same-version sha change or a dependency
-   edit, and the 2026-08-12 lock starts the soak clock on any file change.
-   brew reports the SHA-256 of the definition file it would load
-   (`ruby_source_checksum.sha256`), so the gate is: SHA-256 of the cutoff
-   blob equals that checksum. Equal bytes imply equal version, revision,
-   bottle block and dependencies.
-2. **By-name installs use the bare name, never `user/repo/name`.** brew
-   records item-level trust for every fully qualified name given to
-   `install`, `upgrade` or `reinstall` (see Verified facts), which would
-   trust a third-party package on the user's behalf. A bare name is used only
-   when brew resolves it to the package's own origin; a name that resolves
-   elsewhere is held.
+1. **The gate compares file bytes, not version and revision** (confirmed).
+   The session brief proposed "brew's stable version + revision equals the
+   cutoff's". That cannot see a bottle rebuild, a same-version sha change or
+   a dependency edit, and the 2026-08-12 lock starts the soak clock on any
+   file change. Equal bytes imply equal version, revision, bottle block and
+   dependencies.
+2. **By-name installs use the bare name** (confirmed). brew records
+   item-level trust for every fully qualified name given to `install`,
+   `upgrade` or `reinstall` (see Verified facts), which would trust a
+   third-party package on the user's behalf.
 3. **`--ignore-dependencies` is not passed.** The dependency-closure gate
    below is the one guarantee. The flag is an unsupported developer option
    (brew warns on every use, and may remove it as it removed path loading),
@@ -87,8 +88,12 @@ also listed under Open questions.
 5. **SHA-256 comes from `ring`, added as a direct dependency.** It is already
    in `Cargo.lock` through `ureq` and `rustls`, so no new code enters the
    build. The alternative, the `sha2` crate, adds crates to the lockfile.
-6. **No `brew update` is added for soaked work**, and `outdated`, `info` and
-   the plan total are unchanged. See "Coverage and limits".
+6. **`outdated`, `info` and the plan total are unchanged.** They do not
+   predict stopgap holds and do not run `brew update`.
+7. **Details of the `brew update` decision** that the maintainer left to the
+   design: it also runs on a dry run; a failed update does not stop the run;
+   the no-soak step does not repeat an update that succeeded. See
+   "`brew update` before soaked work".
 
 ## Verified facts (Homebrew 7.0.16-86-gfac0743, 2026-11-26)
 
@@ -131,6 +136,9 @@ also listed under Open questions.
 - With `HOMEBREW_NO_AUTO_UPDATE=1` and `HOMEBREW_FORCE_API_AUTO_UPDATE`
   unset, brew does not re-download its API data (`API.fetch_api_files!`), so
   what the gate reads is what the install uses.
+- An explicit `brew update` downloads brew's API data itself
+  (`fetch_api_file` in `cmd/update.sh`) and does not consult
+  `HOMEBREW_NO_AUTO_UPDATE`. The no-soak step relies on this today.
 - `cmd/install.rb`, `cmd/upgrade.rb` and `cmd/reinstall.rb` call
   `Homebrew::Trust.trust_fully_qualified_items!(args.named)`, which adds
   `user/repo/name` to the trust store unless the tap is an official one.
@@ -211,7 +219,44 @@ per package (an estimated minute at most on a machine with 165 formulae).
 `brew install --formula|--cask [user flags] <bare name>` for each walked
 dependency and then the target, with the flags and environment used today.
 `HOMEBREW_FORCE_API_AUTO_UPDATE` is also unset on every brew child so brew's
-data cannot move between the gate and the install.
+data cannot move between the gate and the install (only the one explicit
+`brew update` moves it, before the gate).
+
+### `brew update` before soaked work
+
+Decided by the maintainer on 2026-11-27; the details are Choice 7.
+
+- **When.** Once per `upgrade`, `install` or `reinstall` run that has soaked
+  work: a bare upgrade whose plan (`plan_size`) is not empty, or a named run
+  that names at least one soaked package. It runs after the tokens are
+  validated and before the first package is evaluated, so before brewsoak
+  asks brew's loaders anything. Its output goes under the existing
+  `Updating Homebrew` header, ahead of the soaked section. A run with no
+  soaked work is unchanged.
+- **Environment.** The `brew update` child gets the same environment as
+  every other brew child. `HOMEBREW_NO_AUTO_UPDATE=1` still stops every other
+  child from updating, so brew's data does not move again during the run.
+- **Order of the data.** brewsoak's own snapshots are refreshed before the
+  command starts (`ensure_snapshots`), so after the update brew's data is at
+  or past the cutoff. `ProcessBrew` drops its remembered loader and
+  `brew deps` answers whenever it runs `brew update`, so nothing read before
+  an update is used after it.
+- **The no-soak step.** When this update succeeded, the no-soak step does not
+  run `brew update` again and prints no second `Updating Homebrew` section:
+  still one update per run (2026-10-05). When it did not run, or failed, the
+  no-soak step runs its own, exactly as today.
+- **Dry run.** A dry run updates too. `brew update` installs nothing, a dry
+  run already runs the no-soak update (ruling of 2026-10-06), and without it
+  the preview would report holds a real run would not.
+- **Failure.** A failed update does not stop the run and holds nothing by
+  itself. brewsoak continues with the data brew has, defers the note
+  `brew update failed (exit <N>); brew's data may be older than the soak
+  cutoff, so more packages may be held`, and the run takes brew's exit code
+  (as a failed no-soak update does). This is safe because the gate compares
+  exact bytes: older data can only make the gate hold more packages, never
+  pass a file that is not the soaked cutoff. `brew` not being found stays
+  fatal, as today.
+- `brewsoak update`, `outdated` and `info` are unchanged.
 
 ### Holds and messages
 
@@ -282,14 +327,13 @@ long-term fix does not have to re-thread it. Kept for the long-term fix: the
 
 ## Coverage and limits
 
-- A package installs only while brew's current file is the soaked cutoff:
-  the definition has not changed for at least the soak time, and brew's data
-  is at or past the cutoff. Packages that change more often than the soak
-  time are held until issue #17 is fixed.
-- brew's data is as old as the last `brew update`. brewsoak runs one only
-  when a no-soak package is involved (2026-10-05). When brew's data is older
-  than the cutoff, the package is held; the README tells users to run
-  `brew update`.
+- A package installs only while brew's current file is the soaked cutoff.
+  After the run's `brew update` that means the definition has not changed
+  since the cutoff. A package that changed again inside the soak window is
+  held until that change has soaked, so one that changes more often than the
+  soak time is held until issue #17 is fixed.
+- When the run's `brew update` fails, brew's data may be older than the
+  cutoff and more packages are held; the note says so.
 - The closure rule can hold more than brew would change: a target is held
   for an outdated dependency that is still soaking even in the case where
   brew would have left that dependency alone (it meets the bottle minimum).
@@ -299,31 +343,29 @@ long-term fix does not have to re-thread it. Kept for the long-term fix: the
 
 ## Re-running
 
-No new persistent state. Removing an `origins.toml` record is idempotent and
-goes through `atomic::write` under the run lock already held. brew answers
-are kept in memory for one process. A second run sees an upgraded package as
+No new persistent state in brewsoak. Removing an `origins.toml` record is
+idempotent and goes through `atomic::write` under the run lock already held.
+brew answers are kept in memory for one process. `brew update` is brew's own
+state: a second run updates again, two brewsoak runs cannot overlap (the run
+lock), and a `brew update` that failed halfway is retried by the next run. A second run sees an upgraded package as
 `NoOpAlreadySoaked`; a held one is evaluated again from scratch. Leftovers
 from a failed run are brew's, as today.
 
-## Open questions for the maintainer
+## Questions answered by the maintainer (2026-11-27)
 
-1. **Third-party tap packages** (Choice 2). This spec uses bare names and
-   holds name collisions. Alternatives: (A) hold every soaked tap package
-   until #17 is fixed; (C) use `user/repo/name` and accept that brew records
-   item-level trust for it, which amends the 2026-10-05 trust decision.
-2. **Gate strictness** (Choice 1). This spec uses file bytes. The proposed
-   version-and-revision gate would install more, including artifacts that
-   changed inside the soak window.
-3. **May a soaked run call `brew update` first** to raise coverage? This
-   spec says no; yes would amend the 2026-10-05 `brew update` decision.
-4. The no-soak step and the `reinstall` true repair already hand brew full
-   tokens, so brew already records item-level trust for those packages. Out
-   of scope here; needs its own ruling.
+1. Third-party tap packages: bare names; name collisions are held.
+2. Gate strictness: exact file bytes.
+3. `brew update`: a run with soaked work runs it once, first.
+
+All three are recorded under "Human decisions". Still open, and out of scope
+here: the no-soak step and the `reinstall` true repair hand brew full tokens,
+so brew records item-level trust for those packages (issue #18).
 
 ## Testing
 
 Unit tests with `MockBrew` (see the plan): the gate and closure rules, each
 never-abort path with a second package that still installs, both trust
-paths, origin records, every verb, casks, `--dry-run`, and a sweep asserting
-that no recorded brew argument is a path. The final check is the real
+paths, origin records, every verb, casks, `--dry-run`, the one `brew update`
+(when it runs, its failure, the no-soak step not repeating it), and a sweep
+asserting that no recorded brew argument is a path. The final check is the real
 `brewsoak upgrade --dry-run ast-grep`, before and after.

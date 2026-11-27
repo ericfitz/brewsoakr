@@ -2,20 +2,20 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `brewsoak upgrade|install|reinstall` stop passing staged file paths to brew. A soaked package is installed by bare name only when brew's own current definition is byte-identical to the soaked cutoff, for the package and for every dependency brew might touch; otherwise it is held with a note, and the run continues.
+**Goal:** `brewsoak upgrade|install|reinstall` stop passing staged file paths to brew. A soaked package is installed by bare name only when brew's own current definition is byte-identical to the soaked cutoff, for the package and for every dependency brew might touch; otherwise it is held with a note, and the run continues. A run with soaked work runs `brew update` once, first.
 
 **Architecture:** A new `Brew::by_name` question runs the loaders `brew install` uses (`Formulary.factory`, `Cask::CaskLoader.load`) under `brew ruby` and answers where a bare name loads from and whether its `ruby_source_checksum` equals the cutoff blob's SHA-256. `brew info` is not used for this: it follows the installed keg, not the loader (spec, "Verified facts"). `CutoffDepWalk` asks `brew deps` by name, gates every closure member with it, and reports a hold instead of an error. `install_cutoff` and `install_missing_dep` build `brew install --formula|--cask <name>`.
 
 **Tech Stack:** Rust 2024. One new direct dependency, `ring` (already in `Cargo.lock` through `ureq`), for SHA-256.
 
-**Spec:** `docs/superpowers/specs/2026-11-26-path-install-stopgap.md`. Read it first; every message string and rule below comes from it. The spec's "Open questions" are the maintainer's to answer: if an answer changes Choice 1 or Choice 2, stop and re-plan Tasks 2 to 4.
+**Spec:** `docs/superpowers/specs/2026-11-26-path-install-stopgap.md`. Read it first; every message string and rule below comes from it. The maintainer answered the spec's questions on 2026-11-27 (bare names, exact bytes, one `brew update` before soaked work), so the design is frozen: surface any gap as a design change, do not guess.
 
 ## Global Constraints
 
 - Done gate (run before claiming any task done, show output): `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test`
-- Read `AGENTS.md` first. Its "Installing soaked formulae" section still describes path installs until Task 6; the spec wins where they differ.
+- Read `AGENTS.md` first. Its "Installing soaked formulae" section still describes path installs until Task 7; the spec wins where they differ.
 - Never pass `--ignore-dependencies`, a file path, or a `user/repo/name` token to a soaked `brew install` or `brew deps`. The no-soak step (`src/nosoak.rs`) and the `reinstall` true repair (`src/cmd/apply.rs:140-166`) keep their full tokens: do not touch them.
-- Never run `brew trust`. Never add a `brew update`.
+- Never run `brew trust`. A run makes at most one successful `brew update`: Task 5 adds the one before soaked work; add no other.
 - No `#[allow(dead_code)]`. Delete crate-private code the compiler reports dead. Keep the `pub` staging helpers and their tests: `tap::write_blob`, `tap_formula_path`, `tap_cask_path`, `sanitize_unofficial`, `taps::staging_root`, `taps::staged_load_failure`. Keep `origin::staged_tap`, `origin::STAGING_TAP` and all of `inventory.rs`.
 - Keep the `tap_root` parameter of `cmd::upgrade`, `cmd::install`, `cmd::reinstall` and `apply_many` (rename to `_tap_root` in Task 4), so about 100 test call sites stay as they are. Remove the `tap_root` field from `CutoffDepWalk` (Task 3) and `ApplySession` (Task 4).
 - `MockBrew::by_name` answers "same source, origin tap, not installed-current" for every name it was not scripted for, so existing tests keep installing.
@@ -25,7 +25,7 @@
 
 ## Review Focus
 
-1. No soaked code path hands brew a path or a full token (Task 5 sweep test).
+1. No soaked code path hands brew a path or a full token (Task 6 sweep test).
 2. The gate hashes the raw cutoff blob from `resolve_pkg_blobs`, not a staged or sanitized file, and never compares against brewsoak's HEAD blob.
 3. A by-name dependency list is used only after that package passed the gate.
 4. Every `Error::Brew` from the walk, `brew deps` or `by_name` becomes a hold of one target; the next package still runs; the run exits 1. Git and I/O errors stay fatal.
@@ -33,13 +33,14 @@
 6. Untrusted-tap refusals keep today's note and count the target once.
 7. Counts: a held target takes back its `upgraded` count (`hold_target_for_dep`).
 8. `origins.toml`: record removed after a real by-name install; untouched on a dry run and on brew's "already installed" answer.
+9. `brew update`: runs once, before any loader or `brew deps` question, only when the run has soaked work; also on a dry run; its failure is a note and an exit code, never a hold or an abort; the no-soak step repeats it only when it did not succeed.
 
 ---
 
 ### Task 0: Record the failing repro
 
 - [ ] Before changing code, run `cargo build` and then `./target/debug/brewsoak upgrade --dry-run ast-grep > <scratch>/before.txt 2>&1; echo "exit=$?" >> <scratch>/before.txt`. If `ast-grep` is no longer outdated, pick a formula that `./target/debug/brewsoak outdated` lists.
-- [ ] **Accept:** the file shows `No available formula with the name` and a non-zero exit. Keep it for Task 7. Nothing is committed.
+- [ ] **Accept:** the file shows `No available formula with the name` and a non-zero exit. Keep it for Task 8. Nothing is committed.
 
 ### Task 1: SHA-256 helper
 
@@ -120,11 +121,12 @@ Verified output on Homebrew 7.0.16: `OK	homebrew/core	0.51.3	b3c32fcf…	false` 
   - With the fake `brew.sh` harness of `process_brew_deps_asks_brew_for_full_names` (line 1497): `process_brew_by_name_asks_about_every_installed_package_in_its_first_call` (after `installed_packages`, one `ruby` spawn whose ARGV holds the installed names and the queried one; a second query for an installed name spawns nothing), `process_brew_by_name_asks_once_per_uninstalled_name`, and `process_brew_by_name_script_failure_is_err_for_every_query` (script exits 1: `Ok(vec![Err(_), Err(_)])`, never an outer `Err`).
   - `process_brew_by_name_never_runs_brew_info`: no logged spawn starts with `info` besides the inventory's `info --json=v2 --installed`.
   - `process_brew_deps_asks_once_per_token` (two `deps` calls, one log line).
+  - `process_brew_forgets_loader_and_deps_answers_after_brew_update`: `by_name`, `deps`, then `run_visible(["update"])`, then the same `by_name` and `deps` again: the fake brew logs two `ruby` and two `deps` spawns.
   - `brew_children_never_force_api_auto_update`: `brewsoak_brew_env_pairs()` contains `("HOMEBREW_FORCE_API_AUTO_UPDATE", None)`.
   - `mock_by_name_defaults_to_same_source` and `mock_by_name_honors_scripted_answers`.
 - [ ] Implement:
   - `pub(crate) struct Loaded { tap: String, version: String, source_sha256: Option<String>, installed_current: bool }`, `pub(crate) fn parse_by_name_lines(stdout: &str, count: usize) -> Vec<Result<Loaded, String>>`, and `pub(crate) fn judge(loaded: &Loaded, q: &NameQuery) -> ByName`.
-  - `ProcessBrew`: `loaded: Mutex<HashMap<(&'static str, String), Result<Loaded, String>>>` and `installed_names: Mutex<Vec<(PkgKind, String)>>` (filled by `installed_packages`). `by_name` asks, in one `brew ruby -e BY_NAME_RUBY -- kind name …` spawn, for every queried name not yet in `loaded`, plus (the first time) every installed name; failures are remembered like successes. `deps_memo: Mutex<HashMap<(&'static str, String), Vec<String>>>` in `deps` (successes only).
+  - `ProcessBrew`: `loaded: Mutex<HashMap<(&'static str, String), Result<Loaded, String>>>` and `installed_names: Mutex<Vec<(PkgKind, String)>>` (filled by `installed_packages`). `by_name` asks, in one `brew ruby -e BY_NAME_RUBY -- kind name …` spawn, for every queried name not yet in `loaded`, plus (the first time) every installed name; failures are remembered like successes. `deps_memo: Mutex<HashMap<(&'static str, String), Vec<String>>>` in `deps` (successes only). `run_visible_in` clears `loaded` and `deps_memo` when `args[0] == "update"`, whatever the exit status.
   - `MockBrew`: `pub by_name: BTreeMap<String, Result<ByName, String>>` (keyed by name) and `pub by_name_queries: Mutex<Vec<NameQuery>>`. An unscripted name answers `Ok(ByName { tap: q.origin.clone(), version: String::new(), same_source: true, installed_current: false })`.
   - Delegate `by_name` in `EchoVisibleBrew` and both `FailDepsBrew` impls.
 - [ ] **Accept:** done gate passes; no caller yet. Commit.
@@ -198,7 +200,50 @@ pub(super) fn by_name_note(name: &str, dep: Option<&str>, why: &str, brew_verb: 
 - [ ] Implement: `pub fn brew_install_args(pkg: &PkgRef, token: &str, user_flags: &[String]) -> Vec<String>`; rename `record_staged_install` to `record_name_install` and `StagedRun` to `NameRun { Ran { failed }, Untrusted(String) }`; on `installed_now` call `forget_origin(kind, name)`; delete `record_origin`, `LoadFailure`, the staged-copy holds, `staging_dir`, and the `tap_root` field of `ApplySession`. Rename `run_is_soaked_install` to `run_is_name_install(runs, name)` (an `install` run whose last argument is `name`, without `--ignore-dependencies`) and update its callers.
 - [ ] **Accept:** done gate passes; `rg -n 'write_blob|staging_dir|staged_load_failure' src/cmd` is empty. Commit.
 
-### Task 5: Sweep
+### Task 5: One `brew update` before soaked work
+
+**Files:** Modify `src/nosoak.rs` (`run_step`, line 143; its inline update at 163-176), `src/cmd/apply.rs` (`reinstall` at 35, `apply_many` at 177, `ApplySession` at 268, `run_nosoak` at 1103), and tests in `src/cmd/{apply,install,upgrade}.rs`, `src/nosoak.rs`, `src/lib.rs`.
+
+Shapes (spec "`brew update` before soaked work"):
+
+```rust
+// nosoak.rs
+/// Runs `brew update` under the `Updating Homebrew` header.
+/// `None` when it succeeded, else brew's exit code.
+pub fn brew_update(brew: &impl Brew, out: &mut impl Write) -> Result<Option<i32>, Error>;
+/// `run_step`, skipping its own update (and header) when `updated`.
+pub fn run_step_after(brew: &impl Brew, verb: &str, user_flags: &[String],
+    targets: &[Target], updated: bool, out: &mut impl Write) -> Result<StepResult, Error>;
+// `run_step` keeps its signature and calls `run_step_after(.., false, ..)`.
+
+// apply.rs, ApplySession
+/// `Some(true)`: this run's `brew update` succeeded. `Some(false)`: it failed. `None`: it did not run.
+brew_updated: Option<bool>,
+fn update_before_soaked_work(&mut self, names: &[String]) -> Result<(), Error>;
+```
+
+Rules:
+
+- Soaked work means: a bare run with `plan_total` above 0, or a named run where `resolve_token` gives `PkgClass::Soaked` for at least one name.
+- `apply_many` calls it after `validate_tokens` and the verbose banner, before `session.out.open()` and the package loop. `reinstall` calls it after its banner, before its loop. It writes through `self.out.get_mut()`, so the header is at column 0 ahead of the soaked section.
+- On failure: `defer("brew update failed (exit <N>); brew's data may be older than the soak cutoff, so more packages may be held")`, `max_status(&mut self.brew_status, N)`, and continue. Nothing is held and `refused` is not set. The update's output is not fed to `self.done`.
+- `run_nosoak` calls `run_step_after` with `self.brew_updated == Some(true)`.
+- `cmd::update`, `outdated` and `info` do not change.
+
+- [ ] **Failing tests first:**
+  - `soaked_upgrade_runs_brew_update_before_asking_brew_anything` (`src/cmd/apply.rs`): a wrapper brew (the `FailDepsBrew` pattern) logs `run_visible_in`, `deps` and `by_name` calls in one list; the first entry is `update`, and it appears once.
+  - Rewrite `upgrade_without_no_soak_packages_never_runs_brew_update` (`src/cmd/apply.rs:1975`) as `bare_upgrade_with_an_empty_plan_runs_no_brew_update`, and add `named_run_of_only_no_soak_packages_updates_in_the_no_soak_step` (one `update`, after no soaked run, as today).
+  - `run_with_soaked_and_no_soak_work_updates_exactly_once`: one `["update"]` run, and the output has one `Updating Homebrew` header, above the soaked header.
+  - `failed_brew_update_notes_it_and_the_package_still_installs`: queue `(1, b"Error: offline")` first; the package's `install` run still happens, the Notes hold the exact failure note, nothing is under `Held:`, `brew_status` is `Some(1)`, `refused` is false.
+  - `failed_brew_update_is_retried_by_the_no_soak_step`: with a no-soak target, two `update` runs.
+  - `dry_run_still_runs_brew_update` (`--dry-run`).
+  - `install_and_reinstall_update_before_soaked_work` (`src/cmd/install.rs`): for `install` of a new soaked package and for a cutoff `reinstall`.
+  - `src/nosoak.rs`: `brew_update_returns_the_exit_code_on_failure`, `run_step_after_an_update_runs_no_brew_update_and_prints_no_header`, and the existing `run_step` tests unchanged.
+- [ ] Implement as above.
+- [ ] Migrate: a soaked run now makes `update` its first visible run, so it takes the first queued `MockBrew::next_outputs` entry and sees `next_status`. Find the sites with `rg -n 'next_outputs|next_status' src/cmd src/lib.rs` (about a dozen) and `rg -n '"update"' src/cmd src/lib.rs`; prepend `(0, Vec::new())` to a queue, and extend exact run-list assertions with the leading `update`. Do not special-case `update` in `MockBrew`.
+- [ ] **Accept:** done gate passes. Commit.
+
+### Task 6: Sweep
 
 **Files:** Modify `src/cmd/test_support.rs`, `src/brew.rs` (`MockBrew::deps`, line 943), remaining tests in `src/cmd/{apply,bare,deps,install,upgrade,view}.rs` and `src/lib.rs`.
 
@@ -208,19 +253,19 @@ pub(super) fn by_name_note(name: &str, dep: Option<&str>, why: &str, brew_verb: 
 - [ ] Update the comment on `apply_brewsoak_brew_env` (`src/brew.rs:640-645`): `HOMEBREW_DEVELOPER` and the `FORBID` removal no longer enable anything; they stay until the long-term fix decides.
 - [ ] **Accept:** done gate passes. Commit.
 
-### Task 6: Documentation
+### Task 7: Documentation
 
 **Files:** Modify `AGENTS.md`, `README.md`.
 
-- [ ] `AGENTS.md`, "Installing soaked formulae": replace the two path-install bullets with the stopgap rules (install by bare name only behind `Brew::by_name`; hash the raw cutoff blob; never a path or a full token on a soaked run; holds are never fatal; pointer to the spec and issue #17). Keep the `--ignore-dependencies` bullet. In "Origins and staging", change "write the origin record after every successful staged tap install" to the by-name rule, and note that `<cache>/staging/` is read (old receipts) but no longer written.
-- [ ] `README.md`: a short "Homebrew 7.0.14 and later (issue #17)" section under "Commands": what is held and why, the note's wording, the bypass, and "run `brew update` if brew's data is older than the cutoff".
+- [ ] `AGENTS.md`, "Installing soaked formulae": replace the two path-install bullets with the stopgap rules (install by bare name only behind `Brew::by_name`; hash the raw cutoff blob; never a path or a full token on a soaked run; holds are never fatal; pointer to the spec and issue #17). Keep the `--ignore-dependencies` bullet. Add the one-`brew update`-per-run rule (before soaked work; the no-soak step does not repeat a successful one). In "Origins and staging", change "write the origin record after every successful staged tap install" to the by-name rule, and note that `<cache>/staging/` is read (old receipts) but no longer written.
+- [ ] `README.md`: a short "Homebrew 7.0.14 and later (issue #17)" section under "Commands": what is held and why, the note's wording, the bypass, and that `upgrade`, `install` and `reinstall` now run `brew update` once before soaked work (also on a dry run). Correct any sentence that says `brew update` runs only for no-soak packages.
 - [ ] Check every claim against the code as merged. No private hostnames, paths or account names (the repo is public).
 - [ ] **Accept:** done gate passes. Commit.
 
-### Task 7: Verify against real Homebrew
+### Task 8: Verify against real Homebrew
 
 - [ ] `cargo build`, then `./target/debug/brewsoak upgrade --dry-run ast-grep > <scratch>/after.txt 2>&1; echo "exit=$?" >> <scratch>/after.txt` (same package as Task 0).
-- [ ] **Accept:** `after.txt` has no `No available formula`; it shows either brew's `Would upgrade` for the package or a `Held:` note with `issue #17`; exit is 0 or 1, never brew's error status. `tail -5 "$TMPDIR"/brewsoak-*.log` shows `$ brew install --formula --dry-run ast-grep`.
+- [ ] **Accept:** `after.txt` has no `No available formula`; it shows either brew's `Would upgrade` for the package or a `Held:` note with `issue #17`; exit is 0 or 1, never brew's error status. The newest `"$TMPDIR"/brewsoak-*.log` shows `$ brew update` before any `$ brew ruby` or `$ brew deps` line, and `$ brew install --formula --dry-run ast-grep` if the package was not held.
 - [ ] Run `./target/debug/brewsoak upgrade --dry-run > <scratch>/bare.txt 2>&1` and report: packages planned, installed by name, held, and the wall time. The run must reach the Summary.
 - [ ] Run the done gate and show its output. Report `before.txt`, `after.txt` and the bare-run numbers side by side.
 - [ ] Do not push, open a PR, or close issue #17: the PR says `Refs #17`. Wait for the maintainer.
