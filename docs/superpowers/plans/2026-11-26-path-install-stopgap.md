@@ -93,7 +93,7 @@ impl ByName {
 fn by_name(&self, queries: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error>;
 ```
 
-The script, a new constant beside `COMPARE_VERSIONS_RUBY` (names arrive as ARGV, never as Ruby source):
+The script, a new constant beside `COMPARE_VERSIONS_RUBY` (names arrive as ARGV, never as Ruby source; every row leads with `kind name` so the parser matches rows to queries by key, never by position, and a missing, mismatched or duplicated row is that query's `Err`):
 
 ```ruby
 ARGV.each_slice(2) do |kind, name|
@@ -101,18 +101,18 @@ ARGV.each_slice(2) do |kind, name|
     if kind == "cask"
       c = Cask::CaskLoader.load(name)
       sum = c.ruby_source_checksum
-      puts ["OK", c.tap&.name, c.version, sum && sum[:sha256], c.installed_version.to_s == c.version.to_s].join("\t")
+      puts ["OK", kind, name, c.tap&.name, c.version, sum && sum[:sha256], c.installed_version.to_s == c.version.to_s].join("\t")
     else
       f = Formulary.factory(name)
-      puts ["OK", f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?].join("\t")
+      puts ["OK", kind, name, f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?].join("\t")
     end
   rescue StandardError, ScriptError => e
-    puts ["ERR", e.class, e.message.lines.first.to_s.strip].join("\t")
+    puts ["ERR", kind, name, e.class, e.message.lines.first.to_s.strip].join("\t")
   end
 end
 ```
 
-Verified output on Homebrew 7.0.16: `OK	homebrew/core	0.51.3	b3c32fcf…	false` for `formula ast-grep`; `ERR	FormulaUnavailableError	No available formula with the name "no-such-xyz".`.
+Verified output on Homebrew 7.0.16: `OK	formula	ast-grep	homebrew/core	0.51.3	b3c32fcf…	false` for `formula ast-grep`; `ERR	formula	no-such-xyz	FormulaUnavailableError	No available formula with the name "no-such-xyz".`.
 
 - [ ] **Failing tests first** (`src/brew.rs` tests):
   - `parse_by_name_lines_reads_ok_and_err_rows`: an `OK` formula row, an `OK` cask row, an `OK` row with an empty checksum (never `same_source`), an `OK` row with an empty tap (`Err`), an `ERR` row (`Err` carrying the message), and a malformed row (`Err`).

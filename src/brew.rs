@@ -59,21 +59,23 @@ puts "HOST #{MacOS.version.to_sym} #{Hardware::CPU.arch}"
 puts "LANG #{Cask::Config.new.languages.join(" ")}".strip"##;
 
 /// Runs under `brew ruby -e`: ARGV holds `kind name` pairs, and each prints
-/// one tab-separated row: `OK tap version source_sha256 installed_current`,
-/// or `ERR class message` when brew's own loader refuses the name. Names
-/// arrive as arguments, never as Ruby source.
+/// one tab-separated row: `OK kind name tap version source_sha256
+/// installed_current`, or `ERR kind name class message` when brew's own
+/// loader refuses the name. The leading `kind name` lets the parser match a
+/// row to its query rather than trust its position. Names arrive as
+/// arguments, never as Ruby source.
 const BY_NAME_RUBY: &str = r#"ARGV.each_slice(2) do |kind, name|
   begin
     if kind == "cask"
       c = Cask::CaskLoader.load(name)
       sum = c.ruby_source_checksum
-      puts ["OK", c.tap&.name, c.version, sum && sum[:sha256], c.installed_version.to_s == c.version.to_s].join("\t")
+      puts ["OK", kind, name, c.tap&.name, c.version, sum && sum[:sha256], c.installed_version.to_s == c.version.to_s].join("\t")
     else
       f = Formulary.factory(name)
-      puts ["OK", f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?].join("\t")
+      puts ["OK", kind, name, f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?].join("\t")
     end
   rescue StandardError, ScriptError => e
-    puts ["ERR", e.class, e.message.lines.first.to_s.strip].join("\t")
+    puts ["ERR", kind, name, e.class, e.message.lines.first.to_s.strip].join("\t")
   end
 end"#;
 
@@ -122,34 +124,55 @@ pub(crate) struct Loaded {
 /// One name's `BY_NAME_RUBY` answer, or brew's reason it has none.
 type LoadedAnswer = Result<Loaded, String>;
 
-/// `count` answers from `BY_NAME_RUBY` output, one per line in order. A
-/// missing, malformed or `ERR` row is that name's `Err`.
-pub(crate) fn parse_by_name_lines(stdout: &str, count: usize) -> Vec<Result<Loaded, String>> {
-    let mut lines = stdout.lines();
-    (0..count)
-        .map(|_| match lines.next() {
-            Some(line) => parse_by_name_row(line),
-            None => Err("brew ruby gave no answer for this name".to_string()),
-        })
+/// One answer per `asked` `(kind, name)` from `BY_NAME_RUBY` output. Rows
+/// are matched by `kind name`, never by position: a missing or duplicated
+/// row is that name's `Err`, and lines that are not a row for an asked name
+/// (a stray brew message, a row for another name) are never assigned.
+pub(crate) fn parse_by_name_lines(
+    stdout: &str,
+    asked: &[(PkgKind, String)],
+) -> Vec<Result<Loaded, String>> {
+    let mut rows: HashMap<(&str, &str), Vec<Result<Loaded, String>>> = HashMap::new();
+    for line in stdout.lines() {
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 3 && matches!(fields[0], "OK" | "ERR") {
+            rows.entry((fields[1], fields[2]))
+                .or_default()
+                .push(parse_by_name_row(&fields));
+        }
+    }
+    asked
+        .iter()
+        .map(
+            |(kind, name)| match rows.remove(&(kind_tag(*kind), name.as_str())) {
+                None => Err("brew ruby gave no answer for this name".to_string()),
+                Some(mut found) if found.len() == 1 => found.remove(0),
+                Some(_) => Err("brew ruby answered this name more than once".to_string()),
+            },
+        )
         .collect()
 }
 
-fn parse_by_name_row(line: &str) -> Result<Loaded, String> {
-    let fields: Vec<&str> = line.split('\t').collect();
-    match fields.as_slice() {
-        ["OK", tap, version, sum, installed] => {
+fn parse_by_name_row(fields: &[&str]) -> Result<Loaded, String> {
+    match fields {
+        ["OK", _, _, tap, version, sum, installed] => {
             let tap = tap.trim().to_lowercase();
             if tap.is_empty() {
                 return Err("brew reports no tap for this name".to_string());
             }
+            let installed_current = match installed.trim() {
+                "true" => true,
+                "false" => false,
+                other => return Err(format!("unparseable installed flag from brew: {other:?}")),
+            };
             Ok(Loaded {
                 tap,
                 version: version.trim().to_string(),
                 source_sha256: Some(sum.trim().to_lowercase()).filter(|v| !v.is_empty()),
-                installed_current: installed.trim() == "true",
+                installed_current,
             })
         }
-        ["ERR", class, message] => {
+        ["ERR", _, _, class, message] => {
             let message = message.trim();
             Err(if message.is_empty() {
                 class.trim().to_string()
@@ -157,7 +180,10 @@ fn parse_by_name_row(line: &str) -> Result<Loaded, String> {
                 message.to_string()
             })
         }
-        _ => Err(format!("unparseable brew loader output: {}", line.trim())),
+        _ => Err(format!(
+            "unparseable brew loader row: {}",
+            fields.join("\t").trim()
+        )),
     }
 }
 
@@ -752,29 +778,28 @@ impl Brew for ProcessBrew {
 
     fn by_name(&self, queries: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error> {
         let mut asking: Vec<(PkgKind, String)> = Vec::new();
+        let mut with_installed = false;
         {
             let loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
-            let mut asked = self
+            let asked = *self
                 .installed_asked
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let mut want: Vec<(PkgKind, String)> =
                 queries.iter().map(|q| (q.kind, q.name.clone())).collect();
-            if !*asked {
+            if !asked {
                 let installed = self
                     .installed_names
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 want.extend(installed.iter().cloned());
+                with_installed = !installed.is_empty();
             }
             for (kind, name) in want {
                 let key = (kind_tag(kind), name.clone());
                 if !loaded.contains_key(&key) && !asking.contains(&(kind, name.clone())) {
                     asking.push((kind, name));
                 }
-            }
-            if !asking.is_empty() {
-                *asked = true;
             }
         }
         if !asking.is_empty() {
@@ -788,8 +813,14 @@ impl Brew for ProcessBrew {
                 args.extend([kind_tag(*kind).to_string(), name.clone()]);
             }
             let output = self.run(&args)?;
+            if output.status.success() && with_installed {
+                *self
+                    .installed_asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = true;
+            }
             let answers: Vec<Result<Loaded, String>> = if output.status.success() {
-                parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), asking.len())
+                parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), &asking)
             } else {
                 let text = match brew_fail(&output) {
                     Error::Brew { message, .. } => message,
@@ -2883,6 +2914,7 @@ mod tests {
         assert_eq!(brew.cask_languages("cave-story"), Some(vec!["ja".into()]));
         assert_eq!(brew.cask_languages("other"), None);
     }
+
     fn loaded(tap: &str, sum: Option<&str>) -> Loaded {
         Loaded {
             tap: tap.into(),
@@ -2901,15 +2933,32 @@ mod tests {
         }
     }
 
+    fn asked(names: &[&str]) -> Vec<(PkgKind, String)> {
+        names
+            .iter()
+            .map(|n| (PkgKind::Formula, n.to_string()))
+            .collect()
+    }
+
     #[test]
     fn parse_by_name_lines_reads_ok_and_err_rows() {
-        let out = "OK\thomebrew/core\t1.5.2_3\tAbC123\ttrue\n\
-                   OK\tHomebrew/Cask\t4.0\tdef456\tfalse\n\
-                   OK\thomebrew/core\t1.0\t\tfalse\n\
-                   OK\t\t1.0\tabc\tfalse\n\
-                   ERR\tFormulaUnavailableError\tNo available formula with the name \"x\".\n\
-                   garbage\n";
-        let got = parse_by_name_lines(out, 6);
+        let out = "OK\tformula\ta\thomebrew/core\t1.5.2_3\tAbC123\ttrue\n\
+                   OK\tcask\tb\tHomebrew/Cask\t4.0\tdef456\tfalse\n\
+                   OK\tformula\tc\thomebrew/core\t1.0\t\tfalse\n\
+                   OK\tformula\td\t\t1.0\tabc\tfalse\n\
+                   ERR\tformula\te\tFormulaUnavailableError\tNo available formula with the name \"x\".\n\
+                   OK\tformula\tf\thomebrew/core\t1.0\tabc\tmaybe\n\
+                   OK\tformula\tg\ttoo\tfew\n";
+        let q = vec![
+            (PkgKind::Formula, "a".to_string()),
+            (PkgKind::Cask, "b".to_string()),
+            (PkgKind::Formula, "c".to_string()),
+            (PkgKind::Formula, "d".to_string()),
+            (PkgKind::Formula, "e".to_string()),
+            (PkgKind::Formula, "f".to_string()),
+            (PkgKind::Formula, "g".to_string()),
+        ];
+        let got = parse_by_name_lines(out, &q);
         assert_eq!(
             got[0],
             Ok(Loaded {
@@ -2930,15 +2979,59 @@ mod tests {
                 .unwrap_err()
                 .contains("No available formula")
         );
-        assert!(got[5].is_err());
+        assert!(
+            got[5].as_ref().unwrap_err().contains("unparseable"),
+            "installed must be true or false"
+        );
+        assert!(got[6].is_err(), "a short row is malformed");
     }
 
     #[test]
     fn parse_by_name_lines_short_output_is_err_for_the_missing_names() {
-        let got = parse_by_name_lines("OK\thomebrew/core\t1\tabc\tfalse\n", 3);
+        let got = parse_by_name_lines(
+            "OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n",
+            &asked(&["a", "b", "c"]),
+        );
         assert_eq!(got.len(), 3);
         assert!(got[0].is_ok());
         assert!(got[1].is_err() && got[2].is_err());
+    }
+
+    #[test]
+    fn parse_by_name_lines_ignores_a_stray_line_before_the_rows() {
+        let out = "Warning: something brew printed\n\
+                   OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n\
+                   OK\tformula\tb\tother/tap\t2\tdef\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a", "b"]));
+        assert_eq!(got[0].as_ref().unwrap().tap, "homebrew/core");
+        assert_eq!(got[1].as_ref().unwrap().tap, "other/tap");
+    }
+
+    #[test]
+    fn parse_by_name_lines_matches_rows_by_name_not_position() {
+        let out = "OK\tformula\tb\tother/tap\t2\tdef\tfalse\n\
+                   OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a", "b"]));
+        assert_eq!(got[0].as_ref().unwrap().tap, "homebrew/core");
+        assert_eq!(got[1].as_ref().unwrap().tap, "other/tap");
+    }
+
+    #[test]
+    fn parse_by_name_lines_never_assigns_a_row_for_an_unasked_name() {
+        let out = "OK\tformula\tzzz\thomebrew/core\t1\tabc\tfalse\n\
+                   OK\tcask\ta\thomebrew/cask\t1\tabc\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a"]));
+        assert!(got[0].is_err(), "a cask row is not the formula's answer");
+    }
+
+    #[test]
+    fn parse_by_name_lines_duplicate_rows_are_err() {
+        let out = "OK\tformula\ta\thomebrew/core\t1\tabc\tfalse\n\
+                   OK\tformula\ta\tother/tap\t1\tabc\tfalse\n\
+                   OK\tformula\tb\thomebrew/core\t1\tabc\tfalse\n";
+        let got = parse_by_name_lines(out, &asked(&["a", "b"]));
+        assert!(got[0].is_err());
+        assert!(got[1].is_ok());
     }
 
     #[test]
@@ -2992,7 +3085,7 @@ case "$1" in
     echo "ruby $*" >> {log}
     if [ {ruby_exit} -ne 0 ]; then echo "boom" >&2; exit {ruby_exit}; fi
     while [ $# -gt 0 ]; do
-      printf 'OK\thomebrew/core\t1.0\tabc\tfalse\n'
+      printf 'OK\t%s\t%s\thomebrew/core\t1.0\tabc\tfalse\n' "$1" "$2"
       shift 2
     done
     ;;
@@ -3002,6 +3095,7 @@ case "$1" in
     ;;
   update)
     echo "$@" >> {log}
+    if [ -e {marker} ]; then exit 1; fi
     ;;
   *)
     echo "$@" >> {log}
@@ -3009,6 +3103,7 @@ case "$1" in
 esac
 "#,
             log = log.display(),
+            marker = tmp.join("update_fails").display(),
             ruby_exit = ruby_exit
         );
         std::fs::write(&script, body).expect("script");
@@ -3129,6 +3224,84 @@ esac
         let mut term = Vec::new();
         brew.run_visible(&["update".to_string()], &mut term)
             .expect("update");
+        brew.by_name(std::slice::from_ref(&q)).expect("by_name 2");
+        brew.deps(PkgKind::Formula, "wget").expect("deps 2");
+        let lines = log_lines(&log);
+        let count = |p: &str| lines.iter().filter(|l| l.starts_with(p)).count();
+        assert_eq!((count("ruby"), count("deps")), (2, 2), "{lines:?}");
+    }
+
+    #[test]
+    fn process_brew_by_name_without_a_brew_binary_is_the_outer_err() {
+        let brew = ProcessBrew::new(PathBuf::from("/nonexistent/brew-for-tests"));
+        assert!(
+            brew.by_name(&[query("wget", "homebrew/core", None)])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn process_brew_by_name_asks_a_duplicate_name_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        let q = query("wget", "homebrew/core", Some("abc"));
+        let got = brew.by_name(&[q.clone(), q]).expect("by_name");
+        assert!(got[0].is_ok() && got[1].is_ok());
+        let rubies: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .collect();
+        assert_eq!(rubies, ["ruby formula wget"]);
+    }
+
+    #[test]
+    fn process_brew_by_name_before_installed_packages_still_batches_installed_names_once() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        brew.by_name(&[query("wget", "homebrew/core", Some("abc"))])
+            .expect("early");
+        brew.installed_packages().expect("installed");
+        brew.by_name(&[query("curl", "homebrew/core", Some("abc"))])
+            .expect("later");
+        brew.by_name(&[query("jq", "homebrew/core", Some("abc"))])
+            .expect("again");
+        let rubies: Vec<String> = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby"))
+            .collect();
+        assert_eq!(
+            rubies,
+            [
+                "ruby formula wget",
+                "ruby formula curl cask alt-tab",
+                "ruby formula jq"
+            ]
+        );
+    }
+
+    #[test]
+    fn process_brew_by_name_failed_spawn_does_not_use_up_the_installed_batch() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, _log) = fake_loader_brew(tmp.path(), 1);
+        brew.installed_packages().expect("installed");
+        brew.by_name(&[query("wget", "homebrew/core", None)])
+            .expect("failed spawn is per-name Err");
+        assert!(!*brew.installed_asked.lock().unwrap());
+    }
+
+    #[test]
+    fn process_brew_failing_update_still_clears_both_memos() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        std::fs::write(tmp.path().join("update_fails"), "").expect("marker");
+        let q = query("wget", "homebrew/core", Some("abc"));
+        brew.by_name(std::slice::from_ref(&q)).expect("by_name");
+        brew.deps(PkgKind::Formula, "wget").expect("deps");
+        let mut term = Vec::new();
+        let out = brew
+            .run_visible(&["update".to_string()], &mut term)
+            .expect("update runs");
+        assert!(!out.status.success());
         brew.by_name(std::slice::from_ref(&q)).expect("by_name 2");
         brew.deps(PkgKind::Formula, "wget").expect("deps 2");
         let lines = log_lines(&log);
