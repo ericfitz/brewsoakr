@@ -1643,7 +1643,7 @@ mod tests {
         );
         assert!(
             run_is_name_install(&runs, "app"),
-            "cask target must path-install without --ignore-dependencies: {runs:?}"
+            "cask target must install by bare name without --ignore-dependencies: {runs:?}"
         );
         assert!(!result.refused);
     }

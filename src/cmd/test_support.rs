@@ -220,6 +220,30 @@ pub(super) fn run_is_name_install(runs: &[Vec<String>], name: &str) -> bool {
     })
 }
 
+/// Soaked runs install and ask `brew deps` by bare name: no recorded argument
+/// is a path, and no `install` or `deps` argument is a `user/repo/name` token.
+pub(super) fn assert_no_path_args(brew: &MockBrew) {
+    let mut all = lock_runs(brew);
+    all.extend(brew.visible_runs.lock().expect("visible").clone());
+    for args in &all {
+        let verb = args.first().map(String::as_str);
+        let named = matches!(verb, Some("install" | "deps"));
+        for a in args {
+            assert!(
+                !a.starts_with('/') && !a.ends_with(".rb"),
+                "path argument {a:?} in {args:?}"
+            );
+            assert!(
+                !(named && !a.starts_with('-') && a.contains('/')),
+                "full token {a:?} in soaked {args:?}"
+            );
+        }
+    }
+    for q in brew.by_name_queries.lock().expect("queries").iter() {
+        assert!(!q.name.contains('/'), "full token in by_name query {q:?}");
+    }
+}
+
 pub(super) fn upgrade_names(brew: &MockBrew, git: &InMemoryGit, names: &[String]) -> String {
     upgrade_names_flags(brew, git, names, &[])
 }

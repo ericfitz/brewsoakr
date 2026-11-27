@@ -910,8 +910,9 @@ fn greedy_args(greedy: crate::flags::Greedy) -> Vec<String> {
 }
 
 /// Env for brewsoak-driven `brew` children.
-/// `HOMEBREW_DEVELOPER` allows path installs (`brew install ./foo.rb`).
-/// Unset FORBID so a user-level forbid cannot block us.
+/// `HOMEBREW_DEVELOPER` and the `FORBID_PACKAGES_FROM_PATHS` removal no longer
+/// enable anything (soaked installs go by bare name); they stay until the
+/// long-term fix decides.
 /// `HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK` stops brew from upgrading
 /// dependents of a cutoff install to HEAD.
 fn apply_brewsoak_brew_env(cmd: &mut Command) {
@@ -1242,16 +1243,7 @@ impl Brew for MockBrew {
                 message: message.clone(),
             });
         }
-        let stem = Path::new(token)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(token);
-        Ok(self
-            .deps
-            .get(token)
-            .or_else(|| self.deps.get(stem))
-            .cloned()
-            .unwrap_or_default())
+        Ok(self.deps.get(token).cloned().unwrap_or_default())
     }
 }
 
@@ -1719,6 +1711,24 @@ fn parse_json_string(s: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mock_deps_keys_by_exact_token() {
+        let mut brew = MockBrew::new();
+        brew.deps
+            .insert("python@3.13".to_string(), vec!["openssl@3".to_string()]);
+        assert_eq!(
+            brew.deps(PkgKind::Formula, "python@3.13").unwrap(),
+            ["openssl@3"]
+        );
+        // A different spelling of the same package is a different key.
+        assert!(
+            brew.deps(PkgKind::Formula, "tap/x/python@3.13")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(brew.deps(PkgKind::Formula, "python").unwrap().is_empty());
+    }
+
     use super::*;
 
     #[test]

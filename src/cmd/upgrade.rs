@@ -132,7 +132,7 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(
             run_is_name_install(&runs, "ok"),
-            "expected soaked path install of ok without --ignore-dependencies: {runs:?}"
+            "expected soaked by-name install of ok without --ignore-dependencies: {runs:?}"
         );
         assert!(
             !run_has_token(&runs, "new") && !run_has_token(&runs, "brewsoakr/soaked/new"),

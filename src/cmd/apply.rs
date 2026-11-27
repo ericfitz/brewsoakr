@@ -370,7 +370,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// are brewsoak's (read by `bare_action`), so they are neither forwarded
     /// nor reported as dropped; `-g` would otherwise reach brew install as
     /// `--git`. The install table filter still applies in `brew_install_args`.
-    fn staged_install_flags(&self) -> Vec<String> {
+    fn name_install_flags(&self) -> Vec<String> {
         if self.brew_verb == "upgrade" {
             crate::flags::without_greedy(self.user_flags)
         } else {
@@ -788,7 +788,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
 
-        let install_flags = self.staged_install_flags();
+        let install_flags = self.name_install_flags();
         let args = tap::brew_install_args(&pkg, name, &install_flags);
         self.note_dropped_flags("install", &install_flags, "soaked installs");
         let installing = view.cutoff.as_ref().map(report::identity_version);
@@ -903,7 +903,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
         }
-        let install_flags = self.staged_install_flags();
+        let install_flags = self.name_install_flags();
         let args = tap::brew_install_args(&pkg, dep, &install_flags);
         let installing = want.as_ref().map(report::identity_version);
         match self.record_name_install(dep_origin, dep, kind, installing, &args)? {
@@ -1468,8 +1468,8 @@ mod tests {
         (brew, git)
     }
 
-    /// Names of the staged packages `brew install` ran, in order.
-    fn staged_install_order(brew: &MockBrew) -> Vec<String> {
+    /// Names of the packages `brew install` ran by bare name, in order.
+    fn name_install_order(brew: &MockBrew) -> Vec<String> {
         brew.visible_runs
             .lock()
             .expect("visible")
@@ -1487,14 +1487,14 @@ mod tests {
             "\u{1f37a}  /opt/homebrew/Cellar/simdutf/1.1.0: 5 files, 1MB\n",
         );
         upgrade_names(&brew, &git, &[]);
-        assert_eq!(staged_install_order(&brew), ["simdutf", "node"]);
+        assert_eq!(name_install_order(&brew), ["simdutf", "node"]);
     }
 
     #[test]
     fn named_upgrade_upgrades_an_outdated_installed_dependency_first() {
         let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
         let text = upgrade_names(&brew, &git, &["node".to_string()]);
-        assert_eq!(staged_install_order(&brew), ["simdutf", "node"]);
+        assert_eq!(name_install_order(&brew), ["simdutf", "node"]);
         assert!(
             text.contains("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)"),
             "{text}"
@@ -1505,7 +1505,7 @@ mod tests {
     /// Core `node` depends on `widget`, installed from `hashicorp/tap` at
     /// 1.0.0 behind a 1.1.0 cutoff. `refusal` is brew's answer to the staged
     /// `widget` install. Returns the output and the run's brew.
-    fn node_with_tap_dep_world(refusal: &str) -> (String, MockBrew) {
+    fn node_with_tap_dep_world(refusal: &str) -> (String, MockBrew, super::super::RunResult) {
         let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
         brew.installed[1] = formula_pkg_from(
             "widget",
@@ -1545,7 +1545,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let cache = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
-        upgrade(
+        let r = upgrade(
             &brew,
             &git,
             &snaps,
@@ -1558,12 +1558,12 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        (String::from_utf8(out).unwrap(), brew)
+        (String::from_utf8(out).unwrap(), brew, r)
     }
 
     #[test]
     fn untrusted_dependency_that_was_announced_is_then_reported_held() {
-        let (text, _) = node_with_tap_dep_world(
+        let (text, _, _) = node_with_tap_dep_world(
             "Error: widget: Refusing to load formula hashicorp/tap/widget from untrusted tap hashicorp/tap.\n",
         );
         assert!(
@@ -1582,7 +1582,7 @@ mod tests {
 
     #[test]
     fn dependency_brew_load_error_is_brews_failure_and_not_counted_upgraded() {
-        let (text, _) = node_with_tap_dep_world("Error: cannot load such file -- helper\n");
+        let (text, _, r) = node_with_tap_dep_world("Error: cannot load such file -- helper\n");
         assert!(
             text.contains("upgrading widget 1.0.0 -> 1.1.0 (dependency of node)"),
             "{text}"
@@ -1592,6 +1592,11 @@ mod tests {
         assert!(
             summary_has(&text, "held", "0"),
             "a brew failure is not a hold: {text}"
+        );
+        assert!(
+            r.brew_status.is_some_and(|s| s != 0),
+            "brew's failure keeps the run's exit code: {:?}",
+            r.brew_status
         );
     }
 
@@ -1610,7 +1615,7 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert_eq!(staged_install_order(&brew), ["simdutf", "node"], "{text}");
+        assert_eq!(name_install_order(&brew), ["simdutf", "node"], "{text}");
         assert_eq!(
             text.matches("upgrading simdutf 1.0.0 -> 1.1.0 (dependency of node)")
                 .count(),
@@ -1640,7 +1645,7 @@ mod tests {
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(staged_install_order(&brew).is_empty(), "{text}");
+        assert!(name_install_order(&brew).is_empty(), "{text}");
         assert!(!text.contains("dependency of"), "{text}");
         assert!(
             lock_runs(&brew)
@@ -1732,7 +1737,7 @@ mod tests {
             "\u{1f37a}  /opt/homebrew/Cellar/simdutf/1.1.0: 5 files, 1MB\n",
         );
         let text = upgrade_names(&brew, &git, &[]);
-        assert_eq!(staged_install_order(&brew), ["simdutf", "node"], "{text}");
+        assert_eq!(name_install_order(&brew), ["simdutf", "node"], "{text}");
         assert!(
             text.contains("[2/2] simdutf 1.1.0: already upgraded as a dependency"),
             "{text}"
@@ -1744,7 +1749,7 @@ mod tests {
     fn installed_dependency_at_the_cutoff_is_not_reinstalled() {
         let (brew, git) = node_simdutf_world("1.0.0", "1.1.0", "");
         upgrade_names(&brew, &git, &[]);
-        assert_eq!(staged_install_order(&brew), ["node"]);
+        assert_eq!(name_install_order(&brew), ["node"]);
     }
 
     #[test]
@@ -1755,7 +1760,7 @@ mod tests {
             std::cmp::Ordering::Greater,
         );
         let text = upgrade_names(&brew, &git, &[]);
-        assert_eq!(staged_install_order(&brew), ["node"], "{text}");
+        assert_eq!(name_install_order(&brew), ["node"], "{text}");
     }
 
     #[test]
@@ -1763,11 +1768,11 @@ mod tests {
         let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
         brew.installed[1].pinned = true;
         upgrade_names(&brew, &git, &[]);
-        assert_eq!(staged_install_order(&brew), ["node"]);
+        assert_eq!(name_install_order(&brew), ["node"]);
     }
 
     #[test]
-    fn staged_install_drops_flags_brew_install_rejects_and_says_so_once() {
+    fn name_install_drops_flags_brew_install_rejects_and_says_so_once() {
         let (brew, git) = two_outdated_world("");
         let flags = ["--greedy", "--ignore-pinned", "--verbose"].map(String::from);
         let text = upgrade_names_flags(&brew, &git, &[], &flags);
@@ -2202,10 +2207,186 @@ mod tests {
             ),
             "{text}"
         );
+        let note = text
+            .find("brew update failed (exit 1)")
+            .expect("update failure note");
+        assert!(
+            text.find("Notes").is_some_and(|n| n < note),
+            "the note belongs in the Notes block: {text}"
+        );
         assert!(!text.contains("Held:"), "{text}");
         assert!(summary_has(&text, "held", "0"), "{text}");
         assert_eq!(r.brew_status, Some(1));
         assert!(!r.refused);
+    }
+
+    #[test]
+    fn failed_brew_update_then_failing_install_keeps_the_max_status() {
+        let (brew, _text, r) = named_left_run(
+            vec![
+                (1, b"Error: offline".to_vec()),
+                (3, b"Error: boom".to_vec()),
+            ],
+            &[],
+        );
+        assert!(!name_install_order(&brew).is_empty());
+        assert_eq!(r.brew_status, Some(3));
+    }
+
+    #[test]
+    fn reinstall_with_a_failed_update_notes_it_and_still_reinstalls() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha"))],
+            ..MockBrew::new()
+        };
+        brew.next_outputs
+            .lock()
+            .unwrap()
+            .push_back((1, b"Error: offline".to_vec()));
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["wget".to_string()],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(name_install_order(&brew), ["wget"], "{text}");
+        assert!(text.contains("brew update failed (exit 1)"), "{text}");
+        assert_eq!(r.brew_status, Some(1));
+        assert!(!r.refused);
+    }
+
+    #[test]
+    fn soaked_runs_never_hand_brew_a_path_or_full_token() {
+        use crate::cmd::install::install;
+        use crate::cmd::test_support::assert_no_path_args;
+
+        let run_install = |brew: &MockBrew, git: &InMemoryGit, name: &str, cask: bool| {
+            let cfg = cfg24();
+            let inv = inv_from(brew, &cfg);
+            let tap = tempfile::tempdir().unwrap();
+            install(
+                brew,
+                git,
+                &core_snaps(),
+                unused_cache(),
+                tap.path(),
+                &inv,
+                &cfg,
+                &[name.to_string()],
+                cask,
+                false,
+                &[],
+                &mut Vec::new(),
+            )
+            .unwrap();
+        };
+
+        // Named upgrade with an upgrading dependency.
+        let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        let tap = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["node".to_string()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(!name_install_order(&brew).is_empty());
+        assert_no_path_args(&brew);
+
+        // Bare upgrade.
+        let (brew, git) = two_outdated_world("");
+        let inv = inv_from(&brew, &cfg);
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!name_install_order(&brew).is_empty());
+        assert_no_path_args(&brew);
+
+        // Fresh install with a missing dependency.
+        let git = InMemoryGit::new();
+        for (dir, name) in [("f", "fresh"), ("lib", "lib")] {
+            git.insert_blob(
+                "cutoffsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.2.0", "newsha"),
+            );
+        }
+        let mut brew = MockBrew::new();
+        brew.deps
+            .insert("fresh".to_string(), vec!["lib".to_string()]);
+        run_install(&brew, &git, "fresh", false);
+        assert_eq!(name_install_order(&brew), ["lib", "fresh"]);
+        assert_no_path_args(&brew);
+
+        // Cutoff reinstall of an outdated package.
+        let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["node".to_string()],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!name_install_order(&brew).is_empty());
+        assert_no_path_args(&brew);
+
+        // Cask target.
+        let git = InMemoryGit::new();
+        git.insert_blob("caskcut", "Casks/f/firefox.rb", cask_rb("firefox", "1.0"));
+        git.insert_blob("caskhead", "Casks/f/firefox.rb", cask_rb("firefox", "1.1"));
+        let brew = MockBrew::new();
+        run_install(&brew, &git, "firefox", true);
+        assert_eq!(name_install_order(&brew), ["firefox"]);
+        assert_no_path_args(&brew);
+
+        // Tap formula dependency.
+        let (_text, brew, _r) = node_with_tap_dep_world("");
+        assert!(!name_install_order(&brew).is_empty());
+        assert_no_path_args(&brew);
     }
 
     #[test]
