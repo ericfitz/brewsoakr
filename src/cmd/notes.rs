@@ -22,6 +22,20 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
     ))
 }
 
+/// Why the target is held by the stopgap for issue #17.
+pub(super) fn by_name_note(
+    name: &str,
+    dep: Option<&str>,
+    why: &str,
+    brew_verb: &str,
+    token: &str,
+) -> String {
+    let dep = dep.map(|d| format!("dependency {d}: ")).unwrap_or_default();
+    format!(
+        "{name}: {dep}{why}; brewsoak cannot install a soaked copy until issue #17 is fixed; use `brew {brew_verb} {token}` to bypass brewsoak."
+    )
+}
+
 pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> String {
     format!(
         "{name}: installed {installed} is newer than cutoff {cutoff}; leaving it (upstream may have re-pointed it)"

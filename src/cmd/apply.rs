@@ -1,8 +1,8 @@
 use super::bare::{BareSkip, bare_action, bare_skip, latest_left, latest_note};
-use super::deps::{CutoffDepWalk, CutoffDeps, HeldDep};
+use super::deps::{CutoffDepWalk, CutoffDeps, HeldDep, NameHold, NameWhy, Role, first_line};
 use super::notes::{
-    NoteKind, held_tap_note, newer_than_cutoff_note, refusal_message, unsoakable_note, write_notes,
-    write_session_tail,
+    NoteKind, by_name_note, held_tap_note, newer_than_cutoff_note, refusal_message,
+    unsoakable_note, write_notes, write_session_tail,
 };
 use super::view::{
     Resolved, ResolvedView, calendar_today, host_for_pkg, natural_kind, parse_formula_detected,
@@ -731,16 +731,25 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 self.refuse_ambiguous_dep(name, &token, &message)?;
                 return Ok(());
             }
-            // brew could not even read the staged tap file's dependencies.
-            Err(Error::Brew { message, .. }) if !origin::is_core_or_cask(origin_tap) => {
+            // brew could not list the dependencies of the target by name.
+            Err(Error::Brew { message, .. }) => {
                 match taps::untrusted_tap(&message) {
                     Some(tap) => self.hold_target_untrusted(name, &tap),
-                    None => self.hold_target_staged_copy(name),
+                    None => {
+                        let hold = NameHold {
+                            dep: None,
+                            why: NameWhy::Deps(first_line(&message)),
+                        };
+                        self.hold_target_by_name(name, &token, &hold)?;
+                    }
                 }
                 return Ok(());
             }
             Err(e) => return Err(e),
         };
+        if let Some(hold) = walked.by_name {
+            return self.hold_target_by_name(name, &token, &hold);
+        }
         if let Some(held) = walked.held {
             return self.refuse_held_dep(name, &token, &held);
         }
@@ -778,18 +787,19 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             git: self.git,
             snaps: self.snaps,
             cache: self.cache,
-            tap_root: self.tap_root,
             inv: self.inv,
             cfg: self.cfg,
             visiting: HashSet::new(),
             visited: HashSet::new(),
             out: Vec::new(),
             held: None,
+            by_name: None,
         };
-        walk.visit(root_origin, root, root_kind, false)?;
+        walk.visit(root_origin, root, root_kind, Role::Root)?;
         Ok(CutoffDeps {
             deps: walk.out,
             held: walk.held,
+            by_name: walk.by_name,
         })
     }
 
@@ -939,6 +949,37 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             "cannot install {target}: dependency {why}; use `brew {} {target_token}` to bypass brewsoak.",
             self.brew_verb
         )?;
+        Ok(())
+    }
+
+    /// The by-name gate failed for the target or one of its dependencies:
+    /// hold the target with one inline line and one note, and carry on.
+    fn hold_target_by_name(
+        &mut self,
+        target: &str,
+        target_token: &str,
+        hold: &NameHold,
+    ) -> Result<(), Error> {
+        if let NameWhy::Untrusted(tap) = &hold.why {
+            match &hold.dep {
+                Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
+                None => self.hold_target_untrusted(target, tap),
+            }
+            return Ok(());
+        }
+        self.hold_target_for_dep();
+        let why = hold.why.text();
+        match &hold.dep {
+            Some(dep) => writeln!(self.out, "held {target}: dependency {dep}: {why}")?,
+            None => writeln!(self.out, "held {target}: {why}")?,
+        }
+        self.defer_held(by_name_note(
+            target,
+            hold.dep.as_deref(),
+            &why,
+            self.brew_verb,
+            target_token,
+        ));
         Ok(())
     }
 

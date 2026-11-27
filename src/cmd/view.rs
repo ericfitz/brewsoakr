@@ -1,4 +1,3 @@
-use super::apply::staging_dir;
 use super::bare::snapshotted_pkgs;
 use crate::Error;
 use crate::brew::Brew;
@@ -11,7 +10,6 @@ use crate::origin::{self};
 use crate::report::{self};
 use crate::resolve::{self, PkgKind, PkgRef};
 use crate::snapshot::Snapshots;
-use crate::tap;
 use crate::taps;
 use std::path::{Path, PathBuf};
 
@@ -434,27 +432,6 @@ pub(super) fn natural_kind(
     } else {
         Ok(PkgKind::Cask)
     }
-}
-
-pub(super) fn write_cutoff_blob(
-    git: &impl GitStore,
-    snaps: &Snapshots,
-    cache: &Path,
-    tap_root: &Path,
-    origin_tap: &str,
-    name: &str,
-    kind: PkgKind,
-) -> Result<(), Error> {
-    let blobs = resolve_pkg_blobs(git, snaps, cache, origin_tap, name, kind)?;
-    let blob = blobs.cutoff.as_deref().ok_or_else(|| {
-        Error::Other(format!("{name} is eligible but the cutoff blob is missing"))
-    })?;
-    let pkg = PkgRef {
-        name: name.to_string(),
-        kind,
-    };
-    tap::write_blob(&staging_dir(tap_root, origin_tap), &pkg, blob)?;
-    Ok(())
 }
 
 pub(super) fn tap_repo(cache: &Path, kind: PkgKind) -> PathBuf {

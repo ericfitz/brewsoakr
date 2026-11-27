@@ -1148,4 +1148,71 @@ mod tests {
             "{got}"
         );
     }
+
+    #[test]
+    fn target_not_at_brew_current_is_held_and_the_next_package_installs() {
+        let git = InMemoryGit::new();
+        for name in ["alpha", "gamma"] {
+            let dir = &name[..1];
+            git.insert_blob(
+                "cutoffsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                &format!("Formula/{dir}/{name}.rb"),
+                formula_rb(name, "1.2.0", "newsha"),
+            );
+        }
+        let mut by_name = std::collections::BTreeMap::new();
+        by_name.insert(
+            "alpha".to_string(),
+            Ok(crate::brew::ByName {
+                tap: "homebrew/core".into(),
+                version: "1.2.0".into(),
+                same_source: false,
+                installed_current: false,
+            }),
+        );
+        let brew = MockBrew {
+            installed: vec![
+                formula_pkg("alpha", formula_rb("alpha", "1.0.0", "oldsha")),
+                formula_pkg("gamma", formula_rb("gamma", "1.0.0", "oldsha")),
+            ],
+            by_name,
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().expect("tap");
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .expect("a held target must not fail the run");
+        let text = String::from_utf8(out).expect("utf8");
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains("held alpha: brew would install 1.2.0, which is not the soaked cutoff"),
+            "{text}"
+        );
+        assert!(text.contains("issue #17"), "{text}");
+        assert!(
+            text.contains("use `brew upgrade alpha` to bypass brewsoak."),
+            "{text}"
+        );
+        let runs = lock_runs(&brew);
+        assert!(run_is_soaked_install(&runs, "gamma"), "{runs:?}");
+        assert!(!run_is_soaked_install(&runs, "alpha"), "{runs:?}");
+    }
 }
