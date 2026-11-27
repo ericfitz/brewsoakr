@@ -21,14 +21,13 @@ pub(super) struct HeldDep {
     pub(super) reason: String,
 }
 
-/// Why the by-name gate holds a member of the closure.
+/// Why the by-name gate holds a member of the closure, other than an
+/// untrusted tap (see `NameFail`).
 pub(super) enum NameWhy {
     /// brew's own definition of the name is not the soaked cutoff.
     NotCutoff { brew_version: String },
     /// A bare install would load the name from another tap.
     OtherTap { tap: String, origin: String },
-    /// brew refuses to load the name from this untrusted tap.
-    Untrusted(String),
     /// brew's loaders could not describe the name (first line of its text).
     Lookup(String),
     /// brew could not list the member's dependencies (first line of its text).
@@ -47,10 +46,27 @@ impl NameWhy {
             Self::OtherTap { tap, origin } => {
                 format!("brew resolves the name to {tap}, not {origin}")
             }
-            Self::Untrusted(tap) => format!("brew does not trust tap {tap}"),
             Self::Lookup(first) => format!("brew could not describe it by name ({first})"),
             Self::Deps(first) => format!("brew could not read its dependencies ({first})"),
             Self::NoCutoff => "it has no soaked cutoff yet".to_string(),
+        }
+    }
+}
+
+/// A gate failure: brew refuses the tap (kept as today's trust hold) or one
+/// of the reasons above.
+pub(super) enum NameFail {
+    /// brew refuses to load the name from this untrusted tap.
+    Untrusted(String),
+    Why(NameWhy),
+}
+
+impl NameFail {
+    /// Classify brew's error text for a lookup or dependency failure.
+    fn from_brew(text: &str, why: impl FnOnce(String) -> NameWhy) -> Self {
+        match taps::untrusted_tap(text) {
+            Some(tap) => Self::Untrusted(tap),
+            None => Self::Why(why(first_line(text))),
         }
     }
 }
@@ -59,7 +75,7 @@ impl NameWhy {
 /// when the member is the target itself.
 pub(super) struct NameHold {
     pub(super) dep: Option<String>,
-    pub(super) why: NameWhy,
+    pub(super) why: NameFail,
 }
 
 pub(super) struct CutoffDeps {
@@ -105,7 +121,7 @@ pub(super) fn first_line(text: &str) -> String {
 }
 
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
-    fn hold(&mut self, role: Role, name: &str, why: NameWhy) {
+    fn hold(&mut self, role: Role, name: &str, why: NameFail) {
         let dep = (role != Role::Root).then(|| name.to_string());
         self.by_name = Some(NameHold { dep, why });
     }
@@ -142,20 +158,17 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
             cutoff_sha256: blobs.cutoff.as_deref().map(sha256_hex),
         };
         let has_cutoff = query.cutoff_sha256.is_some();
-        let answer = self
-            .brew
-            .by_name(std::slice::from_ref(&query))?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Err("brew gave no answer for this name".to_string()));
-        let answer = match answer {
+        let asked = match self.brew.by_name(std::slice::from_ref(&query)) {
+            Ok(rows) => rows.into_iter().next(),
+            // The whole call failed: the same as brew failing for this name.
+            Err(Error::Brew { message, .. }) => Some(Err(message)),
+            Err(e) => return Err(e),
+        };
+        let answer = match asked.unwrap_or_else(|| Err("brew gave no answer for this name".into()))
+        {
             Ok(a) => a,
             Err(text) => {
-                let why = match taps::untrusted_tap(&text) {
-                    Some(tap) => NameWhy::Untrusted(tap),
-                    None => NameWhy::Lookup(first_line(&text)),
-                };
-                self.hold(role, name, why);
+                self.hold(role, name, NameFail::from_brew(&text, NameWhy::Lookup));
                 return Ok(());
             }
         };
@@ -186,7 +199,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                     brew_version: answer.version,
                 }
             };
-            self.hold(role, name, why);
+            self.hold(role, name, NameFail::Why(why));
             return Ok(());
         }
         let listed = match early {
@@ -196,11 +209,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 Err(Error::Brew { message, .. })
                     if role != Role::Root && !taps::ambiguous_formula(&message) =>
                 {
-                    let why = match taps::untrusted_tap(&message) {
-                        Some(tap) => NameWhy::Untrusted(tap),
-                        None => NameWhy::Deps(first_line(&message)),
-                    };
-                    self.hold(role, name, why);
+                    self.hold(role, name, NameFail::from_brew(&message, NameWhy::Deps));
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -1733,11 +1742,21 @@ mod gate_tests {
         names: &[&str],
         user_flags: &[&str],
     ) -> (RunResult, String) {
+        run_on(brew, brew, git, names, user_flags)
+    }
+
+    fn run_on(
+        brew: &impl Brew,
+        inner: &MockBrew,
+        git: &InMemoryGit,
+        names: &[&str],
+        user_flags: &[&str],
+    ) -> (RunResult, String) {
         let names: Vec<String> = names.iter().map(|s| (*s).to_string()).collect();
         let user_flags: Vec<String> = user_flags.iter().map(|s| (*s).to_string()).collect();
         let tap = tempfile::tempdir().expect("tap");
         let cfg = cfg24();
-        let inv = inv_from(brew, &cfg);
+        let inv = inv_from(inner, &cfg);
         let mut out = Vec::new();
         let r = upgrade(
             brew,
@@ -1770,6 +1789,8 @@ mod gate_tests {
     struct RecordBrew {
         inner: MockBrew,
         tokens: Mutex<Vec<String>>,
+        /// `by_name` fails as a whole call for a query with this name.
+        fail_by_name: Option<&'static str>,
     }
 
     impl Brew for RecordBrew {
@@ -1797,6 +1818,12 @@ mod gate_tests {
             self.inner.outdated_names(greedy)
         }
         fn by_name(&self, q: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error> {
+            if q.iter().any(|q| Some(q.name.as_str()) == self.fail_by_name) {
+                return Err(Error::Brew {
+                    status: 1,
+                    message: "Error: brew ruby crashed\nbacktrace".into(),
+                });
+            }
             self.inner.by_name(q)
         }
         fn deps(&self, kind: PkgKind, token: &str) -> Result<Vec<String>, Error> {
@@ -1815,6 +1842,7 @@ mod gate_tests {
                 ..MockBrew::new()
             },
             tokens: Mutex::new(Vec::new()),
+            fail_by_name: None,
         };
         let cfg = cfg24();
         let inv = inv_from(&brew.inner, &cfg);
@@ -2113,6 +2141,7 @@ mod gate_tests {
                     ..MockBrew::new()
                 },
                 tokens: Mutex::new(Vec::new()),
+                fail_by_name: None,
             };
             let cfg = cfg24();
             let inv = inv_from(&brew.inner, &cfg);
@@ -2179,5 +2208,135 @@ mod gate_tests {
                 .iter()
                 .all(|a| a.first().map(String::as_str) != Some("trust"))
         );
+    }
+
+    #[test]
+    fn whole_call_by_name_failure_on_a_dependency_holds_it_as_a_lookup_failure() {
+        let git = core_git(&["alpha", "delta", "libx"]);
+        let brew = RecordBrew {
+            inner: MockBrew {
+                installed: vec![outdated("alpha"), outdated("delta")],
+                deps: deps_of(&[("alpha", &["libx"])]),
+                ..MockBrew::new()
+            },
+            tokens: Mutex::new(Vec::new()),
+            fail_by_name: Some("libx"),
+        };
+        let (r, text) = run_on(&brew, &brew.inner, &git, &[], &[]);
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains(
+                "held alpha: dependency libx: brew could not describe it by name (Error: brew ruby crashed)"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("read its dependencies"), "{text}");
+        assert!(
+            run_is_soaked_install(&lock_runs(&brew.inner), "delta"),
+            "{text}"
+        );
+        assert!(
+            !run_is_soaked_install(&lock_runs(&brew.inner), "alpha"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn whole_call_by_name_failure_on_the_target_holds_it_without_a_dep() {
+        let git = core_git(&["alpha"]);
+        let brew = RecordBrew {
+            inner: MockBrew {
+                installed: vec![outdated("alpha")],
+                ..MockBrew::new()
+            },
+            tokens: Mutex::new(Vec::new()),
+            fail_by_name: Some("alpha"),
+        };
+        let (r, text) = run_on(&brew, &brew.inner, &git, &[], &[]);
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains("held alpha: brew could not describe it by name"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn installed_dep_brew_leaves_alone_is_demoted_to_a_check() {
+        // libx is outdated, so this run would upgrade it, but brew already
+        // has its latest version installed and would not touch it.
+        let git = core_git(&["alpha", "libx"]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, true)));
+        let brew = MockBrew {
+            installed: vec![outdated("alpha"), outdated("libx")],
+            deps: deps_of(&[("alpha", &["libx"])]),
+            by_name,
+            ..MockBrew::new()
+        };
+        let (r, text) = run(&brew, &git, &["alpha"], &[]);
+        assert!(!r.refused, "{text}");
+        assert!(run_is_soaked_install(&lock_runs(&brew), "alpha"), "{text}");
+        assert!(!run_is_soaked_install(&lock_runs(&brew), "libx"), "{text}");
+    }
+
+    #[test]
+    fn deps_failure_on_a_dependency_holds_the_target_naming_it() {
+        let git = core_git(&["alpha", "libx"]);
+        let mut deps_errors = BTreeMap::new();
+        deps_errors.insert(
+            "libx".to_string(),
+            "Error: No available formula with the name \"libx\".".to_string(),
+        );
+        let brew = MockBrew {
+            installed: vec![outdated("alpha")],
+            deps: deps_of(&[("alpha", &["libx"])]),
+            deps_errors,
+            ..MockBrew::new()
+        };
+        let (r, text) = run(&brew, &git, &["alpha"], &[]);
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains(
+                "held alpha: dependency libx: brew could not read its dependencies (Error: No available formula with the name \"libx\".)"
+            ),
+            "{text}"
+        );
+        assert!(installs(&brew).is_empty(), "{:?}", installs(&brew));
+        assert!(summary(&text, "held", "1"), "{text}");
+    }
+
+    #[test]
+    fn untrusted_tap_refusal_on_a_checked_dependency_keeps_the_trust_note() {
+        let git = core_git(&["alpha", "libx"]);
+        let mut by_name = BTreeMap::new();
+        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, true)));
+        let mut deps_errors = BTreeMap::new();
+        deps_errors.insert(
+            "libx".to_string(),
+            "Error: libx: Refusing to load formula acme/tools/libx from untrusted tap acme/tools."
+                .to_string(),
+        );
+        let brew = MockBrew {
+            installed: vec![outdated("alpha"), at_cutoff("libx")],
+            deps: deps_of(&[("alpha", &["libx"])]),
+            deps_errors,
+            by_name,
+            ..MockBrew::new()
+        };
+        let (r, text) = run(&brew, &git, &["alpha"], &[]);
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains(
+                "alpha: dependency libx: brew does not trust tap acme/tools; run brew trust acme/tools, or add it to NO_SOAK"
+            ),
+            "{text}"
+        );
+        assert!(summary(&text, "held", "1"), "{text}");
+        assert!(
+            lock_runs(&brew)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("trust"))
+        );
+        assert!(installs(&brew).is_empty(), "{:?}", installs(&brew));
     }
 }

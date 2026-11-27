@@ -1,5 +1,7 @@
 use super::bare::{BareSkip, bare_action, bare_skip, latest_left, latest_note};
-use super::deps::{CutoffDepWalk, CutoffDeps, HeldDep, NameHold, NameWhy, Role, first_line};
+use super::deps::{
+    CutoffDepWalk, CutoffDeps, HeldDep, NameFail, NameHold, NameWhy, Role, first_line,
+};
 use super::notes::{
     NoteKind, by_name_note, held_tap_note, newer_than_cutoff_note, refusal_message,
     unsoakable_note, write_notes, write_session_tail,
@@ -738,7 +740,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     None => {
                         let hold = NameHold {
                             dep: None,
-                            why: NameWhy::Deps(first_line(&message)),
+                            why: NameFail::Why(NameWhy::Deps(first_line(&message))),
                         };
                         self.hold_target_by_name(name, &token, &hold)?;
                     }
@@ -960,15 +962,17 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         target_token: &str,
         hold: &NameHold,
     ) -> Result<(), Error> {
-        if let NameWhy::Untrusted(tap) = &hold.why {
-            match &hold.dep {
-                Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
-                None => self.hold_target_untrusted(target, tap),
+        let why = match &hold.why {
+            NameFail::Untrusted(tap) => {
+                match &hold.dep {
+                    Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
+                    None => self.hold_target_untrusted(target, tap),
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
+            NameFail::Why(why) => why.text(),
+        };
         self.hold_target_for_dep();
-        let why = hold.why.text();
         match &hold.dep {
             Some(dep) => writeln!(self.out, "held {target}: dependency {dep}: {why}")?,
             None => writeln!(self.out, "held {target}: {why}")?,
