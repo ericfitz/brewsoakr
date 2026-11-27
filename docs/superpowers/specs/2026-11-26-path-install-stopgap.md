@@ -92,20 +92,30 @@ also listed under Open questions.
 
 ## Verified facts (Homebrew 7.0.16-86-gfac0743, 2026-11-26)
 
-- `brew info --json=v2 --installed`, which inventory already runs, carries
-  for every formula `tap`, `versions.stable`, `revision`, `installed[].version`
-  and `ruby_source_checksum.sha256`, and for every cask `tap`, `version`,
-  `installed` and `ruby_source_checksum.sha256`. All 165 formulae and 16 casks
-  on the test machine had a checksum.
-- The checksum is the SHA-256 of the raw definition file: for `ast-grep` it
-  equals the SHA-256 of brewsoak's cutoff blob. Of 50 outdated core formulae,
-  47 had a cutoff blob identical to brew's current file.
-- A row describes what the bare name resolves to now, not the installed keg:
-  the row for a staged `cyclonedx/cyclonedx/cyclonedx-gomod` keg says
-  `tap: homebrew/core` with core's checksum.
-- `brew info --json=v2 --formula|--cask <bare name>` answers for packages that
-  are not installed, resolves a bare tap name (`terraform` gives
-  `hashicorp/tap`), and fails with `No available formula` for an unknown name.
+- brew knows the SHA-256 of the definition file it would load
+  (`Formula#ruby_source_checksum`, `Cask#ruby_source_checksum`; also
+  `ruby_source_checksum.sha256` in `brew info --json=v2`). For `ast-grep` it
+  equals the SHA-256 of brewsoak's cutoff blob. Of 50 outdated core formulae
+  on the test machine, 47 had a cutoff blob identical to brew's current file.
+- `brew install <name>`, `brew deps <name>` and `brew ruby` load a bare
+  formula name through `Formulary.factory(name)`: core first, then a unique
+  installed tap (`terraform` gives `hashicorp/tap`). Casks load through
+  `Cask::CaskLoader.load(token)`.
+- `brew info --json=v2` is not that loader. For an unqualified name it
+  reports the installed formula from the keg's receipt tap when that differs
+  from the loader's answer (`installed_resolution` in `cmd/info.rb`), and
+  `--installed` rows come from the installed kegs. A tap keg whose name also
+  exists in core would be described by its tap's file while
+  `brew install <name>` loads core's. So the gate does not read `brew info`.
+- One `brew ruby` call that runs those two loaders for all 181 installed
+  packages takes 0.7 s and prints tap, version, checksum and
+  `latest_version_installed?` for each; an unknown name raises
+  `FormulaUnavailableError` or `Cask::CaskUnavailableError`. For the staged
+  `cyclonedx/cyclonedx/cyclonedx-gomod` keg the bare name loads
+  `homebrew/core`.
+- `Tap.with_formula_name("terraform")` and `Tap.with_cask_token("ant")` are
+  `nil`: a bare name is not a fully qualified item (see the trust fact
+  below).
 - `--1` is `--direct`: `brew deps --1 --full-name <name>` lists the
   dependencies the current definition declares. Without `--1`, an installed
   formula's list comes from its keg. One call takes about 0.4 s.
@@ -131,8 +141,9 @@ also listed under Open questions.
   name) both report the upgrade. A dry run prints nothing for an installed
   cask.
 
-Not verified: what `brew info --installed` reports for a keg whose tap is
-untrusted. The design does not depend on it (see "Tap trust").
+Not verified: the exact error the loaders raise for a package in an
+untrusted tap when asked through `brew ruby`. The design does not depend on
+it (see "Tap trust").
 
 ## Design
 
@@ -157,16 +168,24 @@ inert and are left for the long-term design to remove.
 A soaked package may go to brew by name only when brew answers, from its own
 data, that:
 
-- the bare name (with `--formula` or `--cask`) resolves to the package's
-  origin tap (the row's `tap`), and
-- `ruby_source_checksum.sha256` equals the SHA-256 of the raw cutoff blob
+- the bare name loads from the package's origin tap, and
+- its `ruby_source_checksum` equals the SHA-256 of the raw cutoff blob
   from brewsoak's clone (never the staged file, which `sanitize_unofficial`
   rewrites, and never brewsoak's HEAD blob).
 
-brew's answer comes from the `info --json=v2 --installed` document inventory
-already loads, and from one `brew info --json=v2 --formula|--cask <name>`
-call for each name that is not installed. Answers are kept for the run. A
-package's by-name dependency list is used only after the package passes the
+brew's answer comes from the loaders `brew install` itself uses, run under
+`brew ruby` (as brewsoak already does for version order, version detection
+and the host platform): `Formulary.factory(name)` for a formula and
+`Cask::CaskLoader.load(token)` for a cask, printing the tap, the version
+(`pkg_version`, or the cask `version`), `ruby_source_checksum` and whether the
+latest version is installed. The first question of a run asks about every
+installed package in one call; a name that is not installed is asked when it
+comes up. Answers are kept for the run. If the script fails, or prints
+anything brewsoak does not understand, the answer is unknown and the package
+is held: a brew change that breaks the script stops installs, it does not
+let unsoaked ones through.
+
+A package's by-name dependency list is used only after the package passes the
 gate, so the list is the cutoff's list.
 
 ### Dependency closure
@@ -177,7 +196,7 @@ name and now covers the whole declared closure. For each member:
 | Member | Rule |
 |---|---|
 | The target; a missing soaked dependency; an installed soaked dependency this run upgrades first | must pass the gate; installed by name, dependencies first, as today |
-| An installed soaked formula dependency this run does not upgrade | passes if brew has it at brew's current version (newest keg equals `versions.stable` plus `_revision`), because brew then leaves it alone; otherwise it must pass the gate, because brew may upgrade it to brew's current version; never installed by brewsoak |
+| An installed soaked formula dependency this run does not upgrade | passes if brew has its latest version installed (`latest_version_installed?`, the test brew's own dependency check starts with), because brew then leaves it alone; otherwise it must pass the gate, because brew may upgrade it to brew's current version; never installed by brewsoak |
 | An installed cask dependency | left alone: brew treats any installed version as satisfied (2026-10-17, section 6) |
 | A no-soak or unsoakable dependency | brew's, as today; not walked |
 | A dependency in a held tap, or with no cutoff at all | as today (`HeldDep`, or refused from its upstream status) |
@@ -196,8 +215,8 @@ data cannot move between the gate and the install.
 
 ### Holds and messages
 
-Never fatal. Every `Error::Brew` from the walk or the lookup becomes a hold of
-that target; git and I/O errors stay fatal as today. A held target keeps its
+Never fatal. Every `Error::Brew` from the walk or the loader script becomes a
+hold of that target; git and I/O errors stay fatal as today. A held target keeps its
 `[i/N]` line, then prints `held <name>: <why>` and defers one note under
 `Held:`. The run exits 1 (2026-08-12 mixed-upgrade rule).
 
@@ -233,12 +252,13 @@ A by-name install writes a receipt that names the real tap, so:
 
 ### Tap trust
 
-Bare names never reach `trust_fully_qualified_items!`, so brew's own check
-applies: it refuses to load a package from an untrusted tap. For a target
+A bare name is not a fully qualified item, so `trust_fully_qualified_items!`
+skips it and brew's own check applies: it refuses to load a package from an
+untrusted tap. For a target
 whose origin is a third-party tap the walk asks `brew deps` before the gate,
 so the refusal keeps today's note (`<name>: brew does not trust tap <tap>;
-run brew trust <tap>, or add it to NO_SOAK`). The same text from the lookup
-or from the install maps to the same hold. brewsoak never runs `brew trust`.
+run brew trust <tap>, or add it to NO_SOAK`). The same text from the loader
+script or from the install maps to the same hold. brewsoak never runs `brew trust`.
 A tap package whose name also exists in core (`cyclonedx-gomod`) is held with
 "brew resolves the name to homebrew/core".
 

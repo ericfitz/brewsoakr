@@ -4,7 +4,7 @@
 
 **Goal:** `brewsoak upgrade|install|reinstall` stop passing staged file paths to brew. A soaked package is installed by bare name only when brew's own current definition is byte-identical to the soaked cutoff, for the package and for every dependency brew might touch; otherwise it is held with a note, and the run continues.
 
-**Architecture:** A new `Brew::by_name` question answers, from `brew info --json=v2`, where a bare name resolves and whether its `ruby_source_checksum.sha256` equals the cutoff blob's SHA-256. `CutoffDepWalk` asks `brew deps` by name, gates every closure member with it, and reports a hold instead of an error. `install_cutoff` and `install_missing_dep` build `brew install --formula|--cask <name>`.
+**Architecture:** A new `Brew::by_name` question runs the loaders `brew install` uses (`Formulary.factory`, `Cask::CaskLoader.load`) under `brew ruby` and answers where a bare name loads from and whether its `ruby_source_checksum` equals the cutoff blob's SHA-256. `brew info` is not used for this: it follows the installed keg, not the loader (spec, "Verified facts"). `CutoffDepWalk` asks `brew deps` by name, gates every closure member with it, and reports a hold instead of an error. `install_cutoff` and `install_missing_dep` build `brew install --formula|--cask <name>`.
 
 **Tech Stack:** Rust 2024. One new direct dependency, `ring` (already in `Cargo.lock` through `ureq`), for SHA-256.
 
@@ -17,7 +17,7 @@
 - Never pass `--ignore-dependencies`, a file path, or a `user/repo/name` token to a soaked `brew install` or `brew deps`. The no-soak step (`src/nosoak.rs`) and the `reinstall` true repair (`src/cmd/apply.rs:140-166`) keep their full tokens: do not touch them.
 - Never run `brew trust`. Never add a `brew update`.
 - No `#[allow(dead_code)]`. Delete crate-private code the compiler reports dead. Keep the `pub` staging helpers and their tests: `tap::write_blob`, `tap_formula_path`, `tap_cask_path`, `sanitize_unofficial`, `taps::staging_root`, `taps::staged_load_failure`. Keep `origin::staged_tap`, `origin::STAGING_TAP` and all of `inventory.rs`.
-- Keep the `tap_root` parameter of `cmd::upgrade`, `cmd::install`, `cmd::reinstall` and `apply_many` (rename to `_tap_root`), so about 100 test call sites stay as they are. Remove the `tap_root` field from `ApplySession` and `CutoffDepWalk`.
+- Keep the `tap_root` parameter of `cmd::upgrade`, `cmd::install`, `cmd::reinstall` and `apply_many` (rename to `_tap_root` in Task 4), so about 100 test call sites stay as they are. Remove the `tap_root` field from `CutoffDepWalk` (Task 3) and `ApplySession` (Task 4).
 - `MockBrew::by_name` answers "same source, origin tap, not installed-current" for every name it was not scripted for, so existing tests keep installing.
 - Existing tests that assert `.rb` paths are migrated to assert the bare name, not deleted.
 - American English. Match surrounding comment density. Use `rg PATTERN .` (always give a path).
@@ -51,7 +51,7 @@
 
 ### Task 2: `Brew::by_name`
 
-**Files:** Modify `src/brew.rs` (trait at line 61, `ProcessBrew` at 135 and 377, `brewsoak_brew_env_pairs` at 658, `MockBrew` at 253 and 788, `parse_installed_json` at 1176); create `tests/fixtures/brew-info-v2.json`; modify the delegating test brews at `src/lib.rs:672` and `src/cmd/deps.rs:502`, `:590`.
+**Files:** Modify `src/brew.rs` (the `*_RUBY` constants at lines 43-60, trait at 61, `ProcessBrew` at 135 and 377, `brewsoak_brew_env_pairs` at 658, `MockBrew` at 253 and 788); modify the delegating test brews at `src/lib.rs:672` and `src/cmd/deps.rs:502`, `:590`.
 
 Types (all `pub`, `Debug, Clone, PartialEq, Eq`):
 
@@ -71,11 +71,11 @@ pub struct NameQuery {
 pub struct ByName {
     /// Lowercase `user/repo` the name resolves to.
     pub tap: String,
-    /// Formula: `versions.stable`, plus `_<revision>` when it is above 0. Cask: `version`.
+    /// Formula: `pkg_version` (`1.5.2_3`). Cask: `version`.
     pub version: String,
-    /// `ruby_source_checksum.sha256` equals the query's `cutoff_sha256`.
+    /// brew's `ruby_source_checksum` equals the query's `cutoff_sha256`.
     pub same_source: bool,
-    /// The newest installed keg (or the installed cask) is at `version`.
+    /// brew's `latest_version_installed?` (cask: installed at `version`).
     pub installed_current: bool,
 }
 
@@ -87,21 +87,45 @@ impl ByName {
 
 // trait Brew, no default body:
 /// One answer per query, in order. `Err(text)` is brew's own failure for
-/// that name (unknown name, untrusted tap). The outer `Err` is a spawn failure.
+/// that name (unknown name, untrusted tap, a script brewsoak could not
+/// read). The outer `Err` is only "brew not found".
 fn by_name(&self, queries: &[NameQuery]) -> Result<Vec<Result<ByName, String>>, Error>;
 ```
 
+The script, a new constant beside `COMPARE_VERSIONS_RUBY` (names arrive as ARGV, never as Ruby source):
+
+```ruby
+ARGV.each_slice(2) do |kind, name|
+  begin
+    if kind == "cask"
+      c = Cask::CaskLoader.load(name)
+      sum = c.ruby_source_checksum
+      puts ["OK", c.tap&.name, c.version, sum && sum[:sha256], c.installed_version.to_s == c.version.to_s].join("\t")
+    else
+      f = Formulary.factory(name)
+      puts ["OK", f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?].join("\t")
+    end
+  rescue StandardError, ScriptError => e
+    puts ["ERR", e.class, e.message.lines.first.to_s.strip].join("\t")
+  end
+end
+```
+
+Verified output on Homebrew 7.0.16: `OK	homebrew/core	0.51.3	b3c32fcf…	false` for `formula ast-grep`; `ERR	FormulaUnavailableError	No available formula with the name "no-such-xyz".`.
+
 - [ ] **Failing tests first** (`src/brew.rs` tests):
-  - `parse_current_rows_reads_formulae_and_casks`: from the fixture, `ast-grep` (stable `0.51.3`, revision 0, installed `0.51.1`, its checksum), a formula with revision 3 (version `1.5.2_3`), a row with no `ruby_source_checksum` (checksum `None`), a core-collision row (`cyclonedx-gomod`, tap `homebrew/core`), and a cask (`version`, string `installed`, `tap`). Build the fixture by trimming real `brew info --json=v2 --installed` output to those rows and the fields named here; it must contain no local paths.
-  - `judge_same_source_needs_equal_checksum`, `judge_no_cutoff_is_never_same_source`, `judge_installed_current_compares_newest_keg_to_stable_plus_revision`, `installs_cutoff_needs_the_origin_tap` (case-insensitive).
-  - `process_brew_by_name_asks_info_once_per_uninstalled_name` and `process_brew_by_name_reports_brew_failure_as_err_text`, with the fake `brew.sh` harness of `process_brew_deps_asks_brew_for_full_names` (line 1497): assert the logged args are `info --json=v2 --formula hello` exactly once for two queries, and that a script exiting 1 with stderr yields `Ok(vec![Err(text)])`.
-  - `process_brew_deps_asks_once_per_token` (same harness, two `deps` calls, one log line).
+  - `parse_by_name_lines_reads_ok_and_err_rows`: an `OK` formula row, an `OK` cask row, an `OK` row with an empty checksum (never `same_source`), an `OK` row with an empty tap (`Err`), an `ERR` row (`Err` carrying the message), and a malformed row (`Err`).
+  - `parse_by_name_lines_short_output_is_err_for_the_missing_names` (fewer lines than queries).
+  - `judge_same_source_needs_equal_checksum`, `judge_no_cutoff_is_never_same_source`, `installs_cutoff_needs_the_origin_tap` (case-insensitive; `cyclonedx-gomod` loading `homebrew/core` with origin `cyclonedx/cyclonedx` is false).
+  - With the fake `brew.sh` harness of `process_brew_deps_asks_brew_for_full_names` (line 1497): `process_brew_by_name_asks_about_every_installed_package_in_its_first_call` (after `installed_packages`, one `ruby` spawn whose ARGV holds the installed names and the queried one; a second query for an installed name spawns nothing), `process_brew_by_name_asks_once_per_uninstalled_name`, and `process_brew_by_name_script_failure_is_err_for_every_query` (script exits 1: `Ok(vec![Err(_), Err(_)])`, never an outer `Err`).
+  - `process_brew_by_name_never_runs_brew_info`: no logged spawn starts with `info` besides the inventory's `info --json=v2 --installed`.
+  - `process_brew_deps_asks_once_per_token` (two `deps` calls, one log line).
   - `brew_children_never_force_api_auto_update`: `brewsoak_brew_env_pairs()` contains `("HOMEBREW_FORCE_API_AUTO_UPDATE", None)`.
   - `mock_by_name_defaults_to_same_source` and `mock_by_name_honors_scripted_answers`.
 - [ ] Implement:
-  - `pub(crate) struct CurrentRow { kind, name, tap, version, source_sha256: Option<String>, installed: Option<String> }`, `pub(crate) fn parse_current_rows(json: &str) -> Result<Vec<CurrentRow>, Error>` (reuse `json_objects_in_array`, `find_json_key`, `json_string_value`, `installed_version`; add a small integer reader for `revision`), and `pub(crate) fn judge(row: &CurrentRow, q: &NameQuery) -> ByName`.
-  - `ProcessBrew`: `current: Mutex<HashMap<(&'static str, String), Result<CurrentRow, String>>>`, filled from the same JSON inside `installed_packages` and by `by_name` misses (`info --json=v2 --formula|--cask <name>`, one call per name, failures remembered). `deps_memo: Mutex<HashMap<(&'static str, String), Vec<String>>>` in `deps` (successes only).
-  - `MockBrew`: `pub by_name: BTreeMap<String, Result<ByName, String>>` (keyed by name) and `pub by_name_queries: Mutex<Vec<NameQuery>>`. An unscripted name answers `Ok(ByName { tap: q.origin.clone(), version: String::new(), same_source: true, installed_current: false })`. `ProcessBrew` reads the tap from brew and ignores `q.origin`.
+  - `pub(crate) struct Loaded { tap: String, version: String, source_sha256: Option<String>, installed_current: bool }`, `pub(crate) fn parse_by_name_lines(stdout: &str, count: usize) -> Vec<Result<Loaded, String>>`, and `pub(crate) fn judge(loaded: &Loaded, q: &NameQuery) -> ByName`.
+  - `ProcessBrew`: `loaded: Mutex<HashMap<(&'static str, String), Result<Loaded, String>>>` and `installed_names: Mutex<Vec<(PkgKind, String)>>` (filled by `installed_packages`). `by_name` asks, in one `brew ruby -e BY_NAME_RUBY -- kind name …` spawn, for every queried name not yet in `loaded`, plus (the first time) every installed name; failures are remembered like successes. `deps_memo: Mutex<HashMap<(&'static str, String), Vec<String>>>` in `deps` (successes only).
+  - `MockBrew`: `pub by_name: BTreeMap<String, Result<ByName, String>>` (keyed by name) and `pub by_name_queries: Mutex<Vec<NameQuery>>`. An unscripted name answers `Ok(ByName { tap: q.origin.clone(), version: String::new(), same_source: true, installed_current: false })`.
   - Delegate `by_name` in `EchoVisibleBrew` and both `FailDepsBrew` impls.
 - [ ] **Accept:** done gate passes; no caller yet. Commit.
 
@@ -134,7 +158,7 @@ pub(super) fn by_name_note(name: &str, dep: Option<&str>, why: &str, brew_verb: 
 
 1. Token for `brew.deps` is the bare `name`. No staging write.
 2. A `Root` whose origin is a third-party tap calls `brew.deps` first, so an untrusted-tap refusal keeps its note; the list is used only after step 3 passes.
-3. Ask `by_name` with `sha256_hex` of the cutoff blob from `resolve_pkg_blobs` (`None` when there is none). `Root` and `Install` need `installs_cutoff(origin)`. `Check` passes on `installed_current || installs_cutoff(origin)`. An installed dependency that would be `Install` but is `installed_current` without `installs_cutoff` is treated as `Check`. A failure sets `self.by_name` (`dep: None` for `Root`) and returns. An `Err(text)` answer is `Untrusted` when `taps::untrusted_tap(text)` matches, else `Lookup`.
+3. Ask `by_name` (with the member's origin and `sha256_hex` of the cutoff blob from `resolve_pkg_blobs`, `None` when there is none). `Root` and `Install` need `installs_cutoff(origin)`. `Check` passes on `installed_current || installs_cutoff(origin)`. An installed dependency that would be `Install` but is `installed_current` without `installs_cutoff` is treated as `Check`. A failure sets `self.by_name` (`dep: None` for `Root`) and returns. An `Err(text)` answer is `Untrusted` when `taps::untrusted_tap(text)` matches, else `Lookup`.
 4. For each dependency: an installed cask, a no-soak or unsoakable package, and an installed package in a held or snapshot-less tap `continue` as today. An installed soaked formula is visited as `Install` when `upgrades_this_run`, else as `Check`. A missing dependency is handled as today (`HeldDep`, the no-cutoff push, or `visit(.., Install)`).
 5. A `brew.deps` error below the root sets `NameHold { dep, why: Deps | Untrusted }`; at the root it propagates as today.
 6. Only `Install` members are pushed to `out`.
@@ -149,17 +173,17 @@ pub(super) fn by_name_note(name: &str, dep: Option<&str>, why: &str, brew_verb: 
   - `missing_dep_not_at_brew_current_holds_the_target`: note reads `alpha: dependency libx: brew would install …`.
   - `outdated_installed_dep_not_at_cutoff_holds_the_target`: `libx` installed, not upgrading this run, scripted `same_source: false, installed_current: false`.
   - `installed_current_dep_is_left_alone_and_walked_through`: `libx` scripted `installed_current: true, same_source: false` passes; its missing dependency `liby` scripted `same_source: false` holds the target naming `liby`.
-  - `name_resolving_to_another_tap_holds_the_target`: tap formula `cyclonedx-gomod`, answer tap `homebrew/core`; note has `brew resolves the name to homebrew/core, not cyclonedx/cyclonedx` and the bypass token `cyclonedx/cyclonedx/cyclonedx-gomod`.
+  - `name_resolving_to_another_tap_holds_the_target`: installed tap formula `cyclonedx-gomod` with receipt tap `cyclonedx/cyclonedx` (the keg the note's own bypass command creates), answer tap `homebrew/core` with `same_source: true`; note has `brew resolves the name to homebrew/core, not cyclonedx/cyclonedx` and the bypass token `cyclonedx/cyclonedx/cyclonedx-gomod`.
   - `held_target_takes_back_its_upgraded_count`: Summary shows it under held, not upgraded.
   - `dry_run_reports_the_same_hold` (`--dry-run` flag).
   - `cask_target_is_gated_by_name` (`--cask` deps token is the bare cask token).
   - Migrate, do not delete: `deps_failure_on_staged_tap_formula_holds_with_note` (now the `Deps` hold, keyed by bare name), `deps_untrusted_tap_refusal_holds_with_trust_note`, `untrusted_tap_refusal_on_a_dep_holds_the_dep`; each still asserts no `trust` run.
-- [ ] Implement as above. Staged installs are still built by `install_cutoff` in this task; tests that asserted the walk staged dependency files move their assertion to Task 4.
+- [ ] Implement as above. Remove the `tap_root` field of `CutoffDepWalk` here (nothing reads it once the walk stops staging; clippy would fail the gate). `install_cutoff` and `install_missing_dep` still stage and install by path in this task, so `ApplySession.tap_root` stays until Task 4; tests that asserted the walk staged dependency files move their assertion to Task 4.
 - [ ] **Accept:** done gate passes; `rg -n 'write_cutoff_blob' src` is empty. Commit.
 
 ### Task 4: Install by name; origin bookkeeping
 
-**Files:** Modify `src/tap.rs` (`brew_install_args`, line 41, and its tests), `src/cmd/apply.rs` (`install_cutoff`, `install_missing_dep` 798-909, `record_staged_install` 1051-1089, `record_origin` 1032-1046, `StagedRun` 1172-1180, `hold_staged_copy`/`hold_target_staged_copy`, `staged_install_flags`, `staging_dir` 1203, the `tap_root` field), `src/cmd/deps.rs` (drop its `tap_root` field), `src/cmd/test_support.rs` (`run_is_soaked_install`, line 215).
+**Files:** Modify `src/tap.rs` (`brew_install_args`, line 41, and its tests), `src/cmd/apply.rs` (`install_cutoff`, `install_missing_dep` 798-909, `record_staged_install` 1051-1089, `record_origin` 1032-1046, `StagedRun` 1172-1180, `hold_staged_copy`/`hold_target_staged_copy`, `staged_install_flags`, `staging_dir` 1203, the `tap_root` field), `src/cmd/test_support.rs` (`run_is_soaked_install`, line 215).
 
 - [ ] **Failing tests first:**
   - `src/tap.rs`: `brew_install_args_ends_with_the_bare_name` (`["install", "--formula", "wget"]`); migrate the four flag tests to a token argument.
@@ -171,7 +195,7 @@ pub(super) fn by_name_note(name: &str, dep: Option<&str>, why: &str, brew_verb: 
   - Migrate `untrusted_tap_refusal_holds_the_target_and_never_runs_brew_trust` (`src/cmd/install.rs:353`) to the by-name args.
   - Replace `staged_load_failure_holds_with_note_and_does_not_fail_the_run` (`src/cmd/install.rs:263`) with `brew_load_error_by_name_is_brews_failure_and_the_run_continues`: brew's exit code is kept, no "staged copy" text, the next package runs.
   - `src/inventory.rs`: `by_name_keg_classifies_by_its_receipt_tap_ahead_of_a_stale_record` (receipt tap `hashicorp/tap`, record naming another tap); skip if an existing test already asserts exactly this, and say which.
-- [ ] Implement: `pub fn brew_install_args(pkg: &PkgRef, token: &str, user_flags: &[String]) -> Vec<String>`; rename `record_staged_install` to `record_name_install` and `StagedRun` to `NameRun { Ran { failed }, Untrusted(String) }`; on `installed_now` call `forget_origin(kind, name)`; delete `record_origin`, `LoadFailure`, the staged-copy holds, `staging_dir`, and the `tap_root` fields. Rename `run_is_soaked_install` to `run_is_name_install(runs, name)` (an `install` run whose last argument is `name`, without `--ignore-dependencies`) and update its callers.
+- [ ] Implement: `pub fn brew_install_args(pkg: &PkgRef, token: &str, user_flags: &[String]) -> Vec<String>`; rename `record_staged_install` to `record_name_install` and `StagedRun` to `NameRun { Ran { failed }, Untrusted(String) }`; on `installed_now` call `forget_origin(kind, name)`; delete `record_origin`, `LoadFailure`, the staged-copy holds, `staging_dir`, and the `tap_root` field of `ApplySession`. Rename `run_is_soaked_install` to `run_is_name_install(runs, name)` (an `install` run whose last argument is `name`, without `--ignore-dependencies`) and update its callers.
 - [ ] **Accept:** done gate passes; `rg -n 'write_blob|staging_dir|staged_load_failure' src/cmd` is empty. Commit.
 
 ### Task 5: Sweep
