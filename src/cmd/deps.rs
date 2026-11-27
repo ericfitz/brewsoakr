@@ -523,6 +523,12 @@ mod tests {
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
             }
+            fn by_name(
+                &self,
+                q: &[crate::brew::NameQuery],
+            ) -> Result<Vec<Result<crate::brew::ByName, String>>, Error> {
+                self.0.by_name(q)
+            }
             fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
                 Err(Error::Brew {
                     status: 1,
@@ -610,6 +616,12 @@ mod tests {
             }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
+            }
+            fn by_name(
+                &self,
+                q: &[crate::brew::NameQuery],
+            ) -> Result<Vec<Result<crate::brew::ByName, String>>, Error> {
+                self.0.by_name(q)
             }
             fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
                 Err(Error::Brew {
