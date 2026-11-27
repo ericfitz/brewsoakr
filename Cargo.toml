@@ -11,6 +11,7 @@ keywords = ["homebrew", "brew", "security"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
 toml = "0.8"
