@@ -588,6 +588,7 @@ mod tests {
             deps,
             taps: hashicorp_tap(),
             next_outputs: std::sync::Mutex::new(std::collections::VecDeque::from(vec![
+                (0, Vec::new()),
                 (1, widget_refusal.into_bytes()),
                 (1, PACKER_REFUSAL.to_vec()),
             ])),
@@ -1482,6 +1483,7 @@ mod tests {
         assert_eq!(
             visible,
             vec![
+                vec!["update"],
                 vec!["install", "--formula", "lib"],
                 vec!["install", "--formula", "fresh"]
             ]

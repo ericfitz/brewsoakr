@@ -88,7 +88,10 @@ mod tests {
         )
         .unwrap();
         let visible = brew.visible_runs.lock().unwrap().clone();
-        assert_eq!(visible, vec![vec!["install", "--formula", "alpha"]]);
+        assert_eq!(
+            visible,
+            vec![vec!["update"], vec!["install", "--formula", "alpha"]]
+        );
     }
 
     #[test]
@@ -217,7 +220,18 @@ mod tests {
             &mut out,
         )
         .expect("upgrade");
-        assert!(lock_runs(&brew).is_empty(), "soaking must not invoke brew");
+        // A bare run with an empty plan has no soaked work; a named run of a
+        // soaked package updates once and runs nothing else.
+        let expected: Vec<Vec<String>> = if names.is_empty() {
+            Vec::new()
+        } else {
+            vec![vec!["update".to_string()]]
+        };
+        assert_eq!(
+            lock_runs(&brew),
+            expected,
+            "soaking runs at most the update"
+        );
         String::from_utf8(out).expect("utf8")
     }
 
@@ -248,7 +262,7 @@ mod tests {
     fn named_run_nothing_to_do_no_soaked_header() {
         let text = soaking_upgrade(&["wget".to_string()]);
         assert!(!text.contains("soaked packages"), "{text}");
-        assert!(text.starts_with("Summary\n"), "{text}");
+        assert!(text.starts_with("Updating Homebrew\nSummary\n"), "{text}");
     }
 
     #[test]

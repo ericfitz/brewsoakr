@@ -276,6 +276,8 @@ mod tests {
             taps: hashicorp_tap(),
             ..MockBrew::new()
         };
+        // The run's `brew update` takes the first queued answer.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
         brew.next_outputs.lock().unwrap().push_back((
             1,
             b"Error: cannot load such file -- ../lib/helper\n".to_vec(),
@@ -364,6 +366,8 @@ mod tests {
             next_stdout: PACKER_REFUSAL.to_vec(),
             ..MockBrew::new()
         };
+        // The run's `brew update` succeeds; the install after it is refused.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
         let (r, text) = install_packer(&brew, &git, &snaps);
         assert!(r.refused);
         assert_eq!(r.brew_status, None, "a trust hold is not a brew failure");
@@ -695,9 +699,10 @@ mod tests {
         let result =
             call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out).expect("reinstall");
         let runs = lock_runs(&brew);
-        assert!(
-            runs.is_empty(),
-            "already soaked must not brew reinstall or install: {runs:?}"
+        assert_eq!(
+            runs,
+            vec![vec!["update".to_string()]],
+            "already soaked must only update, not reinstall or install"
         );
         assert!(!result.refused, "already soaked is not a refusal");
     }
@@ -741,6 +746,68 @@ mod tests {
     }
 
     #[test]
+    fn install_and_reinstall_update_before_soaked_work() {
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.2.0", "newsha"),
+        );
+        // `install` of a package that is not installed yet.
+        let brew = MockBrew::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let tap = tempfile::tempdir().expect("tap");
+        install(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["wget".to_string()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .expect("install");
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[0], vec!["update".to_string()], "{runs:?}");
+        assert_eq!(
+            runs.iter().filter(|a| a.as_slice() == ["update"]).count(),
+            1
+        );
+        assert!(run_is_name_install(&runs[1..], "wget"), "{runs:?}");
+        // A cutoff `reinstall` of a package installed behind the cutoff.
+        let old = formula_rb("wget", "1.0.0", "oldsha");
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", old)],
+            ..MockBrew::new()
+        };
+        let mut out = Vec::new();
+        call_reinstall(
+            &brew,
+            &git,
+            &core_snaps(),
+            tap.path(),
+            &["wget".to_string()],
+            &mut out,
+        )
+        .expect("reinstall");
+        let runs = lock_runs(&brew);
+        assert_eq!(runs[0], vec!["update".to_string()], "{runs:?}");
+        assert_eq!(
+            runs.iter().filter(|a| a.as_slice() == ["update"]).count(),
+            1
+        );
+        assert!(run_is_name_install(&runs[1..], "wget"), "{runs:?}");
+    }
+
+    #[test]
     fn reinstall_missing() {
         let wget_mid = formula_rb("wget", "1.1.0", "midsha");
         let wget_new = formula_rb("wget", "1.2.0", "newsha");
@@ -757,9 +824,10 @@ mod tests {
         let err = call_reinstall(&brew, &git, &snaps, tap.path(), &names, &mut out)
             .expect_err("missing reinstall must refuse");
         let runs = lock_runs(&brew);
-        assert!(
-            runs.is_empty(),
-            "missing reinstall must not run brew: {runs:?}"
+        assert_eq!(
+            runs,
+            vec![vec!["update".to_string()]],
+            "missing reinstall must only update"
         );
         match err {
             Error::Refusal(msg) => {
@@ -898,6 +966,8 @@ mod tests {
             next_stderr: b"Error: fresh 1.1.0 is already installed\n".to_vec(),
             ..MockBrew::new()
         };
+        // The run's `brew update` succeeds; the install after it answers.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
         let snaps = core_snaps();
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
@@ -1112,10 +1182,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             lock_runs(&brew),
-            vec![vec![
-                "reinstall".to_string(),
-                "hashicorp/tap/terraform".to_string()
-            ]]
+            vec![
+                vec!["update".to_string()],
+                vec![
+                    "reinstall".to_string(),
+                    "hashicorp/tap/terraform".to_string()
+                ]
+            ]
         );
     }
 
@@ -1295,7 +1368,8 @@ mod tests {
         assert!(String::from_utf8(out).unwrap().contains(
             "terraform is installed from homebrew/core; brewsoak does not switch taps; use brew"
         ));
-        assert!(lock_runs(&brew).is_empty());
+        // Soaked work still updates; the refusal runs nothing else.
+        assert_eq!(lock_runs(&brew), vec![vec!["update".to_string()]]);
         assert_eq!(
             OriginRecords::load(cache.path()).get(PkgKind::Formula, "terraform"),
             None

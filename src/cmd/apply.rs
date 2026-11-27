@@ -67,6 +67,7 @@ pub fn reinstall(
         force_formula: false,
         refused: false,
         brew_status: None,
+        brew_updated: None,
         counts: Counts {
             dry_run,
             ..Counts::default()
@@ -89,6 +90,7 @@ pub fn reinstall(
             report::soak_banner("reinstalling", snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
+    session.update_before_soaked_work(names)?;
     for raw in names {
         let r = resolve_token(raw, inv, cfg)?;
         if session.refuses_tap_switch(&r) {
@@ -214,6 +216,7 @@ pub(super) fn apply_many(
         force_formula,
         refused: false,
         brew_status: None,
+        brew_updated: None,
         counts: Counts {
             dry_run,
             ..Counts::default()
@@ -243,6 +246,7 @@ pub(super) fn apply_many(
             report::soak_banner(doing, snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
+    session.update_before_soaked_work(names)?;
     if plan.is_some() {
         session.out.open()?;
     }
@@ -282,6 +286,9 @@ pub(super) struct ApplySession<'a, B, G, W: Write> {
     force_formula: bool,
     refused: bool,
     brew_status: Option<i32>,
+    /// `Some(true)`: this run's `brew update` succeeded. `Some(false)`: it
+    /// failed. `None`: it did not run.
+    brew_updated: Option<bool>,
     counts: Counts,
     /// Cellar versions brew has reported installing so far this session,
     /// including transitive dependencies nobody asked for by name. The
@@ -312,6 +319,34 @@ pub(super) struct ApplySession<'a, B, G, W: Write> {
 }
 
 impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
+    /// Spec "`brew update` before soaked work": one `brew update` ahead of any
+    /// loader or `brew deps` question, so brew's data is fresh for the gate.
+    /// A failure is a note and an exit code, never a hold.
+    fn update_before_soaked_work(&mut self, names: &[String]) -> Result<(), Error> {
+        let soaked = if self.bare_run {
+            self.plan_total.is_some_and(|n| n > 0)
+        } else {
+            names.iter().any(|raw| {
+                resolve_token(raw, self.inv, self.cfg)
+                    .is_ok_and(|r| matches!(r.class, PkgClass::Soaked))
+            })
+        };
+        if !soaked {
+            return Ok(());
+        }
+        match nosoak::brew_update(self.brew, self.out.get_mut())? {
+            None => self.brew_updated = Some(true),
+            Some(code) => {
+                self.brew_updated = Some(false);
+                self.defer(format!(
+                    "brew update failed (exit {code}); brew's data may be older than the soak cutoff, so more packages may be held"
+                ));
+                max_status(&mut self.brew_status, code);
+            }
+        }
+        Ok(())
+    }
+
     fn defer(&mut self, msg: String) {
         self.deferred.push((NoteKind::Other, msg));
     }
@@ -1086,11 +1121,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// one `brew <verb>` with every no-soak package as a full token.
     fn run_nosoak(&mut self) -> Result<(), Error> {
         let targets = std::mem::take(&mut self.nosoak);
-        let step = nosoak::run_step(
+        let step = nosoak::run_step_after(
             self.brew,
             self.brew_verb,
             self.user_flags,
             &targets,
+            self.brew_updated == Some(true),
             self.out.get_mut(),
         )?;
         self.counts.no_soak += step.count;
@@ -1199,8 +1235,7 @@ mod tests {
     use crate::cmd::test_support::{
         call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg,
         formula_pkg_from, formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs,
-        run_has_token, run_is_name_install, tapped, unused_cache, upgrade_names,
-        upgrade_names_flags,
+        run_is_name_install, tapped, unused_cache, upgrade_names, upgrade_names_flags,
     };
     use crate::cmd::upgrade::upgrade;
 
@@ -1275,7 +1310,7 @@ mod tests {
             &flags,
         );
         assert!(
-            text.starts_with("Would upgrade soaked packages\n  "),
+            text.starts_with("Updating Homebrew\nWould upgrade soaked packages\n  "),
             "{text}"
         );
         assert!(text.contains("\n  would upgrade "), "{text}");
@@ -1287,7 +1322,9 @@ mod tests {
             two_outdated_world("\u{1f37a}  /opt/homebrew/Cellar/left/1.1.0: 5 files, 1MB\n");
         let text = upgrade_both(&brew, &git);
         assert!(
-            text.starts_with("Upgrading soaked packages\n  upgrading left 1.0.0 -> 1.1.0\n"),
+            text.starts_with(
+                "Updating Homebrew\nUpgrading soaked packages\n  upgrading left 1.0.0 -> 1.1.0\n"
+            ),
             "{text}"
         );
         assert!(text.contains("\nSummary\n  upgraded"), "{text}");
@@ -1333,7 +1370,7 @@ mod tests {
         let visible = brew.visible_runs.lock().expect("visible").clone();
         assert_eq!(
             visible.len(),
-            1,
+            2,
             "right was already at cutoff; expected no second brew run: {visible:?}"
         );
         assert!(text.contains("upgrading left 1.0.0 -> 1.1.0"), "{text}");
@@ -1350,7 +1387,7 @@ mod tests {
         );
         let text = upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
-        assert_eq!(visible.len(), 1, "{visible:?}\n{text}");
+        assert_eq!(visible.len(), 2, "{visible:?}\n{text}");
         assert!(
             text.contains("[2/2] right go1.1.0: already upgraded as a dependency"),
             "{text}"
@@ -1365,7 +1402,7 @@ mod tests {
         );
         upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
-        assert_eq!(visible.len(), 2, "{visible:?}");
+        assert_eq!(visible.len(), 3, "{visible:?}");
     }
 
     #[test]
@@ -1375,7 +1412,7 @@ mod tests {
         brew.kegs.clear();
         upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
-        assert_eq!(visible.len(), 2, "{visible:?}");
+        assert_eq!(visible.len(), 3, "{visible:?}");
     }
 
     /// `node` depends on `simdutf`; both are installed, `node` sorts first.
@@ -1481,6 +1518,8 @@ mod tests {
         )];
         brew.deps
             .insert("node".to_string(), vec!["hashicorp/tap/widget".to_string()]);
+        // The run's `brew update` takes the first queued answer.
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
         brew.next_outputs
             .lock()
             .unwrap()
@@ -1678,8 +1717,9 @@ mod tests {
         let flags = ["--dry-run".to_string()];
         upgrade_names_flags(&brew, &git, &["node".to_string()], &flags);
         let visible = brew.visible_runs.lock().expect("visible").clone();
-        assert_eq!(visible.len(), 2, "{visible:?}");
-        for args in &visible {
+        assert_eq!(visible.len(), 3, "{visible:?}");
+        assert_eq!(visible[0], ["update"], "{visible:?}");
+        for args in &visible[1..] {
             assert!(args.iter().any(|a| a == "--dry-run"), "{args:?}");
         }
     }
@@ -1732,8 +1772,8 @@ mod tests {
         let flags = ["--greedy", "--ignore-pinned", "--verbose"].map(String::from);
         let text = upgrade_names_flags(&brew, &git, &[], &flags);
         let visible = brew.visible_runs.lock().expect("visible").clone();
-        assert_eq!(visible.len(), 2, "{visible:?}");
-        for args in &visible {
+        assert_eq!(visible.len(), 3, "{visible:?}");
+        for args in &visible[1..] {
             assert!(
                 !args
                     .iter()
@@ -1798,7 +1838,7 @@ mod tests {
             two_outdated_world("\u{1f37a}  /opt/homebrew/Cellar/right/1.0.9: 5 files, 1MB\n");
         upgrade_both(&brew, &git);
         let visible = brew.visible_runs.lock().expect("visible").clone();
-        assert_eq!(visible.len(), 2, "{visible:?}");
+        assert_eq!(visible.len(), 3, "{visible:?}");
     }
 
     #[test]
@@ -1879,8 +1919,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn upgrade_runs_soaked_work_first_then_one_update_and_one_upgrade_for_no_soak() {
+    /// `alpha` is soaked work; `brewsoak` and `wget` are no-soak.
+    fn soaked_and_no_soak_world() -> (MockBrew, InMemoryGit, Config) {
         let git = InMemoryGit::new();
         git.insert_blob(
             "cutoffsha",
@@ -1909,6 +1949,12 @@ mod tests {
             ..MockBrew::new()
         };
         let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\", \"wget\"]\n");
+        (brew, git, cfg)
+    }
+
+    #[test]
+    fn upgrade_runs_soaked_work_first_then_one_update_and_one_upgrade_for_no_soak() {
+        let (brew, git, cfg) = soaked_and_no_soak_world();
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
@@ -1926,23 +1972,278 @@ mod tests {
         )
         .unwrap();
         let runs = lock_runs(&brew);
+        assert_eq!(runs[0], vec!["update".to_string()], "{runs:?}");
         assert!(
-            run_is_name_install(&runs[..1], "alpha"),
+            run_is_name_install(&runs[1..2], "alpha"),
             "soaked first: {runs:?}"
         );
-        assert_eq!(runs[1], vec!["update".to_string()]);
         assert_eq!(runs[2], vec!["upgrade", "ericfitz/tap/brewsoak", "wget"]);
-        assert_eq!(runs.len(), 3);
+        assert_eq!(
+            runs.len(),
+            3,
+            "the no-soak step repeats no update: {runs:?}"
+        );
         assert!(!r.refused);
         let text = String::from_utf8(out).unwrap();
         assert!(summary_has(&text, "no-soak", "2"), "{text}");
     }
 
+    /// Wraps a `MockBrew` and logs every `run_visible_in`, `deps` and
+    /// `by_name` call in one list, in call order.
+    struct LogBrew {
+        inner: MockBrew,
+        log: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LogBrew {
+        fn note(&self, entry: String) {
+            self.log.lock().unwrap().push(entry);
+        }
+    }
+
+    impl crate::brew::Brew for LogBrew {
+        fn brew_bin(&self) -> &Path {
+            self.inner.brew_bin()
+        }
+        fn run(&self, a: &[String]) -> Result<std::process::Output, Error> {
+            self.inner.run(a)
+        }
+        fn run_visible_in(
+            &self,
+            a: &[String],
+            t: &mut dyn std::io::Write,
+            ctx: &crate::quiet::RunContext,
+        ) -> Result<std::process::Output, Error> {
+            self.note(format!("run {}", a.join(" ")));
+            self.inner.run_visible_in(a, t, ctx)
+        }
+        fn installed_packages(&self) -> Result<Vec<InstalledPkg>, Error> {
+            self.inner.installed_packages()
+        }
+        fn tap_info(&self) -> Result<Vec<crate::taps::TapInfo>, Error> {
+            self.inner.tap_info()
+        }
+        fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
+            self.inner.outdated_names(greedy)
+        }
+        fn by_name(
+            &self,
+            q: &[crate::brew::NameQuery],
+        ) -> Result<Vec<Result<crate::brew::ByName, String>>, Error> {
+            self.note("by_name".to_string());
+            self.inner.by_name(q)
+        }
+        fn deps(&self, k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
+            self.note(format!("deps {token}"));
+            self.inner.deps(k, token)
+        }
+    }
+
     #[test]
-    fn upgrade_without_no_soak_packages_never_runs_brew_update() {
+    fn soaked_upgrade_runs_brew_update_before_asking_brew_anything() {
+        let (inner, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        let brew = LogBrew {
+            inner,
+            log: std::sync::Mutex::new(Vec::new()),
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew.inner, &cfg);
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &["node".to_string()],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let log = brew.log.lock().unwrap().clone();
+        assert_eq!(
+            log.first().map(String::as_str),
+            Some("run update"),
+            "{log:?}"
+        );
+        assert_eq!(
+            log.iter().filter(|e| *e == "run update").count(),
+            1,
+            "{log:?}"
+        );
+        assert!(
+            log.iter().any(|e| e.starts_with("deps ") || e == "by_name"),
+            "the gate asked brew something after the update: {log:?}"
+        );
+    }
+
+    #[test]
+    fn bare_upgrade_with_an_empty_plan_runs_no_brew_update() {
+        // Installed at the cutoff while HEAD is newer: nothing to upgrade.
+        let wget_mid = formula_rb("wget", "1.1.0", "midsha");
+        let git = InMemoryGit::new();
+        git.insert_blob("cutoffsha", "Formula/w/wget.rb", wget_mid.clone());
+        git.insert_blob(
+            "headsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.2.0", "newsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", wget_mid)],
+            ..MockBrew::new()
+        };
+        let text = upgrade_names(&brew, &git, &[]);
+        assert!(lock_runs(&brew).is_empty(), "{:?}", lock_runs(&brew));
+        assert!(!text.contains("Updating Homebrew"), "{text}");
+    }
+
+    #[test]
+    fn named_run_of_only_no_soak_packages_updates_in_the_no_soak_step() {
+        let (brew, git, cfg) = soaked_and_no_soak_world();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &["wget".to_string()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let runs = lock_runs(&brew);
+        assert_eq!(
+            runs,
+            vec![
+                vec!["update".to_string()],
+                vec!["upgrade".into(), "wget".into()]
+            ],
+            "{runs:?}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("Updating Homebrew").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn run_with_soaked_and_no_soak_work_updates_exactly_once() {
+        let (brew, git, cfg) = soaked_and_no_soak_world();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let updates = lock_runs(&brew)
+            .iter()
+            .filter(|a| a.as_slice() == ["update"])
+            .count();
+        assert_eq!(updates, 1);
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("Updating Homebrew").count(), 1, "{text}");
+        assert!(
+            text.find("Updating Homebrew") < text.find("Upgrading soaked packages"),
+            "{text}"
+        );
+    }
+
+    /// `left` upgraded by name with `queue` as brew's first answers.
+    fn named_left_run(
+        queue: Vec<(i32, Vec<u8>)>,
+        flags: &[String],
+    ) -> (MockBrew, String, super::super::RunResult) {
         let (brew, git) = two_outdated_world("");
-        let _ = upgrade_both(&brew, &git);
-        assert!(!run_has_token(&lock_runs(&brew), "update"));
+        brew.next_outputs.lock().unwrap().extend(queue);
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        let r = upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &["left".to_string()],
+            flags,
+            &mut out,
+        )
+        .unwrap();
+        (brew, String::from_utf8(out).unwrap(), r)
+    }
+
+    #[test]
+    fn failed_brew_update_notes_it_and_the_package_still_installs() {
+        let (brew, text, r) = named_left_run(vec![(1, b"Error: offline".to_vec())], &[]);
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert!(
+            visible
+                .iter()
+                .any(|a| a == &["install", "--formula", "left"]),
+            "{visible:?}"
+        );
+        assert!(
+            text.contains(
+                "brew update failed (exit 1); brew's data may be older than the soak cutoff, so more packages may be held"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("Held:"), "{text}");
+        assert!(summary_has(&text, "held", "0"), "{text}");
+        assert_eq!(r.brew_status, Some(1));
+        assert!(!r.refused);
+    }
+
+    #[test]
+    fn failed_brew_update_is_retried_by_the_no_soak_step() {
+        let (brew, git, cfg) = soaked_and_no_soak_world();
+        brew.next_outputs
+            .lock()
+            .unwrap()
+            .push_back((1, b"Error: offline".to_vec()));
+        let inv = inv_from(&brew, &cfg);
+        upgrade(
+            &brew,
+            &git,
+            &core_snaps(),
+            unused_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &[],
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let updates = lock_runs(&brew)
+            .iter()
+            .filter(|a| a.as_slice() == ["update"])
+            .count();
+        assert_eq!(updates, 2, "{:?}", lock_runs(&brew));
+    }
+
+    #[test]
+    fn dry_run_still_runs_brew_update() {
+        let (brew, _, _) = named_left_run(Vec::new(), &["--dry-run".to_string()]);
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert_eq!(
+            visible.first().map(Vec::as_slice),
+            Some(&["update".to_string()][..])
+        );
     }
 
     #[test]
