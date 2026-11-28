@@ -4826,6 +4826,37 @@ mod tests {
         }
 
         #[test]
+        fn reinstall_of_a_soak_receipt_cask_at_head_is_the_true_repair() {
+            // The production path: `reinstall()` sends an installed == HEAD
+            // package to the true repair before `apply_one`, with the bare
+            // token (spec: "True repair").
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
+            for (sha, version) in [("caskcut", "1.1.0"), ("caskhead", "1.2.0")] {
+                git.insert_blob(
+                    sha,
+                    "Casks/font/font-h/font-hack.rb",
+                    cask_rb("font-hack", version),
+                );
+            }
+            brew.installed.push(InstalledPkg {
+                own_tap: Some(crate::origin::OwnTap::Soak),
+                ..cask_pkg_from("font-hack", "homebrew/cask", cask_rb("font-hack", "1.2.0"))
+            });
+            let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), "reinstall", &["font-hack"]);
+            assert!(text.contains("reinstalling font-hack"), "{text}");
+            assert!(!text.contains("ahead of soak"), "{text}");
+            assert!(!r.refused, "{text}");
+            let runs: Vec<Vec<String>> =
+                lock_runs(&brew).into_iter().chain(visible(&brew)).collect();
+            assert!(
+                runs.iter().any(|a| a == &["reinstall", "font-hack"]),
+                "{runs:?}"
+            );
+            assert!(summary_has(&text, "upgraded", "1"), "{text}");
+        }
+
+        #[test]
         fn closure_hold_of_a_soak_receipt_cask_names_homebrew_cask_on_upgrade_and_install() {
             for verb in ["upgrade", "install"] {
                 let tap = tempfile::tempdir().unwrap();
