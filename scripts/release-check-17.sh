@@ -174,7 +174,7 @@ load_marker() {
 
 # What this check can leave behind, one item per line (empty when clean).
 leftovers() {
-	if hello_installed; then echo "formula $PKG is installed (brew uninstall $PKG)"; fi
+	if hello_installed; then echo "formula $PKG is installed (brew uninstall --force $PKG)"; fi
 	if [[ -e "$TAP/Formula/$PKG.rb" ]]; then echo "file $TAP/Formula/$PKG.rb"; fi
 	if [[ -e "$SPIKE" ]]; then echo "tap directory $SPIKE (brew untap $SPIKE_TAP)"; fi
 	if trust_has taps "$SPIKE_TAP"; then echo "trust entry for tap $SPIKE_TAP (brew untrust --tap $SPIKE_TAP)"; fi
@@ -191,10 +191,13 @@ cleanup_steps() {
 		fi
 	}
 	# Uninstall unless brew says hello is absent; on a doubt run it anyway.
+	# --force: the upgrade keeps the throwaway tap's keg next to the _1 one,
+	# a plain uninstall removes only the newest, and brew then refuses to
+	# untap a tap with an installed formula.
 	local q=0
 	if ((INSTALLED)); then
 		installed_query || q=$?
-		if ((q != 1)); then step_c "$BREW" uninstall "$PKG"; fi
+		if ((q != 1)); then step_c "$BREW" uninstall --force "$PKG"; fi
 	fi
 	if ((WROTE_FILE)) && [[ -e "$TAP/Formula/$PKG.rb" ]]; then step_c rm -f "$TAP/Formula/$PKG.rb"; fi
 	if ((CREATED_TAP)) && [[ -e "$SPIKE" ]]; then step_c "$BREW" untap "$SPIKE_TAP"; fi
@@ -413,10 +416,18 @@ upgrade)
 	! grep -q 'bottle do' "$TAPS/ericfitz/homebrew-brewsoak/Formula/hello.rb" || { echo "Error: hello: Couldn't find manifest matching bottle checksum." >&2; exit 1; }
 	if [[ "${FAKE_HANG:-}" == upgrade ]]; then : >"$R/hang"; sleep 1; fi
 	[[ -z "${FAKE_BREAK_TRUST_JSON:-}" ]] || : >"$R/trust-json-broken"
-	rm -rf "$CELLAR/hello"; receipt hello 2.12_1 "${FAKE_RECEIPT_TAP:-ericfitz/brewsoak}"
+	receipt hello 2.12_1 "${FAKE_RECEIPT_TAP:-ericfitz/brewsoak}"
 	jq '.formulae += ["ericfitz/brewsoak/hello"]' "$TRUST" >"$TRUST.new" && mv "$TRUST.new" "$TRUST" ;;
-uninstall) rm -rf "$CELLAR/$2" ;;
-untap) rm -rf "$TAPS/${2%%/*}/homebrew-${2##*/}" ;;
+uninstall)
+	# Like brew: without --force only the newest keg goes.
+	if [[ "$2" == --force ]]; then rm -rf "${CELLAR:?}/$3"; else
+		k="$(ls "$CELLAR/$2" | sort | tail -1)"; rm -rf "${CELLAR:?}/$2/$k"
+		rmdir "$CELLAR/$2" 2>/dev/null || echo "$2 is still installed."
+	fi ;;
+untap)
+	# Like brew: refuse while a keg's receipt names the tap.
+	if grep -rqsF "\"tap\":\"$2\"" "$CELLAR"; then echo "Error: Refusing to untap $2 because it contains installed formulae" >&2; exit 1; fi
+	rm -rf "$TAPS/${2%%/*}/homebrew-${2##*/}" ;;
 *) echo "fake brew: unsupported: $*" >&2; exit 64 ;;
 esac
 STUB
@@ -543,7 +554,7 @@ self_test() {
 	has happy-pass "release-check-17: PASS"
 	has happy-state "state: unchanged"
 	untouched happy-restored
-	for c in "uninstall hello" "untap spike17c/t3" "untrust --tap spike17c/t3" "untrust --formula ericfitz/brewsoak/hello"; do
+	for c in "uninstall --force hello" "untap spike17c/t3" "untrust --tap spike17c/t3" "untrust --formula ericfitz/brewsoak/hello"; do
 		check "happy-cleanup-$c" "$(grep -qxF "$c" "$ROOT/calls" && echo 0 || echo 1)" "fake brew never saw '$c'"
 	done
 	check happy-lock-released "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left behind"
@@ -590,7 +601,7 @@ self_test() {
 	reset_fake "$ROOT" "$HOME_"
 	run_case "$P" FAKE_FAIL=uninstall bash "$SELF" --run
 	want_rc cleanup-fails-exit 1
-	has cleanup-fails-leftover "formula hello is installed (brew uninstall hello)"
+	has cleanup-fails-leftover "formula hello is installed (brew uninstall --force hello)"
 	has cleanup-fails-retry "retry the cleanup with: bash $SELF --cleanup"
 	check cleanup-fails-marker "$([[ -s "$STATE/release-check-17.marker" ]] && echo 0 || echo 1)" "marker missing"
 	check marker-not-in-tmpdir "$([[ ! -e "$ROOT/tmp/release-check-17.marker" ]] && echo 0 || echo 1)" "marker written under TMPDIR"
