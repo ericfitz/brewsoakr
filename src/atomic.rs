@@ -42,11 +42,21 @@ fn create_dirs_durably(dir: &Path) -> Result<(), Error> {
     std::fs::create_dir_all(dir)?;
     missing.reverse();
     for created in missing {
-        if let Some(parent) = created.parent().filter(|p| !p.as_os_str().is_empty()) {
-            sync_dir(parent)?;
+        if let Some(parent) = created.parent() {
+            sync_dir(dir_or_cwd(parent))?;
         }
     }
     Ok(())
+}
+
+/// The parent of a relative one-component path is empty: that is the current
+/// directory, which still needs its fsync.
+fn dir_or_cwd(dir: &Path) -> &Path {
+    if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    }
 }
 
 fn sync_dir(dir: &Path) -> Result<(), Error> {
@@ -66,6 +76,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     fn names(dir: &Path) -> Vec<String> {
@@ -75,6 +86,21 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn a_relative_directory_syncs_the_current_directory() {
+        // Unique name under the crate root (the test cwd), removed at the end.
+        let name = format!("atomic-relative-test-{}", std::process::id());
+        let dir = Path::new(&name);
+        SYNCED.with(|s| s.borrow_mut().clear());
+        let result = create_dirs_durably(dir);
+        let synced = SYNCED.with(|s| s.borrow().clone());
+        let _ = std::fs::remove_dir(dir);
+        result.unwrap();
+        assert_eq!(synced, vec![PathBuf::from(".")]);
+        assert_eq!(dir_or_cwd(Path::new("")), Path::new("."));
+        assert_eq!(dir_or_cwd(Path::new("a")), Path::new("a"));
     }
 
     #[test]
