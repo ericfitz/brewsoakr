@@ -9,7 +9,8 @@
 #   release-check-17.sh --self-test  test this script against a fake brew
 #
 # Exit codes: 0 pass (or skipped because hello is installed), 1 the check or
-# the cleanup failed, 2 a precondition is missing.
+# the cleanup failed (including a cleanup that could not check for leftovers),
+# 2 a precondition is missing.
 #
 # Second run: a finished run leaves no state, so it behaves like the first.
 # Overlapping runs: a lock directory refuses the second one.
@@ -124,10 +125,20 @@ preconditions() {
 	fi
 }
 
-hello_installed() {
+# installed_query: 0 hello is installed, 1 it is not, 2 brew could not answer.
+installed_query() {
 	local list # captured first: grep -q would SIGPIPE brew and pipefail would report 141
-	list="$("$BREW" list --formula)" || return 1
+	list="$("$BREW" list --formula)" || return 2
 	grep -qx "$PKG" <<<"$list"
+}
+
+# hello_installed: 0 installed, 1 not installed. When brew cannot answer, die:
+# "not installed" and "could not ask" must not look alike.
+hello_installed() {
+	local rc=0
+	installed_query || rc=$?
+	if ((rc == 2)); then die "could not read brew's list of installed formulae ('brew list --formula' failed)"; fi
+	return "$rc"
 }
 
 CREATED_TAP=0 TRUSTED_SPIKE=0 INSTALLED=0 WROTE_FILE=0 TRUSTED_PKG=0
@@ -179,12 +190,16 @@ cleanup_steps() {
 			ok=1
 		fi
 	}
-	if ((INSTALLED)) && hello_installed; then step_c "$BREW" uninstall "$PKG"; fi
+	# Uninstall unless brew says hello is absent; on a doubt run it anyway.
+	local q=0
+	if ((INSTALLED)); then
+		installed_query || q=$?
+		if ((q != 1)); then step_c "$BREW" uninstall "$PKG"; fi
+	fi
 	if ((WROTE_FILE)) && [[ -e "$TAP/Formula/$PKG.rb" ]]; then step_c rm -f "$TAP/Formula/$PKG.rb"; fi
 	if ((CREATED_TAP)) && [[ -e "$SPIKE" ]]; then step_c "$BREW" untap "$SPIKE_TAP"; fi
 	# Untrust only an entry that is listed. When brew cannot list the trust
 	# store, run the untrust anyway: cleanup is never skipped on a doubt.
-	local q=0
 	if ((TRUSTED_SPIKE)); then
 		q=0
 		trust_query taps "$SPIKE_TAP" || q=$?
@@ -337,7 +352,11 @@ do_cleanup() {
 		exit 1
 	fi
 	cleanup_steps || true
-	left="$(leftovers)" || { release_lock; exit 2; }
+	left="$(leftovers)" || {
+		echo "cleanup: could not check for leftovers (see the message above); the marker is kept. Retry with: bash $SELF --cleanup" >&2
+		release_lock
+		exit 1
+	}
 	if [[ -n "$left" ]]; then
 		echo "cleanup: leftovers remain (log: $LOG):" >&2
 		indent "$left" >&2
@@ -664,6 +683,48 @@ self_test() {
 	want_rc trust-unreadable-left-exit 2
 	has trust-unreadable-left-msg "could not read brew's trust list: brew trust --json=v1 failed"
 	check trust-unreadable-left-no-lock "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left"
+
+	# 8c. brew cannot list formulae: not "hello is not installed"
+	reset_fake "$ROOT" "$HOME_"
+	run_case "$P" FAKE_FAIL=list bash "$SELF" --run
+	want_rc list-unreadable-run-exit 2
+	has list-unreadable-run-msg "could not read brew's list of installed formulae"
+	check list-unreadable-run-no-lock "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left"
+	check list-unreadable-run-no-install "$(grep -qE '^(install|upgrade|trust spike)' "$ROOT/calls" && echo 1 || echo 0)" "$(cat "$ROOT/calls")"
+	reset_fake "$ROOT" "$HOME_"
+	mkdir -p "$ROOT/cellar/hello/2.12"
+	mkdir -p "$STATE"
+	: >"$STATE/release-check-17.marker"
+	run_case "$P" FAKE_FAIL=list bash "$SELF" --cleanup
+	check list-unreadable-cleanup-exit "$([[ $rc != 0 ]] && echo 0 || echo 1)" "exit $rc: $out"
+	has list-unreadable-cleanup-msg "could not read brew's list of installed formulae"
+	check list-unreadable-cleanup-marker-kept "$([[ -e "$STATE/release-check-17.marker" ]] && echo 0 || echo 1)" "the marker was removed"
+	check list-unreadable-cleanup-no-done "$(grep -qF 'cleanup: done' <<<"$out" && echo 1 || echo 0)" "$out"
+	rm -f -- "$STATE/release-check-17.marker"
+
+	# 8d. the trust list is readable but not JSON: the jq branch of the message
+	reset_fake "$ROOT" "$HOME_"
+	echo 'not json' >"$ROOT/trust.json"
+	run_case "$P" bash "$SELF" --run
+	want_rc trust-notjson-exit 2
+	has trust-notjson-msg "could not read brew's trust list: jq could not read the output of brew trust --json=v1"
+
+	# 8e. the trust list becomes unreadable during the run: finish reports it
+	# (exit 1, marker kept), and --cleanup with that marker exits 1 too
+	reset_fake "$ROOT" "$HOME_"
+	run_case "$P" FAKE_BREAK_TRUST_JSON=1 bash "$SELF" --run
+	want_rc trust-lost-finish-exit 1
+	has trust-lost-finish-msg "could not check for leftovers (see the message above)"
+	has trust-lost-finish-why "could not read brew's trust list: brew trust --json=v1 failed"
+	check trust-lost-finish-marker "$([[ -e "$STATE/release-check-17.marker" ]] && echo 0 || echo 1)" "the marker was removed"
+	check trust-lost-finish-no-lock "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left"
+	run_case "$P" bash "$SELF" --cleanup
+	want_rc trust-lost-cleanup-exit 1
+	has trust-lost-cleanup-msg "could not check for leftovers"
+	has trust-lost-cleanup-why "could not read brew's trust list: brew trust --json=v1 failed"
+	check trust-lost-cleanup-marker "$([[ -e "$STATE/release-check-17.marker" ]] && echo 0 || echo 1)" "the marker was removed"
+	check trust-lost-cleanup-no-lock "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left"
+	rm -f -- "$STATE/release-check-17.marker"
 
 	# 8b. hello installed, with a long `brew list` that prints hello first
 	# (grep -q under pipefail would SIGPIPE brew and report "not installed")
