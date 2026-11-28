@@ -581,14 +581,19 @@ fn already_current_head(t: &str) -> Option<&str> {
 const SOAK_TAP_PREFIX: &str = "ericfitz/brewsoak/";
 
 /// Remove `ericfitz/brewsoak/` where it begins a token: at the start of the
-/// line or after whitespace or one of `(`, `'`, `"`, `:`, `` ` ``, `,`. A path
-/// or URL that merely contains it, or a longer word ending in it, is left.
+/// line or after whitespace or one of `(`, `[`, `'`, `"`, `:`, `` ` ``, `,`,
+/// `;`, `=`. A path or URL that merely contains it, or a longer word ending in
+/// it, is left.
+///
+/// `=` is in the set so that `--tap=ericfitz/brewsoak/x` loses the prefix. The
+/// same rule strips it from a URL query such as `?tap=ericfitz/brewsoak/x`
+/// (Eric accepted that, 2026-11-27, issue #23); a URL path still keeps it.
 fn strip_soak_tap_prefix(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut prev: Option<char> = None;
     let mut rest = line;
     while let Some(c) = rest.chars().next() {
-        let at_start = prev.is_none_or(|p| p.is_whitespace() || "('\":`,".contains(p));
+        let at_start = prev.is_none_or(|p| p.is_whitespace() || "(['\":`,;=".contains(p));
         if at_start && rest.starts_with(SOAK_TAP_PREFIX) {
             rest = &rest[SOAK_TAP_PREFIX.len()..];
             prev = Some('/');
@@ -1394,6 +1399,21 @@ Already up-to-date.
             ("\u{e9} ericfitz/brewsoak/x", "\u{e9} x"),
             ("\u{e9}ericfitz/brewsoak/x", "\u{e9}ericfitz/brewsoak/x"),
             ("ericfitz/brewsoak/\u{e9}", "\u{e9}"),
+            ("[ericfitz/brewsoak/a]", "[a]"),
+            ("a;ericfitz/brewsoak/b", "a;b"),
+            ("a; ericfitz/brewsoak/b", "a; b"),
+            ("--tap=ericfitz/brewsoak/x", "--tap=x"),
+            // `=` strips a URL query too; this is accepted.
+            (
+                "https://example.com/?tap=ericfitz/brewsoak/x",
+                "https://example.com/?tap=x",
+            ),
+            // A URL path still keeps it.
+            (
+                "https://example.com/ericfitz/brewsoak/x",
+                "https://example.com/ericfitz/brewsoak/x",
+            ),
+            ("a]ericfitz/brewsoak/x", "a]ericfitz/brewsoak/x"),
         ] {
             assert_eq!(strip_soak_tap_prefix(input), want, "{input}");
         }
