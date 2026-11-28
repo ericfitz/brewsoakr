@@ -16,13 +16,17 @@ use crate::snapshot::Snapshots;
 use std::io::Write;
 use std::path::Path;
 
-/// `name (installed) < cutoff`. A `:latest` cask has no version to order, and
+/// `name (installed) < cutoff`, or `name installed (source changed)` when both
+/// read the same version. A `:latest` cask has no version to order, and
 /// is listed only because its cutoff definition (url or sha) differs from the
 /// installed one, so say that in brew's own `outdated --verbose` style
 /// (`Cask#outdated_info`: `token (latest) != latest`, without the colon).
 fn compare_line(name: &str, installed: &str, cmp: char, cutoff: &str) -> String {
     if crate::report::latest_redefined(Some(installed), Some(cutoff)) {
         return format!("{name} (latest) != latest (definition changed)");
+    }
+    if cmp == '<' && crate::report::source_changed(Some(installed), Some(cutoff)) {
+        return format!("{name} {installed} (source changed)");
     }
     format!("{name} ({installed}) {cmp} {cutoff}")
 }
@@ -466,6 +470,33 @@ mod tests {
         );
         assert!(!r.refused);
         assert!(brew.visible_runs.lock().expect("visible").is_empty());
+    }
+
+    #[test]
+    fn outdated_labels_a_same_version_change() {
+        let (mut brew, git) = local_tap_world();
+        brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+        let mut out = Vec::new();
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        outdated(
+            &brew,
+            &git,
+            &core_snaps(),
+            test_cache(),
+            &inv,
+            &cfg,
+            &[],
+            &mut out,
+        )
+        .expect("outdated");
+        let text = String::from_utf8(out).expect("utf8");
+        assert_eq!(
+            section_lines(&text, OUTDATED_HEADER),
+            ["alpha 1.1.0 (source changed)"],
+            "{text}"
+        );
+        assert!(!text.contains("(1.1.0) < 1.1.0"), "{text}");
     }
 
     #[test]

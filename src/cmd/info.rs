@@ -222,8 +222,14 @@ pub fn info(
                         .map(report::identity_version)
                         .as_deref(),
                 );
+            let installed_ver = view.installed.as_ref().map(report::identity_version);
+            let cutoff_ver = view.cutoff.as_ref().map(report::identity_version);
             if redefined {
                 writeln!(out, "action: would reinstall (latest definition changed)")?;
+            } else if view.action == DesiredAction::InstallCutoff
+                && report::source_changed(installed_ver.as_deref(), cutoff_ver.as_deref())
+            {
+                writeln!(out, "action: would upgrade (source changed)")?;
             } else {
                 let soaking = view
                     .soaking_label()
@@ -350,6 +356,46 @@ mod tests {
             "missing install cutoff / upgrade wording: {text}"
         );
         assert!(!result.refused, "info is read-only");
+    }
+
+    #[test]
+    fn info_labels_a_same_version_change() {
+        let (mut brew, git) = local_tap_world();
+        brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = core_snaps();
+        let run = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let mut out = Vec::new();
+            info(
+                &brew,
+                &git,
+                &snaps,
+                test_cache(),
+                &inv,
+                &cfg,
+                &names,
+                &[],
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let named = run(&["alpha"]);
+        for want in [
+            "installed: 1.1.0",
+            "cutoff: 1.1.0",
+            "action: would upgrade (source changed)",
+        ] {
+            assert!(named.lines().any(|l| l == want), "{want}: {named}");
+        }
+        let bare = run(&[]);
+        assert!(
+            bare.lines()
+                .any(|l| l == "alpha  1.1.0  would upgrade (source changed)"),
+            "{bare}"
+        );
     }
 
     #[test]

@@ -371,6 +371,21 @@ mod tests {
     }
 
     #[test]
+    fn install_line_of_a_package_that_is_not_installed_is_unchanged() {
+        let (git, snaps) = packer_world();
+        let brew = MockBrew {
+            taps: hashicorp_tap(),
+            ..MockBrew::new()
+        };
+        let (_, text) = install_packer(&brew, &git, &snaps);
+        assert!(
+            text.lines().any(|l| l.trim() == "installing packer 1.16.1"),
+            "{text}"
+        );
+        assert!(!text.contains("source changed"), "{text}");
+    }
+
+    #[test]
     fn untrusted_tap_refusal_holds_the_target_and_never_runs_brew_trust() {
         let (git, snaps) = packer_world();
         let brew = MockBrew {

@@ -495,6 +495,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Some(from) if from != to => {
                 writeln!(self.out, "{counter}{doing} {name} {from} -> {to}")?
             }
+            Some(_) if view.action == DesiredAction::InstallCutoff => {
+                writeln!(self.out, "{counter}{doing} {name} {to} (source changed)")?
+            }
             _ => writeln!(self.out, "{counter}{doing} {name} {to}")?,
         }
         Ok(())
@@ -1116,15 +1119,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if counted_here {
             let from = installed_id.as_ref().map(report::identity_version);
             let to = want.as_ref().map(report::identity_version);
+            let changed = report::source_changed(from.as_deref(), to.as_deref());
             let versions = match (from, to) {
+                (Some(_), Some(to)) if changed => format!(" {to}"),
                 (Some(from), Some(to)) => format!(" {from} -> {to}"),
                 (Some(from), None) => format!(" {from}"),
                 (None, Some(to)) => format!(" {to}"),
                 (None, None) => String::new(),
             };
+            let why = if changed { "source changed; " } else { "" };
             writeln!(
                 self.out,
-                "upgrading {dep}{versions} (dependency of {target})"
+                "upgrading {dep}{versions} ({why}dependency of {target})"
             )?;
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
@@ -4170,6 +4176,39 @@ mod tests {
             );
             brew.deps.insert("alpha".into(), vec!["libx".into()]);
             (brew, git)
+        }
+
+        #[test]
+        fn upgrade_line_labels_a_same_version_change() {
+            for (names, want) in [
+                (&["alpha"][..], "upgrading alpha 1.1.0 (source changed)"),
+                (&[][..], "[1/1] upgrading alpha 1.1.0 (source changed)"),
+            ] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git) = soak_world(tap.path());
+                brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+                brew.next_stdout = b"Warning: alpha 1.1.0 already installed\n".to_vec();
+                let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), names, &[]);
+                assert!(text.lines().any(|l| l.trim() == want), "{want}: {text}");
+                assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
+                assert!(summary_has(&text, "skipped", "1"), "{text}");
+            }
+        }
+
+        #[test]
+        fn dependency_line_labels_a_same_version_change() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.installed
+                .push(formula_pkg("libx", formula_rb("libx", "1.1.0", "othersha")));
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(
+                text.lines()
+                    .any(|l| l.trim()
+                        == "upgrading libx 1.1.0 (source changed; dependency of alpha)"),
+                "{text}"
+            );
+            assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
         }
 
         #[test]
