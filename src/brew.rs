@@ -4492,7 +4492,8 @@ esac
         assert!(prefix.join("var/homebrew/locks/wget.formula.lock").exists());
         assert_eq!(brew.lock_formula("wget").unwrap_err(), BrewLockError::Busy);
         drop(guard);
-        assert!(brew.lock_formula("wget").is_ok());
+        let locks = prefix.join("var/homebrew/locks");
+        assert!(crate::test_util::lock_eventually(&locks, "wget").is_ok());
         assert_eq!(log_lines(&log), ["--prefix"], "asked once");
     }
 

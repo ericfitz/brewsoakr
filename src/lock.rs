@@ -376,7 +376,7 @@ mod tests {
         );
         assert!(try_brew_formula_lock(dir.path(), "curl").is_ok());
         drop(held);
-        assert!(try_brew_formula_lock(dir.path(), "wget").is_ok());
+        assert!(crate::test_util::lock_eventually(dir.path(), "wget").is_ok());
     }
 
     #[test]
@@ -395,7 +395,7 @@ mod tests {
             BrewLockError::Busy
         );
         file.unlock().unwrap();
-        assert!(try_brew_formula_lock(dir.path(), "wget").is_ok());
+        assert!(crate::test_util::lock_eventually(dir.path(), "wget").is_ok());
     }
 
     #[test]
