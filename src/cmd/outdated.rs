@@ -218,7 +218,7 @@ pub fn outdated(
         .filter(|n| brew_outdated.contains(n))
         .map(|n| format!("{n} (no-soak, brew)"))
         .collect();
-    if let Some(why) = crate::soaktap::unusable_with_packages(inv) {
+    if let Some(why) = crate::soaktap::unusable_with_packages(inv, only) {
         held.push(why.note());
     }
     held.extend(hidden_notes(inv, only));
@@ -847,5 +847,23 @@ mod tests {
         assert!(!text.contains("widget"), "{text}");
         let text = outdated_with(&brew, &git, &["--formula"]).unwrap();
         assert!(text.contains("widget"), "{text}");
+    }
+
+    #[test]
+    fn outdated_note_about_the_soak_tap_follows_the_kind() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, _) = hello_world(tap.path(), false, "1.0.0");
+        let note = NotReady::Untrusted.note();
+        assert!(outdated_with(&brew, &git, &[]).unwrap().contains(&note));
+        assert!(
+            outdated_with(&brew, &git, &["--formula"])
+                .unwrap()
+                .contains(&note)
+        );
+        assert!(
+            !outdated_with(&brew, &git, &["--cask"])
+                .unwrap()
+                .contains(&note)
+        );
     }
 }

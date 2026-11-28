@@ -1502,4 +1502,16 @@ mod tests {
             "{runs:?}"
         );
     }
+
+    #[test]
+    fn bare_formula_upgrade_leaves_cask_no_soak_names_alone() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let cfg = cfg_with("NO_SOAK = [\"docker\"]\n");
+        upgrade_with(&brew, &git, tap.path(), &cfg, &[], &["--formula"]).unwrap();
+        let mut all = lock_runs(&brew);
+        all.extend(visible_runs(&brew));
+        assert!(!run_has_token(&all, "docker"), "{all:?}");
+        assert!(!run_has_token(&all, "ericfitz/brewsoak/docker"), "{all:?}");
+    }
 }

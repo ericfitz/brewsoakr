@@ -107,12 +107,13 @@ pub fn unusable(entry: Option<&TapInfo>) -> Option<NotReady> {
 }
 
 /// `Some` when the tap is tapped but unusable (untrusted, or from a remote)
-/// and at least one installed package's receipt names it.
-pub fn unusable_with_packages(inv: &Inventory) -> Option<NotReady> {
+/// and at least one installed package of `only` (any kind: `None`) has a
+/// receipt that names it.
+pub fn unusable_with_packages(inv: &Inventory, only: Option<PkgKind>) -> Option<NotReady> {
     let why = unusable(inv.soak_tap.as_ref())?;
     inv.pkgs
         .iter()
-        .any(|p| p.own_tap == Some(OwnTap::Soak))
+        .any(|p| p.own_tap == Some(OwnTap::Soak) && crate::flags::kind_matches(only, p.kind))
         .then_some(why)
 }
 

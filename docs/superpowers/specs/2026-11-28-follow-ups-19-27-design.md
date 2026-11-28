@@ -83,9 +83,16 @@ bare-run command that takes the flags.
   (recovery and pruning) always sees every installed package, so `upgrade --cask` cannot prune the
   tap file of an installed formula.
 
-**Limit.** Bare `info` resolves each listed name as it does today, formula first. When an installed
-formula and an installed cask share a name, `info --cask` prints the formula's line for it. That
-is how bare `info` already treats such a pair.
+**Controller ruling (Task 5 review): bare info resolves each package by its own kind.** Bare
+`info` walks the installed packages as (kind, name) and resolves each with its own kind, so a
+formula and a cask that share a name each show their own line, with or without a kind flag. This
+replaces the earlier limit (formula first), which printed the formula's line twice. A typed name
+resolves as before.
+
+**Controller ruling (Task 5 review): the soak-tap note follows the kind.** The "soak tap is
+untrusted" note in `outdated` and bare `info` is printed only when an installed package of the
+walked kind has a receipt naming the soak tap, so `--cask` prints no such note because of a
+formula.
 
 ## #27: the same version shown as `X < X`
 
@@ -400,7 +407,6 @@ a skipped dependency are still not walked.
   notice. A third-party package could then install a definition newer than its cutoff, and brew
   could upgrade an installed dependency that is not anchored. A core or cask target itself is not
   affected: it installs from the tap file. The window is the length of one target's install.
-- Bare `info --cask` with a formula and a cask of one name ("#26").
 - A same-version source change is announced on every run ("#27").
 - A hidden package is still unknown to brewsoak ("#22").
 - Cask pruning has no lock ("#25").

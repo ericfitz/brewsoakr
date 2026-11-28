@@ -1,4 +1,5 @@
 use super::notes::{held_tap_note, hidden_notes, own_tap_token_note, unsoakable_note};
+use super::view::Resolved;
 use super::view::{
     host_for_pkg, natural_kind, parse_pkg, prefetch_orderings, resolve_token, resolve_view,
     settle_origin,
@@ -10,7 +11,7 @@ use crate::config::Config;
 use crate::eligibility::DesiredAction;
 use crate::flags;
 use crate::git::GitStore;
-use crate::inventory::{Inventory, PkgClass};
+use crate::inventory::{Inventory, Pkg, PkgClass};
 use crate::nosoak;
 use crate::origin;
 use crate::report::{self};
@@ -49,20 +50,33 @@ pub fn info(
     } else {
         None
     };
-    let owned_names: Vec<String> = if names.is_empty() {
+    // A bare run walks the installed packages themselves, so a formula and a
+    // cask of one name each show their own kind; a typed name is resolved.
+    let entries: Vec<(&str, Option<&Pkg>)> = if names.is_empty() {
         inv.pkgs
             .iter()
             .filter(|p| flags::kind_matches(only, p.kind))
-            .map(|p| p.name.clone())
+            .map(|p| (p.name.as_str(), Some(p)))
             .collect()
     } else {
-        names.to_vec()
+        names.iter().map(|n| (n.as_str(), None)).collect()
     };
-    for (i, raw) in owned_names.iter().enumerate() {
+    for (i, &(raw, known)) in entries.iter().enumerate() {
         if long_form && i > 0 {
             writeln!(out)?;
         }
-        let mut r = resolve_token(raw, inv, cfg)?;
+        let mut r = match known {
+            Some(pkg) => Resolved {
+                origin: pkg.origin.clone(),
+                name: pkg.name.clone(),
+                class: pkg.class,
+                receipt_tap: pkg.receipt_tap.clone(),
+                tapped: origin::is_core_or_cask(&pkg.origin)
+                    || inv.tap_class(&pkg.origin).is_some(),
+                named_origin: false,
+            },
+            None => resolve_token(raw, inv, cfg)?,
+        };
         if r.named_origin && origin::own_tap(&r.origin).is_some() {
             writeln!(out, "{}", own_tap_token_note(&r.name, &r.origin))?;
             refused = true;
@@ -70,7 +84,10 @@ pub fn info(
         }
         let mut kind = None;
         if r.class == PkgClass::Soaked && !snaps.held_taps.contains_key(&r.origin) {
-            let k = natural_kind(git, snaps, cache, inv, &r.origin, &r.name)?;
+            let k = match known {
+                Some(pkg) => pkg.kind,
+                None => natural_kind(git, snaps, cache, inv, &r.origin, &r.name)?,
+            };
             settle_origin(&mut r, k, inv, cfg);
             kind = Some(k);
         }
@@ -238,7 +255,7 @@ pub fn info(
             )?;
         }
     }
-    if let Some(why) = soaktap::unusable_with_packages(inv) {
+    if let Some(why) = soaktap::unusable_with_packages(inv, only) {
         writeln!(out, "{}", why.note())?;
     }
     for note in hidden_notes(inv, only) {
@@ -696,5 +713,75 @@ mod tests {
         let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
         let text = bare_info(&brew, &git, &["alpha"], &["--cask"]);
         assert!(text.contains("alpha"), "{text}");
+    }
+
+    #[test]
+    fn bare_info_with_formula_lists_only_formulae() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = bare_info(&brew, &git, &[], &["--formula"]);
+        assert!(text.lines().any(|l| l.starts_with("alpha")), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("docker")), "{text}");
+    }
+
+    /// Formula `docker` 2.0.0 and cask `docker` 4.0 share a name.
+    fn shared_name_world() -> (MockBrew, InMemoryGit) {
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        for sha in ["cutoffsha", "headsha"] {
+            git.insert_blob(
+                sha,
+                "Formula/d/docker.rb",
+                formula_rb("docker", "2.1.0", "midsha"),
+            );
+        }
+        brew.installed.push(formula_pkg(
+            "docker",
+            formula_rb("docker", "2.0.0", "oldsha"),
+        ));
+        (brew, git)
+    }
+
+    fn docker_lines(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| l.starts_with("docker")).collect()
+    }
+
+    #[test]
+    fn bare_info_resolves_each_package_by_its_own_kind() {
+        let (brew, git) = shared_name_world();
+        let both = bare_info(&brew, &git, &[], &[]);
+        let mut lines = docker_lines(&both);
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                "docker  2.0.0  would upgrade to 2.1.0",
+                "docker  4.0  would upgrade to 4.1"
+            ],
+            "{both}"
+        );
+        let cask = bare_info(&brew, &git, &[], &["--cask"]);
+        assert_eq!(
+            docker_lines(&cask),
+            ["docker  4.0  would upgrade to 4.1"],
+            "{cask}"
+        );
+        let formula = bare_info(&brew, &git, &[], &["--formula"]);
+        assert_eq!(
+            docker_lines(&formula),
+            ["docker  2.0.0  would upgrade to 2.1.0"],
+            "{formula}"
+        );
+    }
+
+    #[test]
+    fn bare_info_note_about_the_soak_tap_follows_the_kind() {
+        use crate::cmd::test_support::hello_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, _) = hello_world(tap.path(), false, "1.0.0");
+        let note = crate::soaktap::NotReady::Untrusted.note();
+        assert!(bare_info(&brew, &git, &[], &[]).contains(&note));
+        assert!(bare_info(&brew, &git, &[], &["--formula"]).contains(&note));
+        assert!(!bare_info(&brew, &git, &[], &["--cask"]).contains(&note));
     }
 }
