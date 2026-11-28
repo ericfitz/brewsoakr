@@ -1,7 +1,9 @@
 ==> Trusted formula ericfitz/brewsoak/hello
+Warning: ericfitz/brewsoak/hello 2.12.3 is available and more recent than version 2.12.2.
 ==> Upgrading ericfitz/brewsoak/hello
   2.12.2 -> 2.12.3
 ==> Pouring hello--2.12.3.arm64_tahoe.bottle.tar.gz
 🍺  /opt/homebrew/Cellar/hello/2.12.3: 78 files, 1.8MB
 ==> Would install 1 dependency for ericfitz/brewsoak/hello:
 hello 2.12.3
+Error: ericfitz/brewsoak/hello: No such file or directory @ rb_sysopen - /opt/homebrew/Cellar/hello/2.12.3/.brew/hello.rb

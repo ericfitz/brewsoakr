@@ -106,6 +106,15 @@ fn soak_tap_transcript_collapses() {
         "tap prefix must not show"
     );
     assert!(!got.contains("Trusted"), "trust lines are for the log only");
+    for shown in [
+        "Warning: hello 2.12.3 is available and more recent than version 2.12.2.",
+        "Error: hello: No such file or directory @ rb_sysopen - /opt/homebrew/Cellar/hello/2.12.3/.brew/hello.rb",
+    ] {
+        assert!(
+            got.lines().any(|l| l == shown),
+            "prefixed line missing: {shown}\n{got}"
+        );
+    }
     assert!(
         !got.lines().any(|l| l == "hello 2.12.3"),
         "the dry-run preview must not show"
