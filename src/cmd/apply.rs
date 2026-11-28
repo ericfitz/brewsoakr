@@ -1393,8 +1393,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let failed = brew_failed(&output);
         let why = if failed {
             first_error_line(&output)
-        } else {
+        } else if already_installed_message(&output) {
             "brew left the installed version in place".to_string()
+        } else {
+            "brew ran, but its keg is not from brewsoak's tap at the cutoff version".to_string()
         };
         merge_status(&mut self.brew_status, output);
         if installed_now {
@@ -1505,8 +1507,9 @@ pub(super) fn brew_failed(output: &std::process::Output) -> bool {
 /// What `run_install` came to.
 pub(super) enum InstallRun {
     /// brew ran; `failed` when it exited non-zero for a reason of its own.
-    /// `why` is what to say when the run did not leave the package installed:
-    /// brew's first error line, or that it left the installed version alone.
+    /// `why` is what to say when the run did not leave the package installed
+    /// from the soak tap: brew's first error line, that it left the installed
+    /// version alone, or that its keg is not the soaked one.
     Ran {
         failed: bool,
         why: String,
@@ -3763,6 +3766,33 @@ mod tests {
                 &r,
                 &text,
                 "brew left the installed version in place",
+                &before,
+            );
+        }
+
+        #[test]
+        fn successful_dependency_install_without_a_soak_receipt_names_the_keg() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.by_name.insert("libx".into(), Ok(libx_by_name(false)));
+            // brew reports a fresh install, but the keg's receipt does not
+            // name brewsoak's tap.
+            *brew.next_outputs.lock().unwrap() = [
+                (0, Vec::new()),
+                (
+                    0,
+                    b"==> Installing libx\n==> Pouring libx--1.1.0\n".to_vec(),
+                ),
+            ]
+            .into();
+            let before = tree(tap.path());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert_alpha_held_for_libx(
+                &brew,
+                tap.path(),
+                &r,
+                &text,
+                "brew ran, but its keg is not from brewsoak's tap at the cutoff version",
                 &before,
             );
         }
