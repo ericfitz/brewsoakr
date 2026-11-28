@@ -163,7 +163,10 @@ impl Filter {
     fn filter_line(&mut self, raw: &str) -> Option<String> {
         let plain = strip_ansi(raw.trim_end_matches(['\r', '\n']));
         // brew's trust notice for the soak tap is for the log only; every
-        // other line shows the bare package name.
+        // other line shows the bare package name. Returned before the state
+        // machine, so the line neither ends nor starts a section, and inside a
+        // caveats block it does not open a package sub-block. brew prints it
+        // before the first heading of a run.
         if is_soak_tap_trusted_line(&plain) {
             return None;
         }
@@ -1363,6 +1366,15 @@ Already up-to-date.
     }
 
     #[test]
+    fn trusted_line_inside_caveats_opens_no_block() {
+        let with = "==> Caveats\n==> wget\none\n==> Trusted formula ericfitz/brewsoak/x\ntwo";
+        let without = "==> Caveats\n==> wget\none\ntwo";
+        let (_, f) = run(with);
+        let (_, g) = run(without);
+        assert_eq!(f.caveat_report(), g.caveat_report());
+    }
+
+    #[test]
     fn prefix_is_stripped_only_at_a_token_start() {
         for (input, want) in [
             ("ericfitz/brewsoak/hello", "hello"),
@@ -1378,6 +1390,10 @@ Already up-to-date.
                 "see https://github.com/ericfitz/brewsoak/issues",
             ),
             ("foo-ericfitz/brewsoak/x", "foo-ericfitz/brewsoak/x"),
+            ("\u{1f37a} ericfitz/brewsoak/hello", "\u{1f37a} hello"),
+            ("\u{e9} ericfitz/brewsoak/x", "\u{e9} x"),
+            ("\u{e9}ericfitz/brewsoak/x", "\u{e9}ericfitz/brewsoak/x"),
+            ("ericfitz/brewsoak/\u{e9}", "\u{e9}"),
         ] {
             assert_eq!(strip_soak_tap_prefix(input), want, "{input}");
         }

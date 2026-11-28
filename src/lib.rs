@@ -1587,4 +1587,55 @@ mod tests {
         dispatch_quiet(&s(&["update"]), &world).unwrap();
         assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
     }
+
+    /// A `RealWorld` whose brew is a script running `body`.
+    fn world_with_brew_script(dir: &Path, body: &str) -> RealWorld {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("brew");
+        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        RealWorld {
+            git: git::ProcessGit::default(),
+            github: github::UreqGithub {
+                base: "http://127.0.0.1:1".into(),
+            },
+            brew: brew::ProcessBrew::new(script),
+        }
+    }
+
+    #[test]
+    fn real_world_tap_root_joins_the_soak_tap_under_brews_repository() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let world = world_with_brew_script(tmp.path(), "echo /opt/hb");
+        assert_eq!(
+            world.tap_root().expect("tap root"),
+            PathBuf::from("/opt/hb/Library/Taps/ericfitz/homebrew-brewsoak")
+        );
+    }
+
+    #[test]
+    fn real_world_tap_root_reports_brews_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let world = world_with_brew_script(tmp.path(), "echo boom >&2; exit 3");
+        match world.tap_root() {
+            Err(Error::Brew { status, message }) => {
+                assert_eq!(status, 3);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_world_tap_root_rejects_an_empty_answer() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let world = world_with_brew_script(tmp.path(), "echo");
+        match world.tap_root() {
+            Err(Error::Brew { status, message }) => {
+                assert_eq!(status, 1);
+                assert_eq!(message, "brew --repository printed no path");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }

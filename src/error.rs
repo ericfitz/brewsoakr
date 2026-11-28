@@ -111,4 +111,11 @@ mod tests {
         assert!(text.contains("non-fast-forward"), "{text}");
         assert_eq!(err.exit_code(), 1);
     }
+
+    #[test]
+    fn first_line_skips_blank_lines_trims_and_has_a_fallback() {
+        assert_eq!(first_line("\n  \n  Error: x  \nmore"), "Error: x");
+        assert_eq!(first_line(""), "no detail");
+        assert_eq!(first_line(" \n"), "no detail");
+    }
 }
