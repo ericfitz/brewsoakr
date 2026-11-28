@@ -160,8 +160,9 @@ installed. `--soak-hours` is not accepted with `settings`.
 ### Third-party taps
 
 Every installed tap with an HTTPS remote is soaked like core and cask, from a
-blobless clone under brewsoak's cache. brew's own tap checkouts are never
-touched. A tap with no remote, or a non-HTTPS remote, is not soakable:
+blobless clone under brewsoak's cache. brewsoak never fetches into or changes a
+tap that brew cloned. The only directory it writes under `Library/Taps` is its
+own local tap (see "brewsoak's own tap"). A tap with no remote, or a non-HTTPS remote, is not soakable:
 brewsoak notes its packages and leaves them to `brew`, unless they are in
 `NO_SOAK`.
 
@@ -173,6 +174,11 @@ brewsoak's own tap stays at its soaked version when that `brew upgrade` runs:
 no-soak does not extend to it, so the no-soak package can run against an older
 dependency than its bottle was built with until the dependency's update has
 soaked. Soaked dependents of a no-soak package are not upgraded by that step.
+
+When `brewsoak install` has to run `brew upgrade` for part of the no-soak group
+(a formula installed from the soak tap, which brew refuses to `install`), the
+no-soak section header names what brew runs, for example `Installing no-soak
+packages (brew decides; runs brew install and brew upgrade)`.
 
 ## Commands
 
@@ -187,7 +193,7 @@ soaked. Soaked dependents of a no-soak package are not upgraded by that step.
 | `--version` / `-V` | Print `brewsoak <version>`. |
 | `--help` / `-h` | brewsoak help. `help install` is soak-aware; `help services` is `brew help`. |
 
-Other flags (`--debug`, …) are forwarded to `brew`. `--formula`, `--formulae`, `--cask` and `--casks` are not forwarded to a soaked install or upgrade, because brewsoak adds the flag for the package's own kind.
+Other flags (`--debug`, …) are forwarded to `brew`. `--formula`, `--formulae`, `--cask` and `--casks` are not forwarded to the per-package `brew` commands brewsoak runs, because brewsoak adds the flag for the package's own kind: a soaked install or upgrade, and each kind group of the no-soak step when a run has both formulae and casks. They still choose the kind of a name you type (`--cask` or `--formula`).
 `upgrade` and `outdated` honor brew's `--greedy` (`-g`),
 `--greedy-auto-updates` and `--greedy-latest` themselves (see below); the
 no-soak `brew upgrade` also receives them.
@@ -224,12 +230,34 @@ once. brewsoak never runs `brew trust`. The hold prints
 `Held:`; the run exits 1. A dry run creates nothing and holds the same way.
 `update`, `outdated` and `info` never create the tap.
 
+The note says which of four cases applies:
+
+- Not trusted: `brewsoak installs soaked packages from its own tap,
+  ericfitz/brewsoak, and brew does not trust it yet; run brew trust
+  ericfitz/brewsoak once, then run brewsoak again.`
+- Dry run, no tap yet: `brewsoak's tap, ericfitz/brewsoak, does not exist yet;
+  a real run creates it, and it then needs brew trust ericfitz/brewsoak.`
+- Tapped from a remote: `ericfitz/brewsoak is tapped from <remote>; brewsoak
+  only uses a local tap of that name; remove it with brew untap
+  ericfitz/brewsoak.`
+- `brew tap-new` failed: `brewsoak could not create its tap (<error>).`
+
 **What brew records.** For every package brewsoak installs, upgrades or
 previews with `--dry-run`, brew adds an `ericfitz/brewsoak/<name>` entry to its
 trust store; brewsoak never removes them. A dry run also writes the same tap
 files a real run does, and puts them back at the end, so the files under the
-tap change for the length of the run. On `update` and on a real run, with the tap local and trusted, brewsoak removes
-the tap file of a package that was uninstalled or moved back to core.
+tap change for the length of the run. On `update` and on a real run, with the
+tap local and trusted, brewsoak removes the tap file of a package that was
+uninstalled or moved back to core.
+
+**Plain `brew` at the same time.** Do not run brewsoak and a plain `brew
+upgrade` or `brew install` at the same time. brewsoak's run lock keeps two
+brewsoak runs apart and nothing else; a plain `brew` is not excluded, and a
+package can be lost when the two overlap. A real `brewsoak upgrade`, `install`
+or `reinstall` starts by removing tap files that no installed package uses, and
+`brewsoak update` does the same after its refresh. We saw that start-of-run
+step remove a package's tap file while a plain `brew upgrade` was running, and
+brew then lost that package's keg. Let one finish before you start the other.
 
 **Plain `brew` afterwards.** A package installed from the tap is anchored to it:
 
@@ -297,6 +325,21 @@ For packages from the tap, the hold texts are:
 - ``<name>: [dependency <dep>: ]brew could not load its soaked copy (<first line>); use `<bypass>` to bypass brewsoak.``
 - ``<name>: dependency <dep>: brew would replace installed <dep> <installed> with <version>, which has not soaked; <name> installs once it has; use `<bypass>` to bypass brewsoak.``
 - ``<name>: dependency <dep>: brew cannot replace installed <dep> <installed> as a dependency; run brew upgrade <dep> first; use `<bypass>` to bypass brewsoak.``
+- `<name>: held: its dependency <dep> was not installed from brewsoak's tap (<reason>)`.
+  brewsoak installs a core or cask dependency from the tap before the target,
+  and holds the target when that dependency does not end up installed from the
+  tap, because brew would otherwise pull the dependency from core's current
+  file. The reason is one of: brew's first error line, when its command
+  failed; `brew left the installed version in place`, when brew answered that
+  the package is already installed; or `brew ran, but its keg is not from
+  brewsoak's tap at the cutoff version`, when brew reported success and the
+  receipt check then failed.
+- `held <name>: an earlier brewsoak run was interrupted`, with the note
+  `<name>: an earlier brewsoak run was interrupted; run brewsoak update to
+  finish it`. You normally see this on a dry run, because a real run settles
+  leftovers from an earlier run before it starts; a settle that failed earlier
+  in the same real run leaves the same state. `brewsoak update` or the next
+  real run clears it.
 
 **Leftovers.** A `brewsoakr/soaked` tap from an older brewsoak is never used,
 fetched or written; remove it with `brew untap brewsoakr/soaked`. An explicit

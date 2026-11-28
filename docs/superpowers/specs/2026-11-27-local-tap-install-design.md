@@ -936,6 +936,16 @@ Soak-tap packages:
   dependency: the tap-not-ready hold of "Trust".
 - on a dry run only, a leftover undo entry: see "Re-running".
 - a failed install or upgrade is brew's failure for that package, as today.
+- a dependency that did not end up installed from the soak tap (2026-11-27
+  note, added after the build): the target is held with
+  `held <target>: its dependency <dep> was not installed from brewsoak's tap`
+  and the note `<target>: held: its dependency <dep> was not installed from
+  brewsoak's tap (<reason>)`. The reason is brew's first error line when the
+  dependency's command failed; `brew left the installed version in place` when
+  brew answered that it is already installed; and otherwise `brew ran, but its
+  keg is not from brewsoak's tap at the cutoff version`. The hold exists
+  because brew would otherwise pull the dependency from core's current file
+  when it installs the target. The README lists it too.
 
 Third-party packages (the by-name gate), same reasons as 1.6.1 with a new
 tail:
@@ -1175,6 +1185,12 @@ prune takes a `&RunLock`. A plain `brew` running beside brewsoak is not
 excluded: between a tap write and its settle, a brew install that depends on
 that package could fail as in Fact 22. brew's own locks protect the kegs.
 Nothing unsoaked can be installed this way.
+
+> **2026-11-27 note (observation, after the build).** The sentence "brew's own
+> locks protect the kegs" did not hold in one observed overlap. brewsoak's
+> start-of-run prune removed a tap file during a plain `brew upgrade`, and the
+> keg was then lost. No mechanism is claimed. The README now warns not to run
+> brewsoak and a plain `brew upgrade` or `brew install` at the same time.
 
 **Leftovers from a failed run.** Undo entries are the only new persistent
 state. At the points and under the conditions of Choice 16 (`brewsoak update`
