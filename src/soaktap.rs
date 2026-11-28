@@ -304,8 +304,9 @@ impl<'a> SoakTap<'a> {
     /// The unresolvable directory is deliberately not an error here: the
     /// callers only pick a hint or a no-soak token for a package that is
     /// already installed, and every brew command of the run that follows
-    /// needs the same `brew --repository` answer. A run that stages or
-    /// maintains the tap fails on it through `dir()` (`stage`, `maintain`).
+    /// needs the same `brew --repository` answer. `dir()` reports it: `maintain`
+    /// fails a real run on it, and `stage` returns it (a dry run's dependency
+    /// walk holds that target).
     pub fn anchored(&self, pkg: &Pkg) -> bool {
         pkg.own_tap == Some(OwnTap::Soak) && self.dir().is_ok_and(|dir| anchored(&dir, pkg))
     }
@@ -362,9 +363,13 @@ impl<'a> SoakTap<'a> {
 
     /// Make the package's tap file the sanitized cutoff. `version` is the
     /// cutoff version when the caller knows it; a later `Some` replaces it.
-    /// A tap that is not ready is `Staged::NotReady`; an `Err` is fatal: the
-    /// tap directory could not be resolved (`dir`), or I/O failed. A dry run
-    /// stages too (and settles it back), so it needs the directory as well.
+    /// A tap that is not ready is `Staged::NotReady`. An `Err` means the tap
+    /// directory could not be resolved (`dir`, an `Error::Brew` from
+    /// `brew --repository`) or I/O failed. A real run fails earlier and
+    /// fatally in `maintain`. In a dry run the dependency walk catches the
+    /// `Error::Brew` (`install_cutoff_staged`) and holds that one target; an
+    /// I/O error is still fatal. A dry run stages too (and settles it back),
+    /// so it needs the directory as well.
     pub fn stage(
         &mut self,
         _lock: &RunLock,
@@ -1135,7 +1140,11 @@ mod tests {
         fn tap_root(&self) -> Result<PathBuf, Error> {
             self.calls.set(self.calls.get() + 1);
             if self.fails {
-                return Err(Error::Other("brew --repository failed".into()));
+                // What `RealWorld::tap_root` returns when brew fails.
+                return Err(Error::Brew {
+                    status: 1,
+                    message: "brew --repository failed".into(),
+                });
             }
             Ok(self.path.clone())
         }
@@ -1185,7 +1194,7 @@ mod tests {
             cutoff.as_bytes(),
             None,
         );
-        assert!(matches!(r, Err(Error::Other(m)) if m.contains("--repository")));
+        assert!(matches!(r, Err(Error::Brew { message, .. }) if message.contains("--repository")));
         assert!(!s.anchored(&pkg(Some(OwnTap::Soak), "1.1.0")), "degrades");
         assert!(s.dir().is_err());
     }

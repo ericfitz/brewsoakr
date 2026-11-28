@@ -433,12 +433,14 @@ pub fn dispatch(
     }
 }
 
-/// `world.tap_root()` asked for at most once, and only when a run needs a tap
-/// directory that tap-info did not give (a dry run, `outdated` and `info` never
-/// reach this).
+/// `world.tap_root()` asked for at most once per run, success or failure, and
+/// only when something needs a tap directory that tap-info did not give.
+/// `outdated`, `info` and a dry run with no soak tap never ask. A dry run
+/// that stages a file for a listed tap whose tap-info has no `path` does ask
+/// (once), because it writes the file brew is then asked about.
 struct LazyTapRoot<'a, W: World> {
     world: &'a W,
-    resolved: std::cell::OnceCell<PathBuf>,
+    resolved: std::cell::OnceCell<Result<PathBuf, Error>>,
 }
 
 impl<'a, W: World> LazyTapRoot<'a, W> {
@@ -452,11 +454,16 @@ impl<'a, W: World> LazyTapRoot<'a, W> {
 
 impl<W: World> soaktap::TapRootSource for LazyTapRoot<'_, W> {
     fn tap_root(&self) -> Result<PathBuf, Error> {
-        if let Some(root) = self.resolved.get() {
-            return Ok(root.clone());
+        match self.resolved.get_or_init(|| self.world.tap_root()) {
+            Ok(root) => Ok(root.clone()),
+            // `Error` is not `Clone`: replay a failure; only a brew failure
+            // keeps its variant (the one `brew --repository` produces).
+            Err(Error::Brew { status, message }) => Err(Error::Brew {
+                status: *status,
+                message: message.clone(),
+            }),
+            Err(e) => Err(Error::Other(e.to_string())),
         }
-        let root = self.world.tap_root()?;
-        Ok(self.resolved.get_or_init(|| root).clone())
     }
 }
 
@@ -702,7 +709,11 @@ mod tests {
         fn tap_root(&self) -> Result<PathBuf, Error> {
             self.tap_root_calls.set(self.tap_root_calls.get() + 1);
             if self.tap_root_fails {
-                return Err(Error::Other("brew --repository failed".into()));
+                // What `RealWorld::tap_root` returns when brew fails.
+                return Err(Error::Brew {
+                    status: 1,
+                    message: "brew --repository failed".into(),
+                });
             }
             Ok(self.tap_root.clone())
         }
@@ -1606,7 +1617,7 @@ mod tests {
             world.tap_root_fails = true;
             let result = dispatch_quiet(&s(args), &world);
             assert!(
-                !matches!(&result, Err(Error::Other(m)) if m.contains("--repository")),
+                !matches!(&result, Err(Error::Brew { message, .. }) if message.contains("--repository")),
                 "{args:?}: {result:?}"
             );
             assert_eq!(world.tap_root_calls.get(), 0, "{args:?}");
@@ -1632,10 +1643,34 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_tap_root_is_asked_for_once_per_run() {
+        use crate::soaktap::TapRootSource;
+        let mut world = TestWorld::new();
+        world.tap_root_fails = true;
+        let lazy = LazyTapRoot::new(&world);
+        for _ in 0..3 {
+            assert!(matches!(lazy.tap_root(), Err(Error::Brew { .. })));
+        }
+        assert_eq!(world.tap_root_calls.get(), 1);
+        let ok_world = TestWorld::new();
+        let lazy = LazyTapRoot::new(&ok_world);
+        assert_eq!(lazy.tap_root().unwrap(), lazy.tap_root().unwrap());
+        assert_eq!(ok_world.tap_root_calls.get(), 1);
+    }
+
+    #[test]
     fn a_failing_tap_root_fails_a_run_that_needs_it() {
         let mut world = stale_world();
         world.tap_root_fails = true;
-        assert!(dispatch_quiet(&s(&["update"]), &world).is_err());
+        // `Error::Brew` becomes the run's exit status (`soaked_exit`).
+        let before = tap_and_undo(&world);
+        let result = dispatch_quiet(&s(&["update"]), &world);
+        assert!(
+            matches!(result, Ok(Dispatch::Exit(code)) if code != 0),
+            "{result:?}"
+        );
+        assert_eq!(world.tap_root_calls.get(), 1);
+        assert_eq!(tap_and_undo(&world), before);
     }
 
     #[test]
