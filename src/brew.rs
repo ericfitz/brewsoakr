@@ -860,6 +860,22 @@ impl Brew for ProcessBrew {
                     .unwrap_or_default()
             },
         )?;
+        let mut installed = installed;
+        if let Some(dir) = cellar.as_deref() {
+            let extra = soak_tap_kegs_brew_left_out(dir, &installed, |versions| {
+                let mut best = versions.first()?.clone();
+                for v in &versions[1..] {
+                    let order = self
+                        .compare_versions(&[(PkgKind::Formula, v.clone(), best.clone())])
+                        .ok()?;
+                    if order.first() == Some(&Ordering::Greater) {
+                        best = v.clone();
+                    }
+                }
+                Some(best)
+            });
+            installed.extend(extra);
+        }
         *self
             .installed_names
             .lock()
@@ -1688,6 +1704,70 @@ fn parse_installed_json(
     Ok(out)
 }
 
+/// Formulae with a directory in `cellar` that `listed` lacks and whose newest
+/// keg has a receipt naming the soak tap. `newest` picks the newest of several
+/// keg versions; `None` leaves the formula out.
+pub(crate) fn soak_tap_kegs_brew_left_out(
+    cellar: &Path,
+    listed: &[InstalledPkg],
+    mut newest: impl FnMut(&[String]) -> Option<String>,
+) -> Vec<InstalledPkg> {
+    let Ok(entries) = std::fs::read_dir(cellar) else {
+        return Vec::new();
+    };
+    let subdirs = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect();
+        names.sort();
+        names
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| {
+            !listed
+                .iter()
+                .any(|p| p.kind == PkgKind::Formula && &p.name == n)
+        })
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let versions = subdirs(&cellar.join(&name));
+        let version = match versions.as_slice() {
+            [] => continue,
+            [only] => only.clone(),
+            many => match newest(many) {
+                Some(v) if many.contains(&v) => v,
+                _ => continue,
+            },
+        };
+        let source = read_formula_receipt_source_opt(cellar, &name, Some(&version));
+        if source.and_then(|s| s.own_tap) != Some(OwnTap::Soak) {
+            continue;
+        }
+        let Some(receipt_rb) = read_formula_receipt(cellar, &name, Some(&version)) else {
+            continue;
+        };
+        out.push(InstalledPkg {
+            name,
+            kind: PkgKind::Formula,
+            receipt_rb,
+            pinned: false,
+            tap: None,
+            own_tap: Some(OwnTap::Soak),
+            staged_path: None,
+        });
+    }
+    out
+}
+
 /// Formula: the newest keg. Homebrew sorts `installed` oldest-first, and
 /// `brew upgrade` compares against the newest keg, so reading any other one
 /// makes brewsoak ask brew to upgrade something brew already considers current.
@@ -2434,6 +2514,175 @@ mod tests {
         let keg = cellar.join(name).join(version);
         std::fs::create_dir_all(&keg).expect("keg");
         std::fs::write(keg.join("INSTALL_RECEIPT.json"), body).expect("receipt");
+    }
+
+    fn soak_receipt(tap: &str) -> String {
+        format!(r#"{{"source":{{"tap":{tap}}}}}"#)
+    }
+
+    fn write_keg(cellar: &Path, name: &str, version: &str, receipt: &str, with_rb: bool) {
+        write_receipt(cellar, name, version, receipt);
+        if with_rb {
+            let brew = cellar.join(name).join(version).join(".brew");
+            std::fs::create_dir_all(&brew).expect("brew dir");
+            std::fs::write(
+                brew.join(format!("{name}.rb")),
+                format!("class {name}; end"),
+            )
+            .expect("rb");
+        }
+    }
+
+    fn listed_pkg(name: &str, kind: PkgKind) -> InstalledPkg {
+        InstalledPkg {
+            name: name.into(),
+            kind,
+            receipt_rb: String::new(),
+            pinned: false,
+            tap: None,
+            own_tap: None,
+            staged_path: None,
+        }
+    }
+
+    fn never(_: &[String]) -> Option<String> {
+        panic!("newest must not be called");
+    }
+
+    #[test]
+    fn left_out_keg_from_the_soak_tap_is_added_from_disk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_keg(
+            cellar,
+            "hello",
+            "2.12.2",
+            &soak_receipt(r#""ericfitz/brewsoak""#),
+            true,
+        );
+        let got = soak_tap_kegs_brew_left_out(cellar, &[], never);
+        assert_eq!(
+            got,
+            vec![InstalledPkg {
+                name: "hello".into(),
+                kind: PkgKind::Formula,
+                receipt_rb: "class hello; end".into(),
+                pinned: false,
+                tap: None,
+                own_tap: Some(OwnTap::Soak),
+                staged_path: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn listed_formula_is_not_added_twice() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_keg(
+            cellar,
+            "hello",
+            "2.12.2",
+            &soak_receipt(r#""ericfitz/brewsoak""#),
+            true,
+        );
+        let listed = [listed_pkg("hello", PkgKind::Formula)];
+        assert!(soak_tap_kegs_brew_left_out(cellar, &listed, never).is_empty());
+    }
+
+    #[test]
+    fn a_listed_cask_of_the_same_name_does_not_hide_the_formula() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_keg(
+            cellar,
+            "hello",
+            "2.12.2",
+            &soak_receipt(r#""ericfitz/brewsoak""#),
+            true,
+        );
+        let listed = [listed_pkg("hello", PkgKind::Cask)];
+        let got = soak_tap_kegs_brew_left_out(cellar, &listed, never);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "hello");
+        assert_eq!(got[0].kind, PkgKind::Formula);
+    }
+
+    #[test]
+    fn left_out_keg_from_another_tap_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        for (i, tap) in [r#""acme/tools""#, r#""brewsoakr/soaked""#, "null", "7"]
+            .iter()
+            .enumerate()
+        {
+            write_keg(cellar, &format!("pkg{i}"), "1.0", &soak_receipt(tap), true);
+        }
+        assert!(soak_tap_kegs_brew_left_out(cellar, &[], never).is_empty());
+    }
+
+    #[test]
+    fn left_out_keg_without_its_formula_copy_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_keg(
+            cellar,
+            "hello",
+            "2.12.2",
+            &soak_receipt(r#""ericfitz/brewsoak""#),
+            false,
+        );
+        assert!(soak_tap_kegs_brew_left_out(cellar, &[], never).is_empty());
+    }
+
+    #[test]
+    fn newest_keg_decides_when_there_are_several() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_keg(
+            cellar,
+            "hello",
+            "2.12.2",
+            &soak_receipt(r#""ericfitz/brewsoak""#),
+            true,
+        );
+        write_keg(
+            cellar,
+            "hello",
+            "2.12.3",
+            &soak_receipt(r#""homebrew/core""#),
+            true,
+        );
+        let mut seen = Vec::new();
+        let got = soak_tap_kegs_brew_left_out(cellar, &[], |v| {
+            seen = v.to_vec();
+            Some("2.12.3".into())
+        });
+        assert!(got.is_empty());
+        assert_eq!(seen, ["2.12.2", "2.12.3"]);
+        let got = soak_tap_kegs_brew_left_out(cellar, &[], |_| Some("2.12.2".into()));
+        assert_eq!(got.len(), 1);
+        assert!(soak_tap_kegs_brew_left_out(cellar, &[], |_| None).is_empty());
+        // An answer that names no keg is not trusted.
+        assert!(soak_tap_kegs_brew_left_out(cellar, &[], |_| Some("9.9".into())).is_empty());
+    }
+
+    #[test]
+    fn versioned_names_and_stray_files_are_handled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_keg(
+            cellar,
+            "python@3.12",
+            "3.12.7",
+            &soak_receipt(r#""ericfitz/brewsoak""#),
+            true,
+        );
+        std::fs::write(cellar.join(".DS_Store"), "x").expect("stray");
+        let got = soak_tap_kegs_brew_left_out(cellar, &[], never);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "python@3.12");
+        assert!(soak_tap_kegs_brew_left_out(&cellar.join("missing"), &[], never).is_empty());
     }
 
     #[test]
