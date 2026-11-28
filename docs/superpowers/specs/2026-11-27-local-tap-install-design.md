@@ -153,9 +153,10 @@ options are under "Questions answered by the maintainer".
 ### Human decisions (#23)
 
 Made by the maintainer, Eric, on 2026-11-27 while implementing issue #23.
-Numbers are the issue's decision numbers.
+Numbers are the issue's decision numbers, written "#23 Decision N" to keep them
+apart from the #17 Human decisions above.
 
-- **Decision 1: the user's kind flags are dropped.** Where brewsoak adds its
+- **#23 Decision 1: the user's kind flags are dropped.** Where brewsoak adds its
   own `--formula` or `--cask` (soaked commands, third-party by-name installs,
   split no-soak groups), the user's `--formula`/`--cask`/`--formulae`/`--casks`
   are not forwarded. Where brewsoak adds none (a single-kind no-soak run, the
@@ -164,15 +165,25 @@ Numbers are the issue's decision numbers.
   *Ruling, 2026-11-27: the drop is silent by design.* brewsoak adds the right
   kind flag itself and the user's flag still picks the kind, so no note is
   printed. Cost if wrong: one note line to add.
-- **Decision 2: tap files stay mode 0600.** brew runs as the same user, so
+- **#23 Decision 2: tap files stay mode 0600.** brew runs as the same user, so
   that is enough.
-- **Decision 4: the installed version in hold text is the keg directory
+- **#23 Decision 4: the installed version in hold text is the keg directory
   name**, as Homebrew's `Keg#version` reads it (`brew::PkgState::keg_version`);
   an empty version is omitted from the text.
-- **Decision 5: a no-soak cask stays `brew install --cask`.** Its behavior is
+- **#23 Decision 5: a no-soak cask stays `brew install --cask`.** Its behavior is
   verified by manual check 13.7.
-- **Decision 8: release-check script messages** name the cause (an unreadable
-  trust list is not reported as an untrusted tap) and carry a self-test.
+- **#23 Decision 3: `soaktap::file_version` keeps brewsoak's own parser.** The
+  limitation is commented at the function and tracked in issue #24.
+- **#23 Decision 6: the dependency hold is documented and its reason split.**
+  "brew left the installed version in place" is used only for brew's
+  already-installed answer (see "Holds and messages").
+- **#23 Decision 7: concurrent plain brew is warned about in the README** and
+  recorded under "Two runs at once"; a code fix is tracked in issue #25.
+- **#23 Decision 8: release-check precondition messages are reworded, not
+  reordered.** The two messages that fire when `hello` is installed through
+  brewsoak's tap say so and that check 13.8 needs it absent; self-test
+  `anchored-hello-message`. The check order is kept as a safety net.
+- **Every proposed drop was rejected**: all 14 were implemented.
 
 ## Approaches considered
 
