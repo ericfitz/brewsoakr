@@ -1376,6 +1376,8 @@ Already up-to-date.
         let without = "==> Caveats\n==> wget\none\ntwo";
         let (_, f) = run(with);
         let (_, g) = run(without);
+        assert!(!g.caveat_report().is_empty(), "the control has a report");
+        assert!(!f.caveat_report().is_empty(), "{:?}", f.caveat_report());
         assert_eq!(f.caveat_report(), g.caveat_report());
     }
 

@@ -539,15 +539,18 @@ mod tests {
                 "ericfitz/brewsoak/wget"
             ]
         );
-        assert_eq!(
-            soak_tap_args(&cask("firefox"), false, &flags),
-            [
-                "install",
-                "--cask",
-                "--dry-run",
-                "ericfitz/brewsoak/firefox"
-            ]
-        );
+        for installed in [false, true] {
+            assert_eq!(
+                soak_tap_args(&cask("firefox"), installed, &flags),
+                [
+                    "install",
+                    "--cask",
+                    "--dry-run",
+                    "ericfitz/brewsoak/firefox"
+                ],
+                "installed={installed}"
+            );
+        }
         assert_eq!(
             brew_install_args(&formula("wget"), "wget", &flags),
             ["install", "--formula", "--dry-run", "wget"]
