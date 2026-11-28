@@ -13,7 +13,8 @@
 #
 # Second run: a finished run leaves no state, so it behaves like the first.
 # Overlapping runs: a lock directory refuses the second one.
-# Leftovers of a failed run: --run refuses to start and names --cleanup.
+# Leftovers of a failed run: --run refuses to start and names --cleanup, which
+# acts only on what the marker file of the failed run recorded.
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -28,6 +29,7 @@ die() {
 
 # Resolve tools to absolute paths, failing fast with what to install.
 init_tools() {
+	export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK=1
 	BREW="$(command -v brew || true)"
 	[[ "$BREW" == /* ]] || die "brew not found on PATH; install Homebrew first."
 	JQ="$(command -v jq || true)"
@@ -41,7 +43,7 @@ init_tools() {
 		die "brew did not print absolute --repository, --cellar and --caskroom paths."
 	TAP="$REPO/Library/Taps/ericfitz/homebrew-brewsoak"
 	SPIKE="$REPO/Library/Taps/spike17c/homebrew-t3"
-	TRUST="$HOME/.homebrew/trust.json"
+	MARKER="${TMPDIR:-/tmp}/release-check-17.marker"
 	LOCK="${TMPDIR:-/tmp}/release-check-17.lock"
 }
 
@@ -63,31 +65,81 @@ snapshot() {
 	echo "## casks"
 	"$BREW" list --cask | LC_ALL=C sort
 	echo "## trust"
-	if [[ -f "$TRUST" ]]; then "$JQ" -S . "$TRUST"; else echo "(absent)"; fi
+	"$BREW" trust --json=v1 | "$JQ" -S .
 	echo "## receipts"
 	receipts cellar "$CELLAR"
 	receipts caskroom "$CASKROOM"
 }
 
+indent() { # <text>: print each line indented two spaces
+	local l
+	while IFS= read -r l; do printf '  %s\n' "$l"; done <<<"$1"
+}
+
+trust_has() { # <taps|formulae> <entry>: exact match in brew's trust list
+	# shellcheck disable=SC2016 # $k and $v are jq variables
+	"$BREW" trust --json=v1 | "$JQ" -e --arg k "$1" --arg v "$2" '.[$k] | index($v) != null' >/dev/null
+}
+
 preconditions() {
 	[[ -d "$TAP/Formula" ]] ||
 		die "brewsoak's tap is missing at $TAP; run 'brewsoak upgrade ast-grep' (Task 13.1) first."
-	[[ -f "$TRUST" ]] ||
-		die "$TRUST is missing; run 'brew trust $SOAK_TAP' (Task 13.2) first."
-	# shellcheck disable=SC2016 # $t is a jq variable
-	"$JQ" -e --arg t "$SOAK_TAP" 'tostring | ascii_downcase | contains($t)' "$TRUST" >/dev/null ||
-		die "$SOAK_TAP is not in $TRUST; run 'brew trust $SOAK_TAP' (Task 13.2) first."
-	if [[ -e "$SPIKE" || -e "$TAP/Formula/$PKG.rb" ]]; then
-		die "leftovers of an earlier run exist ($SPIKE or $TAP/Formula/$PKG.rb); run: bash $SELF --cleanup"
+	trust_has taps "$SOAK_TAP" ||
+		die "$SOAK_TAP is not trusted; run 'brew trust $SOAK_TAP' (Task 13.2) first."
+	if [[ -e "$MARKER" || -e "$SPIKE" || -e "$TAP/Formula/$PKG.rb" ]]; then
+		die "leftovers of an earlier run exist ($MARKER, $SPIKE or $TAP/Formula/$PKG.rb); run: bash $SELF --cleanup"
+	fi
+	if trust_has taps "$SPIKE_TAP" || trust_has formulae "$SOAK_TAP/$PKG"; then
+		die "brew already trusts $SPIKE_TAP or $SOAK_TAP/$PKG; this check would untrust it at the end. Remove the entry yourself ('brew untrust --tap $SPIKE_TAP' or 'brew untrust --formula $SOAK_TAP/$PKG') if it is a leftover, then run again."
 	fi
 }
 
 hello_installed() {
-	"$BREW" list --formula | grep -qx "$PKG"
+	local list # captured first: grep -q would SIGPIPE brew and pipefail would report 141
+	list="$("$BREW" list --formula)" || return 1
+	grep -qx "$PKG" <<<"$list"
 }
 
 CREATED_TAP=0 TRUSTED_SPIKE=0 INSTALLED=0 WROTE_FILE=0 TRUSTED_PKG=0
-HAVE_LOCK=0 WORK="" LOG="" FORCE_CLEANUP=0 DID_RUN=0
+HAVE_LOCK=0 WORK="" LOG="" DID_RUN=0
+
+# begin <step>: record in the marker, then set the flag, before the step runs,
+# so a --cleanup after any interruption undoes exactly what this script began.
+begin() {
+	echo "$1" >>"$MARKER"
+	case "$1" in
+	tap) CREATED_TAP=1 ;;
+	spike-trust) TRUSTED_SPIKE=1 ;;
+	installed) INSTALLED=1 ;;
+	file) WROTE_FILE=1 ;;
+	pkg-trust) TRUSTED_PKG=1 ;;
+	*) die "internal error: unknown step $1" ;;
+	esac
+}
+
+load_marker() {
+	local k
+	[[ -f "$MARKER" ]] || return 0
+	while IFS= read -r k; do
+		case "$k" in
+		tap) CREATED_TAP=1 ;;
+		spike-trust) TRUSTED_SPIKE=1 ;;
+		installed) INSTALLED=1 ;;
+		file) WROTE_FILE=1 ;;
+		pkg-trust) TRUSTED_PKG=1 ;;
+		esac
+	done <"$MARKER"
+}
+
+# What this check can leave behind, one item per line (empty when clean).
+leftovers() {
+	if hello_installed; then echo "formula $PKG is installed (brew uninstall $PKG)"; fi
+	if [[ -e "$TAP/Formula/$PKG.rb" ]]; then echo "file $TAP/Formula/$PKG.rb"; fi
+	if [[ -e "$SPIKE" ]]; then echo "tap directory $SPIKE (brew untap $SPIKE_TAP)"; fi
+	if trust_has taps "$SPIKE_TAP"; then echo "trust entry for tap $SPIKE_TAP (brew untrust --tap $SPIKE_TAP)"; fi
+	if trust_has formulae "$SOAK_TAP/$PKG"; then echo "trust entry for formula $SOAK_TAP/$PKG (brew untrust --formula $SOAK_TAP/$PKG)"; fi
+	return 0
+}
 
 cleanup_steps() {
 	local ok=0
@@ -97,11 +149,11 @@ cleanup_steps() {
 			ok=1
 		fi
 	}
-	if ((INSTALLED || FORCE_CLEANUP)) && hello_installed; then step_c "$BREW" uninstall "$PKG"; fi
-	if ((WROTE_FILE || FORCE_CLEANUP)) && [[ -e "$TAP/Formula/$PKG.rb" ]]; then step_c rm -f "$TAP/Formula/$PKG.rb"; fi
-	if ((CREATED_TAP || FORCE_CLEANUP)) && [[ -e "$SPIKE" ]]; then step_c "$BREW" untap "$SPIKE_TAP"; fi
-	if ((TRUSTED_SPIKE || FORCE_CLEANUP)); then step_c "$BREW" untrust --tap "$SPIKE_TAP"; fi
-	if ((TRUSTED_PKG || FORCE_CLEANUP)); then step_c "$BREW" untrust --formula "$SOAK_TAP/$PKG"; fi
+	if ((INSTALLED)) && hello_installed; then step_c "$BREW" uninstall "$PKG"; fi
+	if ((WROTE_FILE)) && [[ -e "$TAP/Formula/$PKG.rb" ]]; then step_c rm -f "$TAP/Formula/$PKG.rb"; fi
+	if ((CREATED_TAP)) && [[ -e "$SPIKE" ]]; then step_c "$BREW" untap "$SPIKE_TAP"; fi
+	if ((TRUSTED_SPIKE)); then step_c "$BREW" untrust --tap "$SPIKE_TAP"; fi
+	if ((TRUSTED_PKG)); then step_c "$BREW" untrust --formula "$SOAK_TAP/$PKG"; fi
 	return "$ok"
 }
 
@@ -115,7 +167,7 @@ release_lock() {
 
 finish() {
 	local rc=$?
-	trap - EXIT INT TERM
+	trap - EXIT INT TERM HUP
 	set +e
 	if ((DID_RUN)); then
 		cleanup_steps
@@ -129,11 +181,20 @@ finish() {
 			rc=1
 		fi
 		((crc == 0)) || rc=1
+		local left
+		left="$(leftovers)"
+		if [[ -n "$left" ]]; then
+			rc=1
+			echo "leftovers:" >&2
+			indent "$left" >&2
+			echo "retry the cleanup with: bash $SELF --cleanup" >&2
+		fi
 		if ((rc == 0)); then
 			echo "release-check-17: PASS"
 			rm -r -- "$WORK"
+			rm -f -- "$MARKER"
 		else
-			echo "release-check-17: FAIL; log and snapshots in $WORK" >&2
+			echo "release-check-17: FAIL; log and snapshots in $WORK; marker $MARKER kept for --cleanup" >&2
 		fi
 	fi
 	release_lock
@@ -182,22 +243,24 @@ do_run() {
 	trap finish EXIT
 	trap 'exit 130' INT
 	trap 'exit 143' TERM
+	trap 'exit 129' HUP
 	snapshot >"$WORK/before"
+	: >"$MARKER"
 	DID_RUN=1
 	echo "snapshot: $(wc -l <"$WORK/before" | tr -d ' ') lines saved in $WORK/before"
 
-	CREATED_TAP=1
+	begin tap
 	run_step "create the throwaway tap directory" mkdir -p "$SPIKE/Formula"
 	# shellcheck disable=SC2016 # expanded by the inner bash
 	run_step "copy $PKG into it" bash -c '"$1" cat "$2" >"$3"' _ "$BREW" "$PKG" "$SPIKE/Formula/$PKG.rb"
 	[[ -s "$SPIKE/Formula/$PKG.rb" ]] || fail "brew cat $PKG printed nothing"
-	TRUSTED_SPIKE=1
+	begin spike-trust
 	run_step "trust the throwaway tap" "$BREW" trust "$SPIKE_TAP"
-	INSTALLED=1
+	begin installed
 	run_step "install $PKG from the throwaway tap" "$BREW" install --formula "$SPIKE_TAP/$PKG"
-	WROTE_FILE=1
+	begin file
 	run_step "write $PKG with 'revision 1' into brewsoak's tap" add_revision "$SPIKE/Formula/$PKG.rb" "$TAP/Formula/$PKG.rb"
-	TRUSTED_PKG=1
+	begin pkg-trust
 	run_step "upgrade $PKG through brewsoak's tap" "$BREW" upgrade --formula "$SOAK_TAP/$PKG"
 
 	local receipt tap
@@ -212,14 +275,34 @@ do_cleanup() {
 	init_tools
 	take_lock
 	setup_work
-	FORCE_CLEANUP=1
-	if ! cleanup_steps; then
-		echo "cleanup: some steps failed; see $LOG" >&2
+	load_marker
+	local left
+	if [[ ! -f "$MARKER" ]]; then
+		left="$(leftovers)"
+		if [[ -z "$left" ]]; then
+			echo "cleanup: nothing to do (no marker, no leftovers)"
+			release_lock
+			rm -r -- "$WORK"
+			return 0
+		fi
+		echo "cleanup: no marker records what a run created, so nothing is removed automatically. Possible leftovers:" >&2
+		indent "$left" >&2
+		echo "Remove them by hand only if you are sure this check created them." >&2
+		release_lock
+		exit 1
+	fi
+	cleanup_steps || true
+	left="$(leftovers)"
+	if [[ -n "$left" ]]; then
+		echo "cleanup: leftovers remain (log: $LOG):" >&2
+		indent "$left" >&2
+		echo "retry with: bash $SELF --cleanup" >&2
 		release_lock
 		exit 1
 	fi
 	echo "cleanup: done"
 	release_lock
+	rm -f -- "$MARKER"
 	rm -r -- "$WORK"
 }
 
@@ -231,8 +314,9 @@ write_fake_brew() { # <dir>
 # Fake brew for release-check-17.sh --self-test. State lives under $FAKE_ROOT.
 set -euo pipefail
 R="$FAKE_ROOT"
+[[ "${HOMEBREW_NO_AUTO_UPDATE:-}" == 1 && "${HOMEBREW_NO_INSTALL_CLEANUP:-}" == 1 && "${HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK:-}" == 1 ]] || { echo "fake brew: HOMEBREW_NO_* not set" >&2; exit 97; }
 CELLAR="$R/cellar"; CASKROOM="$R/caskroom"; TAPS="$R/repo/Library/Taps"
-TRUST="$HOME/.homebrew/trust.json"
+TRUST="$R/trust.json"
 echo "$*" >>"$R/calls"
 [[ "${FAKE_FAIL:-}" == "${1:-}" ]] && { echo "Error: fake $1 failure" >&2; exit 1; }
 receipt() { mkdir -p "$CELLAR/$1/$2"; printf '{"source":{"tap":"%s"}}\n' "$3" >"$CELLAR/$1/$2/INSTALL_RECEIPT.json"; }
@@ -242,9 +326,9 @@ case "$1" in
 --cellar) echo "$CELLAR" ;;
 --caskroom) echo "$CASKROOM" ;;
 tap) for d in "$TAPS"/*/homebrew-*; do [[ -d "$d" ]] && { u="${d%/*}"; echo "${u##*/}/${d##*/homebrew-}"; }; done; true ;;
-list) if [[ "$2" == --formula ]]; then ls "$CELLAR"; else ls "$CASKROOM"; fi ;;
+list) if [[ -n "${FAKE_BIG:-}" && "$2" == --formula ]]; then echo hello; seq 1 20000; elif [[ "$2" == --formula ]]; then ls "$CELLAR"; else ls "$CASKROOM"; fi ;;
 cat) printf 'class Hello < Formula\n  url "https://x/hello.tgz"\n  sha256 "abc"\n  bottle do\n    sha256 cellar: :any, arm64: "def"\n  end\nend\n' ;;
-trust) jq --arg v "$2" '.taps += [$v]' "$TRUST" >"$TRUST.new" && mv "$TRUST.new" "$TRUST" ;;
+trust) if [[ "$2" == --json=v1 ]]; then cat "$TRUST"; else jq --arg v "$2" '.taps += [$v]' "$TRUST" >"$TRUST.new" && mv "$TRUST.new" "$TRUST"; fi ;;
 untrust) if [[ "$2" == --tap ]]; then untrust taps "$3"; else untrust formulae "$3"; fi ;;
 install) receipt hello 2.12 spike17c/t3 ;;
 upgrade)
@@ -263,10 +347,10 @@ STUB
 reset_fake() { # <root> <home>
 	rm -rf "${1:?}" "${2:?}"
 	mkdir -p "$1/repo/Library/Taps/ericfitz/homebrew-brewsoak/Formula" "$1/repo/Library/Taps/homebrew/homebrew-core" \
-		"$1/cellar/wget/1.0" "$1/caskroom/firefox/.metadata" "$2/.homebrew" "$1/tmp"
+		"$1/cellar/wget/1.0" "$1/caskroom/firefox/.metadata" "$2" "$1/tmp"
 	printf '{"source":{"tap":"homebrew/core"}}\n' >"$1/cellar/wget/1.0/INSTALL_RECEIPT.json"
 	printf '{"source":{"tap":"homebrew/cask"}}\n' >"$1/caskroom/firefox/.metadata/INSTALL_RECEIPT.json"
-	printf '{"taps":["ericfitz/brewsoak"],"formulae":[]}\n' >"$2/.homebrew/trust.json"
+	printf '{"casks":[],"commands":[],"formulae":[],"taps":["ericfitz/brewsoak"]}\n' >"$1/trust.json"
 	: >"$1/calls"
 }
 
@@ -282,6 +366,8 @@ wget
 firefox
 ## trust
 {
+  "casks": [],
+  "commands": [],
   "formulae": [],
   "taps": [
     "ericfitz/brewsoak"
@@ -297,13 +383,13 @@ EOF
 # (trust store keeps the throwaway tap and the hello entry).
 expected_leak_diff() {
 	cat <<'EOF'
-10c10,12
+12c12,14
 <   "formulae": [],
 ---
 >   "formulae": [
 >     "ericfitz/brewsoak/hello"
 >   ],
-12c14,15
+14c16,17
 <     "ericfitz/brewsoak"
 ---
 >     "ericfitz/brewsoak",
@@ -323,7 +409,7 @@ self_test() {
 	SHABIN="$(command -v shasum || true)"
 	[[ "$SHABIN" == /* ]] || die "shasum not found on PATH."
 	local t p
-	for t in bash jq shasum dirname basename mktemp rm mkdir cat sed awk sort find diff grep cut head tail wc tr ls mv sleep env; do
+	for t in seq bash jq shasum dirname basename mktemp rm mkdir cat sed awk sort find diff grep cut head tail wc tr ls mv sleep env; do
 		p="$(command -v "$t" || true)"
 		if [[ "$p" == /* ]]; then ln -s "$p" "$T/tools/$t"; fi
 	done
@@ -405,7 +491,9 @@ self_test() {
 	run_case "$P" FAKE_FAIL=untrust bash "$SELF" --run
 	want_rc residue-exit 1
 	has residue-msg "state: CHANGED"
-	printf '%s\n' "$out" | sed -n '/^state: CHANGED/,/^release-check-17: FAIL/p' | sed '1d' | sed -n '/^[0-9]/,/^release-check-17: FAIL/p' | sed '$d' >"$T/leak.got"
+	printf '%s\n' "$out" | sed -n '/^state: CHANGED/,/^leftovers:/p' | sed '1d;$d' >"$T/leak.got"
+	has residue-leftovers "trust entry for tap spike17c/t3 (brew untrust --tap spike17c/t3)"
+	has residue-retry "retry the cleanup with: bash $SELF --cleanup"
 	expected_leak_diff >"$T/leak.want"
 	check residue-diff "$(diff "$T/leak.want" "$T/leak.got" >"$T/leak.diff" && echo 0 || echo 1)" "$(cat "$T/leak.diff")"
 
@@ -415,37 +503,77 @@ self_test() {
 	run_case "$P" bash "$SELF" --run
 	want_rc skip-exit 0
 	has skip-msg "SKIP: hello is installed"
-	check skip-no-mutation "$(grep -qE '^(trust|install|upgrade|uninstall|untap|untrust)' "$ROOT/calls" && echo 1 || echo 0)" "$(cat "$ROOT/calls")"
+	check skip-no-mutation "$(grep -qE '^(trust [a-z]|install|upgrade|uninstall|untap|untrust)' "$ROOT/calls" && echo 1 || echo 0)" "$(cat "$ROOT/calls")"
 
-	# 7. leftovers of an earlier run: refuses, names --cleanup; --cleanup clears them
+	# 7. a run whose cleanup fails keeps its marker, lists the leftovers and the
+	# retry command; --run then refuses; --cleanup finishes the job (twice is safe)
 	reset_fake "$ROOT" "$HOME_"
-	mkdir -p "$ROOT/repo/Library/Taps/spike17c/homebrew-t3/Formula"
-	: >"$ROOT/repo/Library/Taps/ericfitz/homebrew-brewsoak/Formula/hello.rb"
+	run_case "$P" FAKE_FAIL=uninstall bash "$SELF" --run
+	want_rc cleanup-fails-exit 1
+	has cleanup-fails-leftover "formula hello is installed (brew uninstall hello)"
+	has cleanup-fails-retry "retry the cleanup with: bash $SELF --cleanup"
+	check cleanup-fails-marker "$([[ -s "$ROOT/tmp/release-check-17.marker" ]] && echo 0 || echo 1)" "marker missing"
 	run_case "$P" bash "$SELF" --run
 	want_rc leftovers-exit 2
 	has leftovers-msg "--cleanup"
 	run_case "$P" bash "$SELF" --cleanup
 	want_rc cleanup-exit 0
-	check cleanup-removes "$([[ ! -e "$ROOT/repo/Library/Taps/spike17c/homebrew-t3" && ! -e "$ROOT/repo/Library/Taps/ericfitz/homebrew-brewsoak/Formula/hello.rb" ]] && echo 0 || echo 1)" "leftovers remain: $out"
+	untouched cleanup-restores
+	check cleanup-marker-removed "$([[ ! -e "$ROOT/tmp/release-check-17.marker" ]] && echo 0 || echo 1)" "marker remains"
 	run_case "$P" bash "$SELF" --cleanup
 	want_rc cleanup-idempotent 0
+	has cleanup-idempotent-msg "nothing to do"
 
-	# 8. preconditions: tap missing, trust missing, tap not trusted
+	# 7b. --cleanup with no marker removes nothing, even a user-installed hello
+	reset_fake "$ROOT" "$HOME_"
+	mkdir -p "$ROOT/cellar/hello/2.12"
+	run_case "$P" bash "$SELF" --cleanup
+	want_rc cleanup-nomarker-exit 1
+	has cleanup-nomarker-msg "no marker"
+	check cleanup-nomarker-kept "$([[ -d "$ROOT/cellar/hello/2.12" ]] && ! grep -qE '^(uninstall|untap|untrust)' "$ROOT/calls" && echo 0 || echo 1)" "removed something: $(cat "$ROOT/calls")"
+	# ... and a --run's marker alone controls what --cleanup removes: a marker
+	# that records only the file leaves a user's hello and trust entries alone
+	reset_fake "$ROOT" "$HOME_"
+	mkdir -p "$ROOT/cellar/hello/2.12"
+	: >"$ROOT/repo/Library/Taps/ericfitz/homebrew-brewsoak/Formula/hello.rb"
+	echo file >"$ROOT/tmp/release-check-17.marker"
+	run_case "$P" bash "$SELF" --cleanup
+	check cleanup-marker-scope "$([[ -d "$ROOT/cellar/hello/2.12" && ! -e "$ROOT/repo/Library/Taps/ericfitz/homebrew-brewsoak/Formula/hello.rb" ]] && ! grep -qE '^(uninstall|untap|untrust)' "$ROOT/calls" && echo 0 || echo 1)" "calls: $(cat "$ROOT/calls")"
+
+	# 8. preconditions: tap missing, tap not trusted (exact match), pre-existing trust entries
 	reset_fake "$ROOT" "$HOME_"
 	rm -r -- "$ROOT/repo/Library/Taps/ericfitz"
 	run_case "$P" bash "$SELF" --run
 	want_rc no-tap-exit 2
 	has no-tap-msg "Task 13.1"
 	reset_fake "$ROOT" "$HOME_"
-	rm -- "$HOME_/.homebrew/trust.json"
-	run_case "$P" bash "$SELF" --run
-	want_rc no-trust-exit 2
-	has no-trust-msg "brew trust ericfitz/brewsoak"
-	reset_fake "$ROOT" "$HOME_"
-	echo '{"taps":[],"formulae":[]}' >"$HOME_/.homebrew/trust.json"
+	echo '{"casks":[],"commands":[],"formulae":[],"taps":[]}' >"$ROOT/trust.json"
 	run_case "$P" bash "$SELF" --run
 	want_rc untrusted-exit 2
-	has untrusted-msg "is not in"
+	has untrusted-msg "is not trusted; run 'brew trust ericfitz/brewsoak'"
+	reset_fake "$ROOT" "$HOME_"
+	echo '{"casks":[],"commands":[],"formulae":["ericfitz/brewsoak/hello"],"taps":["ericfitz/brewsoak-other"]}' >"$ROOT/trust.json"
+	run_case "$P" bash "$SELF" --run
+	want_rc substring-trust-exit 2
+	has substring-trust-msg "is not trusted"
+	reset_fake "$ROOT" "$HOME_"
+	echo '{"casks":[],"commands":[],"formulae":[],"taps":["ericfitz/brewsoak","spike17c/t3"]}' >"$ROOT/trust.json"
+	run_case "$P" bash "$SELF" --run
+	want_rc preexisting-spike-trust-exit 2
+	has preexisting-spike-trust-msg "already trusts"
+	reset_fake "$ROOT" "$HOME_"
+	echo '{"casks":[],"commands":[],"formulae":["ericfitz/brewsoak/hello"],"taps":["ericfitz/brewsoak"]}' >"$ROOT/trust.json"
+	run_case "$P" bash "$SELF" --run
+	want_rc preexisting-pkg-trust-exit 2
+	has preexisting-pkg-trust-msg "already trusts"
+	check preexisting-trust-untouched "$(grep -qE '^(install|upgrade|uninstall|untap|untrust)' "$ROOT/calls" && echo 1 || echo 0)" "$(cat "$ROOT/calls")"
+
+	# 8b. hello installed, with a long `brew list` that prints hello first
+	# (grep -q under pipefail would SIGPIPE brew and report "not installed")
+	reset_fake "$ROOT" "$HOME_"
+	run_case "$P" FAKE_BIG=1 bash "$SELF" --run
+	want_rc big-list-exit 0
+	has big-list-skip "SKIP: hello is installed"
 
 	# 9. missing tools
 	reset_fake "$ROOT" "$HOME_"
@@ -485,6 +613,21 @@ self_test() {
 	want_rc term-exit 143
 	untouched term-restored
 	check term-lock "$([[ ! -e "$ROOT/tmp/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left behind"
+
+	# 11b. SIGHUP behaves the same
+	reset_fake "$ROOT" "$HOME_"
+	in_env "$P" FAKE_HANG=upgrade bash "$SELF" --run >"$T/hup.out" 2>&1 &
+	pid=$!
+	for _ in $(seq 1 100); do
+		[[ -e "$ROOT/hang" ]] && break
+		sleep 0.1
+	done
+	kill -HUP "$pid" 2>/dev/null || true
+	rc=0
+	wait "$pid" || rc=$?
+	out="$(cat "$T/hup.out")"
+	want_rc hup-exit 129
+	untouched hup-restored
 
 	# 12. the revision insert needs a top-level sha256 line
 	printf 'class X\n  bottle do\n    sha256 cellar: :any, a: "b"\n  end\nend\n' >"$T/nosha.rb"
