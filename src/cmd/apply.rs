@@ -1073,6 +1073,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             )?;
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
+        } else if self.counts.dry_run && installed_rb.is_none() {
+            // brew's own dependency preview is dropped from the terminal, so
+            // say what brewsoak would install, at its cutoff.
+            let to = want
+                .as_ref()
+                .map(|w| format!(" {}", report::identity_version(w)))
+                .unwrap_or_default();
+            writeln!(self.out, "would install {dep}{to} (dependency of {target})")?;
         }
         let installing = want.as_ref().map(report::identity_version);
         match self.run_install(&pkg, dep_origin, blobs.cutoff.as_deref(), installing)? {
@@ -1638,6 +1646,35 @@ mod tests {
         upgrade_names(&brew, &git, &[]);
         let visible = brew.visible_runs.lock().expect("visible").clone();
         assert_eq!(visible.len(), 3, "{visible:?}");
+    }
+
+    /// Characterization: brew's no-op answer is recognized with a full name.
+    #[test]
+    fn already_installed_line_recognizes_full_names() {
+        assert!(already_installed_line(
+            "warning: ericfitz/brewsoak/x 1.0 already installed"
+        ));
+        assert!(!already_installed_line(
+            "warning: ericfitz/brewsoak/x 1.0 already installed but outdated (so it will be upgraded)"
+        ));
+    }
+
+    #[test]
+    fn dry_run_reports_each_dependency_once_at_its_cutoff_version() {
+        let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        brew.installed.retain(|p| p.name == "node");
+        let flags = ["--dry-run".to_string()];
+        let text = upgrade_names_flags(&brew, &git, &["node".to_string()], &flags);
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("simdutf"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            lines,
+            ["would install simdutf 1.1.0 (dependency of node)"],
+            "{text}"
+        );
     }
 
     /// `node` depends on `simdutf`; both are installed, `node` sorts first.

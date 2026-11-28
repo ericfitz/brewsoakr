@@ -1,0 +1,2 @@
+  installing hello 2.12.3
+  installed to /opt/homebrew/Cellar/hello/2.12.3 (78 files, 1.8MB)

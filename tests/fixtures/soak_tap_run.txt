@@ -1,0 +1,7 @@
+==> Trusted formula ericfitz/brewsoak/hello
+==> Upgrading ericfitz/brewsoak/hello
+  2.12.2 -> 2.12.3
+==> Pouring hello--2.12.3.arm64_tahoe.bottle.tar.gz
+🍺  /opt/homebrew/Cellar/hello/2.12.3: 78 files, 1.8MB
+==> Would install 1 dependency for ericfitz/brewsoak/hello:
+hello 2.12.3

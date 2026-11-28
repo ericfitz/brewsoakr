@@ -162,6 +162,12 @@ impl Filter {
 
     fn filter_line(&mut self, raw: &str) -> Option<String> {
         let plain = strip_ansi(raw.trim_end_matches(['\r', '\n']));
+        // brew's trust notice for the soak tap is for the log only; every
+        // other line shows the bare package name.
+        if is_soak_tap_trusted_line(&plain) {
+            return None;
+        }
+        let plain = plain.replace(SOAK_TAP_PREFIX, "");
         let t = plain.as_str();
         match self.state.unwrap_or(State::Normal) {
             State::Caveats => self.caveat_line(t),
@@ -567,6 +573,20 @@ fn already_current_head(t: &str) -> Option<&str> {
         .filter(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
 }
 
+/// `ericfitz/brewsoak/`: removed from every line the terminal shows.
+/// Kept equal to `origin::SOAK_TAP` plus a slash by a test.
+const SOAK_TAP_PREFIX: &str = "ericfitz/brewsoak/";
+
+/// `==> Trusted formula ericfitz/brewsoak/x` / `==> Trusted cask ...`.
+fn is_soak_tap_trusted_line(t: &str) -> bool {
+    t.strip_prefix("==> Trusted ")
+        .and_then(|r| {
+            r.strip_prefix("formula ")
+                .or_else(|| r.strip_prefix("cask "))
+        })
+        .is_some_and(|r| r.starts_with(SOAK_TAP_PREFIX))
+}
+
 fn is_already_up_to_date(t: &str) -> bool {
     t.starts_with("Warning: ") && t.ends_with("is already installed and up-to-date.")
 }
@@ -708,6 +728,7 @@ fn installed_versions(bytes: &[u8], include_warnings: bool) -> BTreeMap<String, 
             && let Some(rest) = line.strip_prefix("Warning: ")
             && is_already_up_to_date(line)
         {
+            let rest = rest.strip_prefix(SOAK_TAP_PREFIX).unwrap_or(rest);
             let mut parts = rest.split_whitespace();
             if let (Some(name), Some(version)) = (parts.next(), parts.next()) {
                 out.insert(name.to_string(), version.to_string());
@@ -1271,6 +1292,66 @@ Already up-to-date.
         let got = installed_from_output(raw.as_bytes());
         assert_eq!(got.get("aws-c-cal").map(String::as_str), Some("1.0.0"));
         assert_eq!(got.get("aws-c-common").map(String::as_str), Some("1.0.0"));
+    }
+
+    fn run_soaked(input: &str) -> Vec<String> {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::Soaked,
+            ..RunContext::default()
+        });
+        input.lines().filter_map(|l| f.line(l)).collect()
+    }
+
+    #[test]
+    fn soak_tap_prefix_is_not_shown() {
+        assert_eq!(
+            run_soaked("Error: ericfitz/brewsoak/hello: boom"),
+            vec!["Error: hello: boom"]
+        );
+        assert_eq!(
+            run_soaked(
+                "Warning: ericfitz/brewsoak/hello 2.12.3 is available and more recent than version 2.12.2."
+            ),
+            vec!["Warning: hello 2.12.3 is available and more recent than version 2.12.2."]
+        );
+    }
+
+    #[test]
+    fn trusted_lines_for_the_soak_tap_go_to_the_log_only() {
+        assert!(run_soaked("==> Trusted formula ericfitz/brewsoak/hello").is_empty());
+        assert!(run_soaked("==> Trusted cask ericfitz/brewsoak/font-hack").is_empty());
+        assert_eq!(
+            run_soaked("==> Trusted formula hashicorp/tap/packer"),
+            vec!["Trusted formula hashicorp/tap/packer"]
+        );
+    }
+
+    /// Characterization: the existing `==> Would ` rule already drops these.
+    #[test]
+    fn dry_run_dependency_preview_of_a_soak_tap_target_is_dropped() {
+        for input in [
+            "==> Would install 1 dependency for parent:\nhello 2.12.3",
+            "==> Would upgrade 2 dependencies for parent:\nhello 2.12.2 -> 2.12.3\nwget 1.0 -> 1.1",
+            "==> Would install 1 dependency for ericfitz/brewsoak/font-hack:\nhello",
+        ] {
+            assert!(run_soaked(input).is_empty(), "{input}");
+            let after = format!("{input}\nError: boom");
+            assert_eq!(run_soaked(&after), vec!["Error: boom"], "{input}");
+        }
+    }
+
+    #[test]
+    fn soak_tap_prefix_matches_the_tap_name() {
+        assert_eq!(SOAK_TAP_PREFIX, format!("{}/", crate::origin::SOAK_TAP));
+    }
+
+    #[test]
+    fn installed_from_output_reads_full_names() {
+        let raw = "Warning: ericfitz/brewsoak/x 1.0 is already installed and up-to-date.\n";
+        let got = installed_from_output(raw.as_bytes());
+        assert_eq!(got.get("x").map(String::as_str), Some("1.0"));
+        assert_eq!(got.len(), 1, "{got:?}");
     }
 
     #[test]
