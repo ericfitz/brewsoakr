@@ -222,10 +222,16 @@ pub(super) fn run_has_token(runs: &[Vec<String>], token: &str) -> bool {
 
 pub(super) fn run_is_name_install(runs: &[Vec<String>], name: &str) -> bool {
     runs.iter().any(|args| {
-        matches!(
-            args.first().map(String::as_str),
-            Some("install" | "upgrade")
-        ) && args.last().map(|a| strip_soak_prefix(a)) == Some(name)
+        let last = args.last().map(String::as_str);
+        // `upgrade` is how brewsoak installs over a soak-tap keg; a bare name
+        // under `upgrade` is something else.
+        let verb_ok = match args.first().map(String::as_str) {
+            Some("install") => true,
+            Some("upgrade") => last.is_some_and(|a| a.starts_with("ericfitz/brewsoak/")),
+            _ => false,
+        };
+        verb_ok
+            && last.map(strip_soak_prefix) == Some(name)
             && !args.iter().any(|a| a == "--ignore-dependencies")
     })
 }
@@ -938,5 +944,22 @@ mod assert_soak_tap_commands_tests {
             .unwrap()
             .push((PkgKind::Formula, "packer".to_string()));
         assert_soak_tap_commands(&brew, &["name"]);
+    }
+
+    #[test]
+    fn run_is_name_install_rejects_an_upgrade_of_a_bare_name() {
+        let runs = |args: &[&str]| vec![args.iter().map(|a| a.to_string()).collect::<Vec<_>>()];
+        assert!(!run_is_name_install(
+            &runs(&["upgrade", "--formula", "packer"]),
+            "packer"
+        ));
+        assert!(run_is_name_install(
+            &runs(&["upgrade", "--formula", "ericfitz/brewsoak/alpha"]),
+            "alpha"
+        ));
+        assert!(run_is_name_install(
+            &runs(&["install", "--formula", "packer"]),
+            "packer"
+        ));
     }
 }
