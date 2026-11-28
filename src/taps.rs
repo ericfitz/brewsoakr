@@ -153,6 +153,16 @@ pub fn untrusted_taps(brew_output: &str) -> Vec<String> {
         .collect()
 }
 
+/// The tap that blocks a command: brewsoak's own tap when any refusal names
+/// it, wherever it falls among several, else the first tap named.
+pub fn blocking_untrusted_tap(brew_output: &str) -> Option<String> {
+    let all = untrusted_taps(brew_output);
+    all.iter()
+        .find(|t| t.eq_ignore_ascii_case(SOAK_TAP))
+        .or_else(|| all.first())
+        .cloned()
+}
+
 /// True when brew's output is its `TapFormulaAmbiguityError`: a bare formula
 /// name that matches formulae in more than one installed tap.
 pub fn ambiguous_formula(brew_output: &str) -> bool {
@@ -163,6 +173,21 @@ pub fn ambiguous_formula(brew_output: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn blocking_untrusted_tap_prefers_the_soak_tap_wherever_it_falls() {
+        let both = "Refusing to load formula a/b/x from untrusted tap hashicorp/tap.\nRefusing to load formula ericfitz/brewsoak/y from untrusted tap Ericfitz/Brewsoak.";
+        assert_eq!(
+            blocking_untrusted_tap(both).as_deref(),
+            Some("ericfitz/brewsoak")
+        );
+        let other = "Refusing to load formula a/b/x from untrusted tap hashicorp/tap.";
+        assert_eq!(
+            blocking_untrusted_tap(other).as_deref(),
+            Some("hashicorp/tap")
+        );
+        assert_eq!(blocking_untrusted_tap("Error: nope"), None);
+    }
+
     #[test]
     fn ambiguous_formula_reads_brews_ambiguity_error() {
         let msg = "Error: Formulae found in multiple taps:\n       * a/tap/cats\n       * b/tap/cats\n\nPlease use the fully-qualified name (e.g. a/tap/cats) to refer to a specific formula.";

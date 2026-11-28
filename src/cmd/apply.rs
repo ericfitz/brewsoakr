@@ -863,7 +863,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             // brew could not list the dependencies of a third-party target
             // by name.
             Err(Error::Brew { message, .. }) => {
-                match taps::untrusted_tap(&message) {
+                match taps::blocking_untrusted_tap(&message) {
+                    Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
+                        self.hold_target_not_ready(name, &NotReady::Untrusted)?
+                    }
                     Some(tap) => self.hold_target_untrusted(name, &tap),
                     None => {
                         let hold = NameHold {
@@ -1272,7 +1275,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let output = self.brew.run_visible_in(args, &mut self.out, &ctx)?;
         let text = String::from_utf8_lossy(&output.stdout);
         if !output.status.success()
-            && let Some(tap) = taps::untrusted_tap(&text)
+            && let Some(tap) = taps::blocking_untrusted_tap(&text)
         {
             if tap.eq_ignore_ascii_case(origin::SOAK_TAP) {
                 return Ok(NameRun::TapNotReady);

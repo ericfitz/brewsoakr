@@ -103,7 +103,7 @@ impl NameFail {
     /// untrusted-tap refusal of brewsoak's own tap is a tap that is not
     /// ready, whichever package brew was loading.
     fn from_brew(text: &str, why: impl FnOnce(String) -> NameWhy) -> Self {
-        match taps::untrusted_tap(text) {
+        match taps::blocking_untrusted_tap(text) {
             Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
                 Self::TapNotReady(NotReady::Untrusted)
             }
@@ -993,9 +993,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn deps_untrusted_tap_refusal_holds_with_trust_note() {
-        struct FailDepsBrew(MockBrew);
+    /// Run `install hashicorp/tap/terraform` with a dependency listing that
+    /// fails with `message`; returns the result and the text.
+    fn install_with_deps_failure(message: &str) -> (RunResult, String) {
+        struct FailDepsBrew(MockBrew, String);
         impl Brew for FailDepsBrew {
             fn brew_bin(&self) -> &Path {
                 self.0.brew_bin()
@@ -1035,9 +1036,7 @@ mod tests {
             fn deps(&self, _k: PkgKind, token: &str) -> Result<Vec<String>, Error> {
                 Err(Error::Brew {
                     status: 1,
-                    message: format!(
-                        "Error: terraform: Refusing to load formula hashicorp/tap/terraform from untrusted tap hashicorp/tap. ({token})"
-                    ),
+                    message: format!("{} ({token})", self.1),
                 })
             }
         }
@@ -1052,13 +1051,16 @@ mod tests {
             "Formula/terraform.rb",
             formula_rb("terraform", "1.2.0", "newsha"),
         );
-        let brew = FailDepsBrew(MockBrew {
-            taps: vec![tapped(
-                "hashicorp/tap",
-                Some("https://github.com/hashicorp/homebrew-tap"),
-            )],
-            ..MockBrew::new()
-        });
+        let brew = FailDepsBrew(
+            MockBrew {
+                taps: vec![tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                )],
+                ..MockBrew::new()
+            },
+            message.to_string(),
+        );
         let cfg = cfg24();
         let inv = inv_from(&brew.0, &cfg);
         let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
@@ -1081,8 +1083,20 @@ mod tests {
             &mut out,
         )
         .unwrap();
+        assert!(
+            lock_runs(&brew.0)
+                .iter()
+                .all(|a| a.first().map(String::as_str) != Some("install"))
+        );
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn deps_untrusted_tap_refusal_holds_with_trust_note() {
+        let (r, text) = install_with_deps_failure(
+            "Error: terraform: Refusing to load formula hashicorp/tap/terraform from untrusted tap hashicorp/tap.",
+        );
         assert!(r.refused);
-        let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains(
                 "terraform: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
@@ -1090,11 +1104,19 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("staged copy"), "{text}");
-        assert!(
-            lock_runs(&brew.0)
-                .iter()
-                .all(|a| a.first().map(String::as_str) != Some("install"))
+    }
+
+    #[test]
+    fn soak_tap_refusal_after_another_taps_in_a_deps_failure_is_the_tap_not_ready_hold() {
+        let (r, text) = install_with_deps_failure(
+            "Error: terraform: Refusing to load formula hashicorp/tap/terraform from untrusted tap hashicorp/tap.\nError: dep: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.",
         );
+        assert!(r.refused);
+        assert!(
+            text.contains("held terraform: brewsoak's tap is not ready"),
+            "{text}"
+        );
+        assert!(!text.contains("NO_SOAK"), "{text}");
     }
 
     #[test]
@@ -3186,5 +3208,51 @@ mod soak_closure_tests {
                 .any(|a| a.last().is_some_and(|l| l == "packer")),
             "{text}"
         );
+    }
+
+    const MULTI_REFUSAL: &str = "Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap hashicorp/tap.\nError: dep: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.";
+
+    #[test]
+    fn soak_tap_refusal_after_another_taps_from_by_name_is_the_tap_not_ready_hold() {
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git, snaps) = third_party_with_core_dep(tap.path());
+        brew.installed.push(pinned_old("dep"));
+        brew.by_name.insert("dep".into(), Err(MULTI_REFUSAL.into()));
+        let (r, text) = run_upgrade(
+            &brew,
+            &git,
+            &snaps,
+            tap.path(),
+            &["hashicorp/tap/packer"],
+            &[],
+        );
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains("held packer: brewsoak's tap is not ready"),
+            "{text}"
+        );
+        assert!(!text.contains("NO_SOAK"), "{text}");
+    }
+
+    #[test]
+    fn soak_tap_refusal_after_another_taps_from_a_third_party_install_is_the_tap_not_ready_hold() {
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git, snaps) = third_party_with_core_dep(tap.path());
+        brew.next_status = 1;
+        brew.next_stdout = MULTI_REFUSAL.as_bytes().to_vec();
+        let (r, text) = run_upgrade(
+            &brew,
+            &git,
+            &snaps,
+            tap.path(),
+            &["hashicorp/tap/packer"],
+            &[],
+        );
+        assert!(r.refused, "{text}");
+        assert!(
+            text.contains("held packer: brewsoak's tap is not ready"),
+            "{text}"
+        );
+        assert!(!text.contains("NO_SOAK"), "{text}");
     }
 }
