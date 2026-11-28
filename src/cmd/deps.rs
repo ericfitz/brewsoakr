@@ -77,12 +77,24 @@ impl NameWhy {
                 brew_version,
                 target,
             } => format!(
-                "brew would replace installed {dep} {installed} with {brew_version}, which has not soaked; {target} installs once it has"
+                "brew would replace installed {} with {brew_version}, which has not soaked; {target} installs once it has",
+                with_version(dep, installed)
             ),
             Self::CannotReplace { dep, installed } => format!(
-                "brew cannot replace installed {dep} {installed} as a dependency; run brew upgrade {dep} first"
+                "brew cannot replace installed {} as a dependency; run brew upgrade {dep} first",
+                with_version(dep, installed)
             ),
         }
+    }
+}
+
+/// `dep` and its installed version, or just `dep` when the version is empty
+/// (no double space in the hold text).
+fn with_version(dep: &str, version: &str) -> String {
+    if version.is_empty() {
+        dep.to_string()
+    } else {
+        format!("{dep} {version}")
     }
 }
 
@@ -623,6 +635,34 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
 mod tests {
     use super::*;
     use crate::SoakHours;
+
+    #[test]
+    fn replace_reasons_omit_an_empty_installed_version() {
+        let would = |installed: &str| {
+            NameWhy::WouldReplace {
+                dep: "dep".into(),
+                installed: installed.into(),
+                brew_version: "2.0".into(),
+                target: "t".into(),
+            }
+            .text()
+        };
+        let cannot = |installed: &str| {
+            NameWhy::CannotReplace {
+                dep: "dep".into(),
+                installed: installed.into(),
+            }
+            .text()
+        };
+        for text in [would(""), cannot("")] {
+            assert!(!text.contains("  "), "{text}");
+            assert!(text.contains("installed dep "), "{text}");
+        }
+        assert!(would("1.0_1").contains("installed dep 1.0_1 with 2.0"));
+        assert!(cannot("1.0_1").contains("installed dep 1.0_1 as a dependency"));
+        assert!(would("").contains("installed dep with 2.0"));
+        assert!(cannot("").contains("installed dep as a dependency"));
+    }
     use crate::brew::{InstalledPkg, MockBrew};
     use crate::cmd::test_support::summary_has;
     use crate::flags;
