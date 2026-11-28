@@ -1,6 +1,6 @@
 use crate::Error;
 use crate::eligibility::DesiredAction;
-use crate::inventory::Pkg;
+use crate::inventory::{HiddenTap, Inventory, Pkg};
 use crate::origin::{self, OwnTap};
 use crate::resolve::PkgKind;
 use crate::section::Section;
@@ -44,6 +44,25 @@ pub fn refusal_message(action: DesiredAction, name: &str, bypass: &str) -> Optio
         | DesiredAction::InstallCutoff => return None,
     };
     Some(format!("{why}; use `{bypass}` to bypass brewsoak."))
+}
+
+/// brew hides installed formulae of an untrusted tap from brewsoak; say how
+/// to let it manage them.
+pub(super) fn hidden_tap_note(h: &HiddenTap) -> String {
+    format!(
+        "brew does not trust tap {tap}, so it hides these installed formulae from brewsoak: {names}; run brew trust {tap} (or brew trust --formula {tap}/<name> for one formula) to let brewsoak manage them.",
+        tap = h.tap,
+        names = h.names.join(", ")
+    )
+}
+
+/// The hidden-formula notes for a run that walks `kind` (`None`: every kind).
+/// A run that walks casks only never reads a formula, so it has none.
+pub(super) fn hidden_notes(inv: &Inventory, kind: Option<PkgKind>) -> Vec<String> {
+    if kind == Some(PkgKind::Cask) {
+        return Vec::new();
+    }
+    inv.hidden.iter().map(hidden_tap_note).collect()
 }
 
 /// Why the target is held while its closure was walked. `bypass` is the whole
@@ -375,5 +394,31 @@ Notes
             bypass_command("upgrade", "hello", Some(&legacy_cask), false),
             "brew upgrade hello"
         );
+    }
+
+    #[test]
+    fn hidden_tap_note_is_the_spec_text() {
+        let h = crate::inventory::HiddenTap {
+            tap: "acme/tools".into(),
+            names: vec!["alpha".into(), "zeta".into()],
+        };
+        assert_eq!(
+            hidden_tap_note(&h),
+            "brew does not trust tap acme/tools, so it hides these installed formulae from brewsoak: alpha, zeta; run brew trust acme/tools (or brew trust --formula acme/tools/<name> for one formula) to let brewsoak manage them."
+        );
+    }
+
+    #[test]
+    fn hidden_notes_are_for_formula_walks_only() {
+        let inv = crate::inventory::Inventory {
+            hidden: vec![crate::inventory::HiddenTap {
+                tap: "acme/tools".into(),
+                names: vec!["alpha".into()],
+            }],
+            ..Default::default()
+        };
+        assert_eq!(hidden_notes(&inv, None).len(), 1);
+        assert_eq!(hidden_notes(&inv, Some(PkgKind::Formula)).len(), 1);
+        assert!(hidden_notes(&inv, Some(PkgKind::Cask)).is_empty());
     }
 }

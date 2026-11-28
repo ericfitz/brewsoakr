@@ -1,12 +1,12 @@
 //! Every installed package with its origin tap and soak class.
 
 use crate::Error;
-use crate::brew::{Brew, InstalledPkg};
+use crate::brew::{Brew, HiddenKeg, InstalledPkg};
 use crate::config::Config;
 use crate::origin::{self, OriginRecords, OwnTap};
 use crate::resolve::PkgKind;
 use crate::taps::{self, TapClass, TapInfo};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +34,57 @@ pub struct Pkg {
     pub keg_version: String,
 }
 
+/// A tapped tap brew reports `trusted: false`, with the installed formulae it
+/// therefore hides from brewsoak.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenTap {
+    pub tap: String,
+    pub names: Vec<String>,
+}
+
+/// The kegs whose tap is tapped and reported `trusted: false`, grouped by tap
+/// (sorted), names sorted and deduplicated. A keg's tap is its receipt tap,
+/// else the tap its staged path names (`origin::staged_tap`), else its
+/// `origins.toml` record; a keg with none, or of `homebrew/core`, gets none.
+/// Kegs of brewsoak's own taps get no note.
+pub fn hidden_taps(
+    kegs: &[HiddenKeg],
+    taps: &[TapInfo],
+    origins: &OriginRecords,
+    cache: Option<&Path>,
+) -> Vec<HiddenTap> {
+    let mut by_tap: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for keg in kegs.iter().filter(|k| !k.own_tap) {
+        let staged_from = cache
+            .zip(keg.staged_path.as_deref())
+            .and_then(|(cache, path)| origin::staged_tap(cache, path));
+        let tap = match keg.tap.as_deref().filter(|t| !t.is_empty()) {
+            Some(tap) => tap.to_ascii_lowercase(),
+            None => match staged_from
+                .or_else(|| origins.get(PkgKind::Formula, &keg.name).map(str::to_string))
+            {
+                Some(tap) => tap.to_ascii_lowercase(),
+                None => continue,
+            },
+        };
+        if tap == origin::CORE
+            || !taps
+                .iter()
+                .any(|t| !t.trusted && t.name.eq_ignore_ascii_case(&tap))
+        {
+            continue;
+        }
+        by_tap.entry(tap).or_default().insert(keg.name.clone());
+    }
+    by_tap
+        .into_iter()
+        .map(|(tap, names)| HiddenTap {
+            tap,
+            names: names.into_iter().collect(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Inventory {
     pub pkgs: Vec<Pkg>,
@@ -41,6 +92,10 @@ pub struct Inventory {
     pub tap_remotes: BTreeMap<String, String>,
     /// The tap-info entry named `SOAK_TAP`.
     pub soak_tap: Option<TapInfo>,
+    /// Formulae brew hides because their tap is untrusted, by tap.
+    pub hidden: Vec<HiddenTap>,
+    /// Every formula rack in the Cellar that brew's installed list lacks.
+    pub unlisted_formulae: Vec<String>,
 }
 
 impl Inventory {
@@ -104,7 +159,29 @@ impl Inventory {
         let installed = brew.installed_packages()?;
         let taps = brew.tap_info()?;
         let origins = OriginRecords::load(cache);
-        Ok(Self::build_in(installed, &taps, &origins, cfg, Some(cache)))
+        let kegs = brew.hidden_kegs(&installed);
+        Ok(
+            Self::build_in(installed, &taps, &origins, cfg, Some(cache)).with_hidden(
+                &kegs,
+                &taps,
+                &origins,
+                Some(cache),
+            ),
+        )
+    }
+
+    /// Record the racks brew's installed list lacks: their names, and the
+    /// untrusted taps that hide them. `load` and the test helper share this.
+    pub fn with_hidden(
+        mut self,
+        kegs: &[HiddenKeg],
+        taps: &[TapInfo],
+        origins: &OriginRecords,
+        cache: Option<&Path>,
+    ) -> Self {
+        self.unlisted_formulae = kegs.iter().map(|k| k.name.clone()).collect();
+        self.hidden = hidden_taps(kegs, taps, origins, cache);
+        self
     }
 
     /// Bare-name lookup. When a formula and a cask share a name, the
@@ -663,5 +740,96 @@ mod tests {
             PkgClass::Soaked
         );
         assert_eq!(inv.needed_taps(&[], &cfg("[]"))[0].0, "hashicorp/other");
+    }
+
+    fn hidden_keg(name: &str, tap: Option<&str>, staged: Option<&str>) -> HiddenKeg {
+        HiddenKeg {
+            name: name.into(),
+            tap: tap.map(str::to_string),
+            staged_path: staged.map(str::to_string),
+            own_tap: false,
+        }
+    }
+
+    fn untrusted(name: &str) -> TapInfo {
+        TapInfo {
+            trusted: false,
+            ..TapInfo::new(name, Some("https://github.com/x/homebrew-y"))
+        }
+    }
+
+    #[test]
+    fn hidden_taps_reads_the_tap_from_the_receipt_the_staged_path_then_the_record() {
+        let cache = tempfile::tempdir().unwrap();
+        let c = cache.path().display();
+        let kegs = vec![
+            hidden_keg("a", Some("acme/tools"), None),
+            hidden_keg(
+                "b",
+                None,
+                Some(&format!("{c}/staging/taps/acme/tools/Formula/b.rb")),
+            ),
+            hidden_keg("c", None, None),
+            hidden_keg("d", None, None),
+            hidden_keg("e", Some("homebrew/core"), None),
+            hidden_keg("f", Some("trusted/tap"), None),
+            hidden_keg("g", Some("gone/tap"), None),
+        ];
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "c", "acme/tools");
+        let taps = vec![
+            untrusted("acme/tools"),
+            TapInfo::new("trusted/tap", Some("https://github.com/t/homebrew-tap")),
+        ];
+        let want = vec![HiddenTap {
+            tap: "acme/tools".into(),
+            names: vec!["a".into(), "b".into(), "c".into()],
+        }];
+        assert_eq!(
+            hidden_taps(&kegs, &taps, &origins, Some(cache.path())),
+            want
+        );
+        let got = hidden_taps(&kegs, &taps, &origins, None);
+        assert_eq!(got[0].names, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn hidden_taps_skips_brewsoaks_own_kegs_but_unlisted_formulae_keep_them() {
+        let mut own = hidden_keg("mine", None, None);
+        own.own_tap = true;
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "mine", "acme/tools");
+        let taps = vec![untrusted("acme/tools")];
+        assert!(hidden_taps(std::slice::from_ref(&own), &taps, &origins, None).is_empty());
+        let inv = Inventory::default().with_hidden(
+            &[own, hidden_keg("widget", Some("acme/tools"), None)],
+            &taps,
+            &origins,
+            None,
+        );
+        assert_eq!(inv.unlisted_formulae, vec!["mine", "widget"]);
+        assert_eq!(inv.hidden.len(), 1);
+        assert_eq!(inv.hidden[0].names, vec!["widget"]);
+    }
+
+    #[test]
+    fn load_records_hidden_taps_and_build_does_not() {
+        let cache = tempfile::tempdir().unwrap();
+        let brew = crate::brew::MockBrew {
+            taps: vec![untrusted("acme/tools")],
+            hidden: vec![hidden_keg("widget", Some("acme/tools"), None)],
+            ..crate::brew::MockBrew::new()
+        };
+        let inv = Inventory::load(&brew, cache.path(), &cfg("[]")).unwrap();
+        assert_eq!(
+            inv.hidden,
+            vec![HiddenTap {
+                tap: "acme/tools".into(),
+                names: vec!["widget".into()]
+            }]
+        );
+        assert_eq!(inv.unlisted_formulae, vec!["widget"]);
+        let built = Inventory::build(vec![], &brew.taps, &OriginRecords::default(), &cfg("[]"));
+        assert!(built.hidden.is_empty() && built.unlisted_formulae.is_empty());
     }
 }

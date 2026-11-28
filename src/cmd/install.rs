@@ -1578,4 +1578,32 @@ mod tests {
             "{visible:?}"
         );
     }
+
+    #[test]
+    fn install_does_not_print_the_hidden_note() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        install(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &core_snaps(),
+            test_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alpha".to_string()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("hides these installed formulae"), "{text}");
+    }
 }

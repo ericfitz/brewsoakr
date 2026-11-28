@@ -3,7 +3,7 @@ use super::deps::{
     CutoffDepWalk, CutoffDeps, GateFail, GateHold, GateWhy, HeldDep, Role, first_line,
 };
 use super::notes::{
-    NoteKind, by_name_note, bypass_command, held_tap_note, newer_than_cutoff_note,
+    NoteKind, by_name_note, bypass_command, held_tap_note, hidden_notes, newer_than_cutoff_note,
     own_tap_token_note, refusal_message, unsoakable_note, write_notes, write_session_tail,
 };
 use super::view::{
@@ -293,6 +293,12 @@ pub(super) fn apply_many(
     }
     if !refused_only {
         session.update_before_soaked_work(names)?;
+    }
+    if brew_verb == "upgrade" {
+        // Task 5's kind filter replaces `None` with the kind this run walks.
+        for note in hidden_notes(inv, None) {
+            session.defer(note);
+        }
     }
     if plan.is_some() {
         session.out.open()?;
@@ -3785,6 +3791,27 @@ mod tests {
             assert!(summary_has(&text, "held", "2"), "{text}");
             assert!(summary_has(&text, "upgraded", "0"), "{text}");
             assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn upgrade_notes_formulae_hidden_by_an_untrusted_tap_once() {
+            use crate::cmd::test_support::hidden_world;
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = hidden_world(tap.path());
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &[], &[]);
+            let note = crate::cmd::notes::hidden_tap_note(&crate::inventory::HiddenTap {
+                tap: "acme/tools".into(),
+                names: vec!["widget".into()],
+            });
+            assert_eq!(text.matches(&note).count(), 1, "{text}");
+            let notes_at = text.lines().position(|l| l == "Notes").expect("Notes line");
+            let note_at = text
+                .lines()
+                .position(|l| l.trim() == note)
+                .expect("note line");
+            assert!(note_at > notes_at, "{text}");
+            assert!(summary_has(&text, "held", "0"), "{text}");
+            assert_soak_tap_commands(&brew, &["alpha"]);
         }
 
         #[test]

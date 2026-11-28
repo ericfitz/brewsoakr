@@ -296,6 +296,11 @@ pub trait Brew {
     fn soak_tap_keg_files(&self, _name: &str) -> Vec<String> {
         Vec::new()
     }
+    /// The Cellar racks `listed` lacks (`kegs_brew_left_out`) for this
+    /// machine. The default knows of none.
+    fn hidden_kegs(&self, _listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+        Vec::new()
+    }
     /// brew's own lock on formula `name`, without waiting.
     fn lock_formula(
         &self,
@@ -527,6 +532,8 @@ pub struct MockBrew {
     pub tap_info_error_after_create: Option<String>,
     /// What `receipt_tap` reports, keyed by `(kind, name, version)`.
     pub receipt_taps: BTreeMap<(PkgKind, String, String), String>,
+    /// What `hidden_kegs` reports.
+    pub hidden: Vec<HiddenKeg>,
     /// `lock_formula` answers `Busy` for these names.
     pub busy_formulae: std::collections::BTreeSet<String>,
     /// `lock_formula` answers `Unavailable` with this text.
@@ -609,6 +616,7 @@ impl Default for MockBrew {
             tap_unlisted_after_create: false,
             tap_info_error_after_create: None,
             receipt_taps: BTreeMap::new(),
+            hidden: Vec::new(),
             busy_formulae: std::collections::BTreeSet::new(),
             lock_error: None,
             lock_calls: Mutex::new(Vec::new()),
@@ -775,6 +783,12 @@ impl Brew for ProcessBrew {
             crate::lock::BrewLockError::Unavailable("brew --prefix gave no directory".into())
         })?;
         crate::lock::try_brew_formula_lock(&dir, name)
+    }
+
+    fn hidden_kegs(&self, listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+        self.cellar()
+            .map(|c| kegs_brew_left_out(&c, listed))
+            .unwrap_or_default()
     }
 
     fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
@@ -1401,6 +1415,10 @@ impl Brew for MockBrew {
         }
     }
 
+    fn hidden_kegs(&self, _listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+        self.hidden.clone()
+    }
+
     fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
         self.receipt_taps
             .iter()
@@ -1905,6 +1923,72 @@ fn parse_installed_json(
         }
     }
     Ok(out)
+}
+
+/// A Cellar rack brew's installed list lacks, with what its newest receipt
+/// says about its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenKeg {
+    pub name: String,
+    /// Lowercase `source.tap`; `None` for null, empty, not a string, one of
+    /// brewsoak's own taps, or no readable receipt.
+    pub tap: Option<String>,
+    /// `source.path`, when `tap` is `None` and the receipt has one.
+    pub staged_path: Option<String>,
+    /// The receipt names one of brewsoak's own taps.
+    pub own_tap: bool,
+}
+
+/// Every rack in `cellar` (a real directory with at least one keg, not
+/// starting with `.`, as `Formula.racks` reads them) that is not a formula in
+/// `listed`. Sorted by name.
+pub(crate) fn kegs_brew_left_out(cellar: &Path, listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+    let real_dirs = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
+    };
+    let mut names: Vec<String> = real_dirs(cellar)
+        .into_iter()
+        .filter(|n| !n.starts_with('.'))
+        .filter(|n| {
+            !listed
+                .iter()
+                .any(|p| p.kind == PkgKind::Formula && &p.name == n)
+        })
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let kegs = real_dirs(&cellar.join(&name));
+        if kegs.is_empty() {
+            continue;
+        }
+        // The newest receipt: latest mtime, ties by keg directory name descending.
+        let newest = kegs
+            .iter()
+            .filter_map(|keg| {
+                let path = cellar.join(&name).join(keg).join("INSTALL_RECEIPT.json");
+                let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+                Some((mtime, keg))
+            })
+            .max();
+        let source = newest
+            .and_then(|(_, keg)| read_formula_receipt_source_opt(cellar, &name, Some(keg)))
+            .unwrap_or_default();
+        let own_tap = source.own_tap.is_some();
+        out.push(HiddenKeg {
+            name,
+            tap: source.tap.map(|t| t.to_lowercase()),
+            staged_path: if own_tap { None } else { source.path },
+            own_tap,
+        });
+    }
+    out
 }
 
 /// Formulae with a directory in `cellar` that `listed` lacks and whose newest
@@ -4741,5 +4825,100 @@ esac
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].name, "hello");
         assert_eq!(got[0].own_tap, Some(OwnTap::Soak));
+    }
+
+    fn write_hidden_receipt(cellar: &Path, name: &str, version: &str, tap: &str, path: &str) {
+        write_receipt(
+            cellar,
+            name,
+            version,
+            &format!(r#"{{"source":{{"tap":{tap},"path":{path}}}}}"#),
+        );
+    }
+
+    fn hidden(name: &str, tap: Option<&str>, staged: Option<&str>, own_tap: bool) -> HiddenKeg {
+        HiddenKeg {
+            name: name.into(),
+            tap: tap.map(str::to_string),
+            staged_path: staged.map(str::to_string),
+            own_tap,
+        }
+    }
+
+    #[test]
+    fn kegs_brew_left_out_reports_every_unlisted_rack_with_its_receipt_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_hidden_receipt(cellar, "widget", "1.0", r#""Acme/Tools""#, "null");
+        write_hidden_receipt(
+            cellar,
+            "staged",
+            "1.0",
+            "null",
+            r#""/c/staging/taps/acme/tools/Formula/staged.rb""#,
+        );
+        write_hidden_receipt(cellar, "bare", "1.0", "null", "null");
+        write_hidden_receipt(cellar, "numtap", "1.0", "3", "null");
+        std::fs::create_dir_all(cellar.join("norecpt").join("1.0")).expect("keg");
+        write_hidden_receipt(cellar, "soak", "1.0", r#""ericfitz/brewsoak""#, "null");
+        write_hidden_receipt(cellar, "wget", "1.0", r#""homebrew/core""#, "null");
+        let listed = [listed_pkg("wget", PkgKind::Formula)];
+        assert_eq!(
+            kegs_brew_left_out(cellar, &listed),
+            vec![
+                hidden("bare", None, None, false),
+                hidden("norecpt", None, None, false),
+                hidden("numtap", None, None, false),
+                hidden("soak", None, None, true),
+                hidden(
+                    "staged",
+                    None,
+                    Some("/c/staging/taps/acme/tools/Formula/staged.rb"),
+                    false
+                ),
+                hidden("widget", Some("acme/tools"), None, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn kegs_brew_left_out_skips_racks_brew_does_not_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        std::fs::create_dir_all(cellar.join("empty")).expect("empty rack");
+        write_hidden_receipt(cellar, ".hidden", "1.0", r#""acme/tools""#, "null");
+        write_hidden_receipt(cellar, "real", "1.0", r#""acme/tools""#, "null");
+        std::os::unix::fs::symlink(cellar.join("real"), cellar.join("link")).expect("link");
+        write_hidden_receipt(cellar, "widget", "1.0", r#""acme/tools""#, "null");
+        let listed = [listed_pkg("widget", PkgKind::Cask)];
+        let names: Vec<String> = kegs_brew_left_out(cellar, &listed)
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        assert_eq!(names, vec!["real", "widget"]);
+    }
+
+    #[test]
+    fn kegs_brew_left_out_uses_the_newest_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        for (version, tap, secs) in [("1.0", "acme/old", 1000), ("2.0", "acme/new", 2000)] {
+            write_hidden_receipt(cellar, "widget", version, &format!("\"{tap}\""), "null");
+            let f = std::fs::File::options()
+                .write(true)
+                .open(
+                    cellar
+                        .join("widget")
+                        .join(version)
+                        .join("INSTALL_RECEIPT.json"),
+                )
+                .expect("open");
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .expect("mtime");
+        }
+        assert_eq!(
+            kegs_brew_left_out(cellar, &[]),
+            vec![hidden("widget", Some("acme/new"), None, false)]
+        );
     }
 }

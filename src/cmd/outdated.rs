@@ -1,5 +1,7 @@
 use super::bare::{bare_action, latest_left, latest_note};
-use super::notes::{held_tap_note, hold_why, unsoakable_note, write_section, write_section_always};
+use super::notes::{
+    held_tap_note, hidden_notes, hold_why, unsoakable_note, write_section, write_section_always,
+};
 use super::view::{prefetch_orderings, resolve_view, view_versions};
 use super::{RunResult, is_verbose};
 use crate::Error;
@@ -214,6 +216,7 @@ pub fn outdated(
     if let Some(why) = crate::soaktap::unusable_with_packages(inv) {
         held.push(why.note());
     }
+    held.extend(hidden_notes(inv, None));
     write_section_always(out, "==> Outdated (will upgrade)", &upgrades)?;
     write_section_always(out, "==> No-soak (brew)", &no_soak)?;
     write_section_always(out, "==> Held", &held)?;
@@ -766,5 +769,19 @@ mod tests {
         let (brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
         let (_, text) = outdated_text(&brew, &git, &snaps);
         assert!(!text.contains("brew trust"), "{text}");
+    }
+
+    #[test]
+    fn outdated_lists_the_hidden_note_under_held() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let (r, text) = outdated_text(&brew, &git, &core_snaps());
+        let note = crate::cmd::notes::hidden_tap_note(&crate::inventory::HiddenTap {
+            tap: "acme/tools".into(),
+            names: vec!["widget".into()],
+        });
+        assert!(section_lines(&text, "==> Held").contains(&note), "{text}");
+        assert!(!r.refused);
     }
 }

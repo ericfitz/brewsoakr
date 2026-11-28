@@ -43,11 +43,13 @@ pub(super) fn cfg_with(file: &str) -> Config {
 }
 
 pub(super) fn inv_from(brew: &MockBrew, cfg: &Config) -> Inventory {
-    Inventory::build(
-        brew.installed.clone(),
-        &brew.tap_info().expect("mock taps"),
-        &OriginRecords::default(),
-        cfg,
+    let taps = brew.tap_info().expect("mock taps");
+    let origins = OriginRecords::default();
+    Inventory::build(brew.installed.clone(), &taps, &origins, cfg).with_hidden(
+        &brew.hidden_kegs(&brew.installed),
+        &taps,
+        &origins,
+        None,
     )
 }
 
@@ -707,6 +709,23 @@ pub(crate) fn soak_tap_at(path: &Path, trusted: bool) -> TapInfo {
 pub(super) fn soak_world(tap: &Path) -> (MockBrew, InMemoryGit) {
     let (mut brew, git) = local_tap_world();
     brew.soak_tap = Some(soak_tap_at(tap, true));
+    (brew, git)
+}
+
+/// `soak_world` plus a formula `widget` brew hides because its tap,
+/// `acme/tools` (HTTPS remote), is untrusted.
+pub(super) fn hidden_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+    let (mut brew, git) = soak_world(tap);
+    brew.hidden = vec![crate::brew::HiddenKeg {
+        name: "widget".into(),
+        tap: Some("acme/tools".into()),
+        staged_path: None,
+        own_tap: false,
+    }];
+    brew.taps.push(TapInfo {
+        trusted: false,
+        ..tapped("acme/tools", Some("https://github.com/acme/homebrew-tools"))
+    });
     (brew, git)
 }
 

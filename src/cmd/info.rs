@@ -1,4 +1,4 @@
-use super::notes::{held_tap_note, own_tap_token_note, unsoakable_note};
+use super::notes::{held_tap_note, hidden_notes, own_tap_token_note, unsoakable_note};
 use super::view::{
     host_for_pkg, natural_kind, parse_pkg, prefetch_orderings, resolve_token, resolve_view,
     settle_origin,
@@ -230,6 +230,9 @@ pub fn info(
     }
     if let Some(why) = soaktap::unusable_with_packages(inv) {
         writeln!(out, "{}", why.note())?;
+    }
+    for note in hidden_notes(inv, None) {
+        writeln!(out, "{note}")?;
     }
     Ok(RunResult {
         refused,
@@ -627,5 +630,19 @@ mod tests {
             text.contains("brewsoakr/soaked is brewsoak's own tap"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn info_prints_the_hidden_note_last() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let (r, text) = info_text(&brew, &git, &core_snaps(), &["alpha"]);
+        let note = crate::cmd::notes::hidden_tap_note(&crate::inventory::HiddenTap {
+            tap: "acme/tools".into(),
+            names: vec!["widget".into()],
+        });
+        assert!(text.ends_with(&format!("{note}\n")), "{text}");
+        assert!(!r.refused);
     }
 }
