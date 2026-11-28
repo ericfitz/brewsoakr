@@ -220,6 +220,23 @@ pub(super) fn lock_runs(brew: &MockBrew) -> Vec<Vec<String>> {
     brew.runs.lock().expect("runs").clone()
 }
 
+/// The first `by_name formula <name>` event precedes the first visible
+/// `install ... <name>`; panics with "no by_name query before the install of
+/// <name>" otherwise.
+pub(super) fn assert_gate_precedes_install(brew: &MockBrew, name: &str) {
+    let events = brew.events.lock().expect("events");
+    let query = format!("by_name formula {name}");
+    let queried = events.iter().position(|e| *e == query);
+    let installed = events.iter().position(|e| {
+        e.strip_prefix("visible install ")
+            .is_some_and(|rest| rest.split(' ').any(|a| a == name))
+    });
+    assert!(
+        matches!((queried, installed), (Some(q), Some(i)) if q < i),
+        "no by_name query before the install of {name}: {events:?}"
+    );
+}
+
 pub(super) fn run_has_token(runs: &[Vec<String>], token: &str) -> bool {
     runs.iter().any(|args| args.iter().any(|a| a == token))
 }
@@ -1021,5 +1038,31 @@ mod assert_soak_tap_commands_tests {
             &runs(&["install", "--formula", "packer"]),
             "packer"
         ));
+    }
+
+    fn events_brew(events: &[&str]) -> MockBrew {
+        let brew = MockBrew::new();
+        *brew.events.lock().unwrap() = events.iter().map(|e| e.to_string()).collect();
+        brew
+    }
+
+    #[test]
+    fn gate_helper_accepts_a_query_before_the_install() {
+        let brew = events_brew(&["by_name formula packer", "visible install --formula packer"]);
+        assert_gate_precedes_install(&brew, "packer");
+    }
+
+    #[test]
+    #[should_panic(expected = "no by_name query before the install of packer")]
+    fn gate_helper_rejects_an_install_with_no_query() {
+        let brew = events_brew(&["visible install --formula packer"]);
+        assert_gate_precedes_install(&brew, "packer");
+    }
+
+    #[test]
+    #[should_panic(expected = "no by_name query before the install of packer")]
+    fn gate_helper_rejects_a_query_after_the_install() {
+        let brew = events_brew(&["visible install --formula packer", "by_name formula packer"]);
+        assert_gate_precedes_install(&brew, "packer");
     }
 }

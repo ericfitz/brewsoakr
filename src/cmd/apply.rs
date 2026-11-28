@@ -940,7 +940,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
                         self.hold_target_not_ready(name, &self.soak_refusal())?
                     }
-                    Some(tap) => self.hold_target_untrusted(name, &tap),
+                    Some(tap) => self.hold_target_untrusted(name, &tap)?,
                     None => {
                         let hold = GateHold {
                             dep: None,
@@ -980,7 +980,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     ));
                 }
             }
-            InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
+            InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap)?,
             InstallRun::NotReady(n) => self.hold_target_not_ready(name, &n)?,
             InstallRun::Interrupted => self.hold_target_interrupted(name)?,
             InstallRun::NoCutoff => {
@@ -1199,7 +1199,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                         "held {dep} (dependency of {target}): brew does not trust tap {tap}"
                     )?;
                 }
-                self.hold_target_untrusted_dep(target, dep, &tap);
+                self.hold_target_untrusted_dep(target, dep, &tap)?;
                 return Ok(false);
             }
         }
@@ -1323,8 +1323,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let why = match &hold.why {
             GateFail::Untrusted(tap) => {
                 match &hold.dep {
-                    Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
-                    None => self.hold_target_untrusted(target, tap),
+                    Some(dep) => self.hold_target_untrusted_dep(target, dep, tap)?,
+                    None => self.hold_target_untrusted(target, tap)?,
                 }
                 return Ok(());
             }
@@ -1404,29 +1404,41 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     /// brew refuses to load a package from a tap the user has not trusted.
     /// Trusting a third-party tap is the user's decision, never brewsoak's.
-    fn hold_untrusted(&mut self, name: &str, tap: &str) {
-        self.defer(format!(
+    fn hold_untrusted(&mut self, name: &str, tap: &str) -> Result<(), Error> {
+        writeln!(self.out, "held {name}: brew does not trust tap {tap}")?;
+        self.defer_held(format!(
             "{name}: brew does not trust tap {tap}; run brew trust {tap}, or add it to NO_SOAK"
         ));
         self.counts.held += 1;
         self.refused = true;
+        Ok(())
     }
 
     /// A dependency lives in a tap brew does not trust, so the target cannot
     /// install: one hold line naming the dependency and the tap, and the
     /// target counted once as held.
-    fn hold_target_untrusted_dep(&mut self, target: &str, dep: &str, tap: &str) {
+    fn hold_target_untrusted_dep(
+        &mut self,
+        target: &str,
+        dep: &str,
+        tap: &str,
+    ) -> Result<(), Error> {
         self.hold_target_for_dep();
-        self.defer(format!(
+        writeln!(
+            self.out,
+            "held {target}: dependency {dep}: brew does not trust tap {tap}"
+        )?;
+        self.defer_held(format!(
             "{target}: dependency {dep}: brew does not trust tap {tap}; run brew trust {tap}, or add it to NO_SOAK"
         ));
+        Ok(())
     }
 
     /// The target was counted as upgraded when it was announced; it is held
     /// instead, so take that count back.
-    fn hold_target_untrusted(&mut self, name: &str, tap: &str) {
+    fn hold_target_untrusted(&mut self, name: &str, tap: &str) -> Result<(), Error> {
         self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
-        self.hold_untrusted(name, tap);
+        self.hold_untrusted(name, tap)
     }
 
     /// Runs one by-name install. A real install writes a receipt that names
@@ -2125,6 +2137,13 @@ mod tests {
             ),
             "{text}"
         );
+        let dep_line = text
+            .find("held widget (dependency of node): brew does not trust tap hashicorp/tap")
+            .expect("dependency line");
+        let target_line = text
+            .find("held node: dependency widget: brew does not trust tap hashicorp/tap")
+            .expect("target line");
+        assert!(dep_line < target_line, "{text}");
         assert!(summary_has(&text, "upgraded", "0"), "{text}");
         assert!(summary_has(&text, "held", "1"), "{text}");
     }
@@ -2777,6 +2796,38 @@ mod tests {
         );
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("Updating Homebrew").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn named_run_of_only_no_soak_packages_reports_a_failed_update_from_the_no_soak_step() {
+        let (mut brew, git, cfg) = soaked_and_no_soak_world();
+        brew.next_status = 1;
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        upgrade(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &core_snaps(),
+            test_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &["wget".to_string()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(lock_runs(&brew), vec![vec!["update".to_string()]]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("no-soak: brew update failed (exit 1); not upgraded: wget"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("brew's data may be older than the soak cutoff"),
+            "{text}"
+        );
     }
 
     #[test]

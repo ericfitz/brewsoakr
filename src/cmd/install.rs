@@ -99,6 +99,7 @@ mod tests {
             None,
             "the receipt names the tap now, so the record is stale"
         );
+        crate::cmd::test_support::assert_gate_precedes_install(&brew, "packer");
     }
 
     #[test]
@@ -383,6 +384,31 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("source changed"), "{text}");
+    }
+
+    #[test]
+    fn untrusted_tap_hold_has_an_inline_line_and_sits_under_held() {
+        let (git, snaps) = packer_world();
+        let brew = MockBrew {
+            taps: hashicorp_tap(),
+            next_status: 1,
+            next_stdout: PACKER_REFUSAL.to_vec(),
+            ..MockBrew::new()
+        };
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
+        let (_, text) = install_packer(&brew, &git, &snaps);
+        assert!(
+            text.contains("held packer: brew does not trust tap hashicorp/tap"),
+            "{text}"
+        );
+        assert!(
+            text.find("Held:")
+                < text.find(
+                    "packer: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
+                ),
+            "the note sits under Held: {text}"
+        );
+        assert!(text.contains("Held:"), "{text}");
     }
 
     #[test]

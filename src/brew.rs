@@ -547,6 +547,9 @@ pub struct MockBrew {
     pub on_call: Mutex<Option<OnCall>>,
     pub runs: Mutex<Vec<Vec<String>>>,
     pub visible_runs: Mutex<Vec<Vec<String>>>,
+    /// One ordered log across both kinds of call: `by_name <kind> <name>` per
+    /// query, and `visible <args joined by one space>` per `run_visible_in`.
+    pub events: Mutex<Vec<String>>,
     /// The `RunContext` of the latest `run_visible_in` call.
     pub last_ctx: Mutex<Option<quiet::RunContext>>,
     pub next_status: i32,
@@ -623,6 +626,7 @@ impl Default for MockBrew {
             on_call: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             last_ctx: Mutex::new(None),
             next_status: 0,
             next_stdout: Vec::new(),
@@ -673,7 +677,15 @@ impl MockBrew {
             .push(args.to_vec());
     }
 
+    fn record_event(&self, event: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event);
+    }
+
     fn record_visible(&self, args: &[String]) {
+        self.record_event(format!("visible {}", args.join(" ")));
         self.visible_runs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1550,6 +1562,14 @@ impl Brew for MockBrew {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         seen.extend(queries.iter().cloned());
+        drop(seen);
+        for q in queries {
+            let kind = match q.kind {
+                PkgKind::Formula => "formula",
+                PkgKind::Cask => "cask",
+            };
+            self.record_event(format!("by_name {kind} {}", q.name));
+        }
         Ok(queries
             .iter()
             .map(|q| {
@@ -2271,6 +2291,27 @@ fn parse_json_string(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_events_interleave_queries_and_visible_runs() {
+        let brew = MockBrew::new();
+        let query = NameQuery {
+            kind: PkgKind::Formula,
+            name: "packer".into(),
+            origin: "hashicorp/tap".into(),
+            cutoff_sha256: None,
+        };
+        brew.by_name(&[query]).unwrap();
+        let args: Vec<String> = ["install", "--formula", "packer"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        brew.run_visible(&args, &mut Vec::new()).unwrap();
+        assert_eq!(
+            *brew.events.lock().unwrap(),
+            ["by_name formula packer", "visible install --formula packer"]
+        );
+    }
 
     #[test]
     fn mock_deps_keys_by_exact_token() {
