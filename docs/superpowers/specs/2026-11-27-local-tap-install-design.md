@@ -10,8 +10,7 @@ Extends: [2026-08-12-brewsoakr-design.md](2026-08-12-brewsoakr-design.md),
 Supersedes for `homebrew/core` and `homebrew/cask` packages:
 [2026-11-26-path-install-stopgap.md](2026-11-26-path-install-stopgap.md)
 
-Status: design, not yet planned or built. Nothing in `src/` changes with this
-document.
+Status: implemented by `../plans/2026-11-27-local-tap-install.md`.
 
 ## Intent
 

@@ -22,6 +22,11 @@ Upgrade later with `brew upgrade brewsoak`. Add `ericfitz/tap` to `NO_SOAK`
 (below) so `brewsoak upgrade` keeps brewsoak itself current without a soak
 delay.
 
+Before the first soaked install, trust brewsoak's own tap once, yourself:
+`brew trust ericfitz/brewsoak`. brewsoak never runs `brew trust`. The first
+run that needs the tap creates it and holds until you have done this (see
+"brewsoak's own tap" below).
+
 ### Cargo
 
 From [crates.io](https://crates.io/crates/brewsoak):
@@ -163,10 +168,11 @@ brewsoak notes its packages and leaves them to `brew`, unless they are in
 No-soak packages are installed by `brew` itself from their real tap after all
 soaked work: one `brew upgrade` (or `install` / `reinstall`) naming every
 no-soak package, preceded by a `brew update` unless one already succeeded
-earlier in the run. `brew upgrade` also upgrades a
-no-soak package's outdated dependencies to brew's latest, so no-soak extends
-to its dependencies. Soaked dependents of a no-soak package are not upgraded
-by that step.
+earlier in the run. A dependency of a no-soak package that was installed from
+brewsoak's own tap stays at its soaked version when that `brew upgrade` runs:
+no-soak does not extend to it, so the no-soak package can run against an older
+dependency than its bottle was built with until the dependency's update has
+soaked. Soaked dependents of a no-soak package are not upgraded by that step.
 
 ## Commands
 
@@ -192,33 +198,123 @@ line for every package evaluated (what happened and why).
 `--raw` turns off output summarizing and forwards `brew`'s output byte for
 byte.
 
-### Homebrew 7.0.14 and later (issue #17)
+### brewsoak's own tap
 
-Homebrew 7.0.14 stopped loading formulae from file paths, which is how
-brewsoak used to install a soaked version. Until
-[issue #17](https://github.com/ericfitz/brewsoakr/issues/17) is fixed,
-brewsoak installs a soaked package by name, and only when brew's own current
-definition of that package is byte-for-byte the soaked cutoff. The same holds
-for every member of its dependency closure that brew might install or upgrade;
-an installed dependency that brew already has at its current version passes.
-Otherwise that package is held, nothing is
-installed for it, the run continues with the next package, and the run exits
-1. The `Notes` section says why:
+Homebrew 7.0.14 stopped loading formulae from file paths. brewsoak therefore
+installs a soaked `homebrew/core` or `homebrew/cask` package from its own local
+tap, `ericfitz/brewsoak` (at
+`$(brew --repository)/Library/Taps/ericfitz/homebrew-brewsoak`): it writes the
+cutoff file there for as long as the install takes and asks brew to install
+`ericfitz/brewsoak/<name>`. Packages from third-party taps do not use it.
 
+**Homebrew version.** The minimum is Homebrew 7.0.14. brewsoak does not check
+brew's version. The design was verified on one build, 7.0.17-27-g96c963e; below
+7.0.14 it is unsupported and untested.
+
+**Trust, once.** The first real run that needs the tap runs
+`brew tap-new --no-git ericfitz/brewsoak` and then holds every package it
+would install from it until you run
+
+```bash
+brew trust ericfitz/brewsoak
 ```
-<name>: [dependency <dep>: ]<reason>; brewsoak cannot install a soaked copy until issue #17 is fixed; use `brew <verb> <token>` to bypass brewsoak.
-```
 
-When brew's current version of the package is the cutoff's version but the
-file changed, the reason reads `brew's <version> formula changed since the
-soaked cutoff; it installs once the change soaks` and the issue #17 clause is
-left out: the package installs on a later run, once the change has soaked.
+once. brewsoak never runs `brew trust`. The hold prints
+`held <name>: brewsoak's tap is not ready` per package and one note under
+`Held:`; the run exits 1. A dry run creates nothing and holds the same way.
+`update`, `outdated` and `info` never create the tap.
 
-Run the printed `brew` command to install brew's current version without the
-soak. `upgrade`, `install` and `reinstall` run `brew update` once before any
-soaked work, also on a dry run, so brew's data is fresh when brewsoak compares
-it. A failed `brew update` is reported in `Notes` and fails the exit code, but
-does not hold anything.
+**What brew records.** For every package brewsoak installs, upgrades or
+previews with `--dry-run`, brew adds an `ericfitz/brewsoak/<name>` entry to its
+trust store; brewsoak never removes them. A dry run also writes the same tap
+files a real run does, and puts them back at the end, so the files under the
+tap change for the length of the run. On `update` and on a real run, with the tap local and trusted, brewsoak removes
+the tap file of a package that was uninstalled or moved back to core.
+
+**Plain `brew` afterwards.** A package installed from the tap is anchored to it:
+
+- Plain `brew upgrade` and `brew outdated` leave it alone. To move it on
+  without brewsoak, use the bypass command from a hold or refusal note
+  (below).
+- A plain `brew install` of another package leaves its anchored dependencies at
+  their soaked versions and installs missing ones from core.
+- `brew untap ericfitz/brewsoak` is refused while packages are installed from
+  it.
+- `brew update` ignores the tap.
+- When `HOMEBREW_VERIFY_ATTESTATIONS` is set, brew warns and skips the
+  attestation check for bottles poured through the tap.
+- While the tap exists and is untrusted, brew prints its untrusted-taps
+  warning on your own installs.
+
+| Package installed from the tap | Bypass command |
+|---|---|
+| Formula, `upgrade` or `install` | `brew upgrade homebrew/core/<name>` |
+| Formula, `reinstall` | `brew reinstall homebrew/core/<name>` |
+| Cask, `upgrade` or `install` | `brew upgrade --cask homebrew/cask/<token>` |
+| Cask, `reinstall` | `brew reinstall --cask homebrew/cask/<token>` |
+| Any other package | `brew <verb> <token>` |
+
+A bypass leaves the package's receipt naming core again, and brewsoak treats it
+like any other core package. A package is moved to the tap at its next soaked
+upgrade; there is no up-front migration.
+
+**If you untrust the tap** (`brew untrust ericfitz/brewsoak`, or a restored or
+wiped trust store) while packages are installed from it, brew drops their
+per-package trust, hides those formulae from `brew info --installed`, and
+refuses plain installs of anything that depends on them. brewsoak still lists
+them (formulae from the Cellar) and holds them with the not-ready note. The two ways
+out are `brew trust ericfitz/brewsoak`, or moving a package back to core with
+`brew upgrade homebrew/core/<name>`.
+
+**No-soak packages.** A no-soak package installed from the tap is handed to
+brew as `homebrew/core/<name>` (a cask as `homebrew/cask/<token>`), so brew
+upgrades it from core and its receipt then names core. `brewsoak outdated`
+takes its no-soak list from `brew outdated`, which does not list such a package
+until it has been upgraded once this way. Its dependencies that came from the
+tap stay at their soaked versions (see "Third-party taps").
+
+**Third-party tap packages** never go through the tap. They keep the by-name
+gate: brewsoak installs one by its bare name, only when brew's own current
+definition is byte-for-byte the soaked cutoff, and the same holds for the
+members of its dependency closure that brew might install or upgrade. Otherwise
+the package is held, nothing is installed for it, the run continues with the
+next package and exits 1. The `Notes` section says why, in the form
+``<name>: [dependency <dep>: ]<reason>; use `<bypass>` to bypass brewsoak.``
+The reasons:
+
+- `brew would install <version>, which is not the soaked cutoff; it installs once that change soaks`
+- `brew's <version> formula|cask changed since the soaked cutoff; it installs once the change soaks`
+- `brew resolves the name to <tap>, not <origin>; brewsoak cannot install it by name`
+- `brew could not describe it by name (<first line>)`, `brew could not read its dependencies (<first line>)`, and `it has no soaked cutoff yet`
+
+A third-party package whose name also exists in `homebrew/core` is held, because
+its bare name resolves to core. A third-party package from a tap brew does not
+trust is held with `brew does not trust tap <tap>; run brew trust <tap>, or add
+it to NO_SOAK`.
+
+For packages from the tap, the hold texts are:
+
+- ``<name>: [dependency <dep>: ]brew could not load its soaked copy (<first line>); use `<bypass>` to bypass brewsoak.``
+- ``<name>: dependency <dep>: brew would replace installed <dep> <installed> with <version>, which has not soaked; <name> installs once it has; use `<bypass>` to bypass brewsoak.``
+- ``<name>: dependency <dep>: brew cannot replace installed <dep> <installed> as a dependency; run brew upgrade <dep> first; use `<bypass>` to bypass brewsoak.``
+
+**Leftovers.** A `brewsoakr/soaked` tap from an older brewsoak is never used,
+fetched or written; remove it with `brew untap brewsoakr/soaked`. An explicit
+`ericfitz/brewsoak/<name>` on the brewsoak command line is refused: name the
+package without the tap.
+
+**The repository `ericfitz/homebrew-brewsoak` does not exist on GitHub and must
+never be created.** `brew install ericfitz/brewsoak/<name>` on a machine where
+the tap is not tapped makes brew clone that repository and trust the named
+package. If it existed, anyone who typed such a command would install whatever
+it held, unsoaked, under brewsoak's tap name, and a machine that tapped it would
+make brewsoak hold everything, because brewsoak only uses a local tap of that
+name.
+
+`upgrade`, `install` and `reinstall` run `brew update` once before any soaked
+work, also on a dry run, so brew's data is fresh when brewsoak compares it. A
+failed `brew update` is reported in `Notes` and fails the exit code, but does
+not hold anything.
 
 ## Output
 

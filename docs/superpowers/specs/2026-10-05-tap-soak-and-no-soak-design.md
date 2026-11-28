@@ -84,10 +84,10 @@ design review. They are not to be changed without the maintainer's approval.
     `brew trust brewsoakr/soaked` code is removed, so brewsoak never runs
     `brew trust`. `origin::STAGING_TAP` and `TapClass::Staging` stay so a
     pre-release keg's receipt or tap entry is treated as staged, never as an
-    origin.
+    origin. *Amended 2026-11-27 ([2026-11-27-local-tap-install-design.md](2026-11-27-local-tap-install-design.md)): brewsoak has a tap again, `ericfitz/brewsoak`, for `homebrew/core` and `homebrew/cask` packages. The trust decision stands: brewsoak still never runs `brew trust`, and the user trusts the tap once. Per-package trust entries that brew records for installs from brewsoak's own tap are accepted (Human decision 2); the acceptance does not extend to third-party taps.*
 - **Accepted consequence:** `brew upgrade` also upgrades a no-soak package's
   outdated dependencies to brew's latest. No-soak therefore extends to its
-  dependencies. This is documented, not prevented.
+  dependencies. This is documented, not prevented. *Amended 2026-11-27 (Human decision 4, [2026-11-27-local-tap-install-design.md](2026-11-27-local-tap-install-design.md)): no longer true for a dependency installed from brewsoak's own tap `ericfitz/brewsoak`. It stays at its soaked version when brew upgrades the no-soak package; soaking wins, and the README says so.*
 
 ## Configuration
 

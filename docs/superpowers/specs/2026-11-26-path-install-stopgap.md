@@ -3,6 +3,8 @@
 Date: 2026-11-26
 Extends: [2026-08-12-brewsoakr-design.md](2026-08-12-brewsoakr-design.md), [2026-10-05-tap-soak-and-no-soak-design.md](2026-10-05-tap-soak-and-no-soak-design.md)
 Issue: #17 (stays open; this is not the fix)
+
+> **Superseded 2026-11-27** for `homebrew/core` and `homebrew/cask` packages by [2026-11-27-local-tap-install-design.md](2026-11-27-local-tap-install-design.md) (Human decisions 1, 2 and 5). "Tokens: the bare name" is amended for soaked installs, which use full `ericfitz/brewsoak/<name>` tokens, and stands for third-party tap packages, which keep this by-name gate.
 Plan: [../plans/2026-11-26-path-install-stopgap.md](../plans/2026-11-26-path-install-stopgap.md)
 
 ## Problem
