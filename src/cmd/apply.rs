@@ -772,7 +772,6 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         self.counts.note(view.action, view.newer_soaking());
         let token = nosoak::brew_token(&r.origin, &name);
-        let bypass = self.bypass_for(&token, installed);
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
@@ -797,6 +796,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::LeaveAutoUpdates => {}
             DesiredAction::LeaveAheadOfSoak => {
                 if self.brew_verb == "reinstall" {
+                    let bypass = self.bypass_for(&token, installed);
                     self.defer_held(format!(
                         "{name} is ahead of soak; reinstall would pull a too-new artifact; use `{bypass}` to bypass brewsoak."
                     ));
@@ -808,6 +808,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::LeaveNewerThanCutoff => {
                 let (installed_ver, cutoff_ver) = view_versions(&view);
                 if self.brew_verb == "reinstall" {
+                    let bypass = self.bypass_for(&token, installed);
                     self.defer_held(format!(
                         "{name} is newer than its cutoff {cutoff_ver}; reinstall would downgrade it; use `{bypass}` to bypass brewsoak."
                     ));
@@ -826,6 +827,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
             | DesiredAction::RefuseDeprecated => {
+                let bypass = self.bypass_for(&token, installed);
                 if let Some(msg) = refusal_message(view.action, &token, &bypass) {
                     self.defer_held(msg);
                 }
@@ -879,12 +881,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         // anchored package is named by its official tap.
         let inv = self.inv;
         let installed = inv.find_in(origin_tap, name).filter(|p| p.kind == kind);
-        let bypass = self.bypass_for(&token, installed);
         let walked = match self.collect_cutoff_deps(origin_tap, name, kind) {
             Ok(w) => w,
             // A bare dependency name matches formulae in several taps: brew
             // will not pick one, and neither will brewsoak.
             Err(Error::Brew { message, .. }) if taps::ambiguous_formula(&message) => {
+                let bypass = self.bypass_for(&token, installed);
                 self.refuse_ambiguous_dep(name, &bypass, &message)?;
                 return Ok(());
             }
@@ -901,6 +903,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                             dep: None,
                             why: NameFail::Why(NameWhy::Deps(first_line(&message))),
                         };
+                        let bypass = self.bypass_for(&token, installed);
                         self.hold_target_by_name(name, &bypass, &hold)?;
                     }
                 }
@@ -909,13 +912,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Err(e) => return Err(e),
         };
         if let Some(hold) = walked.by_name {
+            let bypass = self.bypass_for(&token, installed);
             return self.hold_target_by_name(name, &bypass, &hold);
         }
         if let Some(held) = walked.held {
+            let bypass = self.bypass_for(&token, installed);
             return self.refuse_held_dep(name, &bypass, &held);
         }
         for (dep_origin, dep, dep_kind) in walked.deps {
-            if !self.install_missing_dep(name, &bypass, &dep_origin, dep_kind, &dep)? {
+            if !self.install_missing_dep(name, (&token, installed), &dep_origin, dep_kind, &dep)? {
                 return Ok(());
             }
         }
@@ -1008,7 +1013,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn install_missing_dep(
         &mut self,
         target: &str,
-        bypass: &str,
+        hint: (&str, Option<&Pkg>),
         dep_origin: &str,
         kind: PkgKind,
         dep: &str,
@@ -1022,7 +1027,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             host.as_ref(),
         );
         if status != UpstreamStatus::Eligible {
-            self.refuse_ineligible_dep(target, bypass, dep, status)?;
+            let bypass = self.bypass_for(hint.0, hint.1);
+            self.refuse_ineligible_dep(target, &bypass, dep, status)?;
             return Ok(false);
         }
         // The wanted cutoff and the installed receipt are parsed together:
