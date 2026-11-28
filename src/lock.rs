@@ -150,6 +150,8 @@ pub enum BrewLockError {
     Unavailable(String),
 }
 
+const NOT_REGULAR: &str = "the lock file is not a regular file";
+
 /// Takes brew's lock on formula `name` in `locks_dir` without waiting.
 pub fn try_brew_formula_lock(locks_dir: &Path, name: &str) -> Result<BrewLock, BrewLockError> {
     lock_with_hook(locks_dir, name, &|_, _| {})
@@ -175,8 +177,18 @@ fn lock_with_hook(
     // The path is judged by `symlink_metadata`, so a link swapped in after the
     // first check is a different file and sends the loop around to refuse it.
     for attempt in 0..3 {
-        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(unavailable("the lock file is a symbolic link".into()));
+        if let Ok(m) = std::fs::symlink_metadata(&path) {
+            if m.file_type().is_symlink() {
+                return Err(unavailable("the lock file is a symbolic link".into()));
+            }
+            // Judged before the open: a FIFO would block a read-only open, and
+            // a directory opens and flocks though brew could never lock it. A
+            // file swapped in after this check is caught by the fd check below,
+            // except a FIFO, whose open could block (a window this small is
+            // accepted rather than adding O_NONBLOCK and a libc dependency).
+            if !m.file_type().is_file() {
+                return Err(unavailable(NOT_REGULAR.into()));
+            }
         }
         // Open read-only first: it creates and writes nothing, and a link
         // swapped in now is only read through. A missing file is created with
@@ -193,6 +205,9 @@ fn lock_with_hook(
             }
             Err(e) => return Err(unavailable(e.to_string())),
         };
+        if !file.metadata().is_ok_and(|m| m.file_type().is_file()) {
+            return Err(unavailable(NOT_REGULAR.into()));
+        }
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(BrewLockError::Busy),
@@ -380,7 +395,10 @@ mod tests {
     }
 
     #[test]
-    fn brew_formula_lock_is_busy_against_a_plain_flock_on_brews_file() {
+    fn brew_formula_lock_is_busy_against_another_flock_on_the_same_file() {
+        // Both sides are Rust. That Ruby's flock (brew's FormulaLock) and this
+        // lock exclude each other is checked with real brew by
+        // scripts/lock-check-25.sh.
         let dir = tempfile::tempdir().unwrap();
         let file = OpenOptions::new()
             .read(true)
@@ -429,6 +447,41 @@ mod tests {
             BrewLockError::Unavailable("the lock file is a symbolic link".into())
         );
         assert!(!tmp.path().join("target").exists());
+    }
+
+    #[test]
+    fn brew_formula_lock_refuses_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("wget.formula.lock")).unwrap();
+        assert_eq!(
+            try_brew_formula_lock(tmp.path(), "wget").unwrap_err(),
+            BrewLockError::Unavailable("the lock file is not a regular file".into())
+        );
+    }
+
+    #[test]
+    fn brew_formula_lock_refuses_a_fifo_without_blocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("wget.formula.lock");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success());
+        // A read-only open of a FIFO with no writer blocks forever; run the
+        // lock on a thread so a regression fails the test instead of hanging.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = tmp.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(try_brew_formula_lock(&dir, "wget").unwrap_err());
+        });
+        let err = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the lock attempt blocked on the FIFO");
+        assert_eq!(
+            err,
+            BrewLockError::Unavailable("the lock file is not a regular file".into())
+        );
     }
 
     #[test]
