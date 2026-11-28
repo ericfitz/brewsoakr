@@ -282,9 +282,22 @@ setup_work() {
 	: >"$LOG"
 }
 
-add_revision() { # <src> <dst>: insert "revision 1" after the first top-level sha256 line
-	awk '{print} /^  sha256 / && !done {print "  revision 1"; done=1}' "$1" >"$2"
-	grep -qx '  revision 1' "$2"
+# add_revision <src> <dst>: insert "revision 1" after the first top-level
+# sha256 line and drop the top-level bottle block. The block pins bottles (and
+# their manifest) to the unrevised version, so brew would look for a bottle
+# of the revision that does not exist ("Couldn't find manifest matching
+# bottle checksum"); without it brew builds the revision from source.
+# Fails on no top-level sha256 or an unclosed bottle block.
+add_revision() {
+	awk '
+		/^  bottle do$/ && !skipped { inblock=1; next }
+		inblock { if ($0 == "  end") { inblock=0; skipped=1 } next }
+		{ print }
+		/^  sha256 / && !done { print "  revision 1"; done=1 }
+		END { if (inblock) exit 1 }
+	' "$1" >"$2" || return 1
+	grep -qx '  revision 1' "$2" || return 1
+	! grep -q '^ *bottle do' "$2"
 }
 
 do_run() {
@@ -315,7 +328,7 @@ do_run() {
 	begin installed
 	run_step "install $PKG from the throwaway tap" "$BREW" install --formula "$SPIKE_TAP/$PKG"
 	begin file
-	run_step "write $PKG with 'revision 1' into brewsoak's tap" add_revision "$SPIKE/Formula/$PKG.rb" "$TAP/Formula/$PKG.rb"
+	run_step "write $PKG with 'revision 1' and no bottle block into brewsoak's tap" add_revision "$SPIKE/Formula/$PKG.rb" "$TAP/Formula/$PKG.rb"
 	begin pkg-trust
 	run_step "upgrade $PKG through brewsoak's tap" "$BREW" upgrade --formula "$SOAK_TAP/$PKG"
 
@@ -397,6 +410,7 @@ untrust) if [[ "$2" == --tap ]]; then untrust taps "$3"; else untrust formulae "
 install) receipt hello 2.12 spike17c/t3 ;;
 upgrade)
 	[[ -f "$TAPS/ericfitz/homebrew-brewsoak/Formula/hello.rb" ]] || { echo "Error: no such formula" >&2; exit 1; }
+	! grep -q 'bottle do' "$TAPS/ericfitz/homebrew-brewsoak/Formula/hello.rb" || { echo "Error: hello: Couldn't find manifest matching bottle checksum." >&2; exit 1; }
 	if [[ "${FAKE_HANG:-}" == upgrade ]]; then : >"$R/hang"; sleep 1; fi
 	[[ -z "${FAKE_BREAK_TRUST_JSON:-}" ]] || : >"$R/trust-json-broken"
 	rm -rf "$CELLAR/hello"; receipt hello 2.12_1 "${FAKE_RECEIPT_TAP:-ericfitz/brewsoak}"
@@ -790,6 +804,16 @@ self_test() {
 	# 12. the revision insert needs a top-level sha256 line
 	printf 'class X\n  bottle do\n    sha256 cellar: :any, a: "b"\n  end\nend\n' >"$T/nosha.rb"
 	check revision-needs-sha "$(add_revision "$T/nosha.rb" "$T/nosha.out" && echo 1 || echo 0)" "accepted a file with no top-level sha256"
+
+	# 13. the revision drops the bottle block (brew has no bottle for it) and keeps the rest
+	printf 'class X < Formula\n  url "u"\n  sha256 "a"\n  license "l"\n\n  bottle do\n    rebuild 1\n    manifest_sha256 "m"\n    sha256 cellar: :any, arm64: "b"\n  end\n\n  def install\n    system "make"\n  end\nend\n' >"$T/bottle.rb"
+	printf 'class X < Formula\n  url "u"\n  sha256 "a"\n  revision 1\n  license "l"\n\n\n  def install\n    system "make"\n  end\nend\n' >"$T/bottle.want"
+	add_revision "$T/bottle.rb" "$T/bottle.out" || true
+	check revision-drops-bottle "$(diff "$T/bottle.want" "$T/bottle.out" >/dev/null 2>&1 && echo 0 || echo 1)" "bottle block not dropped cleanly: $(diff "$T/bottle.want" "$T/bottle.out" 2>&1 | tr '\n' ' ')"
+
+	# 14. an unclosed bottle block is refused
+	printf 'class X\n  sha256 "a"\n  bottle do\n    sha256 cellar: :any, a: "b"\nend\n' >"$T/open.rb"
+	check revision-refuses-open-bottle "$(add_revision "$T/open.rb" "$T/open.out" && echo 1 || echo 0)" "accepted an unclosed bottle block"
 
 	echo "self-test: $total checks, $((total - failed)) passed, $failed failed"
 	if ((failed)); then
