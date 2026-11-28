@@ -5,7 +5,6 @@ use crate::config::Config;
 use crate::digest::sha256_hex;
 use crate::eligibility::DesiredAction;
 use crate::git::GitStore;
-use crate::identity::{self, PkgIdentity};
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
 use crate::origin::{self};
 use crate::resolve::PkgKind;
@@ -123,18 +122,6 @@ pub(super) struct CutoffDepWalk<'a, B, G> {
     pub(super) by_name: Option<NameHold>,
 }
 
-/// The cutoff blob's version as brew names it (`1.0.0_2` with a revision),
-/// for comparing with brew's own answer. None when the blob is missing or
-/// does not parse.
-fn cutoff_version(kind: PkgKind, blob: Option<&[u8]>) -> Option<String> {
-    let rb = std::str::from_utf8(blob?).ok()?;
-    let id = match kind {
-        PkgKind::Formula => PkgIdentity::Formula(identity::parse_formula(rb, None).ok()?),
-        PkgKind::Cask => PkgIdentity::Cask(identity::parse_cask(rb, None).ok()?),
-    };
-    Some(crate::report::identity_version(&id))
-}
-
 /// First line of brew's text, for a hold line.
 pub(super) fn first_line(text: &str) -> String {
     text.lines()
@@ -218,7 +205,11 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 }
             } else if !has_cutoff {
                 NameWhy::NoCutoff
-            } else if cutoff_version(kind, blobs.cutoff.as_deref()).as_deref()
+            } else if blobs
+                .cutoff
+                .as_deref()
+                .and_then(|b| crate::soaktap::file_version(kind, b))
+                .as_deref()
                 == Some(answer.version.as_str())
             {
                 NameWhy::ChangedSinceCutoff {

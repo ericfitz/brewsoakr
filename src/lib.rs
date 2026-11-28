@@ -23,6 +23,7 @@ pub mod resolve;
 pub mod section;
 pub mod settings;
 pub mod snapshot;
+pub mod soaktap;
 pub mod tap;
 pub mod taps;
 
