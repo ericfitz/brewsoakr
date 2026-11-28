@@ -76,7 +76,6 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
 
     fn names(dir: &Path) -> Vec<String> {
@@ -89,16 +88,16 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_directory_syncs_the_current_directory() {
-        // Unique name under the crate root (the test cwd), removed at the end.
-        let name = format!("atomic-relative-test-{}", std::process::id());
-        let dir = Path::new(&name);
+    fn new_directories_are_synced_into_their_parents() {
+        // Everything stays under a temp dir. A relative one-component path
+        // (whose parent is the empty path) needs the process cwd, which a
+        // parallel test must not change, so that case is `dir_or_cwd` below.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("a").join("b");
         SYNCED.with(|s| s.borrow_mut().clear());
-        let result = create_dirs_durably(dir);
+        create_dirs_durably(&dir).unwrap();
         let synced = SYNCED.with(|s| s.borrow().clone());
-        let _ = std::fs::remove_dir(dir);
-        result.unwrap();
-        assert_eq!(synced, vec![PathBuf::from(".")]);
+        assert_eq!(synced, vec![tmp.path().to_path_buf(), tmp.path().join("a")]);
         assert_eq!(dir_or_cwd(Path::new("")), Path::new("."));
         assert_eq!(dir_or_cwd(Path::new("a")), Path::new("a"));
     }

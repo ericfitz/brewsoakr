@@ -929,7 +929,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
             Err(e) => return Err(e),
         };
-        if let Some(hold) = walked.by_name {
+        if let Some(hold) = walked.gate_hold {
             return self.hold_target_by_gate(name, &bypass, &hold);
         }
         if let Some(held) = walked.held {
@@ -1019,13 +1019,13 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             visited: HashSet::new(),
             out: Vec::new(),
             held: None,
-            by_name: None,
+            gate_hold: None,
         };
         walk.visit(root_origin, root, root_kind, Role::Root)?;
         Ok(CutoffDeps {
             deps: walk.out,
             held: walk.held,
-            by_name: walk.by_name,
+            gate_hold: walk.gate_hold,
         })
     }
 
@@ -1271,7 +1271,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
-    /// The by-name gate failed for the target or one of its dependencies:
+    /// A gate (the by-name gate or a soak-tap dependency rule) failed for the
+    /// target or one of its dependencies:
     /// hold the target with one inline line and one note, and carry on.
     fn hold_target_by_gate(
         &mut self,

@@ -137,7 +137,7 @@ pub(super) struct CutoffDeps {
     /// (origin, name, kind), dependencies first.
     pub(super) deps: Vec<(String, String, PkgKind)>,
     pub(super) held: Option<HeldDep>,
-    pub(super) by_name: Option<GateHold>,
+    pub(super) gate_hold: Option<GateHold>,
 }
 
 /// What a member of the closure is for.
@@ -167,7 +167,7 @@ pub(super) struct CutoffDepWalk<'a, 's, B, G> {
     pub(super) visited: HashSet<String>,
     pub(super) out: Vec<(String, String, PkgKind)>,
     pub(super) held: Option<HeldDep>,
-    pub(super) by_name: Option<GateHold>,
+    pub(super) gate_hold: Option<GateHold>,
 }
 
 pub(super) use crate::error::first_line;
@@ -182,11 +182,11 @@ fn kind_word(kind: PkgKind) -> &'static str {
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
     fn hold(&mut self, role: Role, name: &str, why: GateFail) {
         let dep = (role != Role::Root).then(|| name.to_string());
-        self.by_name = Some(GateHold { dep, why });
+        self.gate_hold = Some(GateHold { dep, why });
     }
 
     fn failed(&self) -> bool {
-        self.held.is_some() || self.by_name.is_some()
+        self.held.is_some() || self.gate_hold.is_some()
     }
 
     /// Why brew refused brewsoak's tap: the tap's own state, else untrusted
@@ -638,6 +638,28 @@ mod tests {
     use super::*;
     use crate::SoakHours;
 
+    use crate::brew::{InstalledPkg, MockBrew};
+    use crate::cmd::test_support::summary_has;
+    use crate::flags;
+    use std::collections::BTreeMap;
+
+    use crate::git::InMemoryGit;
+
+    use crate::origin::OriginRecords;
+    use crate::resolve::PkgKind;
+    use crate::snapshot::TapState;
+    use crate::taps::TapInfo;
+    use std::path::Path;
+
+    use crate::cmd::RunResult;
+    use crate::cmd::install::install;
+
+    use crate::cmd::test_support::{
+        PACKER_REFUSAL, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg_from, formula_rb,
+        hashicorp_tap, inv_from, lock_runs, packer_world, run_has_token, run_is_name_install,
+        strip_soak_prefix, tap_snaps, tapped, test_cache,
+    };
+
     #[test]
     fn replace_reasons_omit_an_empty_installed_version() {
         let would = |installed: &str| {
@@ -665,27 +687,6 @@ mod tests {
         assert!(would("").contains("installed dep with 2.0"));
         assert!(cannot("").contains("installed dep as a dependency"));
     }
-    use crate::brew::{InstalledPkg, MockBrew};
-    use crate::cmd::test_support::summary_has;
-    use crate::flags;
-    use std::collections::BTreeMap;
-
-    use crate::git::InMemoryGit;
-
-    use crate::origin::OriginRecords;
-    use crate::resolve::PkgKind;
-    use crate::snapshot::TapState;
-    use crate::taps::TapInfo;
-    use std::path::Path;
-
-    use crate::cmd::RunResult;
-    use crate::cmd::install::install;
-
-    use crate::cmd::test_support::{
-        PACKER_REFUSAL, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg_from, formula_rb,
-        hashicorp_tap, inv_from, lock_runs, packer_world, run_has_token, run_is_name_install,
-        strip_soak_prefix, tap_snaps, tapped, test_cache,
-    };
 
     #[test]
     fn dep_closure_crosses_taps_and_core() {
