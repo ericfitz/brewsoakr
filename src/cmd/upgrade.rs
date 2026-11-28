@@ -1174,6 +1174,11 @@ mod tests {
             ],
             next_stdout: b"\xf0\x9f\x8d\xba  /opt/homebrew/Cellar/alpha/1.1.0: 5 files, 1MB\n"
                 .to_vec(),
+            receipt_taps: [(
+                (PkgKind::Formula, "alpha".to_string(), "1.1.0".to_string()),
+                "ericfitz/brewsoak".to_string(),
+            )]
+            .into(),
             ..MockBrew::new()
         };
         let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");

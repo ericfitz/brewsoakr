@@ -943,10 +943,30 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
         let installing = view.cutoff.as_ref().map(report::identity_version);
         match self.run_install(&pkg, origin_tap, view.cutoff_blob.as_deref(), installing)? {
-            InstallRun::Ran { failed, .. } => {
-                // Counted as upgraded when it was announced; brew failed.
-                if failed {
+            InstallRun::Ran { failed, no_op, .. } => {
+                // Counted as upgraded when it was announced; brew failed, or
+                // exited 0 and left the package where it was.
+                let left = if failed || self.counts.dry_run {
+                    None
+                } else if origin::is_core_or_cask(origin_tap) {
+                    let at_cutoff =
+                        self.keg_from_soak_tap_at(kind, name, view.cutoff_blob.as_deref());
+                    (!at_cutoff).then(|| {
+                        no_op.unwrap_or_else(|| {
+                            "its keg is not from brewsoak's tap at the cutoff version".to_string()
+                        })
+                    })
+                } else {
+                    no_op
+                };
+                if failed || left.is_some() {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                }
+                if let Some(reason) = left {
+                    self.counts.skipped += 1;
+                    self.defer(format!(
+                        "{name}: brew left the installed version in place: {reason}"
+                    ));
                 }
             }
             InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
@@ -1113,7 +1133,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         });
         let installing = want.as_ref().map(report::identity_version);
         match self.run_install(&pkg, dep_origin, blobs.cutoff.as_deref(), installing)? {
-            InstallRun::Ran { failed, why } => {
+            InstallRun::Ran { failed, why, .. } => {
                 if failed && counted_here && self.counted_deps.remove(dep) {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
@@ -1172,9 +1192,26 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(true)
     }
 
+    /// The keg of `name` is installed at the cutoff version with a receipt
+    /// that names brewsoak's tap: brew really installed it from there. Only
+    /// the receipt can tell, because a no-op run leaves the old keg and its
+    /// receipt (`Not upgrading ...`) while brew's current file may still
+    /// equal the cutoff.
+    fn keg_from_soak_tap_at(&self, kind: PkgKind, name: &str, cutoff: Option<&[u8]>) -> bool {
+        cutoff
+            .and_then(|c| soaktap::file_version(kind, c))
+            .is_some_and(|v| {
+                self.brew
+                    .receipt_tap(kind, name, &v)
+                    .is_some_and(|t| origin::own_tap(&t) == Some(OwnTap::Soak))
+            })
+    }
+
     /// After a real run of a core or cask dependency's soak-tap command: its
     /// keg is anchored in brewsoak's tap at the cutoff version, or brew would
-    /// load exactly the cutoff file for it (`installed_dep_rule` passes).
+    /// load exactly the cutoff file for it (`installed_dep_rule` passes). That
+    /// second answer is about what the target's own install will load, so it
+    /// is no proof that brew installed a target.
     fn dep_at_cutoff(
         &self,
         kind: PkgKind,
@@ -1182,14 +1219,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         dep_origin: &str,
         cutoff: Option<&[u8]>,
     ) -> Result<bool, Error> {
-        let cutoff_version = cutoff.and_then(|c| soaktap::file_version(kind, c));
-        if cutoff_version.as_deref().is_some_and(|v| {
-            self.brew
-                .receipt_tap(kind, dep, v)
-                .is_some_and(|t| origin::own_tap(&t) == Some(OwnTap::Soak))
-        }) {
+        if self.keg_from_soak_tap_at(kind, dep, cutoff) {
             return Ok(true);
         }
+        let cutoff_version = cutoff.and_then(|c| soaktap::file_version(kind, c));
         let query = NameQuery {
             kind,
             name: dep.to_string(),
@@ -1425,12 +1458,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             .extend(quiet::installed_from_output(&output.stdout));
         // Only a real install writes a receipt; brew's "already installed"
         // answer changes nothing.
-        let installed_now = output.status.success() && !already_installed_message(&output);
+        let no_op = brew_no_op_reason(&output, name);
+        let installed_now = output.status.success() && no_op.is_none();
         let failed = brew_failed(&output);
         let why = if failed {
             first_error_line(&output)
         } else if already_installed_message(&output) {
             "brew left the installed version in place".to_string()
+        } else if let Some(reason) = &no_op {
+            reason.clone()
         } else {
             "brew ran, but its keg is not from brewsoak's tap at the cutoff version".to_string()
         };
@@ -1438,7 +1474,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if installed_now {
             self.forget_origin(kind, name)?;
         }
-        Ok(InstallRun::Ran { failed, why })
+        Ok(InstallRun::Ran { failed, no_op, why })
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1557,6 +1593,9 @@ pub(super) enum InstallRun {
     /// version alone, or that its keg is not the soaked one.
     Ran {
         failed: bool,
+        /// brew's line saying it left the package where it was
+        /// (`brew_no_op_reason`).
+        no_op: Option<String>,
         why: String,
     },
     /// brew does not trust this tap (lowercase `user/repo`).
@@ -1577,6 +1616,32 @@ pub(super) fn already_installed_message(output: &std::process::Output) -> bool {
         .to_ascii_lowercase()
         .lines()
         .any(already_installed_line)
+}
+
+/// Why brew left `name` where it was, when its output says so: the first line
+/// that is brew's "already installed" answer or `Not upgrading <name>, ...`
+/// (what `brew upgrade` and `brew install --cask` print for a package they
+/// leave alone), without its `Warning: `/`Error: ` prefix. Only those shapes
+/// count; any other line, including one about another package, does not.
+pub(super) fn brew_no_op_reason(output: &std::process::Output, name: &str) -> Option<String> {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let skipping = format!("not upgrading {},", name.to_ascii_lowercase());
+    text.lines().map(str::trim).find_map(|line| {
+        let lower = line.to_ascii_lowercase();
+        let is_no_op = already_installed_line(&lower)
+            || lower
+                .trim_start_matches("warning: ")
+                .trim_start_matches("error: ")
+                .starts_with(&skipping);
+        is_no_op.then(|| {
+            let line = line.strip_prefix("Warning: ").unwrap_or(line);
+            line.strip_prefix("Error: ").unwrap_or(line).to_string()
+        })
+    })
 }
 
 /// brew's no-op answer for one (lowercased) output line. `x 1.0 is already
@@ -1880,7 +1945,17 @@ mod tests {
         );
         let mut deps = BTreeMap::new();
         deps.insert("node".to_string(), vec!["simdutf".to_string()]);
+        // brew wrote soak-tap receipts for what it installed.
+        let receipt_taps = ["node", "simdutf"]
+            .map(|n| {
+                (
+                    (PkgKind::Formula, n.to_string(), "1.1.0".to_string()),
+                    "ericfitz/brewsoak".into(),
+                )
+            })
+            .into();
         let brew = MockBrew {
+            receipt_taps,
             installed: vec![
                 formula_pkg("node", formula_rb("node", node_installed, "oldsha")),
                 formula_pkg(
@@ -2111,7 +2186,16 @@ mod tests {
         }
         let mut deps = BTreeMap::new();
         deps.insert("app".to_string(), vec!["helper".to_string()]);
+        let receipt_taps = ["app", "helper"]
+            .map(|n| {
+                (
+                    (PkgKind::Cask, n.to_string(), "1.1.0".to_string()),
+                    "ericfitz/brewsoak".into(),
+                )
+            })
+            .into();
         let brew = MockBrew {
+            receipt_taps,
             installed: ["app", "helper"]
                 .map(|n| {
                     cask_pkg_from(
@@ -2360,6 +2444,56 @@ mod tests {
         assert!(said(
             "cats 13.8.0 is already installed but outdated (so it will be upgraded).\nWarning: foo 1.0 is already installed and up-to-date.\n"
         ));
+    }
+
+    #[test]
+    fn brew_no_op_reason_recognizes_every_not_upgrading_text_and_nothing_else() {
+        let said = |text: &str| {
+            brew_no_op_reason(
+                &std::process::Output {
+                    status: std::process::ExitStatus::default(),
+                    stdout: text.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                },
+                "Alt-Tab",
+            )
+        };
+        for tail in [
+            "no newer app version was detected",
+            "the downloaded artifact has not changed",
+            "the latest version is already installed",
+            "no version is available for the current platform",
+            "it is deprecated because it is discontinued",
+            "it is disabled because it is unmaintained",
+        ] {
+            let line = format!("Not upgrading alt-tab, {tail}");
+            assert_eq!(
+                said(&format!("==> x\nWarning: {line}\n")),
+                Some(line.clone())
+            );
+            assert_eq!(said(&format!("Error: {line}\n")), Some(line));
+        }
+        assert_eq!(
+            said("Warning: foo 1.0 is already installed and up-to-date.\n").as_deref(),
+            Some("foo 1.0 is already installed and up-to-date.")
+        );
+        assert_eq!(
+            said("cats 1.0 is already installed but outdated (so it will be upgraded).\n"),
+            None
+        );
+        assert_eq!(
+            said("Warning: Not upgrading other-app, no newer app version was detected\n"),
+            None
+        );
+        assert_eq!(
+            said("Warning: Not upgrading alt-tab-pro, no newer app version was detected\n"),
+            None
+        );
+        assert_eq!(
+            said("Warning: alt-tab: something unrelated happened\n"),
+            None
+        );
+        assert_eq!(said(""), None);
     }
 
     /// `alpha` is soaked work; `brewsoak` and `wget` are no-soak.
@@ -3271,6 +3405,133 @@ mod tests {
                 .iter()
                 .filter(|a| a.first().map(String::as_str) == Some("tap-new"))
                 .count()
+        }
+
+        const ALT_TAB_NOOP: &str =
+            "Warning: Not upgrading alt-tab, no newer app version was detected\n";
+
+        /// Cask `alt-tab` from homebrew/cask installed at 7.38.1; cutoff 11.10.2.
+        fn alt_tab_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+            let git = InMemoryGit::new();
+            git.insert_blob(
+                "caskcut",
+                "Casks/a/alt-tab.rb",
+                cask_rb("alt-tab", "11.10.2"),
+            );
+            git.insert_blob(
+                "caskhead",
+                "Casks/a/alt-tab.rb",
+                cask_rb("alt-tab", "11.10.2"),
+            );
+            let mut brew = MockBrew::new();
+            brew.soak_tap = Some(soak_tap_at(tap, true));
+            brew.installed.push(cask_pkg_from(
+                "alt-tab",
+                "homebrew/cask",
+                crate::brew::version_only_cask_receipt("alt-tab", "7.38.1"),
+            ));
+            (brew, git)
+        }
+
+        #[test]
+        fn cask_target_that_brew_left_in_place_is_skipped_not_upgraded() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alt_tab_world(tap.path());
+            brew.next_stdout = ALT_TAB_NOOP.as_bytes().to_vec();
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alt-tab"], &[]);
+            assert!(visible(&brew).contains(&strs(&[
+                "install",
+                "--cask",
+                "ericfitz/brewsoak/alt-tab"
+            ])));
+            assert!(summary_has(&text, "upgraded", "0"), "{text}");
+            assert!(summary_has(&text, "skipped", "1"), "{text}");
+            assert!(
+                text.contains("alt-tab: brew left the installed version in place: Not upgrading alt-tab, no newer app version was detected"),
+                "{text}"
+            );
+            assert!(!r.refused, "{text}");
+            assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+        }
+
+        #[test]
+        fn cask_target_without_a_no_op_line_and_not_from_the_tap_uses_the_fallback_reason() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = alt_tab_world(tap.path());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alt-tab"], &[]);
+            assert!(summary_has(&text, "upgraded", "0"), "{text}");
+            assert!(summary_has(&text, "skipped", "1"), "{text}");
+            assert!(
+                text.contains("alt-tab: brew left the installed version in place: its keg is not from brewsoak's tap at the cutoff version"),
+                "{text}"
+            );
+            assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+        }
+
+        #[test]
+        fn cask_target_that_brew_really_installed_is_upgraded() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alt_tab_world(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Cask, "alt-tab".into(), "11.10.2".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alt-tab"], &[]);
+            assert!(summary_has(&text, "upgraded", "1"), "{text}");
+            assert!(summary_has(&text, "skipped", "0"), "{text}");
+            assert!(!text.contains("brew left the installed version"), "{text}");
+        }
+
+        #[test]
+        fn third_party_target_that_brew_left_in_place_is_skipped_not_upgraded() {
+            for (stdout, reason) in [
+                (
+                    "Warning: hashicorp/tap/packer 1.15.0 already installed\n",
+                    "hashicorp/tap/packer 1.15.0 already installed",
+                ),
+                (
+                    "Warning: Not upgrading packer, the latest version is already installed\n",
+                    "Not upgrading packer, the latest version is already installed",
+                ),
+            ] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+                brew.next_stdout = stdout.as_bytes().to_vec();
+                let (r, text) = run_upgrade(
+                    &brew,
+                    &git,
+                    &snaps,
+                    tap.path(),
+                    &["hashicorp/tap/packer"],
+                    &[],
+                );
+                assert!(summary_has(&text, "upgraded", "0"), "{text}");
+                assert!(summary_has(&text, "skipped", "1"), "{text}");
+                assert!(
+                    text.contains(&format!(
+                        "packer: brew left the installed version in place: {reason}"
+                    )),
+                    "{text}"
+                );
+                assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+            }
+        }
+
+        #[test]
+        fn third_party_target_with_an_unrecognized_warning_is_still_upgraded() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+            brew.next_stdout = b"Warning: Not upgrading something-else, no newer app version was detected\nWarning: packer: odd thing\n".to_vec();
+            let (_, text) = run_upgrade(
+                &brew,
+                &git,
+                &snaps,
+                tap.path(),
+                &["hashicorp/tap/packer"],
+                &[],
+            );
+            assert!(summary_has(&text, "upgraded", "1"), "{text}");
+            assert!(!text.contains("brew left the installed version"), "{text}");
         }
 
         #[test]

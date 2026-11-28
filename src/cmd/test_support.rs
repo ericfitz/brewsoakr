@@ -513,7 +513,21 @@ pub(super) fn greedy_world() -> (MockBrew, InMemoryGit, Snapshots) {
         git.insert_blob("caskcut", &path, rb.clone());
         git.insert_blob("caskhead", &path, rb.clone());
     }
+    // brew wrote soak-tap receipts for what it installed.
+    let mut receipt_taps = BTreeMap::new();
+    receipt_taps.insert(
+        (PkgKind::Formula, "wget".to_string(), "1.1.0".to_string()),
+        "ericfitz/brewsoak".to_string(),
+    );
+    for (name, rb) in &casks {
+        let version = crate::soaktap::file_version(PkgKind::Cask, rb.as_bytes()).unwrap();
+        receipt_taps.insert(
+            (PkgKind::Cask, name.to_string(), version),
+            "ericfitz/brewsoak".to_string(),
+        );
+    }
     let brew = MockBrew {
+        receipt_taps,
         installed: vec![
             formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha")),
             cask_pkg_from(
