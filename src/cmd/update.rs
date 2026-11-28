@@ -16,6 +16,7 @@ use crate::prune;
 use crate::report::{self};
 use crate::section::Section;
 use crate::snapshot::{self, Snapshots};
+use crate::soaktap;
 use std::io::Write;
 use std::path::Path;
 
@@ -164,6 +165,7 @@ pub fn update(
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
+    tap_root: &Path,
     cfg: &Config,
     inv: &Inventory,
     now: time::OffsetDateTime,
@@ -183,6 +185,16 @@ pub fn update(
     let plan = refresh_plan(cfg, inv, &[]);
     let snaps = snapshot::refresh_with(lock, git, gh, cache, &plan, now, out)?;
     prune::prune_cache(lock, cache, inv, verbose, out)?;
+    soaktap::maintain(
+        lock,
+        brew,
+        inv.soak_tap.as_ref(),
+        tap_root,
+        cache,
+        inv,
+        verbose,
+        out,
+    )?;
     writeln!(
         out,
         "core cutoff: {}",
@@ -370,6 +382,7 @@ mod tests {
             &git,
             &fixture_gh(),
             dir.path(),
+            &dir.path().join("tap"),
             &cfg,
             &inv,
             now(),
@@ -415,6 +428,7 @@ mod tests {
             &git,
             &fixture_gh(),
             dir.path(),
+            &dir.path().join("tap"),
             &cfg,
             &inv,
             now(),
@@ -435,6 +449,7 @@ mod tests {
             &git,
             &fixture_gh(),
             dir.path(),
+            &dir.path().join("tap"),
             &cfg,
             &inv,
             now(),
@@ -472,6 +487,7 @@ mod tests {
             &git,
             &fixture_gh(),
             dir.path(),
+            &dir.path().join("tap"),
             &cfg,
             &inv,
             now(),
@@ -483,5 +499,35 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("brew update failed (exit 3)"), "{text}");
         assert!(dir.path().join("state.toml").is_file());
+    }
+
+    #[test]
+    fn update_recovers_and_prunes_the_soak_tap() {
+        use crate::cmd::test_support::{seed_stale_tap, tree};
+        let dir = tempfile::tempdir().unwrap();
+        let tap = tempfile::tempdir().unwrap();
+        seed_stale_tap(tap.path(), dir.path());
+        let cfg = cfg24();
+        let brew = MockBrew::new();
+        let inv = inv_from(&brew, &cfg);
+        update(
+            &RunLock::for_tests(),
+            &brew,
+            &InMemoryGit::new(),
+            &fixture_gh(),
+            dir.path(),
+            tap.path(),
+            &cfg,
+            &inv,
+            now(),
+            false,
+            &mut Vec::new(),
+        )
+        .expect("update");
+        assert!(tree(tap.path()).is_empty(), "{:?}", tree(tap.path()));
+        assert!(
+            tree(&dir.path().join(crate::soaktap::UNDO_DIR)).is_empty(),
+            "undo entry survived"
+        );
     }
 }

@@ -657,6 +657,7 @@ mod tests {
         let names = vec!["openssl@3".to_string()];
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -677,6 +678,7 @@ mod tests {
         assert!(text.contains(OPENSSL_NOTE), "{text}");
         let mut out = Vec::new();
         let r = reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,

@@ -20,6 +20,7 @@ use crate::flags;
 use crate::git::GitStore;
 use crate::identity::PkgIdentity;
 use crate::inventory::{Inventory, Pkg, PkgClass};
+use crate::lock::RunLock;
 use crate::nosoak;
 use crate::origin::{self, OriginRecords};
 use crate::quiet;
@@ -27,6 +28,7 @@ use crate::report::{self, Counts, Verb};
 use crate::resolve::{PkgKind, PkgRef};
 use crate::section::Section;
 use crate::snapshot::Snapshots;
+use crate::soaktap;
 use crate::tap;
 use crate::taps;
 use std::collections::{BTreeMap, HashSet};
@@ -35,11 +37,12 @@ use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub fn reinstall(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    _tap_root: &Path,
+    tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -52,6 +55,18 @@ pub fn reinstall(
     validate_tokens(names)?;
     let plan_total = None;
     let dry_run = flags::is_dry_run(user_flags);
+    if !dry_run {
+        soaktap::maintain(
+            lock,
+            brew,
+            inv.soak_tap.as_ref(),
+            tap_root,
+            cache,
+            inv,
+            is_verbose(user_flags),
+            out,
+        )?;
+    }
     let mut session = ApplySession {
         brew,
         git,
@@ -178,11 +193,12 @@ pub fn reinstall(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_many(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    _tap_root: &Path,
+    tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -233,6 +249,18 @@ pub(super) fn apply_many(
         out: Section::new(out, report::soaked_header(verb, dry_run, plan)),
     };
     validate_tokens(names)?;
+    if !dry_run {
+        soaktap::maintain(
+            lock,
+            brew,
+            inv.soak_tap.as_ref(),
+            tap_root,
+            cache,
+            inv,
+            is_verbose(user_flags),
+            session.out.get_mut(),
+        )?;
+    }
     if is_verbose(user_flags) {
         let doing = match brew_verb {
             "upgrade" => "upgrading installed formulae and casks",
@@ -1339,6 +1367,7 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let err = apply_many(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -1547,6 +1576,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1873,6 +1903,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -1965,6 +1996,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2061,6 +2093,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew.inner, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2116,6 +2149,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2147,6 +2181,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2183,6 +2218,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2289,6 +2325,7 @@ mod tests {
             let inv = inv_from(brew, &cfg);
             let tap = tempfile::tempdir().unwrap();
             install(
+                &crate::lock::RunLock::for_tests(),
                 brew,
                 git,
                 &core_snaps(),
@@ -2312,6 +2349,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2331,6 +2369,7 @@ mod tests {
         let (brew, git) = two_outdated_world("");
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2405,6 +2444,7 @@ mod tests {
             .push_back((1, b"Error: offline".to_vec()));
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -2448,6 +2488,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -2470,6 +2511,7 @@ mod tests {
         // Explicitly named: handed to brew, which errors as it would by hand.
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -2514,6 +2556,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -2563,6 +2606,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             brew,
             &git_empty(),
             &core_snaps(),
@@ -2612,6 +2656,7 @@ mod tests {
         );
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -2665,6 +2710,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -2685,5 +2731,105 @@ mod tests {
         );
         assert!(!text.contains("vault is missing at HEAD"), "{text}");
         assert!(summary_has(&text, "held", "1"), "{text}");
+    }
+
+    /// Run `verb` for `wget` (installed at its cutoff) against `tap` and the
+    /// per-thread test cache, with `flags`.
+    fn run_verb(verb: &str, tap: &Path, flags: &[String]) {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/w/wget.rb",
+            formula_rb("wget", "1.1.0", "midsha"),
+        );
+        let brew = MockBrew {
+            installed: vec![formula_pkg("wget", formula_rb("wget", "1.1.0", "midsha"))],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let lock = crate::lock::RunLock::for_tests();
+        let names = ["wget".to_string()];
+        let mut out = Vec::new();
+        match verb {
+            "upgrade" => upgrade(
+                &lock,
+                &brew,
+                &git,
+                &core_snaps(),
+                test_cache(),
+                tap,
+                &inv,
+                &cfg,
+                &names,
+                flags,
+                &mut out,
+            ),
+            "install" => crate::cmd::install::install(
+                &lock,
+                &brew,
+                &git,
+                &core_snaps(),
+                test_cache(),
+                tap,
+                &inv,
+                &cfg,
+                &names,
+                false,
+                false,
+                flags,
+                &mut out,
+            ),
+            "reinstall" => reinstall(
+                &lock,
+                &brew,
+                &git,
+                &core_snaps(),
+                test_cache(),
+                tap,
+                &inv,
+                &cfg,
+                &names,
+                flags,
+                &mut out,
+            ),
+            other => panic!("unknown verb {other}"),
+        }
+        .unwrap_or_else(|e| panic!("{verb}: {e}"));
+    }
+
+    #[test]
+    fn real_upgrade_install_and_reinstall_maintain_the_tap_first() {
+        use crate::cmd::test_support::{seed_stale_tap, tree};
+        for verb in ["upgrade", "install", "reinstall"] {
+            let tap = tempfile::tempdir().unwrap();
+            seed_stale_tap(tap.path(), test_cache());
+            run_verb(verb, tap.path(), &[]);
+            assert!(
+                tree(tap.path()).is_empty(),
+                "{verb}: {:?}",
+                tree(tap.path())
+            );
+            assert!(
+                tree(&test_cache().join(crate::soaktap::UNDO_DIR)).is_empty(),
+                "{verb}: undo entry survived"
+            );
+        }
+    }
+
+    #[test]
+    fn dry_run_never_maintains_the_tap() {
+        use crate::cmd::test_support::{seed_stale_tap, tree};
+        let undo = test_cache().join(crate::soaktap::UNDO_DIR);
+        for verb in ["upgrade", "install", "reinstall"] {
+            let tap = tempfile::tempdir().unwrap();
+            seed_stale_tap(tap.path(), test_cache());
+            let (tap_before, undo_before) = (tree(tap.path()), tree(&undo));
+            assert_eq!(tap_before.len(), 2);
+            assert_eq!(undo_before.len(), 1);
+            run_verb(verb, tap.path(), &["--dry-run".to_string()]);
+            assert_eq!(tree(tap.path()), tap_before, "{verb}");
+            assert_eq!(tree(&undo), undo_before, "{verb}");
+        }
     }
 }

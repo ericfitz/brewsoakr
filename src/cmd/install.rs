@@ -5,17 +5,19 @@ use crate::brew::Brew;
 use crate::config::Config;
 use crate::git::GitStore;
 use crate::inventory::Inventory;
+use crate::lock::RunLock;
 use crate::snapshot::Snapshots;
 use std::io::Write;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub fn install(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    _tap_root: &Path,
+    tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -28,11 +30,12 @@ pub fn install(
         return Err(Error::Usage("install: no packages specified".into()));
     }
     apply_many(
+        lock,
         brew,
         git,
         snaps,
         cache,
-        _tap_root,
+        tap_root,
         inv,
         cfg,
         names,
@@ -150,6 +153,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -192,6 +196,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -234,6 +239,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -287,6 +293,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -340,6 +347,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             brew,
             git,
             snaps,
@@ -463,6 +471,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -500,6 +509,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -656,6 +666,7 @@ mod tests {
         let names = ["wget".to_string(), "a/b".to_string()];
         let mut out = Vec::new();
         let err = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -761,6 +772,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().expect("tap");
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -855,6 +867,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -890,6 +903,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -930,6 +944,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -975,6 +990,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1027,6 +1043,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1054,6 +1071,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -1077,6 +1095,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -1115,6 +1134,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         let r = reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -1168,6 +1188,7 @@ mod tests {
         let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
         let tap = tempfile::tempdir().unwrap();
         reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1234,6 +1255,7 @@ mod tests {
         );
         let tap = tempfile::tempdir().unwrap();
         reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1272,6 +1294,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1360,6 +1383,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1405,6 +1429,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
@@ -1438,6 +1463,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -1484,6 +1510,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,

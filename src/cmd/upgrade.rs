@@ -7,17 +7,19 @@ use crate::config::Config;
 use crate::flags;
 use crate::git::GitStore;
 use crate::inventory::Inventory;
+use crate::lock::RunLock;
 use crate::snapshot::Snapshots;
 use std::io::Write;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub fn upgrade(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    _tap_root: &Path,
+    tap_root: &Path,
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -29,11 +31,12 @@ pub fn upgrade(
     let plan_total = (names.is_empty())
         .then(|| plan_size(brew, git, snaps, cache, inv, flags::greedy_mode(user_flags)));
     apply_many(
+        lock,
         brew,
         git,
         snaps,
         cache,
-        _tap_root,
+        tap_root,
         inv,
         cfg,
         names,
@@ -75,6 +78,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -117,6 +121,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -160,6 +165,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -208,6 +214,7 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -292,6 +299,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -333,6 +341,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             brew,
             git,
             &snaps,
@@ -440,6 +449,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -483,6 +493,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -535,6 +546,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -591,6 +603,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -654,6 +667,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -682,6 +696,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -764,6 +779,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -822,6 +838,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -907,6 +924,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -965,6 +983,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1026,6 +1045,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1068,6 +1088,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &snaps,
@@ -1085,6 +1106,7 @@ mod tests {
         assert!(text.contains("thing: tap local/tap has no HTTPS remote; not soakable. Use brew, or add it to NO_SOAK"), "{text}");
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &snaps,
@@ -1161,6 +1183,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1236,6 +1259,7 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),

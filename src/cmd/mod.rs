@@ -10,7 +10,7 @@ mod notes;
 mod outdated;
 mod snapshots;
 #[cfg(test)]
-mod test_support;
+pub(crate) mod test_support;
 mod update;
 mod upgrade;
 mod view;

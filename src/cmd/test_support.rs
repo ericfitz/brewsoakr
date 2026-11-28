@@ -14,7 +14,8 @@ use crate::resolve::PkgKind;
 use crate::snapshot::Snapshots;
 use crate::snapshot::{TapSnapshot, TapState};
 use crate::taps::TapInfo;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 /// True when the Summary has a `label  value` row (value ignoring any suffix).
@@ -92,7 +93,7 @@ pub(super) fn now() -> OffsetDateTime {
 
 /// A writable cache directory, the same for every call on one test's thread
 /// and removed when that thread ends.
-pub(super) fn test_cache() -> &'static Path {
+pub(crate) fn test_cache() -> &'static Path {
     thread_local! {
         static CACHE: (tempfile::TempDir, &'static Path) = {
             let dir = tempfile::tempdir().expect("test cache");
@@ -272,6 +273,7 @@ pub(super) fn upgrade_names_flags(
     let cfg = cfg24();
     let inv = inv_from(brew, &cfg);
     upgrade(
+        &crate::lock::RunLock::for_tests(),
         brew,
         git,
         &core_snaps(),
@@ -304,6 +306,7 @@ pub(super) fn call_reinstall(
     let cfg = cfg24();
     let inv = inv_from(brew, &cfg);
     reinstall(
+        &crate::lock::RunLock::for_tests(),
         brew,
         git,
         snaps,
@@ -508,6 +511,7 @@ pub(super) fn greedy_upgrade(
     let flags: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
     upgrade(
+        &crate::lock::RunLock::for_tests(),
         brew,
         git,
         snaps,
@@ -623,6 +627,55 @@ pub(super) fn spawns(brew: &MockBrew) -> (usize, usize) {
 
 pub(super) fn git_empty() -> InMemoryGit {
     InMemoryGit::new()
+}
+
+/// The soak tap as `brew tap-info` reports a local one: at `path`, with the
+/// given trust.
+pub(crate) fn soak_tap_at(path: &Path, trusted: bool) -> TapInfo {
+    let mut tap = TapInfo::new(crate::origin::SOAK_TAP, None);
+    tap.path = Some(path.to_path_buf());
+    tap.trusted = trusted;
+    tap
+}
+
+/// Leave a tap file no package needs (`Formula/gone.rb`) and an unfinished
+/// undo entry (`soak-tap-undo/Formula/back.absent`, whose tap file
+/// `Formula/back.rb` should not outlive it), so maintenance has work to do.
+pub(crate) fn seed_stale_tap(tap: &Path, cache: &Path) {
+    let body = formula_rb("gone", "1.0.0", "x");
+    for (dir, file, bytes) in [
+        (tap.join("Formula"), "gone.rb", body.as_bytes()),
+        (tap.join("Formula"), "back.rb", body.as_bytes()),
+        (
+            cache.join(crate::soaktap::UNDO_DIR).join("Formula"),
+            "back.absent",
+            b"".as_slice(),
+        ),
+    ] {
+        std::fs::create_dir_all(&dir).expect("seed dir");
+        std::fs::write(dir.join(file), bytes).expect("seed file");
+    }
+}
+
+/// Every file under `dir` with its bytes; empty when `dir` is missing.
+pub(crate) fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                let bytes = std::fs::read(&path).expect("read");
+                out.insert(path, bytes);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, &mut out);
+    out
 }
 
 #[cfg(test)]

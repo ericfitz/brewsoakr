@@ -51,7 +51,8 @@ pub trait World {
     fn cache_path(&self) -> PathBuf;
     fn env_soak(&self) -> Option<String>;
     fn now(&self) -> time::OffsetDateTime;
-    fn tap_root(&self) -> PathBuf;
+    /// Where brewsoak expects its tap: `$(brew --repository)/Library/Taps/ericfitz/homebrew-brewsoak`.
+    fn tap_root(&self) -> Result<PathBuf, Error>;
     fn git(&self) -> &Self::Git;
     fn github(&self) -> &Self::Github;
     fn brew(&self) -> &Self::Brew;
@@ -106,10 +107,22 @@ impl World for RealWorld {
         time::OffsetDateTime::now_utc()
     }
 
-    fn tap_root(&self) -> PathBuf {
-        // Must live outside Homebrew's Taps/ so `brew install /path/foo.rb`
-        // is not treated as brewsoak/soaked (same-name tap conflict).
-        self.cache_path().join("staging")
+    fn tap_root(&self) -> Result<PathBuf, Error> {
+        let output = self.brew.run(&["--repository".to_string()])?;
+        let status = output.status.code().unwrap_or(1);
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+        if status != 0 || output.stdout.iter().all(u8::is_ascii_whitespace) {
+            let message = text(&output.stderr);
+            return Err(Error::Brew {
+                status: if status == 0 { 1 } else { status },
+                message: if message.is_empty() {
+                    "brew --repository printed no path".to_string()
+                } else {
+                    message
+                },
+            });
+        }
+        Ok(PathBuf::from(text(&output.stdout)).join("Library/Taps/ericfitz/homebrew-brewsoak"))
     }
 
     fn git(&self) -> &git::ProcessGit {
@@ -238,6 +251,7 @@ pub fn dispatch(
         }
         cli::Command::Update => {
             let cache = world.cache_path();
+            let tap_root = world.tap_root()?;
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             soaked_exit(
                 cmd::update(
@@ -246,6 +260,7 @@ pub fn dispatch(
                     world.git(),
                     world.github(),
                     &cache,
+                    &tap_root,
                     &cfg,
                     &pkgs,
                     world.now(),
@@ -316,7 +331,7 @@ pub fn dispatch(
         }
         cli::Command::Upgrade { names } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root();
+            let tap_root = world.tap_root()?;
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -332,6 +347,7 @@ pub fn dispatch(
                 &mut *out,
             )?;
             soaked_exit(cmd::upgrade(
+                lock.get()?,
                 world.brew(),
                 world.git(),
                 &snaps,
@@ -350,7 +366,7 @@ pub fn dispatch(
             force_formula,
         } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root();
+            let tap_root = world.tap_root()?;
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -366,6 +382,7 @@ pub fn dispatch(
                 &mut *out,
             )?;
             soaked_exit(cmd::install(
+                lock.get()?,
                 world.brew(),
                 world.git(),
                 &snaps,
@@ -382,7 +399,7 @@ pub fn dispatch(
         }
         cli::Command::Reinstall { names } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root();
+            let tap_root = world.tap_root()?;
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -398,6 +415,7 @@ pub fn dispatch(
                 &mut *out,
             )?;
             soaked_exit(cmd::reinstall(
+                lock.get()?,
                 world.brew(),
                 world.git(),
                 &snaps,
@@ -647,8 +665,8 @@ mod tests {
         fn now(&self) -> OffsetDateTime {
             now()
         }
-        fn tap_root(&self) -> PathBuf {
-            self.tap_root.clone()
+        fn tap_root(&self) -> Result<PathBuf, Error> {
+            Ok(self.tap_root.clone())
         }
         fn git(&self) -> &InMemoryGit {
             &self.git
@@ -734,7 +752,7 @@ mod tests {
         fn now(&self) -> OffsetDateTime {
             now()
         }
-        fn tap_root(&self) -> PathBuf {
+        fn tap_root(&self) -> Result<PathBuf, Error> {
             self.inner.tap_root()
         }
         fn git(&self) -> &InMemoryGit {
@@ -1505,5 +1523,68 @@ mod tests {
             "SOAK_HOURS = 48\n",
             "the warning (stderr) does not stop the edit"
         );
+    }
+
+    /// A world with the stale tap state of `seed_stale_tap` in place.
+    fn stale_world() -> TestWorld {
+        let world = TestWorld::new();
+        crate::cmd::test_support::seed_stale_tap(&world.tap_root, &world.cache_path);
+        world
+    }
+
+    fn tap_and_undo(world: &TestWorld) -> [std::collections::BTreeMap<PathBuf, Vec<u8>>; 2] {
+        use crate::cmd::test_support::tree;
+        [
+            tree(&world.tap_root),
+            tree(&world.cache_path.join(soaktap::UNDO_DIR)),
+        ]
+    }
+
+    #[test]
+    fn outdated_info_and_ensure_snapshots_never_touch_the_tap() {
+        let world = stale_world();
+        let before = tap_and_undo(&world);
+        assert!(!before[0].is_empty() && !before[1].is_empty());
+        // The cache is empty of snapshots, so `outdated` refreshes them.
+        dispatch_quiet(&s(&["outdated"]), &world).unwrap();
+        assert!(world.github.refreshed.get(), "no refresh was forced");
+        dispatch_quiet(&s(&["info", "wget"]), &world).unwrap();
+        assert_eq!(tap_and_undo(&world), before);
+    }
+
+    #[test]
+    fn untrusted_local_tap_is_recovered_but_not_pruned() {
+        let mut world = stale_world();
+        world.brew.soak_tap = Some(crate::cmd::test_support::soak_tap_at(
+            &world.tap_root,
+            false,
+        ));
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        let [tap, undo] = tap_and_undo(&world);
+        assert!(undo.is_empty(), "the undo entry was not settled: {undo:?}");
+        let files: Vec<_> = tap
+            .keys()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(files, ["gone.rb"], "recovered but not pruned");
+    }
+
+    #[test]
+    fn absent_or_remote_tap_is_left_alone() {
+        let remote = TapInfo::new(origin::SOAK_TAP, Some("https://example.com/x.git"));
+        for entry in [None, Some(remote)] {
+            let mut world = stale_world();
+            world.brew.soak_tap = entry;
+            let before = tap_and_undo(&world);
+            dispatch_quiet(&s(&["update"]), &world).unwrap();
+            assert_eq!(tap_and_undo(&world), before);
+        }
+    }
+
+    #[test]
+    fn update_recovers_and_prunes_a_ready_tap_through_dispatch() {
+        let world = stale_world();
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
     }
 }
