@@ -1,0 +1,4 @@
+Warning: hello 2.12.3 is available and more recent than version 2.12.2.
+  installing hello 2.12.3
+  installed to /opt/homebrew/Cellar/hello/2.12.3 (78 files, 1.8MB)
+Error: hello: No such file or directory @ rb_sysopen - /opt/homebrew/Cellar/hello/2.12.3/.brew/hello.rb

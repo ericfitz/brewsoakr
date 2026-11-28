@@ -50,6 +50,15 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// First line of brew's text, for a hold line or a note.
+pub(crate) fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no detail")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +110,12 @@ mod tests {
         );
         assert!(text.contains("non-fast-forward"), "{text}");
         assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn first_line_skips_blank_lines_trims_and_has_a_fallback() {
+        assert_eq!(first_line("\n  \n  Error: x  \nmore"), "Error: x");
+        assert_eq!(first_line(""), "no detail");
+        assert_eq!(first_line(" \n"), "no detail");
     }
 }

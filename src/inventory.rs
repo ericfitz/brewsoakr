@@ -3,7 +3,7 @@
 use crate::Error;
 use crate::brew::{Brew, InstalledPkg};
 use crate::config::Config;
-use crate::origin::{self, OriginRecords};
+use crate::origin::{self, OriginRecords, OwnTap};
 use crate::resolve::PkgKind;
 use crate::taps::{self, TapClass, TapInfo};
 use std::collections::BTreeMap;
@@ -26,7 +26,12 @@ pub struct Pkg {
     pub receipt_rb: String,
     /// What brew's receipt says; `None` when it was staged by brewsoak.
     pub receipt_tap: Option<String>,
+    /// Which of brewsoak's own taps the receipt names, if either.
+    pub own_tap: Option<OwnTap>,
     pub pinned: bool,
+    /// The keg's Cellar directory name: brew's own reading of the installed
+    /// version, whatever the receipt says.
+    pub keg_version: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,6 +39,8 @@ pub struct Inventory {
     pub pkgs: Vec<Pkg>,
     pub taps: BTreeMap<String, TapClass>,
     pub tap_remotes: BTreeMap<String, String>,
+    /// The tap-info entry named `SOAK_TAP`.
+    pub soak_tap: Option<TapInfo>,
 }
 
 impl Inventory {
@@ -59,6 +66,9 @@ impl Inventory {
         for tap in taps {
             let name = tap.name.to_ascii_lowercase();
             inv.taps.insert(name.clone(), taps::classify(tap));
+            if name == origin::SOAK_TAP {
+                inv.soak_tap = Some(tap.clone());
+            }
             if let Some(remote) = &tap.remote {
                 inv.tap_remotes.insert(name, remote.clone());
             }
@@ -82,7 +92,9 @@ impl Inventory {
                 class,
                 receipt_rb: p.receipt_rb,
                 receipt_tap: p.tap,
+                own_tap: p.own_tap,
                 pinned: p.pinned,
+                keg_version: p.keg_version,
             });
         }
         inv
@@ -207,42 +219,122 @@ mod tests {
 
     fn installed(name: &str, kind: PkgKind, tap: Option<&str>) -> InstalledPkg {
         InstalledPkg {
+            own_tap: None,
             name: name.into(),
             kind,
             receipt_rb: "rb".into(),
             pinned: false,
             tap: tap.map(str::to_string),
             staged_path: None,
+            keg_version: String::new(),
         }
     }
 
     fn taps() -> Vec<TapInfo> {
         vec![
-            TapInfo {
-                name: "homebrew/core".into(),
-                remote: None,
-            },
-            TapInfo {
-                name: "homebrew/cask".into(),
-                remote: None,
-            },
-            TapInfo {
-                name: "brewsoakr/soaked".into(),
-                remote: None,
-            },
-            TapInfo {
-                name: "hashicorp/tap".into(),
-                remote: Some("https://github.com/hashicorp/homebrew-tap".into()),
-            },
-            TapInfo {
-                name: "ericfitz/tap".into(),
-                remote: Some("https://github.com/ericfitz/homebrew-tap".into()),
-            },
-            TapInfo {
-                name: "local/tap".into(),
-                remote: None,
-            },
+            TapInfo::new("homebrew/core", None),
+            TapInfo::new("homebrew/cask", None),
+            TapInfo::new("brewsoakr/soaked", None),
+            TapInfo::new(
+                "hashicorp/tap",
+                Some("https://github.com/hashicorp/homebrew-tap"),
+            ),
+            TapInfo::new(
+                "ericfitz/tap",
+                Some("https://github.com/ericfitz/homebrew-tap"),
+            ),
+            TapInfo::new("local/tap", None),
         ]
+    }
+
+    fn soak_tap_pkg(name: &str, kind: PkgKind) -> InstalledPkg {
+        InstalledPkg {
+            own_tap: Some(OwnTap::Soak),
+            ..installed(name, kind, None)
+        }
+    }
+
+    #[test]
+    fn soak_tap_receipt_defaults_to_core_and_is_soaked() {
+        let inv = Inventory::build(
+            vec![
+                soak_tap_pkg("wget", PkgKind::Formula),
+                soak_tap_pkg("firefox", PkgKind::Cask),
+            ],
+            &taps(),
+            &OriginRecords::default(),
+            &cfg("[]"),
+        );
+        let wget = inv.find("wget").unwrap();
+        assert_eq!(
+            (wget.origin.as_str(), wget.class, wget.own_tap),
+            ("homebrew/core", PkgClass::Soaked, Some(OwnTap::Soak))
+        );
+        let firefox = inv.find("firefox").unwrap();
+        assert_eq!(firefox.origin, "homebrew/cask");
+        assert_eq!(firefox.own_tap, Some(OwnTap::Soak));
+    }
+
+    #[test]
+    fn a_no_soak_entry_naming_the_soak_tap_matches_no_package() {
+        let inv = Inventory::build(
+            vec![soak_tap_pkg("wget", PkgKind::Formula)],
+            &taps(),
+            &OriginRecords::default(),
+            &cfg("[\"ericfitz/brewsoak\"]"),
+        );
+        assert_eq!(inv.find("wget").unwrap().class, PkgClass::Soaked);
+    }
+
+    #[test]
+    fn ericfitz_tap_packages_keep_their_origin_beside_the_soak_tap() {
+        let mut t = taps();
+        let mut soak = TapInfo::new("ericfitz/brewsoak", None);
+        soak.path = Some("/t/ericfitz/homebrew-brewsoak".into());
+        t.push(soak.clone());
+        let c = cfg("[]");
+        let inv = Inventory::build(
+            vec![installed(
+                "brewsoak",
+                PkgKind::Formula,
+                Some("ericfitz/tap"),
+            )],
+            &t,
+            &OriginRecords::default(),
+            &c,
+        );
+        let pkg = inv.find("brewsoak").unwrap();
+        assert_eq!(
+            (pkg.origin.as_str(), pkg.class),
+            ("ericfitz/tap", PkgClass::Soaked)
+        );
+        assert_eq!(inv.tap_class("ericfitz/brewsoak"), Some(TapClass::SoakTap));
+        assert_eq!(inv.soak_tap, Some(soak));
+        assert_eq!(
+            inv.class_for("ericfitz/brewsoak", "x", &c),
+            PkgClass::Unsoakable
+        );
+    }
+
+    #[test]
+    fn a_tap_entry_naming_the_soak_tap_neither_fetches_nor_makes_it_soakable() {
+        let parsed = parse_file("[[TAP]]\nname = \"ericfitz/brewsoak\"\nsoak_hours = 5\n");
+        let c = Config {
+            taps: parsed.taps,
+            ..Config::uniform(SoakHours::new(24).unwrap())
+        };
+        let mut t = taps();
+        t.push(TapInfo::new(
+            "ericfitz/brewsoak",
+            Some("https://github.com/ericfitz/homebrew-brewsoak"),
+        ));
+        let inv = Inventory::build(Vec::new(), &t, &OriginRecords::default(), &c);
+        let extra = [("ericfitz/brewsoak".to_string(), "x".to_string())];
+        assert_eq!(
+            inv.class_for("ericfitz/brewsoak", "x", &c),
+            PkgClass::Unsoakable
+        );
+        assert!(inv.needed_taps(&extra, &c).is_empty());
     }
 
     #[test]
@@ -505,14 +597,14 @@ mod tests {
     #[test]
     fn third_party_cask_is_soaked_from_its_tap_and_find_in_separates_same_names() {
         let mut t = taps();
-        t.push(TapInfo {
-            name: "anthropics/tap".into(),
-            remote: Some("https://github.com/anthropics/homebrew-tap".into()),
-        });
-        t.push(TapInfo {
-            name: "daveshanley/vacuum".into(),
-            remote: Some("https://github.com/daveshanley/homebrew-vacuum".into()),
-        });
+        t.push(TapInfo::new(
+            "anthropics/tap",
+            Some("https://github.com/anthropics/homebrew-tap"),
+        ));
+        t.push(TapInfo::new(
+            "daveshanley/vacuum",
+            Some("https://github.com/daveshanley/homebrew-vacuum"),
+        ));
         let inv = Inventory::build(
             vec![
                 installed("vacuum", PkgKind::Formula, Some("homebrew/core")),
@@ -554,10 +646,10 @@ mod tests {
     #[test]
     fn mixed_case_receipt_and_tap_names_are_lowercased() {
         let mut t = taps();
-        t.push(TapInfo {
-            name: "HashiCorp/Other".into(),
-            remote: Some("https://github.com/h/o".into()),
-        });
+        t.push(TapInfo::new(
+            "HashiCorp/Other",
+            Some("https://github.com/h/o"),
+        ));
         let inv = Inventory::build(
             vec![installed("x", PkgKind::Formula, Some("HashiCorp/Other"))],
             &t,

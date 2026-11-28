@@ -1,4 +1,4 @@
-use super::notes::{held_tap_note, unsoakable_note};
+use super::notes::{held_tap_note, own_tap_token_note, unsoakable_note};
 use super::view::{
     host_for_pkg, natural_kind, parse_pkg, prefetch_orderings, resolve_token, resolve_view,
     settle_origin,
@@ -11,8 +11,10 @@ use crate::eligibility::DesiredAction;
 use crate::git::GitStore;
 use crate::inventory::{Inventory, PkgClass};
 use crate::nosoak;
+use crate::origin;
 use crate::report::{self};
 use crate::snapshot::Snapshots;
+use crate::soaktap;
 use std::io::Write;
 use std::path::Path;
 
@@ -51,6 +53,11 @@ pub fn info(
             writeln!(out)?;
         }
         let mut r = resolve_token(raw, inv, cfg)?;
+        if r.named_origin && origin::own_tap(&r.origin).is_some() {
+            writeln!(out, "{}", own_tap_token_note(&r.name, &r.origin))?;
+            refused = true;
+            continue;
+        }
         let mut kind = None;
         if r.class == PkgClass::Soaked && !snaps.held_taps.contains_key(&r.origin) {
             let k = natural_kind(git, snaps, cache, inv, &r.origin, &r.name)?;
@@ -221,6 +228,9 @@ pub fn info(
             )?;
         }
     }
+    if let Some(why) = soaktap::unusable_with_packages(inv) {
+        writeln!(out, "{}", why.note())?;
+    }
     Ok(RunResult {
         refused,
         brew_status: None,
@@ -238,7 +248,7 @@ mod tests {
     use crate::cmd::test_support::{
         cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_pkg_from,
         formula_rb, inv_from, local_tap_world, many_detect_world, spawns, tap_cask_world,
-        tap_snaps, tapped, unused_cache, view_world,
+        tap_snaps, tapped, test_cache, view_world,
     };
 
     #[test]
@@ -271,7 +281,7 @@ mod tests {
                 &brew,
                 &git,
                 &snaps,
-                unused_cache(),
+                test_cache(),
                 &inv,
                 &cfg,
                 &names,
@@ -295,7 +305,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &names,
@@ -322,7 +332,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &["moved".to_string()],
@@ -348,7 +358,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &[],
@@ -378,7 +388,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &names,
@@ -408,7 +418,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &["ant".into()],
@@ -463,7 +473,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &["daveshanley/vacuum/vacuum".into(), "vacuum".into()],
@@ -496,7 +506,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &[],
@@ -530,7 +540,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &["alpha".into(), "brewsoak".into()],
@@ -548,6 +558,73 @@ mod tests {
                 && text.contains(
                     "origin: ericfitz/tap\nsoak: no-soak (brew decides)\naction: no-soak"
                 ),
+            "{text}"
+        );
+    }
+
+    fn info_text(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        snaps: &crate::snapshot::Snapshots,
+        names: &[&str],
+    ) -> (RunResult, String) {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let mut out = Vec::new();
+        let r = info(
+            brew,
+            git,
+            snaps,
+            test_cache(),
+            &inv,
+            &cfg,
+            &names,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn info_lists_the_package_and_the_note() {
+        use crate::cmd::test_support::hello_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, snaps) = hello_world(tap.path(), false, "1.0.0");
+        let (r, text) = info_text(&brew, &git, &snaps, &["hello"]);
+        assert!(
+            text.contains("hello\ninstalled: 1.0.0\ncutoff: 1.1.0"),
+            "{text}"
+        );
+        let note = crate::soaktap::NotReady::Untrusted.note();
+        assert_eq!(text.matches(&note).count(), 1, "{text}");
+        assert_eq!(
+            text.trim_end().lines().last(),
+            Some(note.as_str()),
+            "{text}"
+        );
+        assert!(!r.refused);
+    }
+
+    #[test]
+    fn info_refuses_an_explicit_own_tap_token_and_goes_on() {
+        use crate::cmd::test_support::hello_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
+        let (r, text) = info_text(&brew, &git, &snaps, &["ericfitz/brewsoak/hello", "alpha"]);
+        assert!(
+            text.contains(
+                "hello: ericfitz/brewsoak is brewsoak's own tap; name the package without the tap"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("alpha\ninstalled: 1.0.0"), "{text}");
+        assert!(!text.contains("brew info"), "{text}");
+        assert!(r.refused);
+        let (_, text) = info_text(&brew, &git, &snaps, &["brewsoakr/soaked/hello"]);
+        assert!(
+            text.contains("brewsoakr/soaked is brewsoak's own tap"),
             "{text}"
         );
     }

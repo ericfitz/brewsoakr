@@ -578,7 +578,7 @@ mod tests {
     use crate::cmd::test_support::{
         OUTDATED_HEADER, cask_rb, cfg24, core_snaps, formula_pkg, formula_rb, greedy_outdated,
         greedy_upgrade, greedy_world, inv_from, lock_runs, many_detect_world, openssl_is_newer,
-        openssl_repoint_world, run_is_name_install, section_lines, spawns, unused_cache,
+        openssl_repoint_world, run_is_name_install, section_lines, spawns, test_cache,
         upgrade_names,
     };
     use crate::cmd::upgrade::upgrade;
@@ -657,6 +657,7 @@ mod tests {
         let names = vec!["openssl@3".to_string()];
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -677,6 +678,7 @@ mod tests {
         assert!(text.contains(OPENSSL_NOTE), "{text}");
         let mut out = Vec::new();
         let r = reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -954,7 +956,7 @@ mod tests {
                 brew,
                 &git,
                 &core_snaps(),
-                unused_cache(),
+                test_cache(),
                 "homebrew/cask",
                 "ngrok",
                 PkgKind::Cask,
@@ -986,7 +988,7 @@ mod tests {
                 brew,
                 &git,
                 &core_snaps(),
-                unused_cache(),
+                test_cache(),
                 "homebrew/cask",
                 "cave-story",
                 PkgKind::Cask,
@@ -1071,7 +1073,7 @@ mod tests {
                 brew,
                 &git,
                 &core_snaps(),
-                unused_cache(),
+                test_cache(),
                 "homebrew/cask",
                 "cave-story",
                 PkgKind::Cask,
@@ -1100,7 +1102,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             "homebrew/cask",
             "nightly",
             PkgKind::Cask,
@@ -1117,7 +1119,7 @@ mod tests {
             &MockBrew::new(),
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             "homebrew/cask",
             "nightly",
             PkgKind::Cask,

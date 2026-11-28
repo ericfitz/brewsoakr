@@ -23,8 +23,11 @@ pub mod resolve;
 pub mod section;
 pub mod settings;
 pub mod snapshot;
+pub mod soaktap;
 pub mod tap;
 pub mod taps;
+#[cfg(test)]
+mod test_util;
 
 pub use error::Error;
 pub use hours::SoakHours;
@@ -50,7 +53,8 @@ pub trait World {
     fn cache_path(&self) -> PathBuf;
     fn env_soak(&self) -> Option<String>;
     fn now(&self) -> time::OffsetDateTime;
-    fn tap_root(&self) -> PathBuf;
+    /// Where brewsoak expects its tap: `$(brew --repository)/Library/Taps/ericfitz/homebrew-brewsoak`.
+    fn tap_root(&self) -> Result<PathBuf, Error>;
     fn git(&self) -> &Self::Git;
     fn github(&self) -> &Self::Github;
     fn brew(&self) -> &Self::Brew;
@@ -105,10 +109,22 @@ impl World for RealWorld {
         time::OffsetDateTime::now_utc()
     }
 
-    fn tap_root(&self) -> PathBuf {
-        // Must live outside Homebrew's Taps/ so `brew install /path/foo.rb`
-        // is not treated as brewsoak/soaked (same-name tap conflict).
-        self.cache_path().join("staging")
+    fn tap_root(&self) -> Result<PathBuf, Error> {
+        let output = self.brew.run(&["--repository".to_string()])?;
+        let status = output.status.code().unwrap_or(1);
+        let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+        if status != 0 || output.stdout.iter().all(u8::is_ascii_whitespace) {
+            let message = text(&output.stderr);
+            return Err(Error::Brew {
+                status: if status == 0 { 1 } else { status },
+                message: if message.is_empty() {
+                    "brew --repository printed no path".to_string()
+                } else {
+                    message
+                },
+            });
+        }
+        Ok(PathBuf::from(text(&output.stdout)).join("Library/Taps/ericfitz/homebrew-brewsoak"))
     }
 
     fn git(&self) -> &git::ProcessGit {
@@ -237,6 +253,7 @@ pub fn dispatch(
         }
         cli::Command::Update => {
             let cache = world.cache_path();
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             soaked_exit(
                 cmd::update(
@@ -245,6 +262,7 @@ pub fn dispatch(
                     world.git(),
                     world.github(),
                     &cache,
+                    &tap_root,
                     &cfg,
                     &pkgs,
                     world.now(),
@@ -315,7 +333,7 @@ pub fn dispatch(
         }
         cli::Command::Upgrade { names } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root();
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -331,6 +349,7 @@ pub fn dispatch(
                 &mut *out,
             )?;
             soaked_exit(cmd::upgrade(
+                lock.get()?,
                 world.brew(),
                 world.git(),
                 &snaps,
@@ -349,7 +368,7 @@ pub fn dispatch(
             force_formula,
         } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root();
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -365,6 +384,7 @@ pub fn dispatch(
                 &mut *out,
             )?;
             soaked_exit(cmd::install(
+                lock.get()?,
                 world.brew(),
                 world.git(),
                 &snaps,
@@ -381,7 +401,7 @@ pub fn dispatch(
         }
         cli::Command::Reinstall { names } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root();
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -397,6 +417,7 @@ pub fn dispatch(
                 &mut *out,
             )?;
             soaked_exit(cmd::reinstall(
+                lock.get()?,
                 world.brew(),
                 world.git(),
                 &snaps,
@@ -408,6 +429,40 @@ pub fn dispatch(
                 &inv.brew_args,
                 &mut *out,
             ))
+        }
+    }
+}
+
+/// `world.tap_root()` asked for at most once per run, success or failure, and
+/// only when something needs a tap directory that tap-info did not give.
+/// `outdated`, `info` and a dry run with no soak tap never ask. A dry run
+/// that stages a file for a listed tap whose tap-info has no `path` does ask
+/// (once), because it writes the file brew is then asked about.
+struct LazyTapRoot<'a, W: World> {
+    world: &'a W,
+    resolved: std::cell::OnceCell<Result<PathBuf, Error>>,
+}
+
+impl<'a, W: World> LazyTapRoot<'a, W> {
+    fn new(world: &'a W) -> Self {
+        Self {
+            world,
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl<W: World> soaktap::TapRootSource for LazyTapRoot<'_, W> {
+    fn tap_root(&self) -> Result<PathBuf, Error> {
+        match self.resolved.get_or_init(|| self.world.tap_root()) {
+            Ok(root) => Ok(root.clone()),
+            // `Error` is not `Clone`: replay a failure; only a brew failure
+            // keeps its variant (the one `brew --repository` produces).
+            Err(Error::Brew { status, message }) => Err(Error::Brew {
+                status: *status,
+                message: message.clone(),
+            }),
+            Err(e) => Err(Error::Other(e.to_string())),
         }
     }
 }
@@ -573,6 +628,9 @@ mod tests {
         config_path: PathBuf,
         cache_path: PathBuf,
         tap_root: PathBuf,
+        /// `tap_root` answers an error, and counts every ask in `tap_root_calls`.
+        tap_root_fails: bool,
+        tap_root_calls: Cell<usize>,
         env_soak: Option<String>,
         git: InMemoryGit,
         github: RecordingGithub,
@@ -616,6 +674,8 @@ mod tests {
                 config_path,
                 cache_path,
                 tap_root,
+                tap_root_fails: false,
+                tap_root_calls: Cell::new(0),
                 env_soak: None,
                 git: InMemoryGit::new(),
                 github: RecordingGithub {
@@ -646,8 +706,16 @@ mod tests {
         fn now(&self) -> OffsetDateTime {
             now()
         }
-        fn tap_root(&self) -> PathBuf {
-            self.tap_root.clone()
+        fn tap_root(&self) -> Result<PathBuf, Error> {
+            self.tap_root_calls.set(self.tap_root_calls.get() + 1);
+            if self.tap_root_fails {
+                // What `RealWorld::tap_root` returns when brew fails.
+                return Err(Error::Brew {
+                    status: 1,
+                    message: "brew --repository failed".into(),
+                });
+            }
+            Ok(self.tap_root.clone())
         }
         fn git(&self) -> &InMemoryGit {
             &self.git
@@ -691,6 +759,12 @@ mod tests {
         fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
             self.mock.tap_info()
         }
+        fn tap_new(&self, tap: &str) -> Result<(), String> {
+            self.mock.tap_new(tap)
+        }
+        fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
+            self.mock.receipt_tap(kind, name, version)
+        }
         fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
             self.mock.outdated_names(greedy)
         }
@@ -727,7 +801,7 @@ mod tests {
         fn now(&self) -> OffsetDateTime {
             now()
         }
-        fn tap_root(&self) -> PathBuf {
+        fn tap_root(&self) -> Result<PathBuf, Error> {
             self.inner.tap_root()
         }
         fn git(&self) -> &InMemoryGit {
@@ -754,12 +828,14 @@ mod tests {
             brew: EchoVisibleBrew {
                 mock: MockBrew {
                     installed: vec![InstalledPkg {
+                        own_tap: None,
                         name: "wget".into(),
                         kind: PkgKind::Formula,
                         receipt_rb: "class Wget < Formula\nend\n".into(),
                         pinned: false,
                         tap: None,
                         staged_path: None,
+                        keg_version: "1.0.0".into(),
                     }],
                     ..MockBrew::new()
                 },
@@ -1123,22 +1199,18 @@ mod tests {
         );
         let brew = MockBrew {
             installed: vec![InstalledPkg {
+                own_tap: None,
                 name: "terraform".into(),
                 kind: PkgKind::Formula,
                 receipt_rb: "class X < Formula\n  url \"https://e.com/terraform-1.0.0.tar.gz\"\n  sha256 \"a\"\nend\n".into(),
                 pinned: false,
                 tap: Some("hashicorp/tap".into()),
  staged_path: None,
+ keg_version: "1.0.0".into(),
 }],
             taps: vec![
-                TapInfo {
-                    name: "hashicorp/tap".into(),
-                    remote: Some("https://github.com/hashicorp/homebrew-tap".into()),
-                },
-                TapInfo {
-                    name: "ericfitz/tap".into(),
-                    remote: Some("https://github.com/ericfitz/homebrew-tap".into()),
-                },
+                TapInfo::new("hashicorp/tap", Some("https://github.com/hashicorp/homebrew-tap")),
+                TapInfo::new("ericfitz/tap", Some("https://github.com/ericfitz/homebrew-tap")),
             ],
             ..MockBrew::new()
         };
@@ -1502,5 +1574,187 @@ mod tests {
             "SOAK_HOURS = 48\n",
             "the warning (stderr) does not stop the edit"
         );
+    }
+
+    /// A world with the stale tap state of `seed_stale_tap` in place.
+    fn stale_world() -> TestWorld {
+        let world = TestWorld::new();
+        crate::cmd::test_support::seed_stale_tap(&world.tap_root, &world.cache_path);
+        world
+    }
+
+    fn tap_and_undo(world: &TestWorld) -> [std::collections::BTreeMap<PathBuf, Vec<u8>>; 2] {
+        use crate::cmd::test_support::tree;
+        [
+            tree(&world.tap_root),
+            tree(&world.cache_path.join(soaktap::UNDO_DIR)),
+        ]
+    }
+
+    #[test]
+    fn outdated_info_and_ensure_snapshots_never_touch_the_tap() {
+        let world = stale_world();
+        let before = tap_and_undo(&world);
+        assert!(!before[0].is_empty() && !before[1].is_empty());
+        // The cache is empty of snapshots, so `outdated` refreshes them.
+        dispatch_quiet(&s(&["outdated"]), &world).unwrap();
+        assert!(world.github.refreshed.get(), "no refresh was forced");
+        dispatch_quiet(&s(&["info", "wget"]), &world).unwrap();
+        assert_eq!(tap_and_undo(&world), before);
+    }
+
+    #[test]
+    fn tap_root_is_not_asked_for_by_a_dry_run_outdated_or_info() {
+        for args in [
+            &["upgrade", "--dry-run"][..],
+            &["upgrade", "wget", "--dry-run"],
+            &["install", "wget", "--dry-run"],
+            &["reinstall", "wget", "--dry-run"],
+            &["outdated"],
+            &["info", "wget"],
+        ] {
+            let mut world = TestWorld::new();
+            world.tap_root_fails = true;
+            let result = dispatch_quiet(&s(args), &world);
+            assert!(
+                !matches!(&result, Err(Error::Brew { message, .. }) if message.contains("--repository")),
+                "{args:?}: {result:?}"
+            );
+            assert_eq!(world.tap_root_calls.get(), 0, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn tap_root_is_not_asked_for_when_tap_info_has_a_path() {
+        let mut world = stale_world();
+        world.tap_root_fails = true;
+        world.brew.soak_tap = Some(crate::cmd::test_support::soak_tap_at(&world.tap_root, true));
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        assert_eq!(world.tap_root_calls.get(), 0);
+        assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn tap_root_is_asked_for_once_when_tap_info_has_no_path_and_the_run_needs_it() {
+        let world = stale_world();
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        assert_eq!(world.tap_root_calls.get(), 1);
+        assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn a_failed_tap_root_is_asked_for_once_per_run() {
+        use crate::soaktap::TapRootSource;
+        let mut world = TestWorld::new();
+        world.tap_root_fails = true;
+        let lazy = LazyTapRoot::new(&world);
+        for _ in 0..3 {
+            assert!(matches!(lazy.tap_root(), Err(Error::Brew { .. })));
+        }
+        assert_eq!(world.tap_root_calls.get(), 1);
+        let ok_world = TestWorld::new();
+        let lazy = LazyTapRoot::new(&ok_world);
+        assert_eq!(lazy.tap_root().unwrap(), lazy.tap_root().unwrap());
+        assert_eq!(ok_world.tap_root_calls.get(), 1);
+    }
+
+    #[test]
+    fn a_failing_tap_root_fails_a_run_that_needs_it() {
+        let mut world = stale_world();
+        world.tap_root_fails = true;
+        // `Error::Brew` becomes the run's exit status (`soaked_exit`).
+        let before = tap_and_undo(&world);
+        let result = dispatch_quiet(&s(&["update"]), &world);
+        assert!(
+            matches!(result, Ok(Dispatch::Exit(code)) if code != 0),
+            "{result:?}"
+        );
+        assert_eq!(world.tap_root_calls.get(), 1);
+        assert_eq!(tap_and_undo(&world), before);
+    }
+
+    #[test]
+    fn untrusted_local_tap_is_recovered_but_not_pruned() {
+        let mut world = stale_world();
+        world.brew.soak_tap = Some(crate::cmd::test_support::soak_tap_at(
+            &world.tap_root,
+            false,
+        ));
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        let [tap, undo] = tap_and_undo(&world);
+        assert!(undo.is_empty(), "the undo entry was not settled: {undo:?}");
+        let files: Vec<_> = tap
+            .keys()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(files, ["gone.rb"], "recovered but not pruned");
+    }
+
+    #[test]
+    fn absent_or_remote_tap_is_left_alone() {
+        let remote = TapInfo::new(origin::SOAK_TAP, Some("https://example.com/x.git"));
+        for entry in [None, Some(remote)] {
+            let mut world = stale_world();
+            world.brew.soak_tap = entry;
+            let before = tap_and_undo(&world);
+            dispatch_quiet(&s(&["update"]), &world).unwrap();
+            assert_eq!(tap_and_undo(&world), before);
+        }
+    }
+
+    #[test]
+    fn update_recovers_and_prunes_a_ready_tap_through_dispatch() {
+        let world = stale_world();
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
+    }
+
+    /// A `RealWorld` whose brew is a script running `body`.
+    fn world_with_brew_script(dir: &Path, body: &str) -> RealWorld {
+        let script = dir.join("brew");
+        crate::test_util::write_executable(&script, format!("#!/bin/sh\n{body}\n"));
+        RealWorld {
+            git: git::ProcessGit::default(),
+            github: github::UreqGithub {
+                base: "http://127.0.0.1:1".into(),
+            },
+            brew: brew::ProcessBrew::new(script),
+        }
+    }
+
+    #[test]
+    fn real_world_tap_root_joins_the_soak_tap_under_brews_repository() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let world = world_with_brew_script(tmp.path(), "echo /opt/hb");
+        assert_eq!(
+            world.tap_root().expect("tap root"),
+            PathBuf::from("/opt/hb/Library/Taps/ericfitz/homebrew-brewsoak")
+        );
+    }
+
+    #[test]
+    fn real_world_tap_root_reports_brews_error() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let world = world_with_brew_script(tmp.path(), "echo boom >&2; exit 3");
+        match world.tap_root() {
+            Err(Error::Brew { status, message }) => {
+                assert_eq!(status, 3);
+                assert_eq!(message, "boom");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_world_tap_root_rejects_an_empty_answer() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let world = world_with_brew_script(tmp.path(), "echo");
+        match world.tap_root() {
+            Err(Error::Brew { status, message }) => {
+                assert_eq!(status, 1);
+                assert_eq!(message, "brew --repository printed no path");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

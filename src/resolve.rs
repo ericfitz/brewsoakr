@@ -2,7 +2,7 @@ use crate::Error;
 use crate::git::GitStore;
 use std::path::Path;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PkgKind {
     Formula,
     Cask,

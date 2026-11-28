@@ -7,17 +7,20 @@ use crate::config::Config;
 use crate::flags;
 use crate::git::GitStore;
 use crate::inventory::Inventory;
+use crate::lock::RunLock;
 use crate::snapshot::Snapshots;
+use crate::soaktap::TapRootSource;
 use std::io::Write;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub fn upgrade(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    _tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -29,11 +32,12 @@ pub fn upgrade(
     let plan_total = (names.is_empty())
         .then(|| plan_size(brew, git, snaps, cache, inv, flags::greedy_mode(user_flags)));
     apply_many(
+        lock,
         brew,
         git,
         snaps,
         cache,
-        _tap_root,
+        tap_root,
         inv,
         cfg,
         names,
@@ -64,17 +68,18 @@ mod tests {
     use crate::cmd::test_support::{
         cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_pkg_from,
         formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs, run_has_token,
-        run_is_name_install, tap_cask_world, tap_snaps, tapped, unused_cache,
+        run_is_name_install, tap_cask_world, tap_snaps, tapped, test_cache,
     };
 
     #[test]
-    fn upgrade_installs_the_cutoff_by_name() {
+    fn upgrade_installs_the_cutoff_from_the_soak_tap() {
         let (brew, git) = crate::cmd::test_support::local_tap_world();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -90,7 +95,10 @@ mod tests {
         let visible = brew.visible_runs.lock().unwrap().clone();
         assert_eq!(
             visible,
-            vec![vec!["update"], vec!["install", "--formula", "alpha"]]
+            vec![
+                vec!["update"],
+                vec!["upgrade", "--formula", "ericfitz/brewsoak/alpha"]
+            ]
         );
     }
 
@@ -117,10 +125,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -160,10 +169,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -208,10 +218,11 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -292,10 +303,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -333,10 +345,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             brew,
             git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -440,10 +453,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -483,10 +497,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -535,10 +550,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -591,6 +607,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -654,6 +671,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -682,6 +700,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -764,6 +783,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -789,7 +809,7 @@ mod tests {
         let runs = lock_runs(&brew);
         let installs: Vec<&Vec<String>> = runs
             .iter()
-            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .filter(|a| matches!(a.first().map(String::as_str), Some("install" | "upgrade")))
             .collect();
         assert_eq!(installs.len(), 2, "{runs:?}");
         assert!(
@@ -802,11 +822,11 @@ mod tests {
         );
         assert!(
             installs.contains(&&vec![
-                "install".to_string(),
+                "upgrade".to_string(),
                 "--formula".to_string(),
-                "vacuum".to_string()
+                "ericfitz/brewsoak/vacuum".to_string()
             ]),
-            "formula installed by bare name: {runs:?}"
+            "formula upgraded from the soak tap: {runs:?}"
         );
     }
 
@@ -822,6 +842,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let tap = tempfile::tempdir().unwrap();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -907,6 +928,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -965,10 +987,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1026,10 +1049,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1068,10 +1092,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1085,10 +1110,11 @@ mod tests {
         assert!(text.contains("thing: tap local/tap has no HTTPS remote; not soakable. Use brew, or add it to NO_SOAK"), "{text}");
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1148,6 +1174,11 @@ mod tests {
             ],
             next_stdout: b"\xf0\x9f\x8d\xba  /opt/homebrew/Cellar/alpha/1.1.0: 5 files, 1MB\n"
                 .to_vec(),
+            receipt_taps: [(
+                (PkgKind::Formula, "alpha".to_string(), "1.1.0".to_string()),
+                "ericfitz/brewsoak".to_string(),
+            )]
+            .into(),
             ..MockBrew::new()
         };
         let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
@@ -1161,6 +1192,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1198,35 +1230,53 @@ mod tests {
 
     #[test]
     fn target_not_at_brew_current_is_held_and_the_next_package_installs() {
+        // A third-party package keeps the by-name gate; a core one installs
+        // from the soak tap and never asks by name.
         let git = InMemoryGit::new();
-        for name in ["alpha", "gamma"] {
-            let dir = &name[..1];
-            git.insert_blob(
-                "cutoffsha",
-                &format!("Formula/{dir}/{name}.rb"),
-                formula_rb(name, "1.1.0", "midsha"),
-            );
-            git.insert_blob(
-                "headsha",
-                &format!("Formula/{dir}/{name}.rb"),
-                formula_rb(name, "1.2.0", "newsha"),
-            );
-        }
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/g/gamma.rb",
+            formula_rb("gamma", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/g/gamma.rb",
+            formula_rb("gamma", "1.2.0", "newsha"),
+        );
+        git.insert_blob(
+            "tapcut",
+            "Formula/alpha.rb",
+            formula_rb("alpha", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/alpha.rb",
+            formula_rb("alpha", "1.2.0", "newsha"),
+        );
+        let snaps = tap_snaps(&git, "acme/tools", Some("tapcut"), "taphead");
+        git.insert_tree("tapcut", &["Formula/alpha.rb"]);
+        git.insert_tree("taphead", &["Formula/alpha.rb"]);
         let mut by_name = std::collections::BTreeMap::new();
         by_name.insert(
             "alpha".to_string(),
             Ok(crate::brew::ByName {
-                tap: "homebrew/core".into(),
+                tap: "acme/tools".into(),
                 version: "1.2.0".into(),
                 same_source: false,
                 installed_current: false,
+                satisfied: false,
             }),
         );
         let brew = MockBrew {
             installed: vec![
-                formula_pkg("alpha", formula_rb("alpha", "1.0.0", "oldsha")),
+                formula_pkg_from(
+                    "alpha",
+                    "acme/tools",
+                    formula_rb("alpha", "1.0.0", "oldsha"),
+                ),
                 formula_pkg("gamma", formula_rb("gamma", "1.0.0", "oldsha")),
             ],
+            taps: vec![tapped("acme/tools", Some("https://example.com/acme/tools"))],
             by_name,
             ..MockBrew::new()
         };
@@ -1235,10 +1285,11 @@ mod tests {
         let tap = tempfile::tempdir().expect("tap");
         let mut out = Vec::new();
         let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
-            &core_snaps(),
-            unused_cache(),
+            &snaps,
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1253,9 +1304,13 @@ mod tests {
             text.contains("held alpha: brew would install 1.2.0, which is not the soaked cutoff"),
             "{text}"
         );
-        assert!(text.contains("issue #17"), "{text}");
         assert!(
-            text.contains("use `brew upgrade alpha` to bypass brewsoak."),
+            text.contains("it installs once that change soaks"),
+            "{text}"
+        );
+        assert!(!text.contains("#17"), "{text}");
+        assert!(
+            text.contains("use `brew upgrade acme/tools/alpha` to bypass brewsoak."),
             "{text}"
         );
         let runs = lock_runs(&brew);

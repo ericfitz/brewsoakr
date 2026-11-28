@@ -5,17 +5,20 @@ use crate::brew::Brew;
 use crate::config::Config;
 use crate::git::GitStore;
 use crate::inventory::Inventory;
+use crate::lock::RunLock;
 use crate::snapshot::Snapshots;
+use crate::soaktap::TapRootSource;
 use std::io::Write;
 use std::path::Path;
 
 #[allow(clippy::too_many_arguments)]
 pub fn install(
+    lock: &RunLock,
     brew: &impl Brew,
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    _tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -28,11 +31,12 @@ pub fn install(
         return Err(Error::Usage("install: no packages specified".into()));
     }
     apply_many(
+        lock,
         brew,
         git,
         snaps,
         cache,
-        _tap_root,
+        tap_root,
         inv,
         cfg,
         names,
@@ -65,7 +69,7 @@ mod tests {
     use crate::cmd::test_support::{
         PACKER_REFUSAL, call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps,
         formula_pkg, formula_pkg_from, formula_rb, git_empty, hashicorp_tap, inv_from, lock_runs,
-        packer_world, run_has_token, run_is_name_install, tap_snaps, tapped, unused_cache,
+        packer_world, run_has_token, run_is_name_install, tap_snaps, tapped, test_cache,
     };
 
     #[test]
@@ -150,6 +154,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -192,6 +197,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -229,11 +235,16 @@ mod tests {
         let mut records = OriginRecords::default();
         records.set(PkgKind::Formula, "alpha", "old/tap");
         records.save(cache.path()).unwrap();
-        let brew = MockBrew::new();
+        let mut brew = MockBrew::new();
+        brew.receipt_taps.insert(
+            (PkgKind::Formula, "alpha".into(), "1.1.0".into()),
+            "ericfitz/brewsoak".into(),
+        );
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -287,10 +298,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -340,6 +352,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             brew,
             git,
             snaps,
@@ -463,10 +476,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -500,10 +514,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -656,6 +671,7 @@ mod tests {
         let names = ["wget".to_string(), "a/b".to_string()];
         let mut out = Vec::new();
         let err = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
@@ -730,11 +746,11 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(
             runs.contains(&vec![
-                "install".to_string(),
+                "upgrade".to_string(),
                 "--formula".to_string(),
-                "wget".to_string()
+                "ericfitz/brewsoak/wget".to_string()
             ]),
-            "behind reinstall must install the cutoff by bare name: {runs:?}"
+            "behind reinstall must upgrade the cutoff from the soak tap: {runs:?}"
         );
         assert!(
             !runs
@@ -761,10 +777,11 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().expect("tap");
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -855,10 +872,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -874,9 +892,9 @@ mod tests {
             runs.contains(&vec![
                 "install".to_string(),
                 "--formula".to_string(),
-                "fresh".to_string()
+                "ericfitz/brewsoak/fresh".to_string()
             ]),
-            "install must pass the bare name: {runs:?}"
+            "install must pass the soak-tap token: {runs:?}"
         );
     }
 
@@ -890,10 +908,11 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -909,7 +928,7 @@ mod tests {
             runs.contains(&vec![
                 "install".to_string(),
                 "--cask".to_string(),
-                "firefox".to_string()
+                "ericfitz/brewsoak/firefox".to_string()
             ]),
             "{runs:?}"
         );
@@ -930,10 +949,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -949,7 +969,7 @@ mod tests {
             visible
                 .iter()
                 .any(|args| args.first().map(String::as_str) == Some("install")
-                    && args.last().map(String::as_str) == Some("fresh")),
+                    && args.last().map(String::as_str) == Some("ericfitz/brewsoak/fresh")),
             "soaked install must use run_visible: {visible:?}"
         );
     }
@@ -975,10 +995,11 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let result = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1027,6 +1048,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1054,10 +1076,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1077,10 +1100,11 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1115,10 +1139,11 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         let r = reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1168,10 +1193,11 @@ mod tests {
         let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
         let tap = tempfile::tempdir().unwrap();
         reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1226,9 +1252,15 @@ mod tests {
             origins.save(cache.path()).unwrap();
         }
         let cfg = cfg24();
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            &cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1258,10 +1290,16 @@ mod tests {
         origins.set(PkgKind::Formula, "terraform", "hashicorp/tap");
         origins.save(cache.path()).unwrap();
         let cfg = cfg24();
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            &cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = reinstall(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1350,6 +1388,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -1395,10 +1434,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1428,10 +1468,11 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1474,10 +1515,11 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         install(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1492,6 +1534,48 @@ mod tests {
             String::from_utf8(out)
                 .unwrap()
                 .contains("use `brew install hashicorp/tap/terraform` to bypass")
+        );
+    }
+
+    #[test]
+    fn install_of_a_package_from_the_untrusted_tap_is_a_hold_not_a_fresh_install() {
+        use crate::cmd::test_support::hello_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, snaps) = hello_world(tap.path(), false, "1.1.0");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        let r = install(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &snaps,
+            test_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hello".to_string()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("held hello: brewsoak's tap is not ready"),
+            "{text}"
+        );
+        assert!(!text.contains("already installed"), "{text}");
+        assert!(r.refused);
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert!(
+            !visible
+                .iter()
+                .chain(lock_runs(&brew).iter())
+                .any(|a| a.first().map(String::as_str) == Some("install")
+                    && a.iter().any(|x| x.ends_with("hello"))),
+            "{visible:?}"
         );
     }
 }

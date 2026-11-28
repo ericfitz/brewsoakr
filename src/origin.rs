@@ -8,8 +8,28 @@ use std::path::Path;
 
 pub const CORE: &str = "homebrew/core";
 pub const CASK: &str = "homebrew/cask";
-/// brewsoak's own local tap. A receipt that names it says nothing about origin.
+/// brewsoak's own tap, where soaked core and cask packages are installed from.
+pub const SOAK_TAP: &str = "ericfitz/brewsoak";
+/// The legacy local tap earlier versions staged into. Recognized by name only.
 pub const STAGING_TAP: &str = "brewsoakr/soaked";
+
+/// Which of brewsoak's own tap names a receipt carries. Neither says anything about origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnTap {
+    Soak,
+    Legacy,
+}
+
+/// ASCII case-insensitive exact match of `SOAK_TAP` or `STAGING_TAP`.
+pub fn own_tap(tap: &str) -> Option<OwnTap> {
+    if tap.eq_ignore_ascii_case(SOAK_TAP) {
+        Some(OwnTap::Soak)
+    } else if tap.eq_ignore_ascii_case(STAGING_TAP) {
+        Some(OwnTap::Legacy)
+    } else {
+        None
+    }
+}
 
 pub fn default_origin(kind: PkgKind) -> &'static str {
     match kind {
@@ -136,7 +156,7 @@ pub fn staged_tap(cache: &Path, receipt_path: &str) -> Option<String> {
     Some(tap)
 }
 
-/// Spec order: the receipt tap when non-empty and not the staging tap; else
+/// Spec order: the receipt tap when non-empty and not one of brewsoak's own; else
 /// the tap a staged keg's receipt path names; else brewsoak's record; else `homebrew/core` / `homebrew/cask`.
 pub fn resolve_origin(
     receipt_tap: Option<&str>,
@@ -147,7 +167,7 @@ pub fn resolve_origin(
 ) -> String {
     if let Some(tap) = receipt_tap
         && !tap.is_empty()
-        && !tap.eq_ignore_ascii_case(STAGING_TAP)
+        && own_tap(tap).is_none()
     {
         return tap.to_ascii_lowercase();
     }
@@ -163,6 +183,34 @@ pub fn resolve_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn own_tap_matches_both_names_whatever_the_case() {
+        assert_eq!(own_tap("EricFitz/Brewsoak"), Some(OwnTap::Soak));
+        assert_eq!(own_tap("brewsoakr/soaked"), Some(OwnTap::Legacy));
+        assert_eq!(own_tap("ericfitz/tap"), None);
+    }
+
+    #[test]
+    fn resolve_origin_ignores_a_soak_tap_receipt() {
+        let none = OriginRecords::default();
+        assert_eq!(
+            resolve_origin(
+                Some("ericfitz/brewsoak"),
+                None,
+                &none,
+                PkgKind::Formula,
+                "x"
+            ),
+            CORE
+        );
+        let mut rec = OriginRecords::default();
+        rec.set(PkgKind::Formula, "x", "acme/tools");
+        assert_eq!(
+            resolve_origin(Some("ericfitz/brewsoak"), None, &rec, PkgKind::Formula, "x"),
+            "acme/tools"
+        );
+    }
 
     #[test]
     fn split_tap_user_repo() {

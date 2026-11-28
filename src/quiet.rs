@@ -162,6 +162,15 @@ impl Filter {
 
     fn filter_line(&mut self, raw: &str) -> Option<String> {
         let plain = strip_ansi(raw.trim_end_matches(['\r', '\n']));
+        // brew's trust notice for the soak tap is for the log only; every
+        // other line shows the bare package name. Returned before the state
+        // machine, so the line neither ends nor starts a section, and inside a
+        // caveats block it does not open a package sub-block. brew prints it
+        // before the first heading of a run.
+        if is_soak_tap_trusted_line(&plain) {
+            return None;
+        }
+        let plain = strip_soak_tap_prefix(&plain);
         let t = plain.as_str();
         match self.state.unwrap_or(State::Normal) {
             State::Caveats => self.caveat_line(t),
@@ -567,6 +576,46 @@ fn already_current_head(t: &str) -> Option<&str> {
         .filter(|head| head.split_whitespace().count() == 2 && !head.contains("  "))
 }
 
+/// `ericfitz/brewsoak/`: removed from every line the terminal shows.
+/// Kept equal to `origin::SOAK_TAP` plus a slash by a test.
+const SOAK_TAP_PREFIX: &str = "ericfitz/brewsoak/";
+
+/// Remove `ericfitz/brewsoak/` where it begins a token: at the start of the
+/// line or after whitespace or one of `(`, `[`, `'`, `"`, `:`, `` ` ``, `,`,
+/// `;`, `=`. A path or URL that merely contains it, or a longer word ending in
+/// it, is left.
+///
+/// `=` is in the set so that `--tap=ericfitz/brewsoak/x` loses the prefix. The
+/// same rule strips it from a URL query such as `?tap=ericfitz/brewsoak/x`
+/// (Eric accepted that, 2026-11-27, issue #23); a URL path still keeps it.
+fn strip_soak_tap_prefix(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut prev: Option<char> = None;
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        let at_start = prev.is_none_or(|p| p.is_whitespace() || "(['\":`,;=".contains(p));
+        if at_start && rest.starts_with(SOAK_TAP_PREFIX) {
+            rest = &rest[SOAK_TAP_PREFIX.len()..];
+            prev = Some('/');
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// `==> Trusted formula ericfitz/brewsoak/x` / `==> Trusted cask ...`.
+fn is_soak_tap_trusted_line(t: &str) -> bool {
+    t.strip_prefix("==> Trusted ")
+        .and_then(|r| {
+            r.strip_prefix("formula ")
+                .or_else(|| r.strip_prefix("cask "))
+        })
+        .is_some_and(|r| r.starts_with(SOAK_TAP_PREFIX))
+}
+
 fn is_already_up_to_date(t: &str) -> bool {
     t.starts_with("Warning: ") && t.ends_with("is already installed and up-to-date.")
 }
@@ -708,6 +757,7 @@ fn installed_versions(bytes: &[u8], include_warnings: bool) -> BTreeMap<String, 
             && let Some(rest) = line.strip_prefix("Warning: ")
             && is_already_up_to_date(line)
         {
+            let rest = rest.strip_prefix(SOAK_TAP_PREFIX).unwrap_or(rest);
             let mut parts = rest.split_whitespace();
             if let (Some(name), Some(version)) = (parts.next(), parts.next()) {
                 out.insert(name.to_string(), version.to_string());
@@ -1271,6 +1321,117 @@ Already up-to-date.
         let got = installed_from_output(raw.as_bytes());
         assert_eq!(got.get("aws-c-cal").map(String::as_str), Some("1.0.0"));
         assert_eq!(got.get("aws-c-common").map(String::as_str), Some("1.0.0"));
+    }
+
+    fn run_soaked(input: &str) -> Vec<String> {
+        let mut f = Filter::new();
+        f.start_run(&RunContext {
+            mode: RunMode::Soaked,
+            ..RunContext::default()
+        });
+        input.lines().filter_map(|l| f.line(l)).collect()
+    }
+
+    #[test]
+    fn soak_tap_prefix_is_not_shown() {
+        assert_eq!(
+            run_soaked("Error: ericfitz/brewsoak/hello: boom"),
+            vec!["Error: hello: boom"]
+        );
+        assert_eq!(
+            run_soaked(
+                "Warning: ericfitz/brewsoak/hello 2.12.3 is available and more recent than version 2.12.2."
+            ),
+            vec!["Warning: hello 2.12.3 is available and more recent than version 2.12.2."]
+        );
+    }
+
+    #[test]
+    fn trusted_lines_for_the_soak_tap_go_to_the_log_only() {
+        assert!(run_soaked("==> Trusted formula ericfitz/brewsoak/hello").is_empty());
+        assert!(run_soaked("==> Trusted cask ericfitz/brewsoak/font-hack").is_empty());
+        assert_eq!(
+            run_soaked("==> Trusted formula hashicorp/tap/packer"),
+            vec!["Trusted formula hashicorp/tap/packer"]
+        );
+    }
+
+    /// Characterization: the existing `==> Would ` rule already drops these.
+    #[test]
+    fn dry_run_dependency_preview_of_a_soak_tap_target_is_dropped() {
+        for input in [
+            "==> Would install 1 dependency for parent:\nhello 2.12.3",
+            "==> Would upgrade 2 dependencies for parent:\nhello 2.12.2 -> 2.12.3\nwget 1.0 -> 1.1",
+            "==> Would install 1 dependency for ericfitz/brewsoak/font-hack:\nhello",
+        ] {
+            assert!(run_soaked(input).is_empty(), "{input}");
+            let after = format!("{input}\nError: boom");
+            assert_eq!(run_soaked(&after), vec!["Error: boom"], "{input}");
+        }
+    }
+
+    #[test]
+    fn trusted_line_inside_caveats_opens_no_block() {
+        let with = "==> Caveats\n==> wget\none\n==> Trusted formula ericfitz/brewsoak/x\ntwo";
+        let without = "==> Caveats\n==> wget\none\ntwo";
+        let (_, f) = run(with);
+        let (_, g) = run(without);
+        assert!(!g.caveat_report().is_empty(), "the control has a report");
+        assert!(!f.caveat_report().is_empty(), "{:?}", f.caveat_report());
+        assert_eq!(f.caveat_report(), g.caveat_report());
+    }
+
+    #[test]
+    fn prefix_is_stripped_only_at_a_token_start() {
+        for (input, want) in [
+            ("ericfitz/brewsoak/hello", "hello"),
+            ("Error: ericfitz/brewsoak/hello: boom", "Error: hello: boom"),
+            ("'ericfitz/brewsoak/hello'", "'hello'"),
+            ("\"ericfitz/brewsoak/hello\"", "\"hello\""),
+            ("x (ericfitz/brewsoak/a, ericfitz/brewsoak/b)", "x (a, b)"),
+            ("ericfitz/tap/x", "ericfitz/tap/x"),
+            ("homebrew/core/x", "homebrew/core/x"),
+            ("/home/u/ericfitz/brewsoak/x", "/home/u/ericfitz/brewsoak/x"),
+            (
+                "see https://github.com/ericfitz/brewsoak/issues",
+                "see https://github.com/ericfitz/brewsoak/issues",
+            ),
+            ("foo-ericfitz/brewsoak/x", "foo-ericfitz/brewsoak/x"),
+            ("\u{1f37a} ericfitz/brewsoak/hello", "\u{1f37a} hello"),
+            ("\u{e9} ericfitz/brewsoak/x", "\u{e9} x"),
+            ("\u{e9}ericfitz/brewsoak/x", "\u{e9}ericfitz/brewsoak/x"),
+            ("ericfitz/brewsoak/\u{e9}", "\u{e9}"),
+            ("[ericfitz/brewsoak/a]", "[a]"),
+            ("a;ericfitz/brewsoak/b", "a;b"),
+            ("a; ericfitz/brewsoak/b", "a; b"),
+            ("--tap=ericfitz/brewsoak/x", "--tap=x"),
+            // `=` strips a URL query too; this is accepted.
+            (
+                "https://example.com/?tap=ericfitz/brewsoak/x",
+                "https://example.com/?tap=x",
+            ),
+            // A URL path still keeps it.
+            (
+                "https://example.com/ericfitz/brewsoak/x",
+                "https://example.com/ericfitz/brewsoak/x",
+            ),
+            ("a]ericfitz/brewsoak/x", "a]ericfitz/brewsoak/x"),
+        ] {
+            assert_eq!(strip_soak_tap_prefix(input), want, "{input}");
+        }
+    }
+
+    #[test]
+    fn soak_tap_prefix_matches_the_tap_name() {
+        assert_eq!(SOAK_TAP_PREFIX, format!("{}/", crate::origin::SOAK_TAP));
+    }
+
+    #[test]
+    fn installed_from_output_reads_full_names() {
+        let raw = "Warning: ericfitz/brewsoak/x 1.0 is already installed and up-to-date.\n";
+        let got = installed_from_output(raw.as_bytes());
+        assert_eq!(got.get("x").map(String::as_str), Some("1.0"));
+        assert_eq!(got.len(), 1, "{got:?}");
     }
 
     #[test]

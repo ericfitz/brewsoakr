@@ -121,7 +121,9 @@ mod tests {
             class: PkgClass::Unsoakable,
             receipt_rb: String::new(),
             receipt_tap: None,
+            own_tap: None,
             pinned: false,
+            keg_version: String::new(),
         }
     }
 
@@ -133,6 +135,7 @@ mod tests {
                 .map(|t| ((*t).to_string(), TapClass::Soakable))
                 .collect(),
             tap_remotes: Default::default(),
+            soak_tap: None,
         }
     }
 
@@ -283,5 +286,36 @@ mod tests {
         )
         .unwrap();
         assert!(dir.path().join("taps/Live/Tap.git/f").exists());
+    }
+
+    #[test]
+    fn prune_cache_leaves_the_soak_tap_and_undo_directories_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let tap = dir.path().join("soaktap");
+        std::fs::create_dir_all(cache.join("soak-tap-undo/Formula")).unwrap();
+        std::fs::write(cache.join("soak-tap-undo/Formula/wget.absent"), "").unwrap();
+        std::fs::create_dir_all(tap.join("Formula")).unwrap();
+        std::fs::write(tap.join("Formula/a.rb"), "a").unwrap();
+        std::fs::write(tap.join("Formula/b.rb"), "b").unwrap();
+        let before = (
+            crate::cmd::test_support::tree(&cache),
+            crate::cmd::test_support::tree(&tap),
+        );
+        prune_cache(
+            &RunLock::for_tests(),
+            &cache,
+            &world(),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                crate::cmd::test_support::tree(&cache),
+                crate::cmd::test_support::tree(&tap)
+            ),
+            before
+        );
     }
 }

@@ -3,8 +3,8 @@
 //! files live, and how a name maps to a file in a tap.
 
 use crate::Error;
-use crate::brew::{json_string_value, scan_array_objects};
-use crate::origin::{self, CASK, CORE, STAGING_TAP};
+use crate::brew::{find_json_key, json_string_value, scan_array_objects};
+use crate::origin::{self, CASK, CORE, SOAK_TAP, STAGING_TAP};
 use crate::resolve::PkgKind;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,35 @@ pub struct TapInfo {
     pub name: String,
     /// `null` for local taps and for API-mode core/cask.
     pub remote: Option<String>,
+    /// `path` from tap-info; `None` when absent or empty.
+    pub path: Option<PathBuf>,
+    /// `trusted` from tap-info: absent is `true`, `true` is `true`, anything else is `false`.
+    pub trusted: bool,
+}
+
+impl TapInfo {
+    pub fn new(name: &str, remote: Option<&str>) -> Self {
+        Self {
+            name: name.to_ascii_lowercase(),
+            remote: remote.map(str::to_string),
+            path: None,
+            trusted: true,
+        }
+    }
+}
+
+/// `trusted` is `true` when the key is absent; any value other than the
+/// literal `true` (`false`, `null`, a string, a number) is `false`.
+fn tap_trusted(obj: &str) -> bool {
+    let Some(after) = find_json_key(obj, "trusted") else {
+        return true;
+    };
+    let token = after
+        .trim_start()
+        .split(|c: char| c == ',' || c == '}' || c.is_ascii_whitespace())
+        .next()
+        .unwrap_or("");
+    token == "true"
 }
 
 /// `brew tap-info --json --installed` prints a top-level array of tap objects.
@@ -32,6 +61,10 @@ pub fn parse_tap_info_json(json: &str) -> Result<Vec<TapInfo>, Error> {
         out.push(TapInfo {
             name: name.to_ascii_lowercase(),
             remote: json_string_value(obj, "remote").filter(|r| !r.is_empty()),
+            path: json_string_value(obj, "path")
+                .filter(|p| !p.is_empty())
+                .map(PathBuf::from),
+            trusted: tap_trusted(obj),
         });
     }
     Ok(out)
@@ -42,6 +75,8 @@ pub enum TapClass {
     Core,
     Cask,
     Staging,
+    /// brewsoak's own tap, `ericfitz/brewsoak`: local, so it has no remote.
+    SoakTap,
     /// No remote, or not `https://`: brewsoak never installs from it.
     Unsoakable,
     Soakable,
@@ -59,6 +94,9 @@ pub fn classify(tap: &TapInfo) -> TapClass {
     if tap.name == STAGING_TAP {
         return TapClass::Staging;
     }
+    if tap.name == SOAK_TAP {
+        return TapClass::SoakTap;
+    }
     match tap.remote.as_deref() {
         Some(r) if r.starts_with("https://") => TapClass::Soakable,
         _ => TapClass::Unsoakable,
@@ -69,16 +107,6 @@ pub fn classify(tap: &TapInfo) -> TapClass {
 pub fn clone_dir(cache: &Path, tap: &str) -> PathBuf {
     let (user, repo) = origin::split_tap(tap).unwrap_or((tap, "tap"));
     cache.join("taps").join(user).join(format!("{repo}.git"))
-}
-
-/// Per-tap staging directory so a tap formula never collides with a core one.
-/// Core and cask keep the v1 layout directly under `tap_root`.
-pub fn staging_root(tap_root: &Path, origin_tap: &str) -> PathBuf {
-    if origin::is_core_or_cask(origin_tap) {
-        return tap_root.to_path_buf();
-    }
-    let (user, repo) = origin::split_tap(origin_tap).unwrap_or((origin_tap, "tap"));
-    tap_root.join("taps").join(user).join(repo)
 }
 
 /// Homebrew's lookup order for a tap. Tap aliases and renames are not followed.
@@ -101,30 +129,33 @@ pub fn resolve_path(tree: &[String], kind: PkgKind, name: &str) -> Option<String
     }
 }
 
-/// brew could not load the staged `.rb` at all (as opposed to failing to
-/// build or download it): the formula reaches outside its own file.
-pub fn staged_load_failure(brew_output: &str) -> bool {
-    let s = brew_output.to_ascii_lowercase();
-    s.contains("cannot load such file")
-        || s.contains("invalid formula")
-        || s.contains("invalid cask")
-        || s.contains("uninitialized constant")
-        || s.contains("undefined method")
-}
-
-/// The tap named by Homebrew's refusal to load a formula or cask from a tap
+/// Every tap named by Homebrew's refusal to load a formula or cask from a tap
 /// the user has not trusted (`Refusing to load formula x from untrusted tap
-/// u/r.`), lowercase. brewsoak never runs `brew trust` for a third-party tap;
-/// that is the user's decision.
-pub fn untrusted_tap(brew_output: &str) -> Option<String> {
+/// u/r.`), lowercase, in the order brew printed them. brewsoak never runs
+/// `brew trust` for a third-party tap; that is the user's decision.
+pub fn untrusted_taps(brew_output: &str) -> Vec<String> {
     let marker = "from untrusted tap ";
     let lower = brew_output.to_ascii_lowercase();
-    let rest = &lower[lower.find(marker)? + marker.len()..];
-    let tap = rest
-        .split_whitespace()
-        .next()?
-        .trim_end_matches(['.', ',', ';']);
-    (!tap.is_empty()).then(|| tap.to_string())
+    lower
+        .match_indices(marker)
+        .filter_map(|(at, _)| {
+            let tap = lower[at + marker.len()..]
+                .split_whitespace()
+                .next()?
+                .trim_end_matches(['.', ',', ';']);
+            (!tap.is_empty()).then(|| tap.to_string())
+        })
+        .collect()
+}
+
+/// The tap that blocks a command: brewsoak's own tap when any refusal names
+/// it, wherever it falls among several, else the first tap named.
+pub fn blocking_untrusted_tap(brew_output: &str) -> Option<String> {
+    let all = untrusted_taps(brew_output);
+    all.iter()
+        .find(|t| t.eq_ignore_ascii_case(SOAK_TAP))
+        .or_else(|| all.first())
+        .cloned()
 }
 
 /// True when brew's output is its `TapFormulaAmbiguityError`: a bare formula
@@ -138,6 +169,21 @@ pub fn ambiguous_formula(brew_output: &str) -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn blocking_untrusted_tap_prefers_the_soak_tap_wherever_it_falls() {
+        let both = "Refusing to load formula a/b/x from untrusted tap hashicorp/tap.\nRefusing to load formula ericfitz/brewsoak/y from untrusted tap Ericfitz/Brewsoak.";
+        assert_eq!(
+            blocking_untrusted_tap(both).as_deref(),
+            Some("ericfitz/brewsoak")
+        );
+        let other = "Refusing to load formula a/b/x from untrusted tap hashicorp/tap.";
+        assert_eq!(
+            blocking_untrusted_tap(other).as_deref(),
+            Some("hashicorp/tap")
+        );
+        assert_eq!(blocking_untrusted_tap("Error: nope"), None);
+    }
+
+    #[test]
     fn ambiguous_formula_reads_brews_ambiguity_error() {
         let msg = "Error: Formulae found in multiple taps:\n       * a/tap/cats\n       * b/tap/cats\n\nPlease use the fully-qualified name (e.g. a/tap/cats) to refer to a specific formula.";
         assert!(ambiguous_formula(msg));
@@ -148,14 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_tap_reads_the_tap_from_brews_refusal() {
+    fn untrusted_taps_read_the_tap_from_brews_refusal() {
         let msg = "Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap HashiCorp/tap.\nRun `brew trust hashicorp/tap` to trust it.";
-        assert_eq!(untrusted_tap(msg).as_deref(), Some("hashicorp/tap"));
+        assert_eq!(untrusted_taps(msg), ["hashicorp/tap"]);
         let cask =
             "Error: Refusing to load cask hashicorp/tap/packer from untrusted tap hashicorp/tap.";
-        assert_eq!(untrusted_tap(cask).as_deref(), Some("hashicorp/tap"));
-        assert_eq!(untrusted_tap("Error: No bottle available for foo"), None);
-        assert_eq!(untrusted_tap("Error: cannot load such file -- x"), None);
+        assert_eq!(untrusted_taps(cask), ["hashicorp/tap"]);
+        assert!(untrusted_taps("Error: No bottle available for foo").is_empty());
+        assert!(untrusted_taps("Error: cannot load such file -- x").is_empty());
     }
 
     const TAP_INFO: &str = r#"[
@@ -198,30 +244,64 @@ mod tests {
 
     #[test]
     fn http_remote_is_unsoakable() {
-        let tap = TapInfo {
-            name: "a/b".into(),
-            remote: Some("http://example.com/a/homebrew-b".into()),
-        };
+        let tap = TapInfo::new("a/b", Some("http://example.com/a/homebrew-b"));
         assert_eq!(classify(&tap), TapClass::Unsoakable);
     }
 
     #[test]
-    fn clone_and_staging_dirs_are_per_tap() {
+    fn parse_tap_info_reads_path_and_trusted() {
+        let json = r#"[
+          {"name": "a/t1", "trusted": true, "path": "/x/Taps/ericfitz/homebrew-brewsoak"},
+          {"name": "a/t2", "trusted": false},
+          {"name": "a/t3"},
+          {"name": "a/t4", "trusted": "yes"},
+          {"name": "a/t5", "trusted": 1},
+          {"name": "a/t6", "trusted": null, "path": ""}
+        ]"#;
+        let taps = parse_tap_info_json(json).unwrap();
+        let trusted: Vec<bool> = taps.iter().map(|t| t.trusted).collect();
+        assert_eq!(trusted, [true, false, true, false, false, false]);
+        assert_eq!(
+            taps[0].path,
+            Some(PathBuf::from("/x/Taps/ericfitz/homebrew-brewsoak"))
+        );
+        assert_eq!(taps[1].path, None);
+        assert_eq!(taps[5].path, None, "an empty path is no path");
+    }
+
+    #[test]
+    fn classify_names_the_soak_tap_before_the_remote_rule() {
+        assert_eq!(
+            classify(&TapInfo::new("ericfitz/brewsoak", None)),
+            TapClass::SoakTap
+        );
+        assert_eq!(
+            classify(&TapInfo::new(
+                "ericfitz/brewsoak",
+                Some("https://github.com/ericfitz/homebrew-brewsoak")
+            )),
+            TapClass::SoakTap
+        );
+        assert_eq!(
+            classify(&TapInfo::new("brewsoakr/soaked", None)),
+            TapClass::Staging
+        );
+    }
+
+    #[test]
+    fn cloned_ericfitz_tap_stays_soakable() {
+        let tap = TapInfo::new(
+            "ericfitz/tap",
+            Some("https://github.com/ericfitz/homebrew-tap"),
+        );
+        assert_eq!(classify(&tap), TapClass::Soakable);
+    }
+
+    #[test]
+    fn clone_dirs_are_per_tap() {
         assert_eq!(
             clone_dir(Path::new("/cache"), "hashicorp/tap"),
             PathBuf::from("/cache/taps/hashicorp/tap.git")
-        );
-        assert_eq!(
-            staging_root(Path::new("/cache/staging"), "hashicorp/tap"),
-            PathBuf::from("/cache/staging/taps/hashicorp/tap")
-        );
-        assert_eq!(
-            staging_root(Path::new("/cache/staging"), "homebrew/core"),
-            PathBuf::from("/cache/staging")
-        );
-        assert_eq!(
-            staging_root(Path::new("/cache/staging"), "homebrew/cask"),
-            PathBuf::from("/cache/staging")
         );
     }
 
@@ -297,22 +377,5 @@ mod tests {
             resolve_path(&t, PkgKind::Formula, "python@3.12").as_deref(),
             Some("Formula/python@3.12.rb")
         );
-    }
-
-    #[test]
-    fn staged_load_failure_matches_ruby_load_errors() {
-        assert!(staged_load_failure(
-            "Error: cannot load such file -- /x/staging/taps/a/b/Formula/../lib/helper"
-        ));
-        assert!(staged_load_failure(
-            "Error: Invalid formula: /x/Formula/foo.rb\nfoo: uninitialized constant Helper"
-        ));
-        assert!(staged_load_failure(
-            "Error: foo: undefined method `helper' for"
-        ));
-        assert!(!staged_load_failure("Error: No bottle available for foo"));
-        assert!(!staged_load_failure(
-            "Warning: foo 1.0 is already installed and up-to-date."
-        ));
     }
 }

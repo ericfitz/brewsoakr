@@ -141,7 +141,7 @@ mod tests {
         AUTO_UPDATES_HEADER, OUTDATED_HEADER, auto_updates_world, cask_rb, cfg24, formula_pkg,
         formula_pkg_from, formula_rb, greedy, greedy_outdated, greedy_upgrade, greedy_world,
         inv_from, lock_runs, openssl_is_newer, run_is_name_install, section_lines, tap_snaps,
-        tapped, unused_cache,
+        tapped, test_cache,
     };
     use crate::cmd::upgrade::upgrade;
     use crate::cmd::view::ResolvedView;
@@ -153,6 +153,7 @@ mod tests {
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -325,7 +326,7 @@ mod tests {
         );
         let installs: Vec<Vec<String>> = lock_runs(&brew)
             .into_iter()
-            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .filter(|a| matches!(a.first().map(String::as_str), Some("install" | "upgrade")))
             .collect();
         assert_eq!(installs.len(), 4, "{text}");
         for args in &installs {
@@ -349,6 +350,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -490,7 +492,7 @@ mod tests {
                 &brew,
                 &git,
                 &snaps,
-                unused_cache(),
+                test_cache(),
                 &inv,
                 flags::greedy_mode(&owned),
             );
@@ -645,6 +647,7 @@ mod tests {
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,
@@ -681,6 +684,7 @@ mod tests {
 
         let mut out = Vec::new();
         upgrade(
+            &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
             &snaps,

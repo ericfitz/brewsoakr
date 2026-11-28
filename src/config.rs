@@ -336,7 +336,7 @@ pub fn write_atomic(path: &Path, new_body: &str, now: OffsetDateTime) -> Result<
     std::fs::create_dir_all(dir)?;
     let tmp_prefix = format!(".{name}.tmp-");
     let tmp = dir.join(format!("{tmp_prefix}{}", std::process::id()));
-    let result = write_temp(&tmp, new_body)
+    let result = write_temp(&tmp, new_body.as_bytes())
         .map_err(Error::from)
         .and_then(|()| replace_with_temp(path, &tmp, dir, name, new_body, current.is_some(), now));
     if result.is_err() {
@@ -350,7 +350,7 @@ pub fn write_atomic(path: &Path, new_body: &str, now: OffsetDateTime) -> Result<
 /// Mode 0600 and fsync. `create` + `truncate` (not `create_new`) so a
 /// leftover from an earlier run with the same pid does not block the write;
 /// `set_permissions` because `mode()` applies only when the file is created.
-pub(crate) fn write_temp(tmp: &Path, body: &str) -> std::io::Result<()> {
+pub(crate) fn write_temp(tmp: &Path, body: &[u8]) -> std::io::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -358,7 +358,7 @@ pub(crate) fn write_temp(tmp: &Path, body: &str) -> std::io::Result<()> {
         .mode(0o600)
         .open(tmp)?;
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    file.write_all(body.as_bytes())?;
+    file.write_all(body)?;
     file.sync_all()
 }
 

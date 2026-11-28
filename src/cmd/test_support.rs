@@ -1,6 +1,6 @@
 use crate::Error;
 use crate::SoakHours;
-use crate::brew::{InstalledPkg, MockBrew};
+use crate::brew::{Brew, InstalledPkg, MockBrew};
 use crate::cmd::RunResult;
 use crate::cmd::apply::reinstall;
 use crate::cmd::outdated::outdated;
@@ -14,7 +14,8 @@ use crate::resolve::PkgKind;
 use crate::snapshot::Snapshots;
 use crate::snapshot::{TapSnapshot, TapState};
 use crate::taps::TapInfo;
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 
 /// True when the Summary has a `label  value` row (value ignoring any suffix).
@@ -44,17 +45,14 @@ pub(super) fn cfg_with(file: &str) -> Config {
 pub(super) fn inv_from(brew: &MockBrew, cfg: &Config) -> Inventory {
     Inventory::build(
         brew.installed.clone(),
-        &brew.taps,
+        &brew.tap_info().expect("mock taps"),
         &OriginRecords::default(),
         cfg,
     )
 }
 
 pub(super) fn tapped(name: &str, remote: Option<&str>) -> TapInfo {
-    TapInfo {
-        name: name.into(),
-        remote: remote.map(str::to_string),
-    }
+    TapInfo::new(name, remote)
 }
 
 pub(super) fn formula_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
@@ -93,8 +91,17 @@ pub(super) fn now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed now")
 }
 
-pub(super) fn unused_cache() -> &'static Path {
-    Path::new("/brewsoak-in-memory-unused")
+/// A writable cache directory, the same for every call on one test's thread
+/// and removed when that thread ends.
+pub(crate) fn test_cache() -> &'static Path {
+    thread_local! {
+        static CACHE: (tempfile::TempDir, &'static Path) = {
+            let dir = tempfile::tempdir().expect("test cache");
+            let path: &'static Path = Box::leak(dir.path().to_path_buf().into_boxed_path());
+            (dir, path)
+        };
+    }
+    CACHE.with(|c| c.1)
 }
 
 pub(super) fn formula_rb(name: &str, version: &str, sha: &str) -> String {
@@ -188,8 +195,11 @@ pub(super) fn core_snaps() -> Snapshots {
 
 pub(super) fn formula_pkg(name: &str, receipt_rb: String) -> InstalledPkg {
     InstalledPkg {
+        own_tap: None,
         name: name.into(),
         kind: PkgKind::Formula,
+        keg_version: crate::soaktap::file_version(PkgKind::Formula, receipt_rb.as_bytes())
+            .unwrap_or_default(),
         receipt_rb,
         pinned: false,
         tap: None,
@@ -214,19 +224,44 @@ pub(super) fn run_has_token(runs: &[Vec<String>], token: &str) -> bool {
 
 pub(super) fn run_is_name_install(runs: &[Vec<String>], name: &str) -> bool {
     runs.iter().any(|args| {
-        args.first().map(String::as_str) == Some("install")
-            && args.last().map(String::as_str) == Some(name)
+        let last = args.last().map(String::as_str);
+        // `upgrade` is how brewsoak installs over a soak-tap keg; a bare name
+        // under `upgrade` is something else.
+        let verb_ok = match args.first().map(String::as_str) {
+            Some("install") => true,
+            Some("upgrade") => last.is_some_and(|a| a.starts_with("ericfitz/brewsoak/")),
+            _ => false,
+        };
+        verb_ok
+            && last.map(strip_soak_prefix) == Some(name)
             && !args.iter().any(|a| a == "--ignore-dependencies")
     })
 }
 
-/// Soaked runs install and ask `brew deps` by bare name: no recorded argument
-/// is a path, and no `install` or `deps` argument is a `user/repo/name` token.
-pub(super) fn assert_no_path_args(brew: &MockBrew) {
+/// A command argument without the soak tap's `ericfitz/brewsoak/` prefix.
+pub(super) fn strip_soak_prefix(arg: &str) -> &str {
+    arg.strip_prefix("ericfitz/brewsoak/").unwrap_or(arg)
+}
+
+/// No argument is a path; no command is `trust` or `untrust`; no argument is
+/// `--ignore-dependencies` or contains `brewsoakr/soaked`; every argument that
+/// starts with `ericfitz/brewsoak/` names one of `soak_names`. Third-party
+/// installs and `brew deps` questions keep bare names, and no `by_name`
+/// query carries a full token.
+pub(super) fn assert_soak_tap_commands(brew: &MockBrew, soak_names: &[&str]) {
+    let prefix = "ericfitz/brewsoak/";
+    let soak_ok = |a: &str| {
+        a.strip_prefix(prefix)
+            .is_some_and(|n| soak_names.contains(&n))
+    };
     let mut all = lock_runs(brew);
     all.extend(brew.visible_runs.lock().expect("visible").clone());
     for args in &all {
         let verb = args.first().map(String::as_str);
+        assert!(
+            !matches!(verb, Some("trust" | "untrust")),
+            "trust command in {args:?}"
+        );
         let named = matches!(verb, Some("install" | "deps"));
         for a in args {
             assert!(
@@ -234,15 +269,31 @@ pub(super) fn assert_no_path_args(brew: &MockBrew) {
                 "path argument {a:?} in {args:?}"
             );
             assert!(
-                !(named && !a.starts_with('-') && a.contains('/')),
-                "full token {a:?} in soaked {args:?}"
+                a != "--ignore-dependencies" && !a.contains("brewsoakr/soaked"),
+                "forbidden argument {a:?} in {args:?}"
             );
+            if a.starts_with(prefix) {
+                assert!(
+                    soak_ok(a),
+                    "soak token {a:?} not among {soak_names:?} in {args:?}"
+                );
+            } else {
+                assert!(
+                    !(named && !a.starts_with('-') && a.contains('/')),
+                    "full token {a:?} in {args:?}"
+                );
+            }
         }
     }
     for (kind, token) in brew.deps_calls.lock().expect("deps calls").iter() {
+        let fine = if token.starts_with(prefix) {
+            soak_ok(token)
+        } else {
+            !token.contains('/')
+        };
         assert!(
-            !token.starts_with('/') && !token.ends_with(".rb") && !token.contains('/'),
-            "path or full token {token:?} handed to deps ({kind:?})"
+            fine && !token.starts_with('/') && !token.ends_with(".rb"),
+            "path or unexpected token {token:?} handed to deps ({kind:?})"
         );
     }
     for q in brew.by_name_queries.lock().expect("queries").iter() {
@@ -265,10 +316,11 @@ pub(super) fn upgrade_names_flags(
     let cfg = cfg24();
     let inv = inv_from(brew, &cfg);
     upgrade(
+        &crate::lock::RunLock::for_tests(),
         brew,
         git,
         &core_snaps(),
-        unused_cache(),
+        test_cache(),
         tap.path(),
         &inv,
         &cfg,
@@ -297,10 +349,11 @@ pub(super) fn call_reinstall(
     let cfg = cfg24();
     let inv = inv_from(brew, &cfg);
     reinstall(
+        &crate::lock::RunLock::for_tests(),
         brew,
         git,
         snaps,
-        unused_cache(),
+        test_cache(),
         tap,
         &inv,
         &cfg,
@@ -336,8 +389,11 @@ pub(super) fn local_tap_world() -> (MockBrew, InMemoryGit) {
 
 pub(super) fn cask_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
     InstalledPkg {
+        own_tap: None,
         name: name.into(),
         kind: PkgKind::Cask,
+        keg_version: crate::soaktap::file_version(PkgKind::Cask, receipt_rb.as_bytes())
+            .unwrap_or_default(),
         receipt_rb,
         pinned: false,
         tap: Some(tap.into()),
@@ -457,7 +513,21 @@ pub(super) fn greedy_world() -> (MockBrew, InMemoryGit, Snapshots) {
         git.insert_blob("caskcut", &path, rb.clone());
         git.insert_blob("caskhead", &path, rb.clone());
     }
+    // brew wrote soak-tap receipts for what it installed.
+    let mut receipt_taps = BTreeMap::new();
+    receipt_taps.insert(
+        (PkgKind::Formula, "wget".to_string(), "1.1.0".to_string()),
+        "ericfitz/brewsoak".to_string(),
+    );
+    for (name, rb) in &casks {
+        let version = crate::soaktap::file_version(PkgKind::Cask, rb.as_bytes()).unwrap();
+        receipt_taps.insert(
+            (PkgKind::Cask, name.to_string(), version),
+            "ericfitz/brewsoak".to_string(),
+        );
+    }
     let brew = MockBrew {
+        receipt_taps,
         installed: vec![
             formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha")),
             cask_pkg_from(
@@ -500,6 +570,7 @@ pub(super) fn greedy_upgrade(
     let flags: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
     upgrade(
+        &crate::lock::RunLock::for_tests(),
         brew,
         git,
         snaps,
@@ -526,17 +597,7 @@ pub(super) fn greedy_outdated(
     let inv = inv_from(brew, &cfg);
     let flags: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
-    outdated(
-        brew,
-        git,
-        snaps,
-        unused_cache(),
-        &inv,
-        &cfg,
-        &flags,
-        &mut out,
-    )
-    .unwrap();
+    outdated(brew, git, snaps, test_cache(), &inv, &cfg, &flags, &mut out).unwrap();
     String::from_utf8(out).unwrap()
 }
 
@@ -627,8 +688,162 @@ pub(super) fn git_empty() -> InMemoryGit {
     InMemoryGit::new()
 }
 
+/// The soak tap as `brew tap-info` reports a local one: at `path`, with the
+/// given trust.
+pub(crate) fn soak_tap_at(path: &Path, trusted: bool) -> TapInfo {
+    let mut tap = TapInfo::new(crate::origin::SOAK_TAP, None);
+    tap.path = Some(path.to_path_buf());
+    tap.trusted = trusted;
+    tap
+}
+
+/// `local_tap_world` with the soak tap local, trusted and at `tap`.
+pub(super) fn soak_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+    let (mut brew, git) = local_tap_world();
+    brew.soak_tap = Some(soak_tap_at(tap, true));
+    (brew, git)
+}
+
+/// `soak_world` plus the third-party `packer` of `packer_world`, installed
+/// behind its cutoff, so a run has a package the soak tap never touches.
+pub(super) fn soak_and_packer_world(tap: &Path) -> (MockBrew, InMemoryGit, Snapshots) {
+    let (mut brew, git) = soak_world(tap);
+    let (_packer_git, snaps) = packer_world();
+    for (sha, path, bytes) in [
+        (
+            "tapcut",
+            "Formula/packer.rb",
+            formula_rb("packer", "1.16.1", "midsha"),
+        ),
+        (
+            "taphead",
+            "Formula/packer.rb",
+            formula_rb("packer", "1.17.0", "newsha"),
+        ),
+    ] {
+        git.insert_blob(sha, path, bytes);
+    }
+    git.insert_tree("tapcut", &["Formula/packer.rb"]);
+    git.insert_tree("taphead", &["Formula/packer.rb"]);
+    brew.installed.push(formula_pkg_from(
+        "packer",
+        "hashicorp/tap",
+        formula_rb("packer", "1.15.0", "oldsha"),
+    ));
+    brew.taps.extend(hashicorp_tap());
+    (brew, git, snaps)
+}
+
+/// `soak_and_packer_world` with `hello` installed from the soak tap (receipt
+/// names it) at `installed`, soak cutoff 1.1.0 and HEAD 1.2.0, and the soak
+/// tap local at `tap` with the given trust.
+pub(super) fn hello_world(
+    tap: &Path,
+    trusted: bool,
+    installed: &str,
+) -> (MockBrew, InMemoryGit, Snapshots) {
+    let (mut brew, git, snaps) = soak_and_packer_world(tap);
+    brew.soak_tap = Some(soak_tap_at(tap, trusted));
+    git.insert_blob(
+        "cutoffsha",
+        "Formula/h/hello.rb",
+        formula_rb("hello", "1.1.0", "midsha"),
+    );
+    git.insert_blob(
+        "headsha",
+        "Formula/h/hello.rb",
+        formula_rb("hello", "1.2.0", "newsha"),
+    );
+    let sha = match installed {
+        "1.1.0" => "midsha",
+        "1.2.0" => "newsha",
+        _ => "oldsha",
+    };
+    brew.installed.push(InstalledPkg {
+        own_tap: Some(crate::origin::OwnTap::Soak),
+        ..formula_pkg("hello", formula_rb("hello", installed, sha))
+    });
+    (brew, git, snaps)
+}
+
+/// The bytes of `rel` below `tap`, if the file exists.
+pub(super) fn tap_file(tap: &Path, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(tap.join(rel)).ok()
+}
+
+/// Run `upgrade` with `tap` as the tap root and the per-thread test cache.
+pub(super) fn run_upgrade(
+    brew: &MockBrew,
+    git: &InMemoryGit,
+    snaps: &Snapshots,
+    tap: &Path,
+    names: &[&str],
+    user_flags: &[&str],
+) -> (RunResult, String) {
+    let cfg = cfg24();
+    let inv = inv_from(brew, &cfg);
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let user_flags: Vec<String> = user_flags.iter().map(|n| n.to_string()).collect();
+    let mut out = Vec::new();
+    let r = upgrade(
+        &crate::lock::RunLock::for_tests(),
+        brew,
+        git,
+        snaps,
+        test_cache(),
+        tap,
+        &inv,
+        &cfg,
+        &names,
+        &user_flags,
+        &mut out,
+    )
+    .expect("upgrade");
+    (r, String::from_utf8(out).expect("utf8"))
+}
+
+/// Leave a tap file no package needs (`Formula/gone.rb`) and an unfinished
+/// undo entry (`soak-tap-undo/Formula/back.absent`, whose tap file
+/// `Formula/back.rb` should not outlive it), so maintenance has work to do.
+pub(crate) fn seed_stale_tap(tap: &Path, cache: &Path) {
+    let body = formula_rb("gone", "1.0.0", "x");
+    for (dir, file, bytes) in [
+        (tap.join("Formula"), "gone.rb", body.as_bytes()),
+        (tap.join("Formula"), "back.rb", body.as_bytes()),
+        (
+            cache.join(crate::soaktap::UNDO_DIR).join("Formula"),
+            "back.absent",
+            b"".as_slice(),
+        ),
+    ] {
+        std::fs::create_dir_all(&dir).expect("seed dir");
+        std::fs::write(dir.join(file), bytes).expect("seed file");
+    }
+}
+
+/// Every file under `dir` with its bytes; empty when `dir` is missing.
+pub(crate) fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for ent in entries.flatten() {
+            let path = ent.path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                let bytes = std::fs::read(&path).expect("read");
+                out.insert(path, bytes);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, &mut out);
+    out
+}
+
 #[cfg(test)]
-mod assert_no_path_args_tests {
+mod assert_soak_tap_commands_tests {
     use super::*;
     use crate::brew::NameQuery;
 
@@ -644,7 +859,7 @@ mod assert_no_path_args_tests {
     fn flags_a_slash_prefixed_argument() {
         let brew = MockBrew::new();
         visible(&brew, &["install", "/tmp/staging/x"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &[]);
     }
 
     #[test]
@@ -652,26 +867,69 @@ mod assert_no_path_args_tests {
     fn flags_an_rb_argument() {
         let brew = MockBrew::new();
         visible(&brew, &["install", "x.rb"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "trust command")]
+    fn flags_trust_and_untrust() {
+        let brew = MockBrew::new();
+        visible(&brew, &["untrust", "ericfitz/brewsoak"]);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "forbidden argument")]
+    fn flags_ignore_dependencies() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "--ignore-dependencies", "x"]);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "forbidden argument")]
+    fn flags_the_legacy_tap() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "brewsoakr/soaked/x"]);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not among")]
+    fn flags_a_soak_token_for_an_unlisted_name() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "--formula", "ericfitz/brewsoak/other"]);
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
     #[should_panic(expected = "full token")]
-    fn flags_a_full_token_on_an_install_run() {
+    fn flags_a_third_party_full_token_on_an_install_run() {
         let brew = MockBrew::new();
         visible(&brew, &["install", "--formula", "user/repo/name"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
     #[should_panic(expected = "handed to deps")]
-    fn flags_a_full_token_in_deps_calls() {
+    fn flags_a_third_party_full_token_in_deps_calls() {
         let brew = MockBrew::new();
         brew.deps_calls
             .lock()
             .unwrap()
             .push((PkgKind::Formula, "user/repo/name".to_string()));
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "handed to deps")]
+    fn flags_a_soak_token_for_an_unlisted_name_in_deps_calls() {
+        let brew = MockBrew::new();
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "ericfitz/brewsoak/other".to_string()));
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
@@ -680,19 +938,46 @@ mod assert_no_path_args_tests {
         let brew = MockBrew::new();
         brew.by_name_queries.lock().unwrap().push(NameQuery {
             kind: PkgKind::Formula,
-            name: "user/repo/name".to_string(),
-            origin: "user/repo".to_string(),
+            name: "ericfitz/brewsoak/name".to_string(),
+            origin: "homebrew/core".to_string(),
             cutoff_sha256: None,
         });
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
-    fn does_not_flag_no_soak_or_repair_full_tokens() {
+    fn accepts_listed_soak_tokens_bare_third_party_names_and_repair_tokens() {
         let brew = MockBrew::new();
-        visible(&brew, &["upgrade", "--formula", "user/repo/name"]);
-        visible(&brew, &["reinstall", "user/repo/name"]);
-        visible(&brew, &["install", "--formula", "name"]);
-        assert_no_path_args(&brew);
+        visible(&brew, &["upgrade", "--formula", "ericfitz/brewsoak/name"]);
+        visible(&brew, &["install", "--cask", "ericfitz/brewsoak/name"]);
+        visible(&brew, &["upgrade", "--formula", "user/repo/other"]);
+        visible(&brew, &["reinstall", "user/repo/other"]);
+        visible(&brew, &["install", "--formula", "packer"]);
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "ericfitz/brewsoak/name".to_string()));
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "packer".to_string()));
+        assert_soak_tap_commands(&brew, &["name"]);
+    }
+
+    #[test]
+    fn run_is_name_install_rejects_an_upgrade_of_a_bare_name() {
+        let runs = |args: &[&str]| vec![args.iter().map(|a| a.to_string()).collect::<Vec<_>>()];
+        assert!(!run_is_name_install(
+            &runs(&["upgrade", "--formula", "packer"]),
+            "packer"
+        ));
+        assert!(run_is_name_install(
+            &runs(&["upgrade", "--formula", "ericfitz/brewsoak/alpha"]),
+            "alpha"
+        ));
+        assert!(run_is_name_install(
+            &runs(&["install", "--formula", "packer"]),
+            "packer"
+        ));
     }
 }
