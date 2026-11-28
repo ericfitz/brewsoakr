@@ -26,6 +26,8 @@ pub mod snapshot;
 pub mod soaktap;
 pub mod tap;
 pub mod taps;
+#[cfg(test)]
+mod test_util;
 
 pub use error::Error;
 pub use hours::SoakHours;
@@ -1674,10 +1676,8 @@ mod tests {
 
     /// A `RealWorld` whose brew is a script running `body`.
     fn world_with_brew_script(dir: &Path, body: &str) -> RealWorld {
-        use std::os::unix::fs::PermissionsExt;
         let script = dir.join("brew");
-        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_util::write_executable(&script, format!("#!/bin/sh\n{body}\n"));
         RealWorld {
             git: git::ProcessGit::default(),
             github: github::UreqGithub {

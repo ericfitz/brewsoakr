@@ -2078,16 +2078,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let log = tmp.path().join("args");
         let script = tmp.path().join("brew.sh");
-        std::fs::write(
+        crate::test_util::write_executable(
             &script,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {}\necho '{{\"formulae\":[],\"casks\":[]}}'\n",
                 log.display()
             ),
-        )
-        .expect("script");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        );
         let brew = ProcessBrew::new(script);
         for greedy in [
             Greedy::default(),
@@ -2118,16 +2115,13 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmp");
         let log = tmp.path().join("args");
         let script = tmp.path().join("brew.sh");
-        std::fs::write(
+        crate::test_util::write_executable(
             &script,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {}\necho hashicorp/tap/terraform\necho wget\n",
                 log.display()
             ),
-        )
-        .expect("script");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        );
         let brew = ProcessBrew::new(script);
         let got = brew.deps(PkgKind::Formula, "packer").expect("deps");
         assert_eq!(got, ["hashicorp/tap/terraform", "wget"]);
@@ -3022,7 +3016,6 @@ mod tests {
 
     #[test]
     fn keg_receipt_asks_brew_for_the_cellar_once() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tmp");
         let cellar = tmp.path().join("Cellar");
         let brew_dir = cellar.join("wget").join("1.0").join(".brew");
@@ -3030,16 +3023,14 @@ mod tests {
         std::fs::write(brew_dir.join("wget.rb"), "rb").expect("rb");
         let count = tmp.path().join("count");
         let script = tmp.path().join("brew");
-        std::fs::write(
+        crate::test_util::write_executable(
             &script,
             format!(
                 "#!/bin/sh\necho x >> {}\necho {}\n",
                 count.display(),
                 cellar.display()
             ),
-        )
-        .expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         let brew = ProcessBrew::new(script);
         for _ in 0..3 {
             assert_eq!(brew.keg_receipt("wget", "1.0").as_deref(), Some("rb"));
@@ -3053,18 +3044,15 @@ mod tests {
 
     /// A `brew` stand-in that logs its argv (one line per call) and prints `stdout`.
     fn compare_script(tmp: &Path, stdout: &str, status: i32) -> (PathBuf, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let log = tmp.join("argv");
         let script = tmp.join("brew");
-        std::fs::write(
+        crate::test_util::write_executable(
             &script,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {}\nprintf '{stdout}'\nexit {status}\n",
                 log.display()
             ),
-        )
-        .expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         (script, log)
     }
 
@@ -3758,9 +3746,7 @@ esac
             marker = tmp.join("update_fails").display(),
             ruby_exit = ruby_exit
         );
-        std::fs::write(&script, body).expect("script");
-        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-            .expect("chmod");
+        crate::test_util::write_executable(&script, body);
         (ProcessBrew::new(script), log)
     }
 
@@ -4052,21 +4038,18 @@ esac
 
     #[test]
     fn process_brew_tap_new_passes_no_git_and_reports_brews_first_line() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = tempfile::tempdir().expect("tmp");
         let log = tmp.path().join("log");
         let marker = tmp.path().join("fail");
         let script = tmp.path().join("brew");
-        std::fs::write(
+        crate::test_util::write_executable(
             &script,
             format!(
                 "#!/bin/sh\necho \"$@\" >> {log}\nif [ -e {marker} ]; then\n  printf 'Error: Tap is already installed!\\nmore\\n' >&2\n  exit 1\nfi\n",
                 log = log.display(),
                 marker = marker.display()
             ),
-        )
-        .expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         let brew = ProcessBrew::new(script);
         assert_eq!(brew.tap_new("ericfitz/brewsoak"), Ok(()));
         std::fs::write(&marker, "").expect("marker");
@@ -4288,10 +4271,8 @@ esac
     }
 
     fn script_brew(tmp: &Path, body: &str) -> ProcessBrew {
-        use std::os::unix::fs::PermissionsExt;
         let script = tmp.join("brew");
-        std::fs::write(&script, format!("#!/bin/sh\n{body}\n")).expect("script");
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        crate::test_util::write_executable(&script, format!("#!/bin/sh\n{body}\n"));
         ProcessBrew::new(script)
     }
 
@@ -4310,6 +4291,8 @@ esac
         let brew = ProcessBrew::new(PathBuf::from("/nonexistent-brew"));
         let err = brew.tap_new("ericfitz/brewsoak").unwrap_err();
         assert!(!err.is_empty(), "{err:?}");
+        // The message says what went wrong, not just that something did.
+        assert_eq!(err, "brew not found");
     }
 
     #[test]
