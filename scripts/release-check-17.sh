@@ -16,7 +16,9 @@
 # Leftovers of a failed run: --run refuses to start and names --cleanup, which
 # acts only on what the marker file of the failed run recorded. The marker and
 # the lock live in ${XDG_STATE_HOME:-$HOME/.local/state}/brewsoak, so a changed
-# TMPDIR or a temp purge does not lose the marker.
+# TMPDIR or a temp purge does not lose the marker. Both survive a reboot. A
+# SIGKILL or a power loss leaves the lock in place until it is removed with the
+# command the die message names (rm -r <lock>).
 set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
@@ -92,13 +94,22 @@ indent() { # <text>: print each line indented two spaces
 # Returns 0 listed, 1 not listed, 2 brew or jq could not answer.
 trust_query() {
 	local json rc=0
+	TRUST_WHY="brew trust --json=v1 failed"
 	json="$("$BREW" trust --json=v1 2>/dev/null)" || return 2
+	TRUST_WHY="jq could not read the output of brew trust --json=v1"
 	# shellcheck disable=SC2016 # $k and $v are jq variables
 	"$JQ" -e --arg k "$1" --arg v "$2" '.[$k] | index($v) != null' <<<"$json" >/dev/null 2>&1 || rc=$?
 	case "$rc" in 0 | 1) return "$rc" ;; *) return 2 ;; esac
 }
 
-trust_has() { trust_query "$@"; }
+# trust_has <taps|formulae> <entry>: 0 listed, 1 not listed. When brew cannot
+# answer, die: "not listed" and "could not ask" must not look alike.
+trust_has() {
+	local rc=0
+	trust_query "$@" || rc=$?
+	if ((rc == 2)); then die "could not read brew's trust list: $TRUST_WHY"; fi
+	return "$rc"
+}
 
 preconditions() {
 	[[ -d "$TAP/Formula" ]] ||
@@ -212,7 +223,7 @@ finish() {
 		fi
 		((crc == 0)) || rc=1
 		local left
-		left="$(leftovers)"
+		left="$(leftovers)" || { rc=1; left="could not check for leftovers (see the message above)"; }
 		if [[ -n "$left" ]]; then
 			rc=1
 			echo "leftovers:" >&2
@@ -311,7 +322,7 @@ do_cleanup() {
 	load_marker
 	local left
 	if [[ ! -f "$MARKER" ]]; then
-		left="$(leftovers)"
+		left="$(leftovers)" || { release_lock; rm -r -- "$WORK"; exit 2; }
 		if [[ -z "$left" ]]; then
 			echo "cleanup: nothing to do (no marker, no leftovers)"
 			release_lock
@@ -326,7 +337,7 @@ do_cleanup() {
 		exit 1
 	fi
 	cleanup_steps || true
-	left="$(leftovers)"
+	left="$(leftovers)" || { release_lock; exit 2; }
 	if [[ -n "$left" ]]; then
 		echo "cleanup: leftovers remain (log: $LOG):" >&2
 		indent "$left" >&2
@@ -636,7 +647,23 @@ self_test() {
 	run_case "$P" bash "$SELF" --run
 	want_rc preexisting-pkg-trust-exit 2
 	has preexisting-pkg-trust-msg "already trusts"
+	has preexisting-pkg-trust-reworded "(the second is also there when $PKG is installed through brewsoak's tap, which this check needs absent, Task 13.8)"
 	check preexisting-trust-untouched "$(grep -qE '^(install|upgrade|uninstall|untap|untrust)' "$ROOT/calls" && echo 1 || echo 0)" "$(cat "$ROOT/calls")"
+
+	# 8a. brew cannot answer the trust query: not "is not trusted"
+	reset_fake "$ROOT" "$HOME_"
+	: >"$ROOT/trust-json-broken"
+	run_case "$P" bash "$SELF" --run
+	want_rc trust-unreadable-pre-exit 2
+	has trust-unreadable-pre-msg "could not read brew's trust list: brew trust --json=v1 failed"
+	check trust-unreadable-pre-not-untrusted "$(grep -qF 'is not trusted' <<<"$out" && echo 1 || echo 0)" "$out"
+	check trust-unreadable-pre-no-lock "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left"
+	reset_fake "$ROOT" "$HOME_"
+	: >"$ROOT/trust-json-broken"
+	run_case "$P" bash "$SELF" --cleanup
+	want_rc trust-unreadable-left-exit 2
+	has trust-unreadable-left-msg "could not read brew's trust list: brew trust --json=v1 failed"
+	check trust-unreadable-left-no-lock "$([[ ! -e "$STATE/release-check-17.lock" ]] && echo 0 || echo 1)" "lock left"
 
 	# 8b. hello installed, with a long `brew list` that prints hello first
 	# (grep -q under pipefail would SIGPIPE brew and report "not installed")

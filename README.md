@@ -162,9 +162,9 @@ installed. `--soak-hours` is not accepted with `settings`.
 Every installed tap with an HTTPS remote is soaked like core and cask, from a
 blobless clone under brewsoak's cache. brewsoak never fetches into or changes a
 tap that brew cloned. The only directory it writes under `Library/Taps` is its
-own local tap (see "brewsoak's own tap"). A tap with no remote, or a non-HTTPS remote, is not soakable:
-brewsoak notes its packages and leaves them to `brew`, unless they are in
-`NO_SOAK`.
+own local tap (see "brewsoak's own tap"). A tap with no remote, or a non-HTTPS
+remote, is not soakable: brewsoak notes its packages and leaves them to `brew`,
+unless they are in `NO_SOAK`.
 
 No-soak packages are installed by `brew` itself from their real tap after all
 soaked work: one `brew upgrade` (or `install` / `reinstall`) naming every
@@ -257,7 +257,8 @@ package can be lost when the two overlap. A real `brewsoak upgrade`, `install`
 or `reinstall` starts by removing tap files that no installed package uses, and
 `brewsoak update` does the same after its refresh. We saw that start-of-run
 step remove a package's tap file while a plain `brew upgrade` was running, and
-brew then lost that package's keg. Let one finish before you start the other.
+brew then lost that package's keg. A run whose names are only own-tap tokens
+skips that start-of-run prune. Let one finish before you start the other.
 
 **Plain `brew` afterwards.** A package installed from the tap is anchored to it:
 
