@@ -167,7 +167,7 @@ impl Filter {
         if is_soak_tap_trusted_line(&plain) {
             return None;
         }
-        let plain = plain.replace(SOAK_TAP_PREFIX, "");
+        let plain = strip_soak_tap_prefix(&plain);
         let t = plain.as_str();
         match self.state.unwrap_or(State::Normal) {
             State::Caveats => self.caveat_line(t),
@@ -576,6 +576,27 @@ fn already_current_head(t: &str) -> Option<&str> {
 /// `ericfitz/brewsoak/`: removed from every line the terminal shows.
 /// Kept equal to `origin::SOAK_TAP` plus a slash by a test.
 const SOAK_TAP_PREFIX: &str = "ericfitz/brewsoak/";
+
+/// Remove `ericfitz/brewsoak/` where it begins a token: at the start of the
+/// line or after whitespace or one of `(`, `'`, `"`, `:`, `` ` ``, `,`. A path
+/// or URL that merely contains it, or a longer word ending in it, is left.
+fn strip_soak_tap_prefix(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut prev: Option<char> = None;
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        let at_start = prev.is_none_or(|p| p.is_whitespace() || "('\":`,".contains(p));
+        if at_start && rest.starts_with(SOAK_TAP_PREFIX) {
+            rest = &rest[SOAK_TAP_PREFIX.len()..];
+            prev = Some('/');
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
 
 /// `==> Trusted formula ericfitz/brewsoak/x` / `==> Trusted cask ...`.
 fn is_soak_tap_trusted_line(t: &str) -> bool {
@@ -1338,6 +1359,27 @@ Already up-to-date.
             assert!(run_soaked(input).is_empty(), "{input}");
             let after = format!("{input}\nError: boom");
             assert_eq!(run_soaked(&after), vec!["Error: boom"], "{input}");
+        }
+    }
+
+    #[test]
+    fn prefix_is_stripped_only_at_a_token_start() {
+        for (input, want) in [
+            ("ericfitz/brewsoak/hello", "hello"),
+            ("Error: ericfitz/brewsoak/hello: boom", "Error: hello: boom"),
+            ("'ericfitz/brewsoak/hello'", "'hello'"),
+            ("\"ericfitz/brewsoak/hello\"", "\"hello\""),
+            ("x (ericfitz/brewsoak/a, ericfitz/brewsoak/b)", "x (a, b)"),
+            ("ericfitz/tap/x", "ericfitz/tap/x"),
+            ("homebrew/core/x", "homebrew/core/x"),
+            ("/home/u/ericfitz/brewsoak/x", "/home/u/ericfitz/brewsoak/x"),
+            (
+                "see https://github.com/ericfitz/brewsoak/issues",
+                "see https://github.com/ericfitz/brewsoak/issues",
+            ),
+            ("foo-ericfitz/brewsoak/x", "foo-ericfitz/brewsoak/x"),
+        ] {
+            assert_eq!(strip_soak_tap_prefix(input), want, "{input}");
         }
     }
 

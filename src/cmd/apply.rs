@@ -91,6 +91,7 @@ pub fn reinstall(
         },
         done: BTreeMap::new(),
         counted_deps: HashSet::new(),
+        previewed_deps: HashSet::new(),
         deferred: Vec::new(),
         soaking: Vec::new(),
         ahead: Vec::new(),
@@ -249,6 +250,7 @@ pub(super) fn apply_many(
         },
         done: BTreeMap::new(),
         counted_deps: HashSet::new(),
+        previewed_deps: HashSet::new(),
         deferred: Vec::new(),
         soaking: Vec::new(),
         ahead: Vec::new(),
@@ -339,6 +341,8 @@ pub(super) struct ApplySession<'a, B, G, W: Write> {
     /// Installed dependencies a named run upgraded and counted ahead of their
     /// own plan entry, so that entry does not count them a second time.
     counted_deps: HashSet<String>,
+    /// Dry run: dependencies whose `would install` line was shown this run.
+    previewed_deps: HashSet<String>,
     /// Holds, skips, and warnings, printed as one block at the end so they
     /// are not lost in the middle of the install scroll.
     deferred: Vec<(NoteKind, String)>,
@@ -1073,20 +1077,27 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             )?;
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
-        } else if self.counts.dry_run && installed_rb.is_none() {
-            // brew's own dependency preview is dropped from the terminal, so
-            // say what brewsoak would install, at its cutoff.
+        }
+        // Dry run: brew's own dependency preview is dropped from the terminal,
+        // so say what brewsoak would install, at its cutoff. Shown once per
+        // dependency per run, and only when the install was not held.
+        let preview = (self.counts.dry_run && installed_rb.is_none()).then(|| {
             let to = want
                 .as_ref()
                 .map(|w| format!(" {}", report::identity_version(w)))
                 .unwrap_or_default();
-            writeln!(self.out, "would install {dep}{to} (dependency of {target})")?;
-        }
+            format!("would install {dep}{to} (dependency of {target})")
+        });
         let installing = want.as_ref().map(report::identity_version);
         match self.run_install(&pkg, dep_origin, blobs.cutoff.as_deref(), installing)? {
             InstallRun::Ran { failed } => {
                 if failed && counted_here && self.counted_deps.remove(dep) {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
+                }
+                if let Some(line) = preview
+                    && self.previewed_deps.insert(dep.to_string())
+                {
+                    writeln!(self.out, "{line}")?;
                 }
             }
             // The target cannot install without this dep: hold the target.
@@ -1675,6 +1686,34 @@ mod tests {
             ["would install simdutf 1.1.0 (dependency of node)"],
             "{text}"
         );
+    }
+
+    #[test]
+    fn dry_run_reports_a_shared_dependency_once_across_targets() {
+        let (mut brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
+        brew.installed.retain(|p| p.name == "node");
+        git.insert_blob(
+            "cutoffsha",
+            "Formula/a/app.rb",
+            formula_rb("app", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "headsha",
+            "Formula/a/app.rb",
+            formula_rb("app", "1.2.0", "newsha"),
+        );
+        brew.installed
+            .push(formula_pkg("app", formula_rb("app", "1.0.0", "oldsha")));
+        brew.deps
+            .insert("app".to_string(), vec!["simdutf".to_string()]);
+        let flags = ["--dry-run".to_string()];
+        let names = ["node".to_string(), "app".to_string()];
+        let text = upgrade_names_flags(&brew, &git, &names, &flags);
+        let n = text
+            .lines()
+            .filter(|l| l.contains("would install simdutf"))
+            .count();
+        assert_eq!(n, 1, "{text}");
     }
 
     /// `node` depends on `simdutf`; both are installed, `node` sorts first.
