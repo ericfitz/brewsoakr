@@ -36,9 +36,13 @@ pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf,
 ///   everything through the line that closes the block: the first later line
 ///   that has the stanza's own indentation and starts with `end`.
 ///
-/// A `do` block with no such closing line is not removed past its first line
-/// (the file then fails to load, and a file that does not load holds the
-/// package). Eric decided on 2026-11-27 that multi-line stanzas are handled.
+/// A `do` block with no such closing line leaves the whole stanza in the file
+/// untouched (brew then fails with its known error and the package holds).
+/// A trailing Ruby `# comment` is ignored when looking at a line's end. Only
+/// a line whose first non-blank text is `no_autobump!` starts a stanza, so
+/// the word inside a string on another line is kept; a heredoc body line that
+/// itself starts with it is not told apart from code and goes. Eric decided
+/// on 2026-11-27 that multi-line stanzas are handled.
 pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
     const STANZA: &[u8] = b"no_autobump!";
     let lines: Vec<&[u8]> = rb.split_inclusive(|b| *b == b'\n').collect();
@@ -56,11 +60,20 @@ pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
         while last + 1 < lines.len() && continues(lines[last]) {
             last += 1;
         }
-        let end = opens_block(lines[last])
-            .then(|| (last + 1..lines.len()).find(|&j| closes_block(lines[j], indent)))
-            .flatten();
-        last = end.unwrap_or(last);
-        i = last + 1;
+        if !opens_block(lines[last]) {
+            i = last + 1;
+            continue;
+        }
+        match (last + 1..lines.len()).find(|&j| closes_block(lines[j], indent)) {
+            Some(e) => i = e + 1,
+            None => {
+                // Unclosed block: keep the stanza as it is.
+                for l in &lines[i..=last] {
+                    out.extend_from_slice(l);
+                }
+                i = last + 1;
+            }
+        }
     }
     out
 }
@@ -74,8 +87,28 @@ fn indent_of(line: &[u8]) -> &[u8] {
     &line[..n]
 }
 
-/// The line without its trailing whitespace and line ending.
+/// The line without a trailing Ruby comment (a `#` outside a quoted string),
+/// trailing whitespace and line ending.
 fn code_of(line: &[u8]) -> &[u8] {
+    let mut quote: Option<u8> = None;
+    let mut cut = line.len();
+    let mut k = 0;
+    while k < line.len() {
+        let b = line[k];
+        match quote {
+            Some(_) if b == b'\\' => k += 1,
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'#' => {
+                cut = k;
+                break;
+            }
+            None => {}
+        }
+        k += 1;
+    }
+    let line = &line[..cut];
     let n = line
         .iter()
         .rposition(|b| !b.is_ascii_whitespace())
@@ -103,15 +136,17 @@ fn opens_block(line: &[u8]) -> bool {
             || !(code[code.len() - 3].is_ascii_alphanumeric() || code[code.len() - 3] == b'_'))
 }
 
-/// The line is indented exactly as `indent` and starts with the word `end`.
+/// The line is indented exactly as `indent` and starts with `end` as a whole
+/// word: end of line, whitespace or `#` follows (not `end:` or `end.foo`).
 fn closes_block(line: &[u8], indent: &[u8]) -> bool {
     let Some(rest) = line.strip_prefix(indent) else {
         return false;
     };
-    rest.starts_with(b"end")
-        && !rest
-            .get(3)
-            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+    rest.strip_prefix(b"end").is_some_and(|after| {
+        after
+            .first()
+            .is_none_or(|b| b.is_ascii_whitespace() || *b == b'#')
+    })
 }
 
 /// `ericfitz/brewsoak/<name>`.
@@ -308,10 +343,51 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_keeps_everything_after_an_unclosed_block() {
+    fn sanitize_leaves_an_unclosed_block_stanza_untouched() {
         let rb = b"class S < Formula\n  no_autobump! do\n    x\nend\n";
-        // The closing `end` has a different indent: only the first line goes.
-        assert_eq!(sanitize_unofficial(rb), b"class S < Formula\n    x\nend\n");
+        // The closing `end` has a different indent: nothing is removed.
+        assert_eq!(sanitize_unofficial(rb), rb);
+        let rb = b"class S < Formula\n  no_autobump! :a,\n    b do\n    x\nend\n  url \"u\"\n";
+        assert_eq!(sanitize_unofficial(rb), rb);
+    }
+
+    #[test]
+    fn sanitize_ignores_a_trailing_comment_when_looking_for_a_continuation() {
+        let rb = b"class S < Formula\n  no_autobump! because: :x # why,\n  url \"u\"\n  no_autobump! :y # more \\\n  keep\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  url \"u\"\n  keep\nend\n"
+        );
+        // A `#` inside a string is not a comment.
+        let rb =
+            b"class S < Formula\n  no_autobump! because: \"a # b\",\n    c: 1\n  url \"u\"\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  url \"u\"\nend\n"
+        );
+        let rb = b"class S < Formula\n  no_autobump! do # block\n    x\n  end # done\n  url \"u\"\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  url \"u\"\nend\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_closes_a_block_only_at_the_word_end() {
+        let rb = b"class S < Formula\n  no_autobump! do\n  end: 1\n  end.foo\n  endx\n  end\n  url \"u\"\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  url \"u\"\nend\n"
+        );
+        // With no real `end`, the stanza stays.
+        let rb = b"class S < Formula\n  no_autobump! do\n  end: 1\n  end.foo\nend\n";
+        assert_eq!(sanitize_unofficial(rb), rb);
+    }
+
+    #[test]
+    fn sanitize_only_a_line_starting_with_the_stanza_counts() {
+        let rb = b"class S < Formula\n  desc \"no_autobump! in text\"\n  url \"u\" # no_autobump! x\n  puts <<~EOS\n    see no_autobump! here\n  EOS\nend\n";
+        assert_eq!(sanitize_unofficial(rb), rb);
     }
 
     #[test]
