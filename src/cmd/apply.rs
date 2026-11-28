@@ -4558,6 +4558,42 @@ mod tests {
         }
 
         #[test]
+        fn closure_hold_of_a_soak_receipt_cask_names_homebrew_cask_on_upgrade_and_install() {
+            for verb in ["upgrade", "install"] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git) = soak_world(tap.path());
+                let snaps = core_snaps();
+                git.insert_blob(
+                    "caskcut",
+                    "Casks/font/font-h/font-hack.rb",
+                    cask_rb("font-hack", "1.1.0"),
+                );
+                git.insert_blob(
+                    "caskhead",
+                    "Casks/font/font-h/font-hack.rb",
+                    cask_rb("font-hack", "1.2.0"),
+                );
+                let rb = crate::brew::version_only_cask_receipt("font-hack", "1.0.0");
+                brew.installed.push(InstalledPkg {
+                    own_tap: Some(crate::origin::OwnTap::Soak),
+                    ..cask_pkg_from("font-hack", "homebrew/cask", rb)
+                });
+                brew.deps_errors
+                    .insert("ericfitz/brewsoak/font-hack".into(), "Error: boom".into());
+                brew.deps_errors
+                    .insert("font-hack".into(), "Error: boom".into());
+                let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), verb, &["font-hack"]);
+                assert!(r.refused, "{verb}: {text}");
+                assert!(
+                    bypass_line(&text).ends_with(
+                        "use `brew upgrade --cask homebrew/cask/font-hack` to bypass brewsoak."
+                    ),
+                    "{verb}: {text}"
+                );
+            }
+        }
+
+        #[test]
         fn legacy_receipt_keeps_the_bare_hint() {
             let tap = tempfile::tempdir().unwrap();
             let (mut brew, git, snaps) = ahead_hello(tap.path(), true);
