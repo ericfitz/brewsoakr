@@ -1589,11 +1589,6 @@ pub(crate) fn already_installed_line(line: &str) -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn require_cutoff_holds_a_member_without_one() {
-        assert!(matches!(require_cutoff(None), Err(InstallRun::NoCutoff)));
-        assert!(matches!(require_cutoff(Some(b"rb")), Ok(b"rb")));
-    }
     use crate::cmd::test_support::summary_has;
 
     use crate::brew::{InstalledPkg, MockBrew};
@@ -1614,6 +1609,12 @@ mod tests {
         upgrade_names_flags,
     };
     use crate::cmd::upgrade::upgrade;
+
+    #[test]
+    fn require_cutoff_holds_a_member_without_one() {
+        assert!(matches!(require_cutoff(None), Err(InstallRun::NoCutoff)));
+        assert!(matches!(require_cutoff(Some(b"rb")), Ok(b"rb")));
+    }
 
     fn two_outdated_world(next_stdout: &str) -> (MockBrew, InMemoryGit) {
         two_outdated_world_with(formula_rb, next_stdout)
@@ -4526,6 +4527,74 @@ mod tests {
             assert!(undo_tree().is_empty(), "{:?}", undo_tree());
         }
 
+        const REMOTE: &str = "https://example.invalid/x";
+
+        /// `hashicorp/tap/packer` (third party, installed by name) in a world
+        /// whose soak tap is remote. `deps_error` is brew's answer to its
+        /// dependency listing; `install_stdout`, to the by-name install.
+        fn packer_with_remote_soak_tap(
+            deps_error: Option<&str>,
+            install_stdout: &str,
+        ) -> (String, MockBrew) {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+            let mut entry = soak_tap_at(tap.path(), true);
+            entry.remote = Some(REMOTE.into());
+            brew.soak_tap = Some(entry);
+            if let Some(e) = deps_error {
+                brew.deps_errors.insert("packer".into(), e.into());
+            }
+            brew.next_status = 1;
+            brew.next_stdout = install_stdout.as_bytes().to_vec();
+            let (_, text) = run_upgrade(
+                &brew,
+                &git,
+                &snaps,
+                tap.path(),
+                &["hashicorp/tap/packer"],
+                &[],
+            );
+            (text, brew)
+        }
+
+        #[test]
+        fn a_by_name_install_refused_over_a_remote_soak_tap_gives_the_remote_note() {
+            // record_name_install: brew names the soak tap as untrusted while
+            // the inventory says it is remote.
+            let (text, _) = packer_with_remote_soak_tap(
+                None,
+                "Error: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.\n",
+            );
+            let remote = NotReady::Remote(REMOTE.into()).note();
+            assert_eq!(text.matches(&remote).count(), 1, "{text}");
+            assert!(!text.contains(&NotReady::Untrusted.note()), "{text}");
+            assert!(text.contains("held packer"), "{text}");
+        }
+
+        #[test]
+        fn a_dependency_listing_refused_over_a_remote_soak_tap_gives_the_remote_note() {
+            // install_cutoff_staged: the same refusal while listing the target's
+            // dependencies.
+            let (text, brew) = packer_with_remote_soak_tap(
+                Some(
+                    "Error: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.",
+                ),
+                "",
+            );
+            let remote = NotReady::Remote(REMOTE.into()).note();
+            assert_eq!(text.matches(&remote).count(), 1, "{text}");
+            assert!(!text.contains(&NotReady::Untrusted.note()), "{text}");
+            assert!(
+                text.contains("held packer: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert!(
+                !visible(&brew).contains(&strs(&["install", "--formula", "packer"])),
+                "{:?}",
+                visible(&brew)
+            );
+        }
+
         #[test]
         fn tap_not_ready_note_prints_once_when_a_hold_and_a_no_soak_step_both_raise_it() {
             let tap = tempfile::tempdir().unwrap();
@@ -4715,15 +4784,17 @@ mod tests {
                 let (mut brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
                 git.insert_blob(
                     "caskcut",
-                    "Casks/f/font-hack.rb",
+                    "Casks/font/font-h/font-hack.rb",
                     cask_rb("font-hack", "1.1.0"),
                 );
                 git.insert_blob(
                     "caskhead",
-                    "Casks/f/font-hack.rb",
+                    "Casks/font/font-h/font-hack.rb",
                     cask_rb("font-hack", "1.2.0"),
                 );
-                let rb = crate::brew::version_only_cask_receipt("font-hack", "1.2.0");
+                // The installed cask is at HEAD (1.2.0) while the cutoff is 1.1.0:
+                // reinstall would pull a too-new artifact (LeaveAheadOfSoak).
+                let rb = cask_rb("font-hack", "1.2.0");
                 brew.installed.push(InstalledPkg {
                     own_tap: Some(crate::origin::OwnTap::Soak),
                     ..cask_pkg_from("font-hack", "homebrew/cask", rb)
@@ -4736,9 +4807,14 @@ mod tests {
                     )
                     .unwrap();
                 }
-                let (r, text) =
-                    verb_run(&brew, &git, &snaps, tap.path(), "reinstall", &["font-hack"]);
+                let (r, text) = apply_reinstall(&brew, &git, &snaps, tap.path(), &["font-hack"]);
                 assert!(r.refused, "file={file}: {text}");
+                assert!(
+                    text.contains(
+                        "font-hack is ahead of soak; reinstall would pull a too-new artifact"
+                    ),
+                    "file={file}: {text}"
+                );
                 assert!(
                     bypass_line(&text).ends_with(
                         "use `brew reinstall --cask homebrew/cask/font-hack` to bypass brewsoak."
