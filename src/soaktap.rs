@@ -1544,6 +1544,63 @@ mod tests {
     }
 
     #[test]
+    fn from_tap_at_rejects_a_parseable_file_when_the_keg_copy_does_not_parse() {
+        let b = brew_with_go_keg(SOAK_RECEIPT, "not ruby");
+        let file = formula_rb("1.1.0");
+        assert!(file_version(PkgKind::Formula, file.as_bytes()).is_some());
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0"),
+            Some(file.as_bytes())
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_matches_a_revisioned_keg_brew_named_differently() {
+        let revised = |rev: u32| {
+            format!(
+                "class X < Formula\n  url \"https://example.com/x-1.1.0.tar.gz\"\n  sha256 \"abc\"\n  revision {rev}\nend\n"
+            )
+        };
+        let b = brew_with_go_keg(SOAK_RECEIPT, &revised(1));
+        let file = revised(1);
+        assert_eq!(
+            file_version(PkgKind::Formula, file.as_bytes()).as_deref(),
+            Some("1.1.0_1")
+        );
+        assert!(from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0_1"),
+            Some(file.as_bytes())
+        ));
+        let other = revised(2);
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0_2"),
+            Some(other.as_bytes())
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_reads_a_latest_cask_file_as_latest_when_no_version_is_given() {
+        let b = brew_with_receipt(PkgKind::Cask, "nightly", "latest", SOAK_RECEIPT);
+        let file = "cask \"nightly\"\n  version :latest\n  sha256 :no_check\n  url \"https://example.com/n.zip\"\n";
+        assert!(from_tap_at(
+            &b,
+            PkgKind::Cask,
+            "nightly",
+            None,
+            Some(file.as_bytes())
+        ));
+    }
+
+    #[test]
     fn from_tap_at_asks_a_latest_cask_as_latest() {
         let b = brew_with_receipt(PkgKind::Cask, "nightly", "latest", SOAK_RECEIPT);
         assert!(from_tap_at(

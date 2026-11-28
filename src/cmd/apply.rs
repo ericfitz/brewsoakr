@@ -311,7 +311,8 @@ pub(super) fn apply_many(
         session.update_before_soaked_work(names)?;
     }
     if brew_verb == "upgrade" {
-        for note in hidden_notes(inv, only) {
+        // Named or bare, a `--cask` run reads no formula, so it has no note.
+        for note in hidden_notes(inv, flags::kind_filter(user_flags)?) {
             session.defer(note);
         }
     }
@@ -3887,6 +3888,24 @@ mod tests {
         }
 
         #[test]
+        fn named_cask_upgrade_has_no_hidden_formula_note() {
+            use crate::cmd::test_support::hidden_world;
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = hidden_world(tap.path());
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(text.contains("acme/tools"), "control: {text}");
+            let (_, text) = run_upgrade(
+                &brew,
+                &git,
+                &core_snaps(),
+                tap.path(),
+                &["alpha"],
+                &["--cask"],
+            );
+            assert!(!text.contains("hides these installed formulae"), "{text}");
+        }
+
+        #[test]
         fn failed_tap_new_is_a_hold_not_an_error() {
             let tap = tempfile::tempdir().unwrap();
             let (mut brew, git) = soak_world(tap.path());
@@ -4243,6 +4262,58 @@ mod tests {
                 assert!(text.lines().any(|l| l.trim() == want), "{want}: {text}");
                 assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
                 assert!(summary_has(&text, "skipped", "1"), "{text}");
+            }
+        }
+
+        #[test]
+        fn install_and_reinstall_lines_label_a_same_version_change() {
+            for verb in ["install", "reinstall"] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git) = soak_world(tap.path());
+                brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+                brew.next_stdout = b"Warning: alpha 1.1.0 already installed\n".to_vec();
+                let cfg = cfg24();
+                let inv = inv_from(&brew, &cfg);
+                let lock = crate::lock::RunLock::for_tests();
+                let names = ["alpha".to_string()];
+                let snaps = core_snaps();
+                let mut out = Vec::new();
+                if verb == "install" {
+                    crate::cmd::install::install(
+                        &lock,
+                        &brew,
+                        &git,
+                        &snaps,
+                        test_cache(),
+                        tap.path(),
+                        &inv,
+                        &cfg,
+                        &names,
+                        false,
+                        false,
+                        &[],
+                        &mut out,
+                    )
+                } else {
+                    reinstall(
+                        &lock,
+                        &brew,
+                        &git,
+                        &snaps,
+                        test_cache(),
+                        tap.path(),
+                        &inv,
+                        &cfg,
+                        &names,
+                        &[],
+                        &mut out,
+                    )
+                }
+                .unwrap();
+                let text = String::from_utf8(out).unwrap();
+                let want = format!("{verb}ing alpha 1.1.0 (source changed)");
+                assert!(text.lines().any(|l| l.trim() == want), "{want}: {text}");
+                assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
             }
         }
 

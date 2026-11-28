@@ -607,6 +607,17 @@ mod tests {
     }
 
     #[test]
+    fn compact_info_line_leaves_a_revision_bump_unlabeled() {
+        let line = compact_info_line(
+            "x",
+            Some(&formula_sha("1.0", 0, "a")),
+            Some(&formula_sha("1.0", 1, "b")),
+            DesiredAction::InstallCutoff,
+        );
+        assert_eq!(line, "x  1.0  would upgrade to 1.0_1");
+    }
+
+    #[test]
     fn evaluate_line_labels_a_same_version_change() {
         let line = evaluate_line(
             "liblinear",

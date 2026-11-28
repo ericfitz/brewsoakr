@@ -976,6 +976,7 @@ mod tests {
             1,
             "{text}"
         );
+        assert!(text.contains("Held:"), "{text}");
         assert!(
             text.find("Held:")
                 < text.find(
@@ -1745,6 +1746,83 @@ mod tests {
         snaps
             .held_taps
             .insert("acme/tools".into(), "fatal: boom".into());
+        let cache = tempfile::tempdir().unwrap();
+        let r = install(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!r.refused);
+        assert!(run_is_name_install(&lock_runs(&brew), "terraform"));
+        let seen = brew.by_name_queries.lock().unwrap().clone();
+        let widget: Vec<_> = seen.iter().filter(|q| q.name == "widget").collect();
+        assert_eq!(widget.len(), 1, "{seen:?}");
+        assert_eq!(widget[0].cutoff_sha256, None);
+        assert!(!widget[0].name.contains('/'));
+    }
+
+    #[test]
+    fn installed_dep_from_a_tap_without_a_snapshot_that_brew_counts_as_satisfied_does_not_refuse_the_target()
+     {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "terraform".to_string(),
+            vec!["acme/tools/widget".to_string()],
+        );
+        let mut by_name = BTreeMap::new();
+        by_name.insert(
+            "widget".to_string(),
+            Ok(ByName {
+                tap: "acme/tools".into(),
+                version: "2.0.0".into(),
+                same_source: false,
+                installed_current: true,
+                satisfied: true,
+            }),
+        );
+        let brew = MockBrew {
+            by_name,
+            deps,
+            installed: vec![formula_pkg_from(
+                "widget",
+                "acme/tools",
+                formula_rb("widget", "2.0.0", "w1"),
+            )],
+            taps: vec![
+                tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                ),
+                tapped("acme/tools", Some("https://github.com/acme/homebrew-tools")),
+            ],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
         let cache = tempfile::tempdir().unwrap();
         let r = install(
             &crate::lock::RunLock::for_tests(),
@@ -3178,6 +3256,87 @@ mod gate_tests {
     }
 
     #[test]
+    fn installed_dep_whose_by_name_call_fails_refuses_the_target() {
+        let git = InMemoryGit::new();
+        git.insert_blob(
+            "tapcut",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.1.0", "midsha"),
+        );
+        git.insert_blob(
+            "taphead",
+            "Formula/terraform.rb",
+            formula_rb("terraform", "1.2.0", "newsha"),
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let mut deps = BTreeMap::new();
+        deps.insert(
+            "terraform".to_string(),
+            vec!["acme/tools/widget".to_string()],
+        );
+        let brew = MockBrew {
+            deps,
+            installed: vec![formula_pkg_from(
+                "widget",
+                "acme/tools",
+                formula_rb("widget", "2.0.0", "w1"),
+            )],
+            taps: vec![
+                tapped(
+                    "hashicorp/tap",
+                    Some("https://github.com/hashicorp/homebrew-tap"),
+                ),
+                tapped("acme/tools", Some("https://github.com/acme/homebrew-tools")),
+            ],
+            ..MockBrew::new()
+        };
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let brew = RecordBrew {
+            inner: brew,
+            tokens: Mutex::new(Vec::new()),
+            fail_by_name: Some("widget"),
+        };
+        let mut snaps = tap_snaps(&git, "hashicorp/tap", Some("tapcut"), "taphead");
+        snaps
+            .held_taps
+            .insert("acme/tools".into(), "fatal: boom".into());
+        let cache = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        let r = install(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &snaps,
+            cache.path(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hashicorp/tap/terraform".into()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert!(r.refused);
+        assert!(
+            lock_runs(&brew.inner)
+                .iter()
+                .chain(brew.inner.visible_runs.lock().unwrap().iter())
+                .all(|a| a.first().map(String::as_str) != Some("install")),
+            "no install ran"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains(
+                "cannot install terraform: dependency widget: tap acme/tools could not be refreshed, and brew does not count the installed widget as up to date;"
+            ) && text.contains("fatal: boom"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn whole_call_by_name_failure_on_a_dependency_holds_it_as_a_lookup_failure() {
         let git = tap_git(&["alpha", "delta", "libx"]);
         let brew = RecordBrew {
@@ -3538,6 +3697,32 @@ mod soak_closure_tests {
             );
             let file = tap_file(tap.path(), "Formula/dep.rb");
             assert_eq!(file.is_some(), kept, "kept={kept}");
+        }
+    }
+
+    #[test]
+    fn soak_receipt_dependency_with_a_differently_named_keg_keeps_its_file_only_for_a_matching_copy()
+     {
+        // brew named the keg `go1.1_2`, not the cutoff's `1.1.0`: the file the
+        // dependency's cutoff wrote is kept when the keg's own copy has the
+        // file's version, and put back otherwise.
+        for (copy_version, kept) in [("1.1.0", true), ("1.0.0", false)] {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = world(tap.path(), with_tap(at_cutoff("dep"), OwnTap::Soak));
+            brew.by_name
+                .insert("dep".into(), answer(false, "1.2.0", false));
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "dep".into(), "go1.1_2".into()),
+                SOAK_TAP.into(),
+            );
+            brew.kegs.insert(
+                ("dep".into(), "go1.1_2".into()),
+                formula_rb("dep", copy_version, "midsha"),
+            );
+            let text = run(&brew, &git, tap.path(), &["target"]);
+            assert!(!text.contains("held target"), "{text}");
+            let file = tap_file(tap.path(), "Formula/dep.rb");
+            assert_eq!(file.is_some(), kept, "copy {copy_version}: {text}");
         }
     }
 

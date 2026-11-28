@@ -264,7 +264,8 @@ pub fn info(
     if let Some(why) = soaktap::unusable_with_packages(inv, only) {
         writeln!(out, "{}", why.note())?;
     }
-    for note in hidden_notes(inv, only) {
+    // Named or bare, a `--cask` run reads no formula, so it has no note.
+    for note in hidden_notes(inv, flags::kind_filter(user_flags)?) {
         writeln!(out, "{note}")?;
     }
     Ok(RunResult {
@@ -738,6 +739,17 @@ mod tests {
         )
         .unwrap();
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn named_info_with_cask_has_no_hidden_formula_note() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let text = bare_info(&brew, &git, &["alpha"], &[]);
+        assert!(text.contains("acme/tools"), "control: {text}");
+        let text = bare_info(&brew, &git, &["alpha"], &["--cask"]);
+        assert!(!text.contains("hides these installed formulae"), "{text}");
     }
 
     #[test]
