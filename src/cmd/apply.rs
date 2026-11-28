@@ -949,11 +949,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 let left = if failed || self.counts.dry_run {
                     None
                 } else if origin::is_core_or_cask(origin_tap) {
-                    let at_cutoff =
-                        self.keg_from_soak_tap_at(kind, name, view.cutoff_blob.as_deref());
-                    (!at_cutoff).then(|| {
+                    // brew installed it from the soak tap only when a receipt
+                    // of the package names that tap (any keg version, so a keg
+                    // directory brew named differently still counts, #24) and
+                    // brew did not say it left the package alone.
+                    let from_tap = self
+                        .brew
+                        .installed_receipt_taps(kind, name)
+                        .iter()
+                        .any(|t| origin::own_tap(t) == Some(OwnTap::Soak));
+                    (no_op.is_some() || !from_tap).then(|| {
                         no_op.unwrap_or_else(|| {
-                            "its keg is not from brewsoak's tap at the cutoff version".to_string()
+                            "its receipt does not name brewsoak's tap".to_string()
                         })
                     })
                 } else {
@@ -2607,6 +2614,9 @@ mod tests {
         fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
             self.inner.receipt_tap(kind, name, version)
         }
+        fn installed_receipt_taps(&self, kind: PkgKind, name: &str) -> Vec<String> {
+            self.inner.installed_receipt_taps(kind, name)
+        }
         fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
             self.inner.outdated_names(greedy)
         }
@@ -3462,10 +3472,45 @@ mod tests {
             assert!(summary_has(&text, "upgraded", "0"), "{text}");
             assert!(summary_has(&text, "skipped", "1"), "{text}");
             assert!(
-                text.contains("alt-tab: brew left the installed version in place: its keg is not from brewsoak's tap at the cutoff version"),
+                text.contains("alt-tab: brew left the installed version in place: its receipt does not name brewsoak's tap"),
                 "{text}"
             );
             assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+        }
+
+        #[test]
+        fn formula_target_whose_keg_dir_differs_from_the_parsed_version_is_upgraded() {
+            // Issue #24: brew named the new keg `go1.1_2`, the cutoff file
+            // parses as 1.1.0; the receipt names the soak tap.
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "alpha".into(), "go1.1_2".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(summary_has(&text, "upgraded", "1"), "{text}");
+            assert!(summary_has(&text, "skipped", "0"), "{text}");
+            assert!(!text.contains("brew left the installed version"), "{text}");
+            assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+        }
+
+        #[test]
+        fn soak_receipt_cask_that_brew_reports_not_upgrading_is_skipped() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alt_tab_world(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Cask, "alt-tab".into(), "7.38.1".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            brew.next_stdout = ALT_TAB_NOOP.as_bytes().to_vec();
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alt-tab"], &[]);
+            assert!(summary_has(&text, "upgraded", "0"), "{text}");
+            assert!(summary_has(&text, "skipped", "1"), "{text}");
+            assert!(
+                text.contains("alt-tab: brew left the installed version in place: Not upgrading alt-tab, no newer app version was detected"),
+                "{text}"
+            );
         }
 
         #[test]

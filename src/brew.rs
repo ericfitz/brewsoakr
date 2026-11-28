@@ -254,6 +254,15 @@ pub trait Brew {
     /// `source.version` is `version`. `None` when there is no such keg or
     /// receipt or the value is not a string. The soak tap's name is not erased.
     fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String>;
+    /// Lowercase `source.tap` of every receipt `name` has installed, whatever
+    /// its version (the version string of a keg need not match brewsoak's
+    /// parse of the file, issue #24). Cask: the one Caskroom `.metadata`
+    /// receipt. Formula: the receipt of each keg under `<cellar>/<name>/`,
+    /// newest receipt (by file mtime) first. Receipts with no string tap are
+    /// left out. The default knows of none.
+    fn installed_receipt_taps(&self, _kind: PkgKind, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// Names brew itself considers outdated right now (no `brew update`),
     /// with the same greedy mode `upgrade` passes to brew.
     fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error>;
@@ -685,6 +694,23 @@ impl Brew for ProcessBrew {
             .find(|l| !l.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| format!("brew exited {}", output.status.code().unwrap_or(1))))
+    }
+
+    fn installed_receipt_taps(&self, kind: PkgKind, name: &str) -> Vec<String> {
+        match kind {
+            PkgKind::Formula => self
+                .cellar()
+                .map(|c| read_formula_receipt_taps(&c, name))
+                .unwrap_or_default(),
+            PkgKind::Cask => self
+                .caskroom()
+                .and_then(|c| {
+                    let path = c.join(name).join(".metadata").join("INSTALL_RECEIPT.json");
+                    read_receipt_tap(&path, None)
+                })
+                .into_iter()
+                .collect(),
+        }
     }
 
     fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
@@ -1281,6 +1307,14 @@ impl Brew for MockBrew {
             .cloned()
     }
 
+    fn installed_receipt_taps(&self, kind: PkgKind, name: &str) -> Vec<String> {
+        self.receipt_taps
+            .iter()
+            .filter(|((k, n, _), _)| *k == kind && n == name)
+            .map(|(_, tap)| tap.clone())
+            .collect()
+    }
+
     fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
         self.outdated_modes
             .lock()
@@ -1570,6 +1604,25 @@ fn read_receipt_tap(path: &Path, version: Option<&str>) -> Option<String> {
     json_string_value(source, "tap")
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())
+}
+
+/// `source.tap` of each keg receipt under `<cellar>/<name>/`, newest receipt
+/// (file mtime, then directory name) first.
+fn read_formula_receipt_taps(cellar: &Path, name: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(cellar.join(name)) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(std::time::SystemTime, String, String)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path().join("INSTALL_RECEIPT.json");
+            let tap = read_receipt_tap(&path, None)?;
+            let mtime = std::fs::metadata(&path).ok()?.modified().ok()?;
+            Some((mtime, e.file_name().to_string_lossy().into_owned(), tap))
+        })
+        .collect();
+    found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    found.into_iter().map(|(_, _, tap)| tap).collect()
 }
 
 fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Option<String> {
@@ -4108,6 +4161,50 @@ esac
         );
         assert_eq!(brew.receipt_tap(PkgKind::Formula, "wget", "1.0"), None);
         assert_eq!(brew.receipt_tap(PkgKind::Formula, "curl", "1.0_1"), None);
+    }
+
+    #[test]
+    fn installed_receipt_taps_ignore_the_version_and_list_newest_first() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let write = |ver: &str, tap: &str, secs: u64| {
+            let keg = tmp.path().join("wget").join(ver);
+            std::fs::create_dir_all(&keg).expect("keg");
+            let path = keg.join("INSTALL_RECEIPT.json");
+            std::fs::write(&path, format!(r#"{{"source":{{"tap":"{tap}"}}}}"#)).expect("r");
+            let f = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open");
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .expect("mtime");
+        };
+        write("1.0", "homebrew/core", 100);
+        write("go1.1_2", "EricFitz/Brewsoak", 200);
+        std::fs::create_dir_all(tmp.path().join("wget").join("0.9")).expect("no receipt");
+        let meta = tmp.path().join("alt-tab").join(".metadata");
+        std::fs::create_dir_all(&meta).expect("meta");
+        std::fs::write(
+            meta.join("INSTALL_RECEIPT.json"),
+            r#"{"source":{"tap":"homebrew/cask","version":"7.38.1"}}"#,
+        )
+        .expect("receipt");
+        let brew = rooms(tmp.path(), tmp.path());
+        assert_eq!(
+            brew.installed_receipt_taps(PkgKind::Formula, "wget"),
+            ["ericfitz/brewsoak", "homebrew/core"]
+        );
+        assert!(
+            brew.installed_receipt_taps(PkgKind::Formula, "curl")
+                .is_empty()
+        );
+        assert_eq!(
+            brew.installed_receipt_taps(PkgKind::Cask, "alt-tab"),
+            ["homebrew/cask"]
+        );
+        assert!(
+            brew.installed_receipt_taps(PkgKind::Cask, "other")
+                .is_empty()
+        );
     }
 
     #[test]
