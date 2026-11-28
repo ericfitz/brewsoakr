@@ -6,6 +6,7 @@
 
 use crate::Error;
 use crate::brew::Brew;
+use crate::error::first_line;
 use crate::identity::{self, PkgIdentity};
 use crate::inventory::Pkg;
 use crate::lock::RunLock;
@@ -354,14 +355,6 @@ impl SoakTap {
     }
 }
 
-fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("no detail")
-        .to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +526,47 @@ mod tests {
             s.ready(&brew),
             Err(NotReady::CreateFailed("Error: nope".into()))
         );
+    }
+
+    #[test]
+    fn ready_reports_a_tap_that_is_not_listed_after_creation() {
+        let e = env();
+        let brew = MockBrew {
+            soak_tap: None,
+            tap_unlisted_after_create: true,
+            ..MockBrew::new()
+        };
+        let mut s = e.soak(None, false);
+        assert_eq!(
+            s.ready(&brew),
+            Err(NotReady::CreateFailed(
+                "brew created it but does not list it".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn ready_applies_the_row_that_holds_after_creation() {
+        let e = env();
+        let brew = MockBrew {
+            soak_tap: None,
+            tap_after_create: Some(TapInfo::new(SOAK_TAP, Some("https://x"))),
+            ..MockBrew::new()
+        };
+        let mut s = e.soak(None, false);
+        assert_eq!(s.ready(&brew), Err(NotReady::Remote("https://x".into())));
+    }
+
+    #[test]
+    fn ready_reports_a_tap_info_error_after_creation() {
+        let e = env();
+        let brew = MockBrew {
+            soak_tap: None,
+            tap_info_error_after_create: Some("boom\nmore".into()),
+            ..MockBrew::new()
+        };
+        let mut s = e.soak(None, false);
+        assert_eq!(s.ready(&brew), Err(NotReady::CreateFailed("boom".into())));
     }
 
     #[test]
@@ -797,6 +831,33 @@ mod tests {
         let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", "homebrew/core");
         s.settle(&e.lock, &brew).unwrap();
         assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+    }
+
+    #[test]
+    fn settle_puts_back_when_the_keg_is_from_the_legacy_tap() {
+        let e = env();
+        let body = formula_rb("1.1.0");
+        let mut s = staged_wget(&e, false, Some(OLD), &body, Some("1.1.0"));
+        let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", "brewsoakr/soaked");
+        s.settle(&e.lock, &brew).unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+    }
+
+    #[test]
+    fn settle_trusts_the_recorded_version_over_the_file_version() {
+        let e = env();
+        let body = formula_rb("1.1.0");
+        let mut s = staged_wget(&e, false, None, &body, Some("1.1.0_1"));
+        let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0_1", "ericfitz/brewsoak");
+        s.settle(&e.lock, &brew).unwrap();
+        assert!(e.file("Formula", "wget").exists());
+        // The file's own version has a receipt too, but the recorded one decides.
+        let e = env();
+        let mut s = staged_wget(&e, false, None, &body, Some("1.1.0_1"));
+        let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", "ericfitz/brewsoak");
+        s.settle(&e.lock, &brew).unwrap();
+        assert!(!e.file("Formula", "wget").exists());
     }
 
     #[test]

@@ -122,14 +122,7 @@ pub(super) struct CutoffDepWalk<'a, B, G> {
     pub(super) by_name: Option<NameHold>,
 }
 
-/// First line of brew's text, for a hold line.
-pub(super) fn first_line(text: &str) -> String {
-    text.lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty())
-        .unwrap_or("no detail")
-        .to_string()
-}
+pub(super) use crate::error::first_line;
 
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
     fn hold(&mut self, role: Role, name: &str, why: NameFail) {

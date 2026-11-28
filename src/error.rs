@@ -50,6 +50,15 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// First line of brew's text, for a hold line or a note.
+pub(crate) fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("no detail")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

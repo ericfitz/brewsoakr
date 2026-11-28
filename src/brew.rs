@@ -455,6 +455,13 @@ pub struct MockBrew {
     pub tap_new_error: Option<String>,
     /// Set by a successful `tap_new`.
     pub tap_created: Mutex<bool>,
+    /// What `tap_info` lists once `tap_new` has succeeded, instead of the
+    /// untrusted local tap.
+    pub tap_after_create: Option<TapInfo>,
+    /// After a successful `tap_new`, `tap_info` still does not list the tap.
+    pub tap_unlisted_after_create: bool,
+    /// After a successful `tap_new`, `tap_info` fails with this text.
+    pub tap_info_error_after_create: Option<String>,
     /// What `receipt_tap` reports, keyed by `(kind, name, version)`.
     pub receipt_taps: BTreeMap<(PkgKind, String, String), String>,
     /// Runs before the answer of `run`, `run_visible_in`, `tap_new` (their
@@ -527,6 +534,9 @@ impl Default for MockBrew {
             soak_tap: Some(TapInfo::new(crate::origin::SOAK_TAP, None)),
             tap_new_error: None,
             tap_created: Mutex::new(false),
+            tap_after_create: None,
+            tap_unlisted_after_create: false,
+            tap_info_error_after_create: None,
             receipt_taps: BTreeMap::new(),
             on_call: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
@@ -1219,11 +1229,18 @@ impl Brew for MockBrew {
     }
 
     fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
+        let created = *self.tap_created.lock().unwrap_or_else(|e| e.into_inner());
+        if created && let Some(message) = &self.tap_info_error_after_create {
+            return Err(Error::Other(message.clone()));
+        }
         let mut taps = self.taps.clone();
         if !taps.iter().any(|t| t.name == crate::origin::SOAK_TAP) {
             if let Some(soak) = &self.soak_tap {
                 taps.push(soak.clone());
-            } else if *self.tap_created.lock().unwrap_or_else(|e| e.into_inner()) {
+            } else if created && self.tap_unlisted_after_create {
+            } else if created && let Some(soak) = &self.tap_after_create {
+                taps.push(soak.clone());
+            } else if created {
                 let mut soak = TapInfo::new(crate::origin::SOAK_TAP, None);
                 soak.trusted = false;
                 taps.push(soak);
