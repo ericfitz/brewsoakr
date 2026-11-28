@@ -38,6 +38,7 @@ pub fn outdated(
     extra_args: &[String],
     out: &mut impl Write,
 ) -> Result<RunResult, Error> {
+    let only = flags::kind_filter(extra_args)?;
     let verbose = is_verbose(extra_args);
     let greedy = flags::greedy_mode(extra_args);
     if verbose {
@@ -61,7 +62,11 @@ pub fn outdated(
     let mut soaked = 0usize;
     let mut no_soak_names = Vec::new();
     prefetch_orderings(brew, git, snaps, cache, inv);
-    for pkg in &inv.pkgs {
+    for pkg in inv
+        .pkgs
+        .iter()
+        .filter(|p| flags::kind_matches(only, p.kind))
+    {
         if verbose {
             writeln!(
                 out,
@@ -216,7 +221,7 @@ pub fn outdated(
     if let Some(why) = crate::soaktap::unusable_with_packages(inv) {
         held.push(why.note());
     }
-    held.extend(hidden_notes(inv, None));
+    held.extend(hidden_notes(inv, only));
     write_section_always(out, "==> Outdated (will upgrade)", &upgrades)?;
     write_section_always(out, "==> No-soak (brew)", &no_soak)?;
     write_section_always(out, "==> Held", &held)?;
@@ -783,5 +788,64 @@ mod tests {
         });
         assert!(section_lines(&text, "==> Held").contains(&note), "{text}");
         assert!(!r.refused);
+    }
+
+    fn outdated_with(brew: &MockBrew, git: &InMemoryGit, args: &[&str]) -> Result<String, Error> {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let mut out = Vec::new();
+        outdated(
+            brew,
+            git,
+            &core_snaps(),
+            test_cache(),
+            &inv,
+            &cfg,
+            &args,
+            &mut out,
+        )?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn outdated_with_cask_lists_only_casks() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = outdated_with(&brew, &git, &["--cask"]).unwrap();
+        assert!(text.contains("docker (4.0) < 4.1"), "{text}");
+        assert!(!text.contains("alpha"), "{text}");
+        assert!(!text.contains("thing"), "{text}");
+    }
+
+    #[test]
+    fn outdated_with_formula_lists_only_formulae() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = outdated_with(&brew, &git, &["--formula"]).unwrap();
+        assert!(text.contains("alpha (1.0.0) < 1.1.0"), "{text}");
+        assert!(text.contains("thing"), "{text}");
+        assert!(!text.contains("docker"), "{text}");
+    }
+
+    #[test]
+    fn outdated_with_both_kind_flags_is_a_usage_error() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let r = outdated_with(&brew, &git, &["--formula", "--cask"]);
+        assert!(matches!(r, Err(Error::Usage(_))));
+    }
+
+    #[test]
+    fn outdated_with_cask_has_no_hidden_formula_note() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let text = outdated_with(&brew, &git, &[]).unwrap();
+        assert!(text.contains("widget"), "{text}");
+        let text = outdated_with(&brew, &git, &["--cask"]).unwrap();
+        assert!(!text.contains("widget"), "{text}");
+        let text = outdated_with(&brew, &git, &["--formula"]).unwrap();
+        assert!(text.contains("widget"), "{text}");
     }
 }

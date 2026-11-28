@@ -8,6 +8,7 @@ use crate::Error;
 use crate::brew::Brew;
 use crate::config::Config;
 use crate::eligibility::DesiredAction;
+use crate::flags;
 use crate::git::GitStore;
 use crate::inventory::{Inventory, PkgClass};
 use crate::nosoak;
@@ -43,8 +44,17 @@ pub fn info(
     if names.is_empty() {
         prefetch_orderings(brew, git, snaps, cache, inv);
     }
+    let only = if names.is_empty() {
+        flags::kind_filter(user_flags)?
+    } else {
+        None
+    };
     let owned_names: Vec<String> = if names.is_empty() {
-        inv.pkgs.iter().map(|p| p.name.clone()).collect()
+        inv.pkgs
+            .iter()
+            .filter(|p| flags::kind_matches(only, p.kind))
+            .map(|p| p.name.clone())
+            .collect()
     } else {
         names.to_vec()
     };
@@ -231,7 +241,7 @@ pub fn info(
     if let Some(why) = soaktap::unusable_with_packages(inv) {
         writeln!(out, "{}", why.note())?;
     }
-    for note in hidden_notes(inv, None) {
+    for note in hidden_notes(inv, only) {
         writeln!(out, "{note}")?;
     }
     Ok(RunResult {
@@ -644,5 +654,47 @@ mod tests {
         });
         assert!(text.ends_with(&format!("{note}\n")), "{text}");
         assert!(!r.refused);
+    }
+
+    fn bare_info(brew: &MockBrew, git: &InMemoryGit, names: &[&str], flags: &[&str]) -> String {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let flags: Vec<String> = flags.iter().map(|n| n.to_string()).collect();
+        let mut out = Vec::new();
+        info(
+            brew,
+            git,
+            &core_snaps(),
+            test_cache(),
+            &inv,
+            &cfg,
+            &names,
+            &flags,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn bare_info_with_cask_lists_only_casks() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = bare_info(&brew, &git, &[], &["--cask"]);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("docker  4.0  would upgrade to 4.1")),
+            "{text}"
+        );
+        assert!(!text.lines().any(|l| l.starts_with("alpha")), "{text}");
+    }
+
+    #[test]
+    fn named_info_ignores_the_kind_filter() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = bare_info(&brew, &git, &["alpha"], &["--cask"]);
+        assert!(text.contains("alpha"), "{text}");
     }
 }

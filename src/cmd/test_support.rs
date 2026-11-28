@@ -712,6 +712,23 @@ pub(super) fn soak_world(tap: &Path) -> (MockBrew, InMemoryGit) {
     (brew, git)
 }
 
+/// `soak_world` (formula `alpha` 1.0.0 behind cutoff 1.1.0, unsoakable formula
+/// `thing`) plus cask `docker` 4.0 (version-only receipt, tap homebrew/cask)
+/// behind `cask_rb("docker", "4.1")` at `caskcut` and `caskhead`,
+/// path `Casks/d/docker.rb`.
+pub(super) fn formula_and_cask_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+    let (mut brew, git) = soak_world(tap);
+    for sha in ["caskcut", "caskhead"] {
+        git.insert_blob(sha, "Casks/d/docker.rb", cask_rb("docker", "4.1"));
+    }
+    brew.installed.push(cask_pkg_from(
+        "docker",
+        "homebrew/cask",
+        crate::brew::version_only_cask_receipt("docker", "4.0"),
+    ));
+    (brew, git)
+}
+
 /// `soak_world` plus a formula `widget` brew hides because its tap,
 /// `acme/tools` (HTTPS remote), is untrusted.
 pub(super) fn hidden_world(tap: &Path) -> (MockBrew, InMemoryGit) {

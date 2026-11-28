@@ -227,9 +227,21 @@ pub(super) fn apply_many(
         .ok_or_else(|| Error::Usage(format!("unknown brew verb: {brew_verb}")))?;
     let dry_run = flags::is_dry_run(user_flags);
     // Only a bare upgrade knows its plan up front, and always shows it.
+    // A bare run's kind filter narrows the walk below, never the inventory:
+    // tap maintenance still sees every installed package.
+    let only = if bare_run {
+        flags::kind_filter(user_flags)?
+    } else {
+        None
+    };
+    let walked = || {
+        inv.pkgs
+            .iter()
+            .filter(|p| flags::kind_matches(only, p.kind))
+    };
     let plan = plan_total
         .filter(|_| bare_run)
-        .map(|total| (total, inv.pkgs.len()));
+        .map(|total| (total, walked().count()));
     let mut session = ApplySession {
         lock,
         brew,
@@ -280,7 +292,11 @@ pub(super) fn apply_many(
     }
     if is_verbose(user_flags) {
         let doing = match brew_verb {
-            "upgrade" => "upgrading installed formulae and casks",
+            "upgrade" => match only {
+                None => "upgrading installed formulae and casks",
+                Some(PkgKind::Formula) => "upgrading installed formulae",
+                Some(PkgKind::Cask) => "upgrading installed casks",
+            },
             "install" => "installing",
             "reinstall" => "reinstalling",
             other => other,
@@ -295,8 +311,7 @@ pub(super) fn apply_many(
         session.update_before_soaked_work(names)?;
     }
     if brew_verb == "upgrade" {
-        // Task 5's kind filter replaces `None` with the kind this run walks.
-        for note in hidden_notes(inv, None) {
+        for note in hidden_notes(inv, only) {
             session.defer(note);
         }
     }
@@ -306,7 +321,7 @@ pub(super) fn apply_many(
     if bare_run {
         // Walk the installed packages themselves: a formula and a cask can
         // share a name, and a name alone finds only one of them.
-        for pkg in &inv.pkgs {
+        for pkg in walked() {
             session.apply_pkg(pkg)?;
         }
     } else {
