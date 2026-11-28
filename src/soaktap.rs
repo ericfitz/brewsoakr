@@ -360,9 +360,11 @@ impl SoakTap {
 /// `<name>.absent` directly under `soak-tap-undo/Formula` or `/Casks`; any
 /// other file is left alone. Repeating it finds nothing; a run that died
 /// halfway is finished by the next, because `settle_entry` deletes an entry
-/// last. Creates nothing when there is no undo directory.
+/// last. Every entry is tried; the first error is returned after the rest
+/// are settled. Creates nothing when there is no undo directory.
 pub fn recover(_lock: &RunLock, brew: &impl Brew, dir: &Path, cache: &Path) -> Result<(), Error> {
     let undo_root = cache.join(UNDO_DIR);
+    let mut first = None;
     for kind in [PkgKind::Formula, PkgKind::Cask] {
         let Ok(entries) = std::fs::read_dir(undo_root.join(kind_dir(kind))) else {
             continue;
@@ -382,10 +384,12 @@ pub fn recover(_lock: &RunLock, brew: &impl Brew, dir: &Path, cache: &Path) -> R
             }
         }
         for name in names {
-            settle_entry(brew, dir, &undo_root, kind, &name, None, true)?;
+            if let Err(e) = settle_entry(brew, dir, &undo_root, kind, &name, None, true) {
+                first.get_or_insert(e);
+            }
         }
     }
-    Ok(())
+    first.map_or(Ok(()), Err)
 }
 
 /// Remove every `.rb` under `dir/Formula` and `dir/Casks` that has no undo
@@ -411,7 +415,16 @@ pub fn prune(
                     .iter()
                     .any(|p| p.kind == kind && p.name == name && p.own_tap == Some(OwnTap::Soak))
         };
-        prune_walk(&dir.join(kind_dir(kind)), &used, verbose, out)?;
+        let root = dir.join(kind_dir(kind));
+        match std::fs::symlink_metadata(&root) {
+            Ok(m) if m.is_dir() => prune_walk(&root, &used, verbose, out)?,
+            Ok(_) => writeln!(
+                out,
+                "brewsoak: warning: not pruning {}: not a real directory",
+                root.display()
+            )?,
+            Err(_) => {}
+        }
     }
     Ok(())
 }
@@ -1402,16 +1415,62 @@ mod tests {
     fn prune_warns_and_continues_when_a_removal_fails() {
         use std::os::unix::fs::PermissionsExt;
         let e = env();
-        e.put(&e.tap.path().join("Formula/locked/a.rb"), b"a");
-        e.put(&e.file("Formula", "b"), b"b");
-        let locked = e.tap.path().join("Formula/locked");
+        e.put(&e.tap.path().join("Formula/a-locked/x.rb"), b"a");
+        e.put(&e.file("Formula", "z"), b"z");
+        let locked = e.tap.path().join("Formula/a-locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        // Probe: as root, or on a filesystem that ignores the mode, nothing blocks.
+        let probe = locked.join("probe");
+        let blocks = fs::write(&probe, b"p").is_err();
+        if !blocks {
+            let _ = fs::remove_file(&probe);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipped: permissions do not block deletion here");
+            return;
+        }
         let out = prune_in(&e, &inv_with(vec![]), false);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(!e.file("Formula", "b").exists());
-        if locked.join("a.rb").exists() {
-            assert!(out.contains("brewsoak: warning: could not prune"), "{out}");
-        }
+        assert!(locked.join("x.rb").exists());
+        assert!(out.contains("brewsoak: warning: could not prune"), "{out}");
+        assert!(!e.file("Formula", "z").exists());
+    }
+
+    #[test]
+    fn prune_skips_a_symlinked_formula_root() {
+        let e = env();
+        let outside = tempfile::tempdir().unwrap();
+        e.put(&outside.path().join("keep.rb"), b"k");
+        std::os::unix::fs::symlink(outside.path(), e.tap.path().join("Formula")).unwrap();
+        e.put(&e.file("Casks", "old"), b"o");
+        let out = prune_in(&e, &inv_with(vec![]), false);
+        assert_eq!(fs::read(outside.path().join("keep.rb")).unwrap(), b"k");
+        assert!(out.contains("not a real directory"), "{out}");
+        assert!(!e.file("Casks", "old").exists());
+    }
+
+    #[test]
+    fn recover_settles_every_entry_and_returns_the_first_error() {
+        let e = env();
+        let dir = e.cache.path().join(UNDO_DIR).join("Formula");
+        fs::create_dir_all(dir.join("target")).unwrap();
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("bad.rb")).unwrap();
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        e.put(&e.file("Casks", "c"), cask_rb("1.0").as_bytes());
+        e.put(&e.undo("Casks", "c", "absent"), b"");
+        assert!(recover_in(&e, &MockBrew::new()).is_err());
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+        assert!(!e.file("Casks", "c").exists());
+    }
+
+    #[test]
+    fn recover_restores_previous_bytes_when_the_tap_file_is_missing() {
+        let e = env();
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
     }
 
     fn seeded(e: &Env) {
