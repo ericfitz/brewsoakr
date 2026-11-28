@@ -13,8 +13,9 @@ use super::view::{
 };
 use super::{RunResult, is_verbose};
 use crate::Error;
-use crate::brew::Brew;
+use crate::brew::{Brew, NameQuery};
 use crate::config::Config;
+use crate::digest::sha256_hex;
 use crate::eligibility::{self, DesiredAction, UpstreamStatus};
 use crate::flags;
 use crate::git::GitStore;
@@ -919,7 +920,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
         let installing = view.cutoff.as_ref().map(report::identity_version);
         match self.run_install(&pkg, origin_tap, view.cutoff_blob.as_deref(), installing)? {
-            InstallRun::Ran { failed } => {
+            InstallRun::Ran { failed, .. } => {
                 // Counted as upgraded when it was announced; brew failed.
                 if failed {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
@@ -969,7 +970,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         };
         Ok(
             match self.record_name_install(origin_tap, &pkg.name, pkg.kind, installing, &args)? {
-                NameRun::Ran { failed } => InstallRun::Ran { failed },
+                NameRun::Ran { failed, why } => InstallRun::Ran { failed, why },
                 NameRun::Untrusted(tap) => InstallRun::Untrusted(tap),
                 NameRun::TapNotReady => InstallRun::NotReady(NotReady::Untrusted),
             },
@@ -1090,11 +1091,23 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         });
         let installing = want.as_ref().map(report::identity_version);
         match self.run_install(&pkg, dep_origin, blobs.cutoff.as_deref(), installing)? {
-            InstallRun::Ran { failed } => {
+            InstallRun::Ran { failed, why } => {
                 if failed && counted_here && self.counted_deps.remove(dep) {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
-                if let Some(line) = preview
+                // brew takes a dependency that is not in brewsoak's tap from
+                // core's current file when the target runs, so the target
+                // goes on only when this one is at its cutoff.
+                if !self.counts.dry_run
+                    && origin::is_core_or_cask(dep_origin)
+                    && !self.dep_at_cutoff(kind, dep, dep_origin, blobs.cutoff.as_deref())?
+                {
+                    self.uncount_dep(dep);
+                    self.hold_target_dep_not_from_tap(target, dep, &why)?;
+                    return Ok(false);
+                }
+                if !failed
+                    && let Some(line) = preview
                     && self.previewed_deps.insert(dep.to_string())
                 {
                     writeln!(self.out, "{line}")?;
@@ -1126,6 +1139,71 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
         Ok(true)
+    }
+
+    /// After a real run of a core or cask dependency's soak-tap command: its
+    /// keg is anchored in brewsoak's tap at the cutoff version, or brew would
+    /// load exactly the cutoff file for it (`installed_dep_rule` passes).
+    fn dep_at_cutoff(
+        &self,
+        kind: PkgKind,
+        dep: &str,
+        dep_origin: &str,
+        cutoff: Option<&[u8]>,
+    ) -> Result<bool, Error> {
+        let cutoff_version = cutoff.and_then(|c| soaktap::file_version(kind, c));
+        if cutoff_version.as_deref().is_some_and(|v| {
+            self.brew
+                .receipt_tap(kind, dep, v)
+                .is_some_and(|t| origin::own_tap(&t) == Some(OwnTap::Soak))
+        }) {
+            return Ok(true);
+        }
+        let query = NameQuery {
+            kind,
+            name: dep.to_string(),
+            origin: dep_origin.to_ascii_lowercase(),
+            cutoff_sha256: cutoff.map(sha256_hex),
+        };
+        let answer = match self.brew.by_name(std::slice::from_ref(&query)) {
+            Ok(rows) => rows.into_iter().next(),
+            Err(Error::Brew { .. }) => None,
+            Err(e) => return Err(e),
+        };
+        let Some(Ok(answer)) = answer else {
+            return Ok(false);
+        };
+        let installed = self.inv.find_in(dep_origin, dep).filter(|p| p.kind == kind);
+        let installed_version =
+            installed.and_then(|p| soaktap::file_version(kind, p.receipt_rb.as_bytes()));
+        let rule = soaktap::installed_dep_rule(
+            answer.satisfied,
+            installed.and_then(|p| p.own_tap),
+            installed_version.as_deref(),
+            cutoff_version.as_deref(),
+            answer.installs_cutoff(dep_origin),
+        );
+        Ok(rule == soaktap::DepRule::Pass)
+    }
+
+    /// A core or cask dependency did not end up installed from brewsoak's
+    /// tap (its command failed, or brew left an unanchored keg), so the target
+    /// would pull it from core's current file: hold the target.
+    fn hold_target_dep_not_from_tap(
+        &mut self,
+        target: &str,
+        dep: &str,
+        why: &str,
+    ) -> Result<(), Error> {
+        self.hold_target_for_dep();
+        writeln!(
+            self.out,
+            "held {target}: its dependency {dep} was not installed from brewsoak's tap"
+        )?;
+        self.defer_held(format!(
+            "{target}: held: its dependency {dep} was not installed from brewsoak's tap ({why})"
+        ));
+        Ok(())
     }
 
     /// Take back the upgraded count of a dependency that was announced and
@@ -1332,11 +1410,16 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         // answer changes nothing.
         let installed_now = output.status.success() && !already_installed_message(&output);
         let failed = brew_failed(&output);
+        let why = if failed {
+            first_error_line(&output)
+        } else {
+            "brew left the installed version in place".to_string()
+        };
         merge_status(&mut self.brew_status, output);
         if installed_now {
             self.forget_origin(kind, name)?;
         }
-        Ok(NameRun::Ran { failed })
+        Ok(NameRun::Ran { failed, why })
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1415,6 +1498,20 @@ pub(crate) fn merge_status(slot: &mut Option<i32>, output: std::process::Output)
     max_status(slot, code);
 }
 
+/// brew's first `Error:` line, else the first line it printed.
+fn first_error_line(output: &std::process::Output) -> String {
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    text.lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("Error:"))
+        .map(str::to_string)
+        .unwrap_or_else(|| first_line(&text))
+}
+
 /// brew exited non-zero and not with its "already installed" no-op answer.
 pub(super) fn brew_failed(output: &std::process::Output) -> bool {
     !output.status.success() && !already_installed_message(output)
@@ -1423,7 +1520,9 @@ pub(super) fn brew_failed(output: &std::process::Output) -> bool {
 /// What one by-name `brew install` came to.
 pub(super) enum NameRun {
     /// brew ran; `failed` when it exited non-zero for a reason of its own.
-    Ran { failed: bool },
+    /// `why` is what to say when the run did not leave the package installed:
+    /// brew's first error line, or that it left the installed version alone.
+    Ran { failed: bool, why: String },
     /// brew does not trust this tap (lowercase `user/repo`).
     Untrusted(String),
     /// brew does not trust brewsoak's own tap.
@@ -1432,7 +1531,7 @@ pub(super) enum NameRun {
 
 /// What `run_install` came to.
 enum InstallRun {
-    Ran { failed: bool },
+    Ran { failed: bool, why: String },
     Untrusted(String),
     NotReady(NotReady),
     Interrupted,
@@ -3597,6 +3696,125 @@ mod tests {
             }
             assert_eq!(tree(tap.path()), before);
             assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        fn libx_by_name(same_source: bool) -> crate::brew::ByName {
+            crate::brew::ByName {
+                tap: "homebrew/core".into(),
+                version: "1.2.0".into(),
+                same_source,
+                installed_current: false,
+                satisfied: false,
+            }
+        }
+
+        /// Commands that would install or upgrade `alpha` from the soak tap.
+        fn alpha_soak_commands(brew: &MockBrew) -> Vec<Vec<String>> {
+            visible(brew)
+                .into_iter()
+                .filter(|a| a.last().is_some_and(|l| l == "ericfitz/brewsoak/alpha"))
+                .collect()
+        }
+
+        fn assert_alpha_held_for_libx(
+            brew: &MockBrew,
+            tap: &Path,
+            r: &RunResult,
+            text: &str,
+            reason: &str,
+            before: &BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) {
+            let want = format!(
+                "alpha: held: its dependency libx was not installed from brewsoak's tap ({reason})"
+            );
+            assert!(text.contains(&want), "{text}");
+            assert!(r.refused, "{text}");
+            assert!(summary_has(text, "held", "1"), "{text}");
+            assert!(alpha_soak_commands(brew).is_empty(), "{:?}", visible(brew));
+            assert_eq!(&tree(tap), before, "staged files are put back");
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn failed_core_dependency_install_holds_the_target() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.by_name.insert("libx".into(), Ok(libx_by_name(false)));
+            *brew.next_outputs.lock().unwrap() = [
+                (0, Vec::new()),
+                (
+                    1,
+                    b"==> Fetching libx\nError: libx: download failed\n".to_vec(),
+                ),
+            ]
+            .into();
+            let before = tree(tap.path());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert_alpha_held_for_libx(
+                &brew,
+                tap.path(),
+                &r,
+                &text,
+                "Error: libx: download failed",
+                &before,
+            );
+        }
+
+        #[test]
+        fn already_installed_unanchored_core_dependency_holds_the_target() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            // Installed from core at the cutoff's version, but with a file
+            // that is not the cutoff's.
+            brew.installed
+                .push(formula_pkg("libx", formula_rb("libx", "1.1.0", "othersha")));
+            brew.by_name.insert("libx".into(), Ok(libx_by_name(false)));
+            *brew.next_outputs.lock().unwrap() = [
+                (0, Vec::new()),
+                (0, b"Warning: libx 1.1.0 is already installed\n".to_vec()),
+            ]
+            .into();
+            let before = tree(tap.path());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert_alpha_held_for_libx(
+                &brew,
+                tap.path(),
+                &r,
+                &text,
+                "brew left the installed version in place",
+                &before,
+            );
+        }
+
+        #[test]
+        fn dependency_anchored_at_its_cutoff_lets_the_target_go_on() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "libx".into(), "1.1.0".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(!text.contains("held alpha"), "{text}");
+            assert!(!r.refused, "{text}");
+            assert_eq!(alpha_soak_commands(&brew).len(), 1, "{:?}", visible(&brew));
+        }
+
+        #[test]
+        fn dry_run_preview_is_not_printed_for_a_failed_dependency() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = alpha_with_libx(tap.path());
+            *brew.next_outputs.lock().unwrap() =
+                [(0, Vec::new()), (1, b"Error: libx: boom\n".to_vec())].into();
+            let (_, text) = run_upgrade(
+                &brew,
+                &git,
+                &core_snaps(),
+                tap.path(),
+                &["alpha"],
+                &["--dry-run"],
+            );
+            assert!(!text.contains("would install libx"), "{text}");
         }
 
         #[test]
