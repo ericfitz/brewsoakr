@@ -13,7 +13,8 @@ pub fn tap_cask_path(tap_root: &Path, name: &str) -> PathBuf {
 }
 
 /// Writes `sanitize_unofficial(blob)` to `Formula/<name>.rb` or `Casks/<name>.rb`
-/// through `.<name>.rb.tmp-<pid>` and a rename.
+/// through `.<name>.rb.tmp-<pid>` and a rename. The file is mode 0600
+/// (`config::write_temp`); brew runs as the same user, so that is enough.
 pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf, Error> {
     let path = match pkg.kind {
         PkgKind::Formula => tap_formula_path(tap_root, &pkg.name),
@@ -26,6 +27,12 @@ pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf,
 /// The cutoff blob with every line removed whose first non-blank text is
 /// `no_autobump!` (Homebrew allows the stanza only in official taps). Every
 /// other byte, line endings included, is unchanged.
+///
+/// Only the line that starts with `no_autobump!` goes. A stanza continued on
+/// the next line leaves that line behind; brew then either ignores it or fails
+/// to load the file, and a file that does not load holds the package (`brew
+/// could not load its soaked copy`). The spec lists a multi-line stanza under
+/// "Not verified"; manual check 13.9 looks for one in casks.
 pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
     const STANZA: &[u8] = b"no_autobump!";
     let mut out = Vec::with_capacity(rb.len());
@@ -49,10 +56,9 @@ pub fn soak_token(name: &str) -> String {
 
 /// `upgrade` for an installed formula, else `install`.
 pub fn soak_tap_verb(kind: PkgKind, installed: bool) -> &'static str {
-    if installed && kind == PkgKind::Formula {
-        "upgrade"
-    } else {
-        "install"
+    match (kind, installed) {
+        (PkgKind::Formula, true) => "upgrade",
+        (PkgKind::Formula, false) | (PkgKind::Cask, _) => "install",
     }
 }
 
@@ -62,7 +68,7 @@ pub fn soak_tap_args(pkg: &PkgRef, installed: bool, user_flags: &[String]) -> Ve
     let verb = soak_tap_verb(pkg.kind, installed);
     let mut wanted: Vec<String> = user_flags
         .iter()
-        .filter(|f| !is_stripped_flag(f))
+        .filter(|f| !is_stripped_flag(f) && !is_kind_flag(f))
         .cloned()
         .collect();
     if verb == "upgrade" {
@@ -90,12 +96,18 @@ pub fn brew_install_args(pkg: &PkgRef, token: &str, user_flags: &[String]) -> Ve
     // brew install rejects upgrade-only flags such as `--greedy`.
     let wanted: Vec<String> = user_flags
         .iter()
-        .filter(|f| !is_stripped_flag(f))
+        .filter(|f| !is_stripped_flag(f) && !is_kind_flag(f))
         .cloned()
         .collect();
     args.extend(crate::flags::filter_for_verb("install", &wanted).kept);
     args.push(token.to_string());
     args
+}
+
+/// The kind flags brew declares as conflicting with each other. The commands
+/// built here carry the flag for the package's own kind, so the user's is dropped.
+fn is_kind_flag(s: &str) -> bool {
+    matches!(s, "--formula" | "--formulae" | "--cask" | "--casks")
 }
 
 /// Flags brewsoak never forwards to brew: subcommand words and the
@@ -325,5 +337,39 @@ mod tests {
             soak_tap_args(&formula("wget"), true, &strs(&["-vg"])),
             ["upgrade", "--formula", "-v", "ericfitz/brewsoak/wget"]
         );
+    }
+
+    #[test]
+    fn soaked_commands_drop_the_users_kind_flags() {
+        let flags = strs(&["--cask", "--formula", "--formulae", "--casks", "--dry-run"]);
+        assert_eq!(
+            soak_tap_args(&formula("wget"), false, &flags),
+            ["install", "--formula", "--dry-run", "ericfitz/brewsoak/wget"]
+        );
+        assert_eq!(
+            soak_tap_args(&formula("wget"), true, &flags),
+            ["upgrade", "--formula", "--dry-run", "ericfitz/brewsoak/wget"]
+        );
+        assert_eq!(
+            soak_tap_args(&cask("firefox"), false, &flags),
+            ["install", "--cask", "--dry-run", "ericfitz/brewsoak/firefox"]
+        );
+        assert_eq!(
+            brew_install_args(&formula("wget"), "wget", &flags),
+            ["install", "--formula", "--dry-run", "wget"]
+        );
+        assert_eq!(
+            brew_install_args(&cask("firefox"), "firefox", &flags),
+            ["install", "--cask", "--dry-run", "firefox"]
+        );
+    }
+
+    #[test]
+    fn write_blob_writes_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_blob(tmp.path(), &formula("wget"), b"x\n").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 }

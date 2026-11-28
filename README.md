@@ -187,7 +187,7 @@ soaked. Soaked dependents of a no-soak package are not upgraded by that step.
 | `--version` / `-V` | Print `brewsoak <version>`. |
 | `--help` / `-h` | brewsoak help. `help install` is soak-aware; `help services` is `brew help`. |
 
-Other flags (`--formula`, `--cask`, `--debug`, …) are forwarded to `brew`.
+Other flags (`--debug`, …) are forwarded to `brew`. `--formula`, `--formulae`, `--cask` and `--casks` are not forwarded to a soaked install or upgrade, because brewsoak adds the flag for the package's own kind.
 `upgrade` and `outdated` honor brew's `--greedy` (`-g`),
 `--greedy-auto-updates` and `--greedy-latest` themselves (see below); the
 no-soak `brew upgrade` also receives them.
