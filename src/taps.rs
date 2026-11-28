@@ -129,15 +129,10 @@ pub fn resolve_path(tree: &[String], kind: PkgKind, name: &str) -> Option<String
     }
 }
 
-/// The tap named by Homebrew's refusal to load a formula or cask from a tap
+/// Every tap named by Homebrew's refusal to load a formula or cask from a tap
 /// the user has not trusted (`Refusing to load formula x from untrusted tap
-/// u/r.`), lowercase. brewsoak never runs `brew trust` for a third-party tap;
-/// that is the user's decision.
-pub fn untrusted_tap(brew_output: &str) -> Option<String> {
-    untrusted_taps(brew_output).into_iter().next()
-}
-
-/// Every tap named by such a refusal, in the order brew printed them.
+/// u/r.`), lowercase, in the order brew printed them. brewsoak never runs
+/// `brew trust` for a third-party tap; that is the user's decision.
 pub fn untrusted_taps(brew_output: &str) -> Vec<String> {
     let marker = "from untrusted tap ";
     let lower = brew_output.to_ascii_lowercase();
@@ -199,14 +194,14 @@ mod tests {
     }
 
     #[test]
-    fn untrusted_tap_reads_the_tap_from_brews_refusal() {
+    fn untrusted_taps_read_the_tap_from_brews_refusal() {
         let msg = "Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap HashiCorp/tap.\nRun `brew trust hashicorp/tap` to trust it.";
-        assert_eq!(untrusted_tap(msg).as_deref(), Some("hashicorp/tap"));
+        assert_eq!(untrusted_taps(msg), ["hashicorp/tap"]);
         let cask =
             "Error: Refusing to load cask hashicorp/tap/packer from untrusted tap hashicorp/tap.";
-        assert_eq!(untrusted_tap(cask).as_deref(), Some("hashicorp/tap"));
-        assert_eq!(untrusted_tap("Error: No bottle available for foo"), None);
-        assert_eq!(untrusted_tap("Error: cannot load such file -- x"), None);
+        assert_eq!(untrusted_taps(cask), ["hashicorp/tap"]);
+        assert!(untrusted_taps("Error: No bottle available for foo").is_empty());
+        assert!(untrusted_taps("Error: cannot load such file -- x").is_empty());
     }
 
     const TAP_INFO: &str = r#"[
