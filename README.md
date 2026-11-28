@@ -171,8 +171,9 @@ brew hides a formula installed from a tap it does not trust from
 `info` print the note `brew does not trust tap <tap>, so it hides these
 installed formulae from brewsoak: <names>; run brew trust <tap> (or brew trust
 --formula <tap>/<name> for one formula) to let brewsoak manage them.` Under
-`outdated` it sits under `Held:`; under `upgrade` it is a note. A run restricted with `--cask` prints no such
-note. brewsoak never trusts a tap for you.
+`outdated` it is listed in the `==> Held` section; under `upgrade` it is a
+note; `install` and `reinstall` print none. A run restricted with `--cask`,
+named or bare, prints no such note. brewsoak never trusts a tap for you.
 
 No-soak packages are installed by `brew` itself from their real tap after all
 soaked work: one `brew upgrade` (or `install` / `reinstall`) naming every
@@ -273,9 +274,10 @@ skips that start-of-run prune. Before it removes a formula's tap file,
 brewsoak takes brew's own lock for that formula, reads the keg receipts again,
 and leaves the file when brew holds the lock or a receipt names the tap
 (`--verbose` prints `not pruning <file>: brew holds the lock for <name>` or
-`not pruning <file>: <name> is installed from brewsoak's tap`). It holds the lock only for that
-read and the removal. If the lock cannot be taken at all, it prints a warning and leaves the
-file. Casks have no such lock in brew, so their receipt is only read again.
+`not pruning <file>: <name> is installed from brewsoak's tap`). It holds the
+lock only for that read and the removal. If the lock cannot be taken at all, it
+prints a warning and leaves the file. Casks have no such lock in brew, so their
+receipt is only read again.
 Running the two side by side is still unsupported. Let one finish before you
 start the other.
 
@@ -341,7 +343,10 @@ trust is held with `brew does not trust tap <tap>; run brew trust <tap>, or add
 it to NO_SOAK`. The hold also prints an inline line,
 `held <name>: brew does not trust tap <tap>` (for a dependency,
 `held <target>: dependency <dep>: brew does not trust tap <tap>`), and its note
-sits under `Held:`.
+sits under `Held:`. When the untrusted package is a dependency that this run
+had already counted as one to install, an earlier inline line also says
+`held <dep> (dependency of <target>): brew does not trust tap <tap>`, and the
+count is taken back so the dependency and the target are not both counted.
 
 An installed dependency that lives in a tap brewsoak could not refresh, or that
 has no soak snapshot this run, passes when brew counts it as up to date. When
@@ -373,7 +378,7 @@ For packages from the tap, the hold texts are:
   for a cask that updates itself) or an `already installed` line about the
   target; for a `homebrew/core` or `homebrew/cask` package with no such line,
   it is `no installed copy of it is from brewsoak's tap at the cutoff version`,
-  when no keg of the package was installed from brewsoak's tap at the cutoff
+  when no installed copy of the package is from brewsoak's tap at the cutoff
   version.
 - `held <name>: an earlier brewsoak run was interrupted`, with the note
   `<name>: an earlier brewsoak run was interrupted; run brewsoak update to

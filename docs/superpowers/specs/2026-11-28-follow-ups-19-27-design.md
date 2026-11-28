@@ -35,7 +35,7 @@ trusted or untrusted. Facts are numbered `F1`... for reference from the plan.
 | 1 | #24: a tap file is current when a keg's receipt names the soak tap and its `.brew/<name>.rb` is **byte-equal** to the tap file | F8: the one keg installed from the soak tap on this machine (`ast-grep` 0.51.3, a bottle pour) has a `.brew/ast-grep.rb` that differs from the tap file: it has no `bottle do` block. F9: a cask keeps `Casks/<token>.json`, not a `.rb` | Compare **versions read by brewsoak's own parser on both files**, not bytes; casks keep the receipt's `source.version`. See "#24" |
 | 2 | #25: take brew's per-formula/**cask** lock | F13: brew takes no cask lock while it installs or upgrades a cask, and has no global install lock | Formulae use brew's formula lock. Casks get a fresh receipt read just before the removal and nothing more. See "#25" |
 | 3 | #22: decide trust from `brew trust --json=v1` | Human decision 2 and AGENTS.md: brewsoak never runs `brew trust`. F5: a per-formula trust entry makes brew list the formula, so a formula brew leaves out has no entry that works | Decide from `tap-info`'s `trusted`, which brewsoak already has. No `brew trust` child, no extra brew call. See "#22" |
-| 4 | #22: read each hidden keg's tap from its receipt; premise that `cyclonedx-gomod` is listed because of its per-formula trust entry | F6: its receipt has `source.tap: null` and it is listed because core has a formula of that name. F17: a keg with a null receipt tap and no core namesake is hidden when its name resolves into an untrusted tap | A keg with no receipt tap gets its tap from `source.path` (`origin::staged_tap`), then from its `origins.toml` record. See "#22" |
+| 4 | #22: read each hidden keg's tap from its receipt; premise that a formula with a null receipt tap is listed because of a per-formula trust entry | F6: its receipt has `source.tap: null` and it is listed because core has a formula of that name. F17: a keg with a null receipt tap and no core namesake is hidden when its name resolves into an untrusted tap | A keg with no receipt tap gets its tap from `source.path` (`origin::staged_tap`), then from its `origins.toml` record. See "#22" |
 | 5 | #19: "fix each item that still applies" covers item 3 | The 2026-11-27 dependency table says "as today" for it, and a test pins the old behavior | Fixed, as ruled, and recorded as an amendment of that table row (a Claude design row, not a human decision). See "#19, item 3" |
 
 ## #26: `--formula` and `--cask` on a bare run
@@ -313,22 +313,22 @@ a fake Cellar. Do not change Eric's trust settings.
   `<tap>/<name>` is trusted (`trust.rb:213-223`). So the omission of 2026-11-27 Fact 37 applies to
   a formula from any untrusted tap, and a per-formula trust entry prevents it. `Formula.racks`
   skips a rack that is a symbolic link, starts with `.` or has no keg (`formula.rb:2861-2868`).
-- F6. Live: `brew tap-info` reports `anthropics/tap`, `cyclonedx/cyclonedx` and `endava/tap` as
-  `trusted: false`. All 165 Cellar racks are in `brew info --json=v2 --installed` (exit 0, empty
-  stderr). `cats` (receipt `source.tap: endava/tap`) is listed because `brew trust --json=v1`
-  (keys `taps`, `formulae`, `casks`, `commands`) has `endava/tap/cats`. `cyclonedx-gomod` is listed
-  with `tap: homebrew/core` because its receipt has `source.tap: null`; its tap is recorded only in
-  `source.path` (`<cache>/staging/taps/cyclonedx/cyclonedx/Formula/cyclonedx-gomod.rb`), which
-  `origin::staged_tap` already reads. **No keg is hidden on this machine today**, and making one
-  would mean changing trust settings, so the third-party case is confirmed from source (F5, F17) and
-  not by a run.
+- F6. Live: with at least one third-party tap that `brew tap-info` reports as `trusted: false`,
+  every Cellar rack is still in `brew info --json=v2 --installed` (exit 0, empty stderr) when the
+  formula has a per-formula trust entry: a formula whose receipt has `source.tap` naming such a
+  tap is listed because `brew trust --json=v1` (keys `taps`, `formulae`, `casks`, `commands`)
+  has `<tap>/<name>`. A formula whose receipt has `source.tap: null` and a core namesake is
+  listed with `tap: homebrew/core`; its tap is recorded only in `source.path`
+  (`<cache>/staging/taps/<owner>/<repo>/Formula/<name>.rb`), which `origin::staged_tap` already
+  reads. **No keg was hidden on the machine of this survey**, and making one would mean changing
+  trust settings, so the third-party case is confirmed from source (F5, F17) and not by a run.
 - F17. Source: a keg whose receipt has no tap is loaded by its bare name, and only
   `FormulaUnavailableError` is rescued there (`formulary.rb:923-939`). The bare-name loader looks
   in core first and then in every installed tap, trusted or not (`formulary.rb:589-622`); loading
   the file it found then raises `UntrustedTapError`, a `RuntimeError`, for an untrusted tap
   (`formulary.rb:125`, `trust.rb:12`). So a keg staged by brewsoak before 1.6.1 (null receipt tap,
   tap recorded in `source.path`) is hidden too when its name is not in core and its tap is
-  untrusted. `cyclonedx-gomod` escapes only because core has a namesake (F6).
+  untrusted. Such a formula escapes only because core has a namesake (F6).
 
 **Behavior** (architect's calls: the trust source, correction 3; the tap of a keg without a receipt
 tap, correction 4).
