@@ -106,7 +106,7 @@ pub fn brew_install_args(pkg: &PkgRef, token: &str, user_flags: &[String]) -> Ve
 
 /// The kind flags brew declares as conflicting with each other. The commands
 /// built here carry the flag for the package's own kind, so the user's is dropped.
-fn is_kind_flag(s: &str) -> bool {
+pub(crate) fn is_kind_flag(s: &str) -> bool {
     matches!(s, "--formula" | "--formulae" | "--cask" | "--casks")
 }
 

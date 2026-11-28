@@ -76,7 +76,7 @@ use crate::quiet;
 use crate::report::{Verb, nosoak_header};
 use crate::resolve::PkgKind;
 use crate::section::Section;
-use crate::tap::is_stripped_flag;
+use crate::tap::{is_kind_flag, is_stripped_flag};
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -264,6 +264,13 @@ pub fn run_step_after(
     // both kinds are present each runs in its own flagged group.
     let split_kinds = targets.iter().any(|t| t.kind == Some(PkgKind::Formula))
         && targets.iter().any(|t| t.kind == Some(PkgKind::Cask));
+    // Each split group carries the kind flag brewsoak adds, and brew rejects
+    // two of them, so the user's own is dropped there.
+    let flags: Vec<String> = if split_kinds {
+        flags.into_iter().filter(|f| !is_kind_flag(f)).collect()
+    } else {
+        flags
+    };
 
     let plain_flags = filter_for_verb(verb, &flags);
     // `-g` is `--git` to install and `--greedy` to upgrade.
@@ -1307,6 +1314,91 @@ Error: formula-b: boom\n"
         assert_eq!(got[0], vec!["update"]);
         assert_eq!(got[1], vec!["upgrade", "--formula", "vacuum"]);
         assert_eq!(got[2], vec!["upgrade", "--cask", "vacuum"]);
+    }
+
+    fn strs(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn no_soak_split_groups_drop_the_users_kind_flags() {
+        let flags = vec![
+            "--cask".to_string(),
+            "--formulae".to_string(),
+            "--verbose".to_string(),
+        ];
+        // upgrade: a formula group and a cask group, plus a tap switch of each kind.
+        let brew = MockBrew::new();
+        let switch = |name: &str, kind| Target {
+            switch_tap: true,
+            ..typed("hashicorp/tap", name, kind)
+        };
+        let targets = [
+            typed("homebrew/core", "vacuum", PkgKind::Formula),
+            typed("homebrew/cask", "vacuum", PkgKind::Cask),
+            switch("vault", PkgKind::Formula),
+            switch("vaultc", PkgKind::Cask),
+        ];
+        run_step(&brew, "upgrade", &flags, &targets, &mut Vec::new()).unwrap();
+        let got = runs(&brew);
+        assert!(
+            got.contains(&strs(&["upgrade", "--verbose", "--formula", "vacuum"])),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&strs(&["upgrade", "--verbose", "--cask", "vacuum"])),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&strs(&[
+                "reinstall",
+                "--verbose",
+                "--formula",
+                "hashicorp/tap/vault"
+            ])),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&strs(&[
+                "reinstall",
+                "--verbose",
+                "--cask",
+                "hashicorp/tap/vaultc"
+            ])),
+            "{got:?}"
+        );
+        // install: the anchored formula runs as upgrade, in its own kind group.
+        let brew = MockBrew::new();
+        let targets = [
+            Target {
+                official: true,
+                ..typed("homebrew/core", "hello", PkgKind::Formula)
+            },
+            typed("homebrew/cask", "firefox", PkgKind::Cask),
+        ];
+        run_step(&brew, "install", &flags, &targets, &mut Vec::new()).unwrap();
+        let got = runs(&brew);
+        assert!(
+            got.contains(&strs(&[
+                "upgrade",
+                "--verbose",
+                "--formula",
+                "homebrew/core/hello"
+            ])),
+            "{got:?}"
+        );
+        assert!(
+            got.contains(&strs(&["install", "--verbose", "--cask", "firefox"])),
+            "{got:?}"
+        );
+        // One kind: no kind flag of brewsoak's own, so the user's stays.
+        let brew = MockBrew::new();
+        let targets = [typed("homebrew/core", "wget", PkgKind::Formula)];
+        run_step(&brew, "upgrade", &flags, &targets, &mut Vec::new()).unwrap();
+        assert_eq!(
+            runs(&brew)[1],
+            vec!["upgrade", "--cask", "--formulae", "--verbose", "wget"]
+        );
     }
 
     #[test]
