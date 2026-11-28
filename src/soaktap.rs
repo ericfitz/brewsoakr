@@ -8,14 +8,14 @@ use crate::Error;
 use crate::brew::Brew;
 use crate::error::first_line;
 use crate::identity::{self, PkgIdentity};
-use crate::inventory::Pkg;
+use crate::inventory::{Inventory, Pkg};
 use crate::lock::RunLock;
 use crate::origin::{OwnTap, SOAK_TAP};
 use crate::resolve::{PkgKind, PkgRef};
 use crate::taps::TapInfo;
 use crate::{atomic, tap};
-use std::collections::BTreeMap;
-use std::io::ErrorKind;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 
 /// Directory under the cache that holds the undo entries.
@@ -352,6 +352,138 @@ impl SoakTap {
             }
         }
         first.map_or(Ok(()), Err)
+    }
+}
+
+/// Settle every undo entry found on disk, by the settle rule with
+/// `file_version` of the tap file as the version. An entry is `<name>.rb` or
+/// `<name>.absent` directly under `soak-tap-undo/Formula` or `/Casks`; any
+/// other file is left alone. Repeating it finds nothing; a run that died
+/// halfway is finished by the next, because `settle_entry` deletes an entry
+/// last. Creates nothing when there is no undo directory.
+pub fn recover(_lock: &RunLock, brew: &impl Brew, dir: &Path, cache: &Path) -> Result<(), Error> {
+    let undo_root = cache.join(UNDO_DIR);
+    for kind in [PkgKind::Formula, PkgKind::Cask] {
+        let Ok(entries) = std::fs::read_dir(undo_root.join(kind_dir(kind))) else {
+            continue;
+        };
+        let mut names = BTreeSet::new();
+        for ent in entries.filter_map(Result::ok) {
+            if ent.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let path = ent.path();
+            let ext = path.extension().and_then(|e| e.to_str());
+            if !matches!(ext, Some("rb" | "absent")) {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                names.insert(stem.to_string());
+            }
+        }
+        for name in names {
+            settle_entry(brew, dir, &undo_root, kind, &name, None, true)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove every `.rb` under `dir/Formula` and `dir/Casks` that has no undo
+/// entry and no installed package of that kind and name whose receipt names
+/// the soak tap. Real directories only: a link is removed as a link and a
+/// linked directory is not entered. The test is the receipt alone, never the
+/// version. A removal that fails is reported and skipped.
+pub fn prune(
+    _lock: &RunLock,
+    dir: &Path,
+    cache: &Path,
+    inv: &Inventory,
+    verbose: bool,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let undo_root = cache.join(UNDO_DIR);
+    for kind in [PkgKind::Formula, PkgKind::Cask] {
+        let used = |name: &str| {
+            undo_rb(&undo_root, kind, name).exists()
+                || undo_absent(&undo_root, kind, name).exists()
+                || inv
+                    .pkgs
+                    .iter()
+                    .any(|p| p.kind == kind && p.name == name && p.own_tap == Some(OwnTap::Soak))
+        };
+        prune_walk(&dir.join(kind_dir(kind)), &used, verbose, out)?;
+    }
+    Ok(())
+}
+
+fn prune_walk(
+    root: &Path,
+    used: &impl Fn(&str) -> bool,
+    verbose: bool,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(());
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| Some((e.path(), e.file_type().ok()?)))
+        .collect();
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    for (path, ft) in paths {
+        if ft.is_dir() {
+            prune_walk(&path, used, verbose, out)?;
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".rb"))
+        else {
+            continue;
+        };
+        if used(name) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) if verbose => writeln!(
+                out,
+                "pruned {} (no installed package uses it)",
+                path.display()
+            )?,
+            Ok(()) => {}
+            Err(e) => writeln!(
+                out,
+                "brewsoak: warning: could not prune {}: {}",
+                path.display(),
+                first_line(&e.to_string())
+            )?,
+        }
+    }
+    Ok(())
+}
+
+/// Recovery when the tap is local (`Untrusted` or `Ready`), then pruning when
+/// it is `Ready`. Nothing when it is not tapped or tapped from a remote.
+#[allow(clippy::too_many_arguments)]
+pub fn maintain(
+    lock: &RunLock,
+    brew: &impl Brew,
+    entry: Option<&TapInfo>,
+    tap_root: &Path,
+    cache: &Path,
+    inv: &Inventory,
+    verbose: bool,
+    out: &mut impl Write,
+) -> Result<(), Error> {
+    let dir = tap_dir(entry, tap_root);
+    match tap_state(entry) {
+        TapState::NotTapped | TapState::Remote(_) => Ok(()),
+        TapState::Untrusted => recover(lock, brew, &dir, cache),
+        TapState::Ready => {
+            recover(lock, brew, &dir, cache)?;
+            prune(lock, &dir, cache, inv, verbose, out)
+        }
     }
 }
 
@@ -982,5 +1114,397 @@ mod tests {
             installed_dep_rule(false, l, Some("1"), Some("1"), true),
             CannotReplace
         );
+    }
+
+    const SOAK_RECEIPT: &str = "ericfitz/brewsoak";
+
+    fn recover_in(e: &Env, brew: &MockBrew) -> Result<(), Error> {
+        recover(&e.lock, brew, e.tap.path(), e.cache.path())
+    }
+
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            let Ok(rd) = fs::read_dir(dir) else { return };
+            for ent in rd.flatten() {
+                let p = ent.path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else {
+                    out.insert(p.clone(), fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut m = BTreeMap::new();
+        walk(root, &mut m);
+        m
+    }
+
+    #[test]
+    fn recover_keeps_a_file_whose_keg_is_from_the_tap() {
+        let e = env();
+        let body = formula_rb("1.1.0");
+        e.put(&e.file("Formula", "wget"), body.as_bytes());
+        e.put(&e.undo("Formula", "wget", "absent"), b"");
+        let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", SOAK_RECEIPT);
+        recover_in(&e, &brew).unwrap();
+        assert_eq!(
+            fs::read(e.file("Formula", "wget")).unwrap(),
+            body.as_bytes()
+        );
+        assert!(!e.undo("Formula", "wget", "absent").exists());
+
+        // `.rb` entry over previous bytes: the new bytes stay, the entry goes.
+        let e = env();
+        e.put(&e.file("Casks", "x"), cask_rb("2.0").as_bytes());
+        e.put(&e.undo("Casks", "x", "rb"), OLD);
+        let brew = brew_with_receipt(PkgKind::Cask, "x", "2.0", SOAK_RECEIPT);
+        recover_in(&e, &brew).unwrap();
+        assert_eq!(
+            fs::read(e.file("Casks", "x")).unwrap(),
+            cask_rb("2.0").as_bytes()
+        );
+        assert!(!e.undo("Casks", "x", "rb").exists());
+    }
+
+    #[test]
+    fn recover_puts_back_previous_bytes_without_a_matching_keg() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+    }
+
+    #[test]
+    fn recover_deletes_the_file_for_an_absent_marker() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "absent"), b"");
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert!(!e.file("Formula", "wget").exists());
+        assert!(!e.undo("Formula", "wget", "absent").exists());
+        // A missing tap file with no keg just deletes the entry.
+        e.put(&e.undo("Casks", "gone", "absent"), b"");
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert!(!e.undo("Casks", "gone", "absent").exists());
+        assert!(!e.file("Casks", "gone").exists());
+    }
+
+    #[test]
+    fn recover_puts_back_an_unparseable_file() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"not a formula\n");
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", SOAK_RECEIPT);
+        recover_in(&e, &brew).unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+    }
+
+    #[test]
+    fn recover_after_a_partial_put_back_finishes_the_job() {
+        // The file was already restored; the crash left the entry behind.
+        let e = env();
+        e.put(&e.file("Formula", "wget"), OLD);
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+        // Same for an absent marker whose file is already gone.
+        e.put(&e.undo("Formula", "curl", "absent"), b"");
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert!(!e.undo("Formula", "curl", "absent").exists());
+        assert!(!e.file("Formula", "curl").exists());
+    }
+
+    #[test]
+    fn recover_twice_is_a_no_op() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        recover_in(&e, &MockBrew::new()).unwrap();
+        e.put(&e.file("Formula", "wget"), b"later\n");
+        let before = snapshot(e.tap.path());
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert_eq!(snapshot(e.tap.path()), before);
+    }
+
+    #[test]
+    fn recover_without_an_undo_directory_creates_nothing() {
+        let e = env();
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert!(!e.cache.path().join(UNDO_DIR).exists());
+        assert!(fs::read_dir(e.cache.path()).unwrap().next().is_none());
+        assert!(fs::read_dir(e.tap.path()).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn recover_handles_entries_it_never_wrote() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        e.put(&e.undo("Formula", "wget", "absent"), b"");
+        let dir = e.cache.path().join(UNDO_DIR).join("Formula");
+        e.put(&dir.join(".wget.rb.tmp-99"), b"tmp");
+        e.put(&dir.join("notes.txt"), b"n");
+        recover_in(&e, &MockBrew::new()).unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+        assert!(!e.undo("Formula", "wget", "absent").exists());
+        assert!(dir.join(".wget.rb.tmp-99").exists());
+        assert!(dir.join("notes.txt").exists());
+    }
+
+    fn inv_with(pkgs: Vec<Pkg>) -> Inventory {
+        Inventory {
+            pkgs,
+            ..Inventory::default()
+        }
+    }
+
+    fn installed(kind: PkgKind, name: &str, own_tap: Option<OwnTap>) -> Pkg {
+        Pkg {
+            name: name.into(),
+            kind,
+            ..pkg(own_tap, "1.0.0")
+        }
+    }
+
+    fn prune_in(e: &Env, inv: &Inventory, verbose: bool) -> String {
+        let mut out = Vec::new();
+        prune(
+            &e.lock,
+            e.tap.path(),
+            e.cache.path(),
+            inv,
+            verbose,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn prune_removes_a_file_no_installed_package_uses() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        e.put(&e.file("Casks", "docker"), b"b");
+        let out = prune_in(&e, &inv_with(vec![]), true);
+        assert!(!e.file("Formula", "wget").exists());
+        assert!(!e.file("Casks", "docker").exists());
+        let want = format!(
+            "pruned {} (no installed package uses it)",
+            e.file("Formula", "wget").display()
+        );
+        assert!(out.contains(&want), "{out}");
+        assert_eq!(prune_in(&e, &inv_with(vec![]), true), "", "second run");
+    }
+
+    #[test]
+    fn prune_is_quiet_without_verbose() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        assert_eq!(prune_in(&e, &inv_with(vec![]), false), "");
+        assert!(!e.file("Formula", "wget").exists());
+    }
+
+    #[test]
+    fn prune_never_removes_a_file_while_the_receipt_names_the_tap() {
+        let e = env();
+        let other = formula_rb("9.9.9");
+        e.put(&e.file("Formula", "wget"), other.as_bytes());
+        let inv = inv_with(vec![installed(
+            PkgKind::Formula,
+            "wget",
+            Some(OwnTap::Soak),
+        )]);
+        prune_in(&e, &inv, true);
+        assert_eq!(
+            fs::read(e.file("Formula", "wget")).unwrap(),
+            other.as_bytes()
+        );
+        // A legacy-tap receipt does not protect the soak tap file.
+        let inv = inv_with(vec![installed(
+            PkgKind::Formula,
+            "wget",
+            Some(OwnTap::Legacy),
+        )]);
+        prune_in(&e, &inv, false);
+        assert!(!e.file("Formula", "wget").exists());
+    }
+
+    #[test]
+    fn prune_keeps_a_file_with_an_undo_entry() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        e.put(&e.undo("Formula", "wget", "absent"), b"");
+        e.put(&e.file("Casks", "x"), b"b");
+        e.put(&e.undo("Casks", "x", "rb"), OLD);
+        prune_in(&e, &inv_with(vec![]), true);
+        assert!(e.file("Formula", "wget").exists());
+        assert!(e.file("Casks", "x").exists());
+    }
+
+    #[test]
+    fn prune_is_per_kind() {
+        let e = env();
+        e.put(&e.file("Formula", "docker"), b"a");
+        e.put(&e.file("Casks", "docker"), b"b");
+        let inv = inv_with(vec![installed(PkgKind::Cask, "docker", Some(OwnTap::Soak))]);
+        prune_in(&e, &inv, true);
+        assert!(!e.file("Formula", "docker").exists());
+        assert!(e.file("Casks", "docker").exists());
+    }
+
+    #[test]
+    fn prune_touches_nothing_outside_formula_and_casks() {
+        let e = env();
+        e.put(&e.tap.path().join("README.md"), b"r");
+        e.put(&e.tap.path().join(".github/x.yml"), b"y");
+        e.put(&e.tap.path().join("Formula/notes.txt"), b"n");
+        e.put(&e.tap.path().join("Other/x.rb"), b"o");
+        let before = snapshot(e.tap.path());
+        prune_in(&e, &inv_with(vec![]), true);
+        assert_eq!(snapshot(e.tap.path()), before);
+    }
+
+    #[test]
+    fn prune_removes_a_stale_link_and_spares_its_target() {
+        let e = env();
+        let outside = tempfile::tempdir().unwrap();
+        e.put(&outside.path().join("real.rb"), b"real");
+        e.put(&outside.path().join("sub-dir/inner.rb"), b"inner");
+        fs::create_dir_all(e.tap.path().join("Formula")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("real.rb"), e.file("Formula", "x")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("sub-dir"),
+            e.tap.path().join("Formula/sub"),
+        )
+        .unwrap();
+        prune_in(&e, &inv_with(vec![]), true);
+        assert!(e.file("Formula", "x").symlink_metadata().is_err());
+        assert_eq!(fs::read(outside.path().join("real.rb")).unwrap(), b"real");
+        assert_eq!(
+            fs::read(outside.path().join("sub-dir/inner.rb")).unwrap(),
+            b"inner"
+        );
+    }
+
+    #[test]
+    fn prune_removes_a_nested_stale_file() {
+        let e = env();
+        e.put(&e.tap.path().join("Formula/a/old.rb"), b"o");
+        prune_in(&e, &inv_with(vec![]), true);
+        assert!(!e.tap.path().join("Formula/a/old.rb").exists());
+    }
+
+    #[test]
+    fn prune_warns_and_continues_when_a_removal_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let e = env();
+        e.put(&e.tap.path().join("Formula/locked/a.rb"), b"a");
+        e.put(&e.file("Formula", "b"), b"b");
+        let locked = e.tap.path().join("Formula/locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o500)).unwrap();
+        let out = prune_in(&e, &inv_with(vec![]), false);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!e.file("Formula", "b").exists());
+        if locked.join("a.rb").exists() {
+            assert!(out.contains("brewsoak: warning: could not prune"), "{out}");
+        }
+    }
+
+    fn seeded(e: &Env) {
+        e.put(&e.file("Formula", "stale"), b"s");
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+    }
+
+    #[test]
+    fn maintain_recovers_and_prunes_a_ready_tap() {
+        let e = env();
+        seeded(&e);
+        let mut out = Vec::new();
+        maintain(
+            &e.lock,
+            &MockBrew::new(),
+            Some(&local(true)),
+            e.tap.path(),
+            e.cache.path(),
+            &inv_with(vec![]),
+            false,
+            &mut out,
+        )
+        .unwrap();
+        assert!(!e.file("Formula", "stale").exists());
+        // Recovery put OLD back, and the entry is gone, so prune took it too.
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+        assert!(!e.file("Formula", "wget").exists());
+    }
+
+    #[test]
+    fn maintain_recovers_but_does_not_prune_an_untrusted_tap() {
+        let e = env();
+        seeded(&e);
+        maintain(
+            &e.lock,
+            &MockBrew::new(),
+            Some(&local(false)),
+            e.tap.path(),
+            e.cache.path(),
+            &inv_with(vec![]),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(e.file("Formula", "stale").exists());
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
+    }
+
+    #[test]
+    fn maintain_does_nothing_when_not_tapped_or_remote() {
+        let mut remote = local(true);
+        remote.remote = Some("https://example.com/x.git".into());
+        for entry in [None, Some(&remote)] {
+            let e = env();
+            seeded(&e);
+            let before = (snapshot(e.tap.path()), snapshot(e.cache.path()));
+            let mut out = Vec::new();
+            maintain(
+                &e.lock,
+                &MockBrew::new(),
+                entry,
+                e.tap.path(),
+                e.cache.path(),
+                &inv_with(vec![]),
+                true,
+                &mut out,
+            )
+            .unwrap();
+            assert_eq!((snapshot(e.tap.path()), snapshot(e.cache.path())), before);
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn settle_entry_with_may_keep_handles_leftover_entries() {
+        // Direct use of the shared rule, as recovery calls it.
+        let e = env();
+        let undo = e.cache.path().join(UNDO_DIR);
+        e.put(&e.file("Formula", "wget"), formula_rb("1.1.0").as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), OLD);
+        settle_entry(
+            &MockBrew::new(),
+            e.tap.path(),
+            &undo,
+            PkgKind::Formula,
+            "wget",
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(fs::read(e.file("Formula", "wget")).unwrap(), OLD);
+        assert!(!e.undo("Formula", "wget", "rb").exists());
     }
 }

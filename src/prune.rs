@@ -286,4 +286,42 @@ mod tests {
         .unwrap();
         assert!(dir.path().join("taps/Live/Tap.git/f").exists());
     }
+
+    #[test]
+    fn prune_cache_leaves_the_soak_tap_and_undo_directories_untouched() {
+        fn snap(root: &Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn walk(d: &Path, m: &mut std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                let Ok(rd) = std::fs::read_dir(d) else { return };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        walk(&p, m);
+                    } else {
+                        m.insert(p.clone(), std::fs::read(&p).unwrap());
+                    }
+                }
+            }
+            let mut m = Default::default();
+            walk(root, &mut m);
+            m
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let tap = dir.path().join("soaktap");
+        std::fs::create_dir_all(cache.join("soak-tap-undo/Formula")).unwrap();
+        std::fs::write(cache.join("soak-tap-undo/Formula/wget.absent"), "").unwrap();
+        std::fs::create_dir_all(tap.join("Formula")).unwrap();
+        std::fs::write(tap.join("Formula/a.rb"), "a").unwrap();
+        std::fs::write(tap.join("Formula/b.rb"), "b").unwrap();
+        let before = (snap(&cache), snap(&tap));
+        prune_cache(
+            &RunLock::for_tests(),
+            &cache,
+            &world(),
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!((snap(&cache), snap(&tap)), before);
+    }
 }
