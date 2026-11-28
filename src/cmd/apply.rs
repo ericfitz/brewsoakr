@@ -4478,14 +4478,20 @@ mod tests {
             assert_bypass_names_core(&text, "ambiguous dependency");
         }
 
-        #[test]
-        fn tap_file_is_settled_and_the_error_returned_when_the_install_errs() {
+        /// Run `upgrade alpha` where the install succeeds with a receipt of
+        /// the soak tap for keg `receipt_version`, then forgetting the stale
+        /// origin record fails (the cache directory cannot be written any
+        /// more). Returns whether the run erred, the tap file afterwards and
+        /// the undo files left.
+        fn upgrade_whose_install_errs(
+            receipt_version: &str,
+        ) -> (bool, Option<Vec<u8>>, BTreeMap<std::path::PathBuf, Vec<u8>>) {
             use std::os::unix::fs::PermissionsExt;
             let tap = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
             let (mut brew, git) = soak_world(tap.path());
             brew.receipt_taps.insert(
-                (PkgKind::Formula, "alpha".into(), "1.1.0".into()),
+                (PkgKind::Formula, "alpha".into(), receipt_version.into()),
                 "ericfitz/brewsoak".into(),
             );
             // The install succeeds, then forgetting the stale origin record
@@ -4516,24 +4522,34 @@ mod tests {
                 &mut Vec::new(),
             );
             std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(result.is_err(), "the install's error propagates");
-            assert!(
-                visible(&brew).contains(&strs(&[
-                    "upgrade",
-                    "--formula",
-                    "ericfitz/brewsoak/alpha"
-                ])),
-                "{:?}",
-                visible(&brew)
-            );
+            let undo = tree(&cache.path().join(UNDO_DIR));
+            (
+                result.is_err(),
+                tap_file(tap.path(), "Formula/alpha.rb"),
+                undo,
+            )
+        }
+
+        #[test]
+        fn tap_file_is_settled_and_the_error_returned_when_the_install_errs() {
+            let (erred, file, undo) = upgrade_whose_install_errs("1.1.0");
+            assert!(erred, "the install's error propagates");
             // The soak-tap receipt says the install was real, so settle keeps
             // the file and drops the undo entry.
-            assert!(tap_file(tap.path(), "Formula/alpha.rb").is_some());
-            assert!(
-                tree(&cache.path().join(UNDO_DIR)).is_empty(),
-                "{:?}",
-                tree(&cache.path().join(UNDO_DIR))
-            );
+            assert!(file.is_some());
+            assert!(undo.is_empty(), "{undo:?}");
+        }
+
+        #[test]
+        fn tap_file_is_put_back_and_the_error_returned_when_no_receipt_names_the_cutoff_keg() {
+            // The keg brew made is named `go1.1_2`, not the cutoff file's 1.1.0
+            // (#24): the receipt check passes for any keg, so the origin
+            // record is forgotten (and that fails), but settle finds no soak
+            // receipt at the cutoff version and puts the tap file back.
+            let (erred, file, undo) = upgrade_whose_install_errs("go1.1_2");
+            assert!(erred, "the install's error propagates");
+            assert_eq!(file, None, "the staged file is put back");
+            assert!(undo.is_empty(), "{undo:?}");
         }
 
         #[test]

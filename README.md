@@ -332,9 +332,10 @@ For packages from the tap, the hold texts are:
   tap, because brew would otherwise pull the dependency from core's current
   file. The reason is one of: brew's first error line, when its command
   failed; `brew left the installed version in place`, when brew answered that
-  the package is already installed; or `brew ran, but its keg is not from
-  brewsoak's tap at the cutoff version`, when brew reported success and the
-  receipt check then failed.
+  the package is already installed; brew's `Not upgrading <dep>, ...` line
+  (without its `Warning: ` prefix), when brew said it left the dependency
+  alone; or `brew ran, but its keg is not from brewsoak's tap at the cutoff
+  version`, when brew reported success and the receipt check then failed.
 - `<name>: brew left the installed version in place: <reason>`. brew exited 0
   for a target but did not install it, so brewsoak counts it as `skipped`, not
   `upgraded`; it is not a failure and does not change the exit status. The
