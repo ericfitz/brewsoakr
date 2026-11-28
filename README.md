@@ -166,6 +166,14 @@ own local tap (see "brewsoak's own tap"). A tap with no remote, or a non-HTTPS
 remote, is not soakable: brewsoak notes its packages and leaves them to `brew`,
 unless they are in `NO_SOAK`.
 
+brew hides a formula installed from a tap it does not trust from
+`brew info --installed`, so brewsoak cannot see it. `upgrade`, `outdated` and
+`info` print the note `brew does not trust tap <tap>, so it hides these
+installed formulae from brewsoak: <names>; run brew trust <tap> (or brew trust
+--formula <tap>/<name> for one formula) to let brewsoak manage them.` Under
+`outdated` it sits under `Held:`; under `upgrade` it is a note. A run restricted with `--cask` prints no such
+note. brewsoak never trusts a tap for you.
+
 No-soak packages are installed by `brew` itself from their real tap after all
 soaked work: one `brew upgrade` (or `install` / `reinstall`) naming every
 no-soak package, preceded by a `brew update` unless one already succeeded
@@ -194,6 +202,9 @@ packages (brew decides; runs brew install and brew upgrade)`.
 | `--help` / `-h` | brewsoak help. `help install` is soak-aware; `help services` is `brew help`. |
 
 Other flags (`--debug`, …) are forwarded to `brew`. `--formula`, `--formulae`, `--cask` and `--casks` are not forwarded to the per-package `brew` commands brewsoak runs, because brewsoak adds the flag for the package's own kind: a soaked install or upgrade, and each kind group of the no-soak step when a run has both formulae and casks. They still choose the kind of a name you type (`--cask` or `--formula`).
+With no names, `upgrade`, `outdated` and `info` consider only that kind; giving
+one of each is a usage error (`--formula and --cask are mutually exclusive`), as
+in brew. A bare `info` resolves each package by its own kind.
 `upgrade` and `outdated` honor brew's `--greedy` (`-g`),
 `--greedy-auto-updates` and `--greedy-latest` themselves (see below); the
 no-soak `brew upgrade` also receives them.
@@ -258,7 +269,15 @@ or `reinstall` starts by removing tap files that no installed package uses, and
 `brewsoak update` does the same after its refresh. We saw that start-of-run
 step remove a package's tap file while a plain `brew upgrade` was running, and
 brew then lost that package's keg. A run whose names are only own-tap tokens
-skips that start-of-run prune. Let one finish before you start the other.
+skips that start-of-run prune. Before it removes a formula's tap file,
+brewsoak takes brew's own lock for that formula, reads the keg receipts again,
+and leaves the file when brew holds the lock or a receipt names the tap
+(`--verbose` prints `not pruning <file>: brew holds the lock for <name>` or
+`not pruning <file>: <name> is installed from brewsoak's tap`). It holds the lock only for that
+read and the removal. If the lock cannot be taken at all, it prints a warning and leaves the
+file. Casks have no such lock in brew, so their receipt is only read again.
+Running the two side by side is still unsupported. Let one finish before you
+start the other.
 
 **Plain `brew` afterwards.** A package installed from the tap is anchored to it:
 
@@ -319,7 +338,17 @@ The reasons:
 A third-party package whose name also exists in `homebrew/core` is held, because
 its bare name resolves to core. A third-party package from a tap brew does not
 trust is held with `brew does not trust tap <tap>; run brew trust <tap>, or add
-it to NO_SOAK`.
+it to NO_SOAK`. The hold also prints an inline line,
+`held <name>: brew does not trust tap <tap>` (for a dependency,
+`held <target>: dependency <dep>: brew does not trust tap <tap>`), and its note
+sits under `Held:`.
+
+An installed dependency that lives in a tap brewsoak could not refresh, or that
+has no soak snapshot this run, passes when brew counts it as up to date. When
+brew does not, the target is refused with
+``cannot install <target>: dependency <dep>: tap <tap> could not be refreshed, and brew does not count the installed <dep> as up to date;`` (followed by the refresh error) or
+``cannot install <target>: dependency <dep>: tap <tap> has no soak snapshot this run, and brew does not count the installed <dep> as up to date``,
+each followed by ``use `<bypass>` to bypass brewsoak.``
 
 For packages from the tap, the hold texts are:
 
@@ -343,8 +372,9 @@ For packages from the tap, the hold texts are:
   `Not upgrading <name>, ...` (for example `no newer app version was detected`
   for a cask that updates itself) or an `already installed` line about the
   target; for a `homebrew/core` or `homebrew/cask` package with no such line,
-  it is `its receipt does not name brewsoak's tap`, when no receipt of the
-  package names brewsoak's tap.
+  it is `no installed copy of it is from brewsoak's tap at the cutoff version`,
+  when no keg of the package was installed from brewsoak's tap at the cutoff
+  version.
 - `held <name>: an earlier brewsoak run was interrupted`, with the note
   `<name>: an earlier brewsoak run was interrupted; run brewsoak update to
   finish it`. You normally see this on a dry run, because a real run settles
@@ -371,6 +401,12 @@ failed `brew update` is reported in `Notes` and fails the exit code, but does
 not hold anything.
 
 ## Output
+
+A package whose file changed without a version change is labeled
+`(source changed)`: `<name> <version> (source changed)` in `outdated` and on
+the upgrade line, and `would upgrade (source changed)` in `info`, not as
+`X < X`. brew answers "already installed" for the same version, so such
+a package is counted as skipped on each run until its version changes.
 
 brewsoak summarizes `brew`'s install output: one line announcing each package
 it changes, then a short line per download and install step. Bottle manifests,
