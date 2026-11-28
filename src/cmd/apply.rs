@@ -3,8 +3,8 @@ use super::deps::{
     CutoffDepWalk, CutoffDeps, HeldDep, NameFail, NameHold, NameWhy, Role, first_line,
 };
 use super::notes::{
-    NoteKind, by_name_note, held_tap_note, newer_than_cutoff_note, own_tap_token_note,
-    refusal_message, unsoakable_note, write_notes, write_session_tail,
+    NoteKind, by_name_note, bypass_command, held_tap_note, newer_than_cutoff_note,
+    own_tap_token_note, refusal_message, unsoakable_note, write_notes, write_session_tail,
 };
 use super::view::{
     Resolved, ResolvedView, calendar_today, host_for_pkg, natural_kind, parse_formula_detected,
@@ -22,7 +22,7 @@ use crate::identity::PkgIdentity;
 use crate::inventory::{Inventory, Pkg, PkgClass};
 use crate::lock::RunLock;
 use crate::nosoak;
-use crate::origin::{self, OriginRecords};
+use crate::origin::{self, OriginRecords, OwnTap};
 use crate::quiet;
 use crate::report::{self, Counts, Verb};
 use crate::resolve::{PkgKind, PkgRef};
@@ -115,11 +115,14 @@ pub fn reinstall(
         }
         match r.class {
             PkgClass::NoSoak => {
+                let installed = inv.find_in(&r.origin, &r.name);
+                let official = session.is_official(installed);
                 session.nosoak.push(nosoak::Target {
                     origin: r.origin,
                     name: r.name,
                     switch_tap: false,
-                    kind: None,
+                    kind: installed.filter(|_| official).map(|p| p.kind),
+                    official,
                 });
                 continue;
             }
@@ -572,12 +575,29 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(true)
     }
 
+    /// An installed package that brew knows under its official tap: a
+    /// formula anchored in the soak tap, or a cask whose receipt names it.
+    fn is_official(&self, installed: Option<&Pkg>) -> bool {
+        installed.is_some_and(|p| match p.kind {
+            PkgKind::Formula => soaktap::anchored(self.soak.dir(), p),
+            PkgKind::Cask => p.own_tap == Some(OwnTap::Soak),
+        })
+    }
+
+    /// The brew command that bypasses brewsoak for one package.
+    fn bypass_for(&self, token: &str, installed: Option<&Pkg>) -> String {
+        let anchored = installed
+            .is_some_and(|p| p.kind == PkgKind::Formula && soaktap::anchored(self.soak.dir(), p));
+        bypass_command(self.brew_verb, token, installed, anchored)
+    }
+
     fn nosoak_target(&self, r: Resolved, installed: Option<&Pkg>) -> nosoak::Target {
         nosoak::Target {
             switch_tap: r.receipt_tap.is_none()
                 && !origin::is_core_or_cask(&r.origin)
                 && installed.is_some(),
             kind: installed.map(|p| p.kind),
+            official: self.is_official(installed),
             origin: r.origin,
             name: r.name,
         }
@@ -649,8 +669,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 } else {
                     let token = nosoak::brew_token(&r.origin, &name);
                     self.defer_held(format!(
-                        "{msg}; use `brew {} {token}` to bypass brewsoak.",
-                        self.brew_verb
+                        "{msg}; use `{}` to bypass brewsoak.",
+                        bypass_command(self.brew_verb, &token, None, false)
                     ));
                     self.counts.held += 1;
                     self.refused = true;
@@ -750,6 +770,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         }
         self.counts.note(view.action, view.newer_soaking());
         let token = nosoak::brew_token(&r.origin, &name);
+        let bypass = self.bypass_for(&token, installed);
         match view.action {
             DesiredAction::NoOpAlreadySoaked => {
                 if self.brew_verb == "install" {
@@ -775,7 +796,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::LeaveAheadOfSoak => {
                 if self.brew_verb == "reinstall" {
                     self.defer_held(format!(
-                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `brew reinstall {token}` to bypass brewsoak."
+                        "{name} is ahead of soak; reinstall would pull a too-new artifact; use `{bypass}` to bypass brewsoak."
                     ));
                     self.refused = true;
                 } else {
@@ -786,7 +807,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 let (installed_ver, cutoff_ver) = view_versions(&view);
                 if self.brew_verb == "reinstall" {
                     self.defer_held(format!(
-                        "{name} is newer than its cutoff {cutoff_ver}; reinstall would downgrade it; use `brew reinstall {token}` to bypass brewsoak."
+                        "{name} is newer than its cutoff {cutoff_ver}; reinstall would downgrade it; use `{bypass}` to bypass brewsoak."
                     ));
                     self.refused = true;
                 } else {
@@ -803,7 +824,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             DesiredAction::RefuseTooNew
             | DesiredAction::RefuseYanked
             | DesiredAction::RefuseDeprecated => {
-                if let Some(msg) = refusal_message(view.action, &token, self.brew_verb) {
+                if let Some(msg) = refusal_message(view.action, &token, &bypass) {
                     self.defer_held(msg);
                 }
                 self.refused = true;
@@ -1116,8 +1137,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         };
         writeln!(
             self.out,
-            "cannot install {target}: dependency {why}; use `brew {} {target_token}` to bypass brewsoak.",
-            self.brew_verb
+            "cannot install {target}: dependency {why}; use `{}` to bypass brewsoak.",
+            bypass_command(self.brew_verb, target_token, None, false)
         )?;
         Ok(())
     }
@@ -1147,7 +1168,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Some(dep) => writeln!(self.out, "held {target}: dependency {dep}: {why}")?,
             None => writeln!(self.out, "held {target}: {why}")?,
         }
-        let bypass = format!("brew {} {target_token}", self.brew_verb);
+        let bypass = bypass_command(self.brew_verb, target_token, None, false);
         self.defer_held(by_name_note(target, hold.dep.as_deref(), &why, &bypass));
         Ok(())
     }
@@ -1193,8 +1214,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.hold_target_for_dep();
         writeln!(
             self.out,
-            "cannot install {target}: dependency {}: {}\nuse `brew {} {target_token}` to bypass brewsoak.",
-            held.dep, held.reason, self.brew_verb
+            "cannot install {target}: dependency {}: {}\nuse `{}` to bypass brewsoak.",
+            held.dep,
+            held.reason,
+            bypass_command(self.brew_verb, target_token, None, false)
         )?;
         Ok(())
     }
@@ -1210,9 +1233,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.hold_target_for_dep();
         writeln!(
             self.out,
-            "cannot install {target}: a dependency name is ambiguous;\n  {}\nuse `brew {} {target_token}` to bypass brewsoak.",
+            "cannot install {target}: a dependency name is ambiguous;\n  {}\nuse `{}` to bypass brewsoak.",
             message.trim().replace('\n', "\n  "),
-            self.brew_verb
+            bypass_command(self.brew_verb, target_token, None, false)
         )?;
         Ok(())
     }
@@ -3878,6 +3901,213 @@ mod tests {
                 1,
                 "{text}"
             );
+        }
+
+        /// `hello` installed from the soak tap at 1.2.0, ahead of its soak
+        /// cutoff 1.1.0; `anchored` also puts its file in the tap.
+        fn ahead_hello(tap: &Path, anchored: bool) -> (MockBrew, InMemoryGit, Snapshots) {
+            let (brew, git, snaps) = hello_world(tap, true, "1.2.0");
+            if anchored {
+                std::fs::create_dir_all(tap.join("Formula")).unwrap();
+                std::fs::write(
+                    tap.join("Formula/hello.rb"),
+                    formula_rb("hello", "1.2.0", "newsha"),
+                )
+                .unwrap();
+            }
+            (brew, git, snaps)
+        }
+
+        /// The held notes of a run, one per line.
+        fn bypass_line(text: &str) -> String {
+            text.lines()
+                .find(|l| l.contains("to bypass brewsoak"))
+                .unwrap_or_else(|| panic!("no bypass hint: {text}"))
+                .to_string()
+        }
+
+        #[test]
+        fn refusal_of_an_anchored_formula_names_core() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
+            // `newbie` has no cutoff yet: HEAD is inside the soak window.
+            git.insert_blob(
+                "headsha",
+                "Formula/n/newbie.rb",
+                formula_rb("newbie", "1.0.0", "newsha"),
+            );
+            let rb = formula_rb("newbie", "0.9.0", "oldsha");
+            brew.installed.push(InstalledPkg {
+                own_tap: Some(crate::origin::OwnTap::Soak),
+                ..formula_pkg("newbie", rb.clone())
+            });
+            std::fs::create_dir_all(tap.path().join("Formula")).unwrap();
+            std::fs::write(tap.path().join("Formula/newbie.rb"), rb).unwrap();
+            let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), "upgrade", &["newbie"]);
+            assert!(r.refused, "{text}");
+            let line = bypass_line(&text);
+            assert!(line.contains("newbie is too new"), "{text}");
+            assert!(
+                line.ends_with("use `brew upgrade homebrew/core/newbie` to bypass brewsoak."),
+                "{text}"
+            );
+        }
+
+        /// `apply_many` with the `reinstall` verb over `names`: the reinstall
+        /// command sends a package at HEAD to its true-repair path first, so
+        /// the hold for a package ahead of soak is only reachable here.
+        fn apply_reinstall(
+            brew: &MockBrew,
+            git: &InMemoryGit,
+            snaps: &Snapshots,
+            tap: &Path,
+            names: &[&str],
+        ) -> (RunResult, String) {
+            let cfg = cfg24();
+            let inv = inv_from(brew, &cfg);
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let mut out = Vec::new();
+            let r = apply_many(
+                &crate::lock::RunLock::for_tests(),
+                brew,
+                git,
+                snaps,
+                test_cache(),
+                tap,
+                &inv,
+                &cfg,
+                &names,
+                false,
+                "reinstall",
+                false,
+                false,
+                &[],
+                None,
+                &mut out,
+            )
+            .unwrap();
+            (r, String::from_utf8(out).unwrap())
+        }
+
+        #[test]
+        fn reinstall_refusal_of_an_anchored_formula_names_core_reinstall() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = ahead_hello(tap.path(), true);
+            let (r, text) = apply_reinstall(&brew, &git, &snaps, tap.path(), &["hello"]);
+            assert!(r.refused, "{text}");
+            assert!(
+                bypass_line(&text)
+                    .ends_with("use `brew reinstall homebrew/core/hello` to bypass brewsoak."),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn soak_receipt_cask_hint_names_homebrew_cask_whether_or_not_its_file_exists() {
+            for file in [false, true] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
+                git.insert_blob(
+                    "caskcut",
+                    "Casks/f/font-hack.rb",
+                    cask_rb("font-hack", "1.1.0"),
+                );
+                git.insert_blob(
+                    "caskhead",
+                    "Casks/f/font-hack.rb",
+                    cask_rb("font-hack", "1.2.0"),
+                );
+                let rb = crate::brew::version_only_cask_receipt("font-hack", "1.2.0");
+                brew.installed.push(InstalledPkg {
+                    own_tap: Some(crate::origin::OwnTap::Soak),
+                    ..cask_pkg_from("font-hack", "homebrew/cask", rb)
+                });
+                if file {
+                    std::fs::create_dir_all(tap.path().join("Casks")).unwrap();
+                    std::fs::write(
+                        tap.path().join("Casks/font-hack.rb"),
+                        cask_rb("font-hack", "1.2.0"),
+                    )
+                    .unwrap();
+                }
+                let (r, text) =
+                    verb_run(&brew, &git, &snaps, tap.path(), "reinstall", &["font-hack"]);
+                assert!(r.refused, "file={file}: {text}");
+                assert!(
+                    bypass_line(&text).ends_with(
+                        "use `brew reinstall --cask homebrew/cask/font-hack` to bypass brewsoak."
+                    ),
+                    "file={file}: {text}"
+                );
+            }
+        }
+
+        #[test]
+        fn legacy_receipt_keeps_the_bare_hint() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = ahead_hello(tap.path(), true);
+            brew.installed
+                .iter_mut()
+                .find(|p| p.name == "hello")
+                .unwrap()
+                .own_tap = Some(crate::origin::OwnTap::Legacy);
+            let (_, text) = apply_reinstall(&brew, &git, &snaps, tap.path(), &["hello"]);
+            assert!(
+                bypass_line(&text).ends_with("use `brew reinstall hello` to bypass brewsoak."),
+                "{text}"
+            );
+        }
+
+        /// Run `upgrade hello` with `NO_SOAK = ["hello"]`; the commands of
+        /// the no-soak step.
+        fn no_soak_hello(
+            brew: &MockBrew,
+            git: &InMemoryGit,
+            snaps: &Snapshots,
+            tap: &Path,
+        ) -> Vec<Vec<String>> {
+            let cfg = cfg_with("NO_SOAK = [\"hello\"]\n");
+            let inv = inv_from(brew, &cfg);
+            let mut out = Vec::new();
+            upgrade(
+                &crate::lock::RunLock::for_tests(),
+                brew,
+                git,
+                snaps,
+                test_cache(),
+                tap,
+                &inv,
+                &cfg,
+                &["hello".to_string()],
+                &[],
+                &mut out,
+            )
+            .unwrap();
+            visible(brew)
+        }
+
+        #[test]
+        fn no_soak_anchored_formula_uses_the_core_token() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = ahead_hello(tap.path(), true);
+            let runs = no_soak_hello(&brew, &git, &snaps, tap.path());
+            assert!(
+                runs.contains(&strs(&["upgrade", "homebrew/core/hello"])),
+                "{runs:?}"
+            );
+        }
+
+        #[test]
+        fn no_soak_legacy_receipt_formula_keeps_its_bare_name() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = ahead_hello(tap.path(), true);
+            brew.installed
+                .iter_mut()
+                .find(|p| p.name == "hello")
+                .unwrap()
+                .own_tap = Some(crate::origin::OwnTap::Legacy);
+            let runs = no_soak_hello(&brew, &git, &snaps, tap.path());
+            assert!(runs.contains(&strs(&["upgrade", "hello"])), "{runs:?}");
         }
     }
 }

@@ -1,9 +1,39 @@
 use crate::Error;
 use crate::eligibility::DesiredAction;
+use crate::inventory::Pkg;
+use crate::origin::{self, OwnTap};
+use crate::resolve::PkgKind;
 use crate::section::Section;
 use std::io::Write;
 
-pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Option<String> {
+/// The brew command that bypasses brewsoak for one package. A package that
+/// brew knows under its official tap (an anchored formula, or a cask whose
+/// receipt names the soak tap) is named by that tap, so brew does not look in
+/// brewsoak's own tap; `install` of an installed package becomes `upgrade`.
+pub(super) fn bypass_command(
+    brew_verb: &str,
+    token: &str,
+    installed: Option<&Pkg>,
+    anchored: bool,
+) -> String {
+    let verb = if brew_verb == "reinstall" {
+        "reinstall"
+    } else {
+        "upgrade"
+    };
+    match installed {
+        Some(p) if p.kind == PkgKind::Formula && anchored => {
+            format!("brew {verb} {}/{}", origin::CORE, p.name)
+        }
+        Some(p) if p.kind == PkgKind::Cask && p.own_tap == Some(OwnTap::Soak) => {
+            format!("brew {verb} --cask {}/{}", origin::CASK, p.name)
+        }
+        _ => format!("brew {brew_verb} {token}"),
+    }
+}
+
+/// `bypass` is the whole command that skips brewsoak, from `bypass_command`.
+pub fn refusal_message(action: DesiredAction, name: &str, bypass: &str) -> Option<String> {
     let why = match action {
         DesiredAction::RefuseTooNew => format!("{name} is too new (born inside the soak window)"),
         DesiredAction::RefuseYanked => format!("{name} is missing at HEAD (yanked)"),
@@ -17,9 +47,7 @@ pub fn refusal_message(action: DesiredAction, name: &str, brew_verb: &str) -> Op
         | DesiredAction::LeaveAutoUpdates
         | DesiredAction::InstallCutoff => return None,
     };
-    Some(format!(
-        "{why}; use `brew {brew_verb} {name}` to bypass brewsoak."
-    ))
+    Some(format!("{why}; use `{bypass}` to bypass brewsoak."))
 }
 
 /// Why the target is held while its closure was walked. `bypass` is the whole
@@ -190,7 +218,8 @@ mod tests {
     use crate::eligibility::DesiredAction;
 
     fn assert_refuse_copy(action: DesiredAction, name: &str, brew_verb: &str) {
-        let msg = refusal_message(action, name, brew_verb).expect("refuse message");
+        let bypass = format!("brew {brew_verb} {name}");
+        let msg = refusal_message(action, name, &bypass).expect("refuse message");
         assert!(
             msg.contains(&format!("brew {brew_verb} {name}")),
             "{action:?} missing `brew {brew_verb} {name}`: {msg}"
@@ -285,8 +314,69 @@ Notes
     #[test]
     fn leave_ahead_of_soak_is_not_a_refusal() {
         assert_eq!(
-            refusal_message(DesiredAction::LeaveAheadOfSoak, "wget", "upgrade"),
+            refusal_message(DesiredAction::LeaveAheadOfSoak, "wget", "brew upgrade wget"),
             None
+        );
+    }
+
+    fn pkg(kind: PkgKind, own_tap: Option<OwnTap>) -> Pkg {
+        Pkg {
+            name: "hello".into(),
+            kind,
+            origin: "homebrew/core".into(),
+            class: crate::inventory::PkgClass::Soaked,
+            receipt_rb: String::new(),
+            receipt_tap: None,
+            own_tap,
+            pinned: false,
+        }
+    }
+
+    #[test]
+    fn bypass_command_table() {
+        let soak = pkg(PkgKind::Formula, Some(OwnTap::Soak));
+        let cask = pkg(PkgKind::Cask, Some(OwnTap::Soak));
+        assert_eq!(
+            bypass_command("upgrade", "wget", None, false),
+            "brew upgrade wget"
+        );
+        assert_eq!(
+            bypass_command("install", "acme/tools/wget", None, false),
+            "brew install acme/tools/wget"
+        );
+        for verb in ["upgrade", "install"] {
+            assert_eq!(
+                bypass_command(verb, "hello", Some(&soak), true),
+                "brew upgrade homebrew/core/hello"
+            );
+            assert_eq!(
+                bypass_command(verb, "hello", Some(&cask), false),
+                "brew upgrade --cask homebrew/cask/hello"
+            );
+        }
+        assert_eq!(
+            bypass_command("reinstall", "hello", Some(&soak), true),
+            "brew reinstall homebrew/core/hello"
+        );
+        assert_eq!(
+            bypass_command("reinstall", "hello", Some(&cask), false),
+            "brew reinstall --cask homebrew/cask/hello"
+        );
+        // A legacy receipt, or a soak receipt whose tap file is gone, keeps
+        // the bare name.
+        let legacy = pkg(PkgKind::Formula, Some(OwnTap::Legacy));
+        assert_eq!(
+            bypass_command("upgrade", "hello", Some(&legacy), false),
+            "brew upgrade hello"
+        );
+        assert_eq!(
+            bypass_command("upgrade", "hello", Some(&soak), false),
+            "brew upgrade hello"
+        );
+        let legacy_cask = pkg(PkgKind::Cask, Some(OwnTap::Legacy));
+        assert_eq!(
+            bypass_command("upgrade", "hello", Some(&legacy_cask), false),
+            "brew upgrade hello"
         );
     }
 }

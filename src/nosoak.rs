@@ -89,6 +89,18 @@ pub struct Target {
     pub switch_tap: bool,
     /// Known for an installed package; `None` for a name not installed yet.
     pub kind: Option<PkgKind>,
+    /// Installed from the soak tap: goes to brew under its official tap.
+    pub official: bool,
+}
+
+/// `homebrew/core/<name>` (or `homebrew/cask/<name>` for a cask) when
+/// `official`, else `brew_token`.
+pub fn target_token(t: &Target) -> String {
+    match (t.official, t.kind) {
+        (true, Some(PkgKind::Formula)) => format!("{}/{}", origin::CORE, t.name),
+        (true, Some(PkgKind::Cask)) => format!("{}/{}", origin::CASK, t.name),
+        _ => brew_token(&t.origin, &t.name),
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -200,11 +212,8 @@ pub fn run_step_after(
         return Ok(result);
     }
     result.count = targets.len();
-    let tokens: Vec<String> = targets
-        .iter()
-        .map(|t| brew_token(&t.origin, &t.name))
-        .collect();
-    let token_of = |t: &Target| brew_token(&t.origin, &t.name);
+    let tokens: Vec<String> = targets.iter().map(target_token).collect();
+    let token_of = |t: &Target| target_token(t);
 
     if !updated && let Some(code) = brew_update(brew, out)? {
         result.notes.push(format!(
@@ -561,6 +570,7 @@ mod tests {
             name: name.into(),
             switch_tap: false,
             kind: None,
+            official: false,
         }
     }
 
@@ -694,6 +704,7 @@ mod tests {
                 name: "vault".into(),
                 switch_tap: true,
                 kind: None,
+                official: false,
             },
         ];
         let r = run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
@@ -727,6 +738,7 @@ mod tests {
             name: "vault".into(),
             switch_tap: true,
             kind: None,
+            official: false,
         }];
         let r = run_step(&brew, "upgrade", &[], &targets, &mut Vec::new()).unwrap();
         assert_eq!(
@@ -1286,6 +1298,7 @@ Error: formula-b: boom\n"
             name: "vault".into(),
             switch_tap: true,
             kind: None,
+            official: false,
         }];
         run_step(&brew, "reinstall", &[], &targets, &mut Vec::new()).unwrap();
         assert_eq!(runs(&brew)[1], vec!["reinstall", "hashicorp/tap/vault"]);
@@ -1350,6 +1363,7 @@ Error: formula-b: boom\n"
             name: name.into(),
             switch_tap: true,
             kind: None,
+            official: false,
         }]
     }
 
@@ -1525,5 +1539,38 @@ Error: formula-b: boom\n"
         )
         .unwrap();
         assert!(!r.notes.contains(&note), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn official_target_goes_to_brew_under_its_official_tap() {
+        let formula = Target {
+            kind: Some(PkgKind::Formula),
+            official: true,
+            ..t("homebrew/core", "hello")
+        };
+        let cask = Target {
+            kind: Some(PkgKind::Cask),
+            official: true,
+            ..t("homebrew/cask", "font-hack")
+        };
+        let core = Target {
+            kind: Some(PkgKind::Formula),
+            ..t("homebrew/core", "hello")
+        };
+        assert_eq!(target_token(&formula), "homebrew/core/hello");
+        assert_eq!(target_token(&cask), "homebrew/cask/font-hack");
+        assert_eq!(target_token(&core), "hello");
+        for (target, want) in [
+            (formula, "homebrew/core/hello"),
+            (cask, "homebrew/cask/font-hack"),
+            (core, "hello"),
+        ] {
+            let brew = MockBrew::new();
+            run_step_after(&brew, "upgrade", &[], &[target], true, &mut Vec::new()).unwrap();
+            assert_eq!(
+                runs(&brew)[0],
+                vec!["upgrade".to_string(), want.to_string()]
+            );
+        }
     }
 }
