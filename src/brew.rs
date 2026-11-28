@@ -296,6 +296,15 @@ pub trait Brew {
     fn soak_tap_keg_files(&self, _name: &str) -> Vec<String> {
         Vec::new()
     }
+    /// brew's own lock on formula `name`, without waiting.
+    fn lock_formula(
+        &self,
+        _name: &str,
+    ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+        Err(crate::lock::BrewLockError::Unavailable(
+            "brew's lock directory is unknown".into(),
+        ))
+    }
     /// Names brew itself considers outdated right now (no `brew update`),
     /// with the same greedy mode `upgrade` passes to brew.
     fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error>;
@@ -356,6 +365,8 @@ pub struct ProcessBrew {
     cellar: std::cell::OnceCell<Option<PathBuf>>,
     /// `brew --caskroom`, asked once.
     caskroom: std::cell::OnceCell<Option<PathBuf>>,
+    /// `$(brew --prefix)/var/homebrew/locks`, asked once.
+    locks: std::cell::OnceCell<Option<PathBuf>>,
     /// `read_cask_languages` answers for this run, keyed by cask token.
     languages: Mutex<HashMap<String, Option<Vec<String>>>>,
     /// The `--language` flag's languages (`set_cli_languages`).
@@ -465,6 +476,7 @@ impl ProcessBrew {
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
             caskroom: std::cell::OnceCell::new(),
+            locks: std::cell::OnceCell::new(),
             languages: Mutex::new(HashMap::new()),
             cli: Mutex::new(Vec::new()),
             orderings: Mutex::new(HashMap::new()),
@@ -515,6 +527,12 @@ pub struct MockBrew {
     pub tap_info_error_after_create: Option<String>,
     /// What `receipt_tap` reports, keyed by `(kind, name, version)`.
     pub receipt_taps: BTreeMap<(PkgKind, String, String), String>,
+    /// `lock_formula` answers `Busy` for these names.
+    pub busy_formulae: std::collections::BTreeSet<String>,
+    /// `lock_formula` answers `Unavailable` with this text.
+    pub lock_error: Option<String>,
+    /// Every name `lock_formula` was asked for, in order.
+    pub lock_calls: Mutex<Vec<String>>,
     /// Runs before the answer of `run`, `run_visible_in`, `tap_new` (their
     /// args) and `deps` (`["deps", "--formula"|"--cask", token]`). The hook
     /// runs while the `on_call` lock is held, so it must not call `run`,
@@ -591,6 +609,9 @@ impl Default for MockBrew {
             tap_unlisted_after_create: false,
             tap_info_error_after_create: None,
             receipt_taps: BTreeMap::new(),
+            busy_formulae: std::collections::BTreeSet::new(),
+            lock_error: None,
+            lock_calls: Mutex::new(Vec::new()),
             on_call: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
@@ -744,6 +765,16 @@ impl Brew for ProcessBrew {
                 .into_iter()
                 .collect(),
         }
+    }
+
+    fn lock_formula(
+        &self,
+        name: &str,
+    ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+        let dir = self.locks_dir().ok_or_else(|| {
+            crate::lock::BrewLockError::Unavailable("brew --prefix gave no directory".into())
+        })?;
+        crate::lock::try_brew_formula_lock(&dir, name)
     }
 
     fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
@@ -1143,6 +1174,16 @@ impl ProcessBrew {
             .clone()
     }
 
+    /// brew's formula lock directory, from `brew --prefix`, asked once.
+    fn locks_dir(&self) -> Option<PathBuf> {
+        self.locks
+            .get_or_init(|| {
+                self.brew_dir("--prefix")
+                    .map(|p| p.join("var/homebrew/locks"))
+            })
+            .clone()
+    }
+
     /// `brew --caskroom`, asked once and shared by every reader.
     fn caskroom(&self) -> Option<PathBuf> {
         self.caskroom
@@ -1344,6 +1385,20 @@ impl Brew for MockBrew {
             .filter(|((k, n, _), _)| *k == kind && n == name)
             .map(|(_, tap)| tap.clone())
             .collect()
+    }
+
+    fn lock_formula(
+        &self,
+        name: &str,
+    ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+        self.lock_calls.lock().unwrap().push(name.to_string());
+        if self.busy_formulae.contains(name) {
+            return Err(crate::lock::BrewLockError::Busy);
+        }
+        match &self.lock_error {
+            Some(why) => Err(crate::lock::BrewLockError::Unavailable(why.clone())),
+            None => Ok(crate::lock::BrewLock::unguarded()),
+        }
     }
 
     fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
@@ -4331,6 +4386,58 @@ esac
         assert_eq!(read_soak_tap_keg_files(tmp.path(), "wget"), ["A"]);
         assert_eq!(brew.soak_tap_keg_files("wget"), ["A"]);
         assert!(read_soak_tap_keg_files(tmp.path(), "curl").is_empty());
+    }
+
+    #[test]
+    fn process_brew_lock_formula_uses_the_prefix_lock_directory() {
+        use crate::lock::BrewLockError;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let prefix = tmp.path().join("prefix");
+        let log = tmp.path().join("log");
+        let script = tmp.path().join("brew.sh");
+        crate::test_util::write_executable(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1\" in --prefix) echo {};; esac\n",
+                log.display(),
+                prefix.display()
+            ),
+        );
+        let brew = ProcessBrew::new(script);
+        let guard = brew.lock_formula("wget").expect("lock");
+        assert!(prefix.join("var/homebrew/locks/wget.formula.lock").exists());
+        assert_eq!(brew.lock_formula("wget").unwrap_err(), BrewLockError::Busy);
+        drop(guard);
+        assert!(brew.lock_formula("wget").is_ok());
+        assert_eq!(log_lines(&log), ["--prefix"], "asked once");
+    }
+
+    #[test]
+    fn process_brew_lock_formula_without_a_prefix_is_unavailable() {
+        use crate::lock::BrewLockError;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script = tmp.path().join("brew.sh");
+        crate::test_util::write_executable(&script, "#!/bin/sh\nexit 1\n");
+        let brew = ProcessBrew::new(script);
+        assert_eq!(
+            brew.lock_formula("wget").unwrap_err(),
+            BrewLockError::Unavailable("brew --prefix gave no directory".into())
+        );
+    }
+
+    #[test]
+    fn mock_lock_formula_follows_its_script() {
+        use crate::lock::BrewLockError;
+        let mut brew = MockBrew::new();
+        assert!(brew.lock_formula("wget").is_ok());
+        brew.busy_formulae.insert("curl".into());
+        assert_eq!(brew.lock_formula("curl").unwrap_err(), BrewLockError::Busy);
+        brew.lock_error = Some("nope".into());
+        assert_eq!(
+            brew.lock_formula("jq").unwrap_err(),
+            BrewLockError::Unavailable("nope".into())
+        );
+        assert_eq!(*brew.lock_calls.lock().unwrap(), ["wget", "curl", "jq"]);
     }
 
     #[test]

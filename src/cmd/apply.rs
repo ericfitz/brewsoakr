@@ -2635,6 +2635,12 @@ mod tests {
         fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
             self.inner.soak_tap_keg_files(name)
         }
+        fn lock_formula(
+            &self,
+            name: &str,
+        ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+            self.inner.lock_formula(name)
+        }
         fn installed_receipt_taps(&self, kind: PkgKind, name: &str) -> Vec<String> {
             self.inner.installed_receipt_taps(kind, name)
         }

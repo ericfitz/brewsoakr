@@ -9,6 +9,7 @@ use crate::brew::Brew;
 use crate::error::first_line;
 use crate::identity::{self, PkgIdentity};
 use crate::inventory::{Inventory, Pkg};
+use crate::lock::BrewLockError;
 use crate::lock::RunLock;
 use crate::origin::{OwnTap, SOAK_TAP};
 use crate::resolve::{PkgKind, PkgRef};
@@ -517,6 +518,7 @@ pub fn recover(_lock: &RunLock, brew: &impl Brew, dir: &Path, cache: &Path) -> R
 /// entries.
 pub fn prune(
     _lock: &RunLock,
+    brew: &impl Brew,
     dir: &Path,
     cache: &Path,
     inv: &Inventory,
@@ -535,7 +537,7 @@ pub fn prune(
         };
         let root = dir.join(kind_dir(kind));
         match std::fs::symlink_metadata(&root) {
-            Ok(m) if m.is_dir() => prune_walk(&root, &used, verbose, out)?,
+            Ok(m) if m.is_dir() => prune_walk(&root, kind, brew, &used, verbose, out)?,
             Ok(_) => writeln!(
                 out,
                 "brewsoak: warning: not pruning {}: not a real directory",
@@ -547,8 +549,17 @@ pub fn prune(
     Ok(())
 }
 
+/// Whether a receipt on disk now names the soak tap for `name`.
+fn receipt_names_soak(brew: &impl Brew, kind: PkgKind, name: &str) -> bool {
+    brew.installed_receipt_taps(kind, name)
+        .iter()
+        .any(|t| crate::origin::own_tap(t) == Some(OwnTap::Soak))
+}
+
 fn prune_walk(
     root: &Path,
+    kind: PkgKind,
+    brew: &impl Brew,
     used: &impl Fn(&str) -> bool,
     verbose: bool,
     out: &mut impl Write,
@@ -563,7 +574,7 @@ fn prune_walk(
     paths.sort_by(|a, b| a.0.cmp(&b.0));
     for (path, ft) in paths {
         if ft.is_dir() {
-            prune_walk(&path, used, verbose, out)?;
+            prune_walk(&path, kind, brew, used, verbose, out)?;
             continue;
         }
         let Some(name) = path
@@ -574,6 +585,44 @@ fn prune_walk(
             continue;
         };
         if used(name) {
+            continue;
+        }
+        // The inventory is a snapshot: the receipt is read again under brew's
+        // own lock (formulae), so an install in flight is never undone.
+        let _guard = if kind == PkgKind::Formula {
+            match brew.lock_formula(name) {
+                Ok(guard) => Some(guard),
+                Err(BrewLockError::Busy) => {
+                    if verbose {
+                        writeln!(
+                            out,
+                            "not pruning {}: brew holds the lock for {name}",
+                            path.display()
+                        )?;
+                    }
+                    continue;
+                }
+                Err(BrewLockError::Unavailable(why)) => {
+                    writeln!(
+                        out,
+                        "brewsoak: warning: not pruning {}: could not take brew's lock for {name} ({})",
+                        path.display(),
+                        first_line(&why)
+                    )?;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        if receipt_names_soak(brew, kind, name) {
+            if verbose {
+                writeln!(
+                    out,
+                    "not pruning {}: {name} is installed from brewsoak's tap",
+                    path.display()
+                )?;
+            }
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -613,7 +662,7 @@ pub fn maintain(
         TapState::Ready => {
             let dir = tap_dir(entry, tap_root)?;
             recover(lock, brew, &dir, cache)?;
-            prune(lock, &dir, cache, inv, verbose, out)
+            prune(lock, brew, &dir, cache, inv, verbose, out)
         }
     }
 }
@@ -1646,10 +1695,11 @@ mod tests {
         }
     }
 
-    fn prune_in(e: &Env, inv: &Inventory, verbose: bool) -> String {
+    fn prune_in(e: &Env, brew: &MockBrew, inv: &Inventory, verbose: bool) -> String {
         let mut out = Vec::new();
         prune(
             &e.lock,
+            brew,
             e.tap.path(),
             e.cache.path(),
             inv,
@@ -1665,7 +1715,7 @@ mod tests {
         let e = env();
         e.put(&e.file("Formula", "wget"), b"a");
         e.put(&e.file("Casks", "docker"), b"b");
-        let out = prune_in(&e, &inv_with(vec![]), true);
+        let out = prune_in(&e, &MockBrew::new(), &inv_with(vec![]), true);
         assert!(!e.file("Formula", "wget").exists());
         assert!(!e.file("Casks", "docker").exists());
         let want = format!(
@@ -1673,14 +1723,18 @@ mod tests {
             e.file("Formula", "wget").display()
         );
         assert!(out.contains(&want), "{out}");
-        assert_eq!(prune_in(&e, &inv_with(vec![]), true), "", "second run");
+        assert_eq!(
+            prune_in(&e, &MockBrew::new(), &inv_with(vec![]), true),
+            "",
+            "second run"
+        );
     }
 
     #[test]
     fn prune_is_quiet_without_verbose() {
         let e = env();
         e.put(&e.file("Formula", "wget"), b"a");
-        assert_eq!(prune_in(&e, &inv_with(vec![]), false), "");
+        assert_eq!(prune_in(&e, &MockBrew::new(), &inv_with(vec![]), false), "");
         assert!(!e.file("Formula", "wget").exists());
     }
 
@@ -1694,7 +1748,7 @@ mod tests {
             "wget",
             Some(OwnTap::Soak),
         )]);
-        prune_in(&e, &inv, true);
+        prune_in(&e, &MockBrew::new(), &inv, true);
         assert_eq!(
             fs::read(e.file("Formula", "wget")).unwrap(),
             other.as_bytes()
@@ -1705,7 +1759,7 @@ mod tests {
             "wget",
             Some(OwnTap::Legacy),
         )]);
-        prune_in(&e, &inv, false);
+        prune_in(&e, &MockBrew::new(), &inv, false);
         assert!(!e.file("Formula", "wget").exists());
     }
 
@@ -1716,7 +1770,7 @@ mod tests {
         e.put(&e.undo("Formula", "wget", "absent"), b"");
         e.put(&e.file("Casks", "x"), b"b");
         e.put(&e.undo("Casks", "x", "rb"), OLD);
-        prune_in(&e, &inv_with(vec![]), true);
+        prune_in(&e, &MockBrew::new(), &inv_with(vec![]), true);
         assert!(e.file("Formula", "wget").exists());
         assert!(e.file("Casks", "x").exists());
     }
@@ -1727,7 +1781,7 @@ mod tests {
         e.put(&e.file("Formula", "docker"), b"a");
         e.put(&e.file("Casks", "docker"), b"b");
         let inv = inv_with(vec![installed(PkgKind::Cask, "docker", Some(OwnTap::Soak))]);
-        prune_in(&e, &inv, true);
+        prune_in(&e, &MockBrew::new(), &inv, true);
         assert!(!e.file("Formula", "docker").exists());
         assert!(e.file("Casks", "docker").exists());
     }
@@ -1740,7 +1794,7 @@ mod tests {
         e.put(&e.tap.path().join("Formula/notes.txt"), b"n");
         e.put(&e.tap.path().join("Other/x.rb"), b"o");
         let before = crate::cmd::test_support::tree(e.tap.path());
-        prune_in(&e, &inv_with(vec![]), true);
+        prune_in(&e, &MockBrew::new(), &inv_with(vec![]), true);
         assert_eq!(crate::cmd::test_support::tree(e.tap.path()), before);
     }
 
@@ -1757,7 +1811,7 @@ mod tests {
             e.tap.path().join("Formula/sub"),
         )
         .unwrap();
-        prune_in(&e, &inv_with(vec![]), true);
+        prune_in(&e, &MockBrew::new(), &inv_with(vec![]), true);
         assert!(e.file("Formula", "x").symlink_metadata().is_err());
         assert_eq!(fs::read(outside.path().join("real.rb")).unwrap(), b"real");
         assert_eq!(
@@ -1770,7 +1824,7 @@ mod tests {
     fn prune_removes_a_nested_stale_file() {
         let e = env();
         e.put(&e.tap.path().join("Formula/a/old.rb"), b"o");
-        prune_in(&e, &inv_with(vec![]), true);
+        prune_in(&e, &MockBrew::new(), &inv_with(vec![]), true);
         assert!(!e.tap.path().join("Formula/a/old.rb").exists());
     }
 
@@ -1791,7 +1845,7 @@ mod tests {
             eprintln!("skipped: permissions do not block deletion here");
             return;
         }
-        let out = prune_in(&e, &inv_with(vec![]), false);
+        let out = prune_in(&e, &MockBrew::new(), &inv_with(vec![]), false);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(locked.join("x.rb").exists());
         assert!(out.contains("brewsoak: warning: could not prune"), "{out}");
@@ -1805,7 +1859,7 @@ mod tests {
         e.put(&outside.path().join("keep.rb"), b"k");
         std::os::unix::fs::symlink(outside.path(), e.tap.path().join("Formula")).unwrap();
         e.put(&e.file("Casks", "old"), b"o");
-        let out = prune_in(&e, &inv_with(vec![]), false);
+        let out = prune_in(&e, &MockBrew::new(), &inv_with(vec![]), false);
         assert_eq!(fs::read(outside.path().join("keep.rb")).unwrap(), b"k");
         assert!(out.contains("not a real directory"), "{out}");
         assert!(!e.file("Casks", "old").exists());
@@ -1818,13 +1872,128 @@ mod tests {
         e.put(&outside.path().join("keep.rb"), b"k");
         std::os::unix::fs::symlink(outside.path(), e.tap.path().join("Casks")).unwrap();
         e.put(&e.file("Formula", "old"), b"o");
-        let out = prune_in(&e, &inv_with(vec![]), false);
+        let out = prune_in(&e, &MockBrew::new(), &inv_with(vec![]), false);
         assert_eq!(fs::read(outside.path().join("keep.rb")).unwrap(), b"k");
         assert!(
             out.contains("not pruning") && out.contains("Casks"),
             "{out}"
         );
         assert!(!e.file("Formula", "old").exists());
+    }
+
+    fn soak_receipt(brew: &mut MockBrew, kind: PkgKind, name: &str, version: &str) {
+        brew.receipt_taps
+            .insert((kind, name.into(), version.into()), SOAK_TAP.into());
+    }
+
+    #[test]
+    fn prune_skips_a_formula_whose_brew_lock_is_busy() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        let mut brew = MockBrew::new();
+        brew.busy_formulae.insert("wget".into());
+        let out = prune_in(&e, &brew, &inv_with(vec![]), true);
+        assert!(e.file("Formula", "wget").exists());
+        assert_eq!(
+            out,
+            format!(
+                "not pruning {}: brew holds the lock for wget\n",
+                e.file("Formula", "wget").display()
+            )
+        );
+        assert_eq!(prune_in(&e, &brew, &inv_with(vec![]), false), "");
+        // Brew finished: the next run prunes it, and a third run has nothing to do.
+        let free = MockBrew::new();
+        prune_in(&e, &free, &inv_with(vec![]), false);
+        assert!(!e.file("Formula", "wget").exists());
+        assert_eq!(prune_in(&e, &free, &inv_with(vec![]), true), "");
+    }
+
+    #[test]
+    fn prune_warns_when_brews_lock_cannot_be_taken() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        let mut brew = MockBrew::new();
+        brew.lock_error = Some("no such directory".into());
+        let out = prune_in(&e, &brew, &inv_with(vec![]), false);
+        assert!(e.file("Formula", "wget").exists());
+        assert_eq!(
+            out,
+            format!(
+                "brewsoak: warning: not pruning {}: could not take brew's lock for wget (no such directory)\n",
+                e.file("Formula", "wget").display()
+            )
+        );
+    }
+
+    #[test]
+    fn prune_reads_the_receipt_again_under_the_lock() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        let mut brew = MockBrew::new();
+        soak_receipt(&mut brew, PkgKind::Formula, "wget", "1.0.0");
+        let out = prune_in(&e, &brew, &inv_with(vec![]), true);
+        assert!(e.file("Formula", "wget").exists());
+        assert_eq!(
+            out,
+            format!(
+                "not pruning {}: wget is installed from brewsoak's tap\n",
+                e.file("Formula", "wget").display()
+            )
+        );
+        assert_eq!(*brew.lock_calls.lock().unwrap(), ["wget"]);
+    }
+
+    #[test]
+    fn prune_reads_a_cask_receipt_again_and_takes_no_lock() {
+        let e = env();
+        e.put(&e.file("Casks", "docker"), b"a");
+        let mut brew = MockBrew::new();
+        soak_receipt(&mut brew, PkgKind::Cask, "docker", "4.0");
+        let out = prune_in(&e, &brew, &inv_with(vec![]), true);
+        assert!(e.file("Casks", "docker").exists());
+        assert_eq!(
+            out,
+            format!(
+                "not pruning {}: docker is installed from brewsoak's tap\n",
+                e.file("Casks", "docker").display()
+            )
+        );
+        assert!(brew.lock_calls.lock().unwrap().is_empty());
+        let plain = MockBrew::new();
+        prune_in(&e, &plain, &inv_with(vec![]), false);
+        assert!(!e.file("Casks", "docker").exists());
+        assert!(plain.lock_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_takes_no_lock_for_a_file_it_keeps_anyway() {
+        let e = env();
+        e.put(&e.file("Formula", "wget"), b"a");
+        e.put(&e.file("Formula", "curl"), b"b");
+        e.put(&e.undo("Formula", "curl", "absent"), b"");
+        let inv = inv_with(vec![installed(
+            PkgKind::Formula,
+            "wget",
+            Some(OwnTap::Soak),
+        )]);
+        let brew = MockBrew::new();
+        prune_in(&e, &brew, &inv, true);
+        assert!(e.file("Formula", "wget").exists());
+        assert!(e.file("Formula", "curl").exists());
+        assert!(brew.lock_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_locks_each_formula_by_its_file_stem() {
+        let e = env();
+        e.put(&e.file("Formula", "python@3.12"), b"a");
+        e.put(&e.tap.path().join("Formula/sub/c++filt.rb"), b"b");
+        let brew = MockBrew::new();
+        prune_in(&e, &brew, &inv_with(vec![]), false);
+        assert_eq!(*brew.lock_calls.lock().unwrap(), ["python@3.12", "c++filt"]);
+        assert!(!e.file("Formula", "python@3.12").exists());
+        assert!(!e.tap.path().join("Formula/sub/c++filt.rb").exists());
     }
 
     #[test]

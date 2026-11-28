@@ -975,6 +975,12 @@ mod tests {
             fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
                 self.0.soak_tap_keg_files(name)
             }
+            fn lock_formula(
+                &self,
+                name: &str,
+            ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+                self.0.lock_formula(name)
+            }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
             }
@@ -1086,6 +1092,12 @@ mod tests {
             }
             fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
                 self.0.soak_tap_keg_files(name)
+            }
+            fn lock_formula(
+                &self,
+                name: &str,
+            ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+                self.0.lock_formula(name)
             }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
@@ -2265,6 +2277,12 @@ mod gate_tests {
         }
         fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
             self.inner.soak_tap_keg_files(name)
+        }
+        fn lock_formula(
+            &self,
+            name: &str,
+        ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+            self.inner.lock_formula(name)
         }
         fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
             self.inner.outdated_names(greedy)
