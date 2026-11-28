@@ -3831,6 +3831,85 @@ mod tests {
         }
 
         #[test]
+        fn failed_core_dependency_whose_core_file_is_the_cutoff_lets_the_target_go_on() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            // Core's own file for libx is the cutoff file, so brew loads the
+            // soaked version whether or not the soak-tap command worked.
+            brew.by_name.insert("libx".into(), Ok(libx_by_name(true)));
+            *brew.next_outputs.lock().unwrap() = [
+                (0, Vec::new()),
+                (1, b"Error: libx: download failed\n".to_vec()),
+            ]
+            .into();
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(!text.contains("held alpha"), "{text}");
+            assert_eq!(alpha_soak_commands(&brew).len(), 1, "{:?}", visible(&brew));
+        }
+
+        /// `alpha` with the missing cask dependency `capp` (cutoff 1.1.0).
+        fn alpha_with_cask_dep(tap: &Path) -> (MockBrew, InMemoryGit) {
+            let (mut brew, git) = soak_world(tap);
+            git.insert_blob("caskcut", "Casks/c/capp.rb", cask_rb("capp", "1.1.0"));
+            git.insert_blob("caskhead", "Casks/c/capp.rb", cask_rb("capp", "1.2.0"));
+            brew.deps.insert("alpha".into(), vec!["capp".into()]);
+            (brew, git)
+        }
+
+        #[test]
+        fn missing_cask_dependency_from_the_tap_lets_the_target_go_on() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_cask_dep(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Cask, "capp".into(), "1.1.0".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(!text.contains("held alpha"), "{text}");
+            assert!(!r.refused, "{text}");
+            assert!(
+                visible(&brew).contains(&strs(&["install", "--cask", "ericfitz/brewsoak/capp"])),
+                "{:?}",
+                visible(&brew)
+            );
+            assert_eq!(alpha_soak_commands(&brew).len(), 1, "{:?}", visible(&brew));
+        }
+
+        #[test]
+        fn failed_cask_dependency_install_holds_the_target() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_cask_dep(tap.path());
+            brew.by_name.insert(
+                "capp".into(),
+                Ok(crate::brew::ByName {
+                    tap: "homebrew/cask".into(),
+                    version: "1.2.0".into(),
+                    same_source: false,
+                    installed_current: false,
+                    satisfied: false,
+                }),
+            );
+            *brew.next_outputs.lock().unwrap() = [
+                (0, Vec::new()),
+                (1, b"Error: capp: download failed\n".to_vec()),
+            ]
+            .into();
+            let before = tree(tap.path());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            let want = "alpha: held: its dependency capp was not installed from brewsoak's tap (Error: capp: download failed)";
+            assert!(text.contains(want), "{text}");
+            assert!(r.refused, "{text}");
+            assert!(summary_has(&text, "held", "1"), "{text}");
+            assert!(
+                alpha_soak_commands(&brew).is_empty(),
+                "{:?}",
+                visible(&brew)
+            );
+            assert_eq!(tree(tap.path()), before, "staged files are put back");
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
         fn dependency_anchored_at_its_cutoff_lets_the_target_go_on() {
             let tap = tempfile::tempdir().unwrap();
             let (mut brew, git) = alpha_with_libx(tap.path());
