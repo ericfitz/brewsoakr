@@ -29,8 +29,22 @@ pub fn upgrade(
 ) -> Result<RunResult, Error> {
     // A bare `brew soak upgrade` walks everything installed, so say up front
     // how many will actually change and count them off as they go.
-    let plan_total = (names.is_empty())
-        .then(|| plan_size(brew, git, snaps, cache, inv, flags::greedy_mode(user_flags)));
+    let only = if names.is_empty() {
+        flags::kind_filter(user_flags)?
+    } else {
+        None
+    };
+    let plan_total = (names.is_empty()).then(|| {
+        plan_size(
+            brew,
+            git,
+            snaps,
+            cache,
+            inv,
+            flags::greedy_mode(user_flags),
+            only,
+        )
+    });
     apply_many(
         lock,
         brew,
@@ -1316,5 +1330,188 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(run_is_name_install(&runs, "gamma"), "{runs:?}");
         assert!(!run_is_name_install(&runs, "alpha"), "{runs:?}");
+    }
+
+    fn upgrade_with(
+        brew: &MockBrew,
+        git: &InMemoryGit,
+        tap: &Path,
+        cfg: &crate::config::Config,
+        names: &[&str],
+        user_flags: &[&str],
+    ) -> Result<(RunResult, String), Error> {
+        let inv = inv_from(brew, cfg);
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let user_flags: Vec<String> = user_flags.iter().map(|n| n.to_string()).collect();
+        let mut out = Vec::new();
+        let r = upgrade(
+            &crate::lock::RunLock::for_tests(),
+            brew,
+            git,
+            &core_snaps(),
+            test_cache(),
+            tap,
+            &inv,
+            cfg,
+            &names,
+            &user_flags,
+            &mut out,
+        )?;
+        Ok((r, String::from_utf8(out).expect("utf8")))
+    }
+
+    fn visible_runs(brew: &MockBrew) -> Vec<Vec<String>> {
+        brew.visible_runs.lock().expect("visible").clone()
+    }
+
+    fn ran(runs: &[Vec<String>], args: &[&str]) -> bool {
+        runs.iter()
+            .any(|r| r.iter().map(String::as_str).eq(args.iter().copied()))
+    }
+
+    fn kind_run(flags: &[&str]) -> (MockBrew, String) {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let (_, text) = upgrade_with(&brew, &git, tap.path(), &cfg24(), &[], flags).unwrap();
+        (brew, text)
+    }
+
+    #[test]
+    fn bare_upgrade_without_a_kind_flag_takes_both_kinds() {
+        let (brew, text) = kind_run(&[]);
+        assert!(
+            text.contains("Upgrading soaked packages (2 of 3)"),
+            "{text}"
+        );
+        let runs = visible_runs(&brew);
+        assert!(
+            ran(&runs, &["upgrade", "--formula", "ericfitz/brewsoak/alpha"]),
+            "{runs:?}"
+        );
+        assert!(
+            ran(&runs, &["install", "--cask", "ericfitz/brewsoak/docker"]),
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_upgrade_with_cask_takes_only_casks() {
+        let (brew, text) = kind_run(&["--cask"]);
+        assert!(
+            text.contains("Upgrading soaked packages (1 of 1)"),
+            "{text}"
+        );
+        assert!(text.contains("[1/1] upgrading docker 4.0 -> 4.1"), "{text}");
+        let runs = visible_runs(&brew);
+        assert!(!run_has_token(&runs, "ericfitz/brewsoak/alpha"), "{runs:?}");
+        assert!(
+            ran(&runs, &["install", "--cask", "ericfitz/brewsoak/docker"]),
+            "{runs:?}"
+        );
+        assert!(!text.contains("thing"), "{text}");
+    }
+
+    #[test]
+    fn bare_upgrade_with_formulae_takes_only_formulae() {
+        let (brew, text) = kind_run(&["--formulae"]);
+        assert!(
+            text.contains("Upgrading soaked packages (1 of 2)"),
+            "{text}"
+        );
+        let runs = visible_runs(&brew);
+        assert!(
+            ran(&runs, &["upgrade", "--formula", "ericfitz/brewsoak/alpha"]),
+            "{runs:?}"
+        );
+        assert!(
+            !run_has_token(&runs, "ericfitz/brewsoak/docker"),
+            "{runs:?}"
+        );
+        assert!(text.contains("thing"), "{text}");
+    }
+
+    #[test]
+    fn bare_upgrade_with_both_kind_flags_is_a_usage_error() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let r = upgrade_with(
+            &brew,
+            &git,
+            tap.path(),
+            &cfg24(),
+            &[],
+            &["--formula", "--cask"],
+        );
+        assert!(matches!(r, Err(Error::Usage(_))));
+        assert!(lock_runs(&brew).is_empty());
+        assert!(visible_runs(&brew).is_empty());
+    }
+
+    #[test]
+    fn verbose_bare_upgrade_names_the_kind() {
+        let (_, text) = kind_run(&["-v", "--cask"]);
+        assert!(
+            text.contains("upgrading installed casks; soak window"),
+            "{text}"
+        );
+        let (_, text) = kind_run(&["-v", "--formula"]);
+        assert!(
+            text.contains("upgrading installed formulae; soak window"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn bare_cask_upgrade_does_not_prune_an_installed_formulas_tap_file() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, _) = crate::cmd::test_support::hello_world(tap.path(), true, "1.1.0");
+        std::fs::create_dir_all(tap.path().join("Formula")).unwrap();
+        std::fs::write(
+            tap.path().join("Formula/hello.rb"),
+            formula_rb("hello", "1.1.0", "midsha"),
+        )
+        .unwrap();
+        upgrade_with(&brew, &git, tap.path(), &cfg24(), &[], &["--cask"]).unwrap();
+        assert!(
+            crate::cmd::test_support::tap_file(tap.path(), "Formula/hello.rb").is_some(),
+            "the start-of-run prune must see every installed package"
+        );
+    }
+
+    #[test]
+    fn bare_cask_upgrade_hands_only_no_soak_casks_to_brew() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let cfg = cfg_with("NO_SOAK = [\"alpha\", \"docker\"]\n");
+        upgrade_with(&brew, &git, tap.path(), &cfg, &[], &["--cask"]).unwrap();
+        let runs = lock_runs(&brew);
+        let mut all = runs.clone();
+        all.extend(visible_runs(&brew));
+        assert!(ran(&all, &["upgrade", "--cask", "docker"]), "{all:?}");
+        assert!(!run_has_token(&all, "alpha"), "{all:?}");
+    }
+
+    #[test]
+    fn named_upgrade_ignores_the_kind_filter() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        upgrade_with(&brew, &git, tap.path(), &cfg24(), &["alpha"], &["--cask"]).unwrap();
+        let runs = visible_runs(&brew);
+        assert!(
+            ran(&runs, &["upgrade", "--formula", "ericfitz/brewsoak/alpha"]),
+            "{runs:?}"
+        );
+    }
+
+    #[test]
+    fn bare_formula_upgrade_leaves_cask_no_soak_names_alone() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let cfg = cfg_with("NO_SOAK = [\"docker\"]\n");
+        upgrade_with(&brew, &git, tap.path(), &cfg, &[], &["--formula"]).unwrap();
+        let mut all = lock_runs(&brew);
+        all.extend(visible_runs(&brew));
+        assert!(!run_has_token(&all, "docker"), "{all:?}");
+        assert!(!run_has_token(&all, "ericfitz/brewsoak/docker"), "{all:?}");
     }
 }

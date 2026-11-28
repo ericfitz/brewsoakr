@@ -77,6 +77,13 @@ pub fn latest_redefined(installed: Option<&str>, cutoff: Option<&str>) -> bool {
     installed == Some(":latest") && cutoff == Some(":latest")
 }
 
+/// Installed and cutoff read as the same version while an install is planned:
+/// the identity differs in its source (a formula's `sha256`; a cask's `sha256`
+/// or `url`). A `:latest` pair has its own wording and is not this.
+pub fn source_changed(installed: Option<&str>, cutoff: Option<&str>) -> bool {
+    installed.is_some() && installed == cutoff && !latest_redefined(installed, cutoff)
+}
+
 pub fn human_action(action: DesiredAction) -> &'static str {
     match action {
         DesiredAction::InstallCutoff => "would upgrade",
@@ -105,6 +112,9 @@ pub fn compact_info_line(
             let cut = cutoff.map(identity_version).unwrap_or_else(|| "?".into());
             if latest_redefined(Some(&inst), Some(&cut)) {
                 return format!("{name}  {inst}  definition changed; would reinstall");
+            }
+            if source_changed(Some(&inst), Some(&cut)) {
+                return format!("{name}  {inst}  would upgrade (source changed)");
             }
             format!("{name}  {inst}  would upgrade to {cut}")
         }
@@ -143,6 +153,11 @@ pub fn evaluate_line(
         DesiredAction::InstallCutoff if latest_redefined(inst, cut) => {
             format!("installed :latest definition differs from cutoff; reinstalling; {did}")
         }
+        DesiredAction::InstallCutoff if source_changed(inst, cut) => format!(
+            "installing cutoff {}; installed {} has the same version and a changed source; {did}",
+            cut.unwrap_or("?"),
+            inst.unwrap_or("?")
+        ),
         DesiredAction::InstallCutoff => {
             let state = match inst {
                 Some(v) => format!("installed {v} is behind soak"),
@@ -552,6 +567,95 @@ mod tests {
             sha256: "s".into(),
             derived_from: None,
         })
+    }
+
+    fn formula_sha(version: &str, revision: u32, sha: &str) -> PkgIdentity {
+        PkgIdentity::Formula(crate::identity::FormulaIdentity {
+            version: version.into(),
+            revision,
+            rebuild: None,
+            sha256: sha.into(),
+            derived_from: None,
+        })
+    }
+
+    #[test]
+    fn source_changed_needs_equal_versions_and_an_installed_package() {
+        assert!(source_changed(Some("2.50"), Some("2.50")));
+        assert!(!source_changed(Some("2.49"), Some("2.50")));
+        assert!(!source_changed(None, Some("2.50")));
+        assert!(!source_changed(None, None));
+        assert!(!source_changed(Some(":latest"), Some(":latest")));
+    }
+
+    #[test]
+    fn compact_info_line_labels_a_same_version_change() {
+        let line = compact_info_line(
+            "liblinear",
+            Some(&formula_sha("2.50", 0, "a")),
+            Some(&formula_sha("2.50", 0, "b")),
+            DesiredAction::InstallCutoff,
+        );
+        assert_eq!(line, "liblinear  2.50  would upgrade (source changed)");
+        let line = compact_info_line(
+            "x",
+            Some(&formula_sha("1.0", 1, "a")),
+            Some(&formula_sha("1.0", 1, "b")),
+            DesiredAction::InstallCutoff,
+        );
+        assert_eq!(line, "x  1.0_1  would upgrade (source changed)");
+    }
+
+    #[test]
+    fn compact_info_line_leaves_a_revision_bump_unlabeled() {
+        let line = compact_info_line(
+            "x",
+            Some(&formula_sha("1.0", 0, "a")),
+            Some(&formula_sha("1.0", 1, "b")),
+            DesiredAction::InstallCutoff,
+        );
+        assert_eq!(line, "x  1.0  would upgrade to 1.0_1");
+    }
+
+    #[test]
+    fn evaluate_line_labels_a_same_version_change() {
+        let line = evaluate_line(
+            "liblinear",
+            DesiredAction::InstallCutoff,
+            Some(&formula_sha("2.50", 0, "a")),
+            Some(&formula_sha("2.50", 0, "b")),
+            None,
+            false,
+            "classified for info",
+        );
+        assert_eq!(
+            line,
+            "liblinear: installing cutoff 2.50; installed 2.50 has the same version and a changed source; classified for info"
+        );
+    }
+
+    #[test]
+    fn a_latest_cask_never_gets_the_source_changed_label() {
+        let latest = |url: &str| {
+            PkgIdentity::Cask(crate::identity::CaskIdentity {
+                version: ":latest".into(),
+                sha256: Some(":no_check".into()),
+                url: Some(url.into()),
+            })
+        };
+        let (a, b) = (latest("https://e.com/a"), latest("https://e.com/b"));
+        let line = compact_info_line("moved", Some(&a), Some(&b), DesiredAction::InstallCutoff);
+        assert!(!line.contains("source changed"), "{line}");
+        let line = evaluate_line(
+            "moved",
+            DesiredAction::InstallCutoff,
+            Some(&a),
+            Some(&b),
+            None,
+            false,
+            "did",
+        );
+        assert!(!line.contains("source changed"), "{line}");
     }
 
     #[test]

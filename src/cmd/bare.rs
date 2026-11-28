@@ -5,6 +5,7 @@ use crate::flags;
 use crate::git::GitStore;
 use crate::inventory::{Inventory, Pkg, PkgClass};
 use crate::origin::{self};
+use crate::resolve::PkgKind;
 use crate::snapshot::Snapshots;
 use std::path::Path;
 
@@ -56,6 +57,7 @@ pub(super) fn plan_size(
     cache: &Path,
     inv: &Inventory,
     greedy: flags::Greedy,
+    only: Option<PkgKind>,
 ) -> usize {
     // Keep this in step with `apply_resolved` and the `outdated` report:
     // every package counted here must reach `announce` there and land under
@@ -65,6 +67,7 @@ pub(super) fn plan_size(
     // under all four modes.
     prefetch_orderings(brew, git, snaps, cache, inv);
     snapshotted_pkgs(inv, snaps)
+        .filter(|pkg| flags::kind_matches(only, pkg.kind))
         .filter(|pkg| bare_skip(pkg, snaps).is_none())
         .filter(|pkg| {
             matches!(
@@ -495,6 +498,7 @@ mod tests {
                 test_cache(),
                 &inv,
                 flags::greedy_mode(&owned),
+                None,
             );
             assert_eq!(size, want, "plan_size {argv:?}");
 
@@ -732,5 +736,30 @@ mod tests {
         );
         assert!(snaps.tap("hashicorp/tap").is_some(), "stale table is kept");
         assert_eq!(snapshotted_pkgs(&inv, &snaps).count(), 0);
+    }
+
+    #[test]
+    fn plan_size_counts_only_the_kind_asked_for() {
+        use crate::cmd::test_support::{core_snaps, formula_and_cask_world};
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = formula_and_cask_world(tap.path());
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        for (only, want) in [
+            (None, 2usize),
+            (Some(PkgKind::Formula), 1),
+            (Some(PkgKind::Cask), 1),
+        ] {
+            let n = plan_size(
+                &brew,
+                &git,
+                &core_snaps(),
+                test_cache(),
+                &inv,
+                flags::Greedy::default(),
+                only,
+            );
+            assert_eq!(n, want, "{only:?}");
+        }
     }
 }

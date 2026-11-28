@@ -3,7 +3,7 @@ use super::deps::{
     CutoffDepWalk, CutoffDeps, GateFail, GateHold, GateWhy, HeldDep, Role, first_line,
 };
 use super::notes::{
-    NoteKind, by_name_note, bypass_command, held_tap_note, newer_than_cutoff_note,
+    NoteKind, by_name_note, bypass_command, held_tap_note, hidden_notes, newer_than_cutoff_note,
     own_tap_token_note, refusal_message, unsoakable_note, write_notes, write_session_tail,
 };
 use super::view::{
@@ -227,9 +227,21 @@ pub(super) fn apply_many(
         .ok_or_else(|| Error::Usage(format!("unknown brew verb: {brew_verb}")))?;
     let dry_run = flags::is_dry_run(user_flags);
     // Only a bare upgrade knows its plan up front, and always shows it.
+    // A bare run's kind filter narrows the walk below, never the inventory:
+    // tap maintenance still sees every installed package.
+    let only = if bare_run {
+        flags::kind_filter(user_flags)?
+    } else {
+        None
+    };
+    let walked = || {
+        inv.pkgs
+            .iter()
+            .filter(|p| flags::kind_matches(only, p.kind))
+    };
     let plan = plan_total
         .filter(|_| bare_run)
-        .map(|total| (total, inv.pkgs.len()));
+        .map(|total| (total, walked().count()));
     let mut session = ApplySession {
         lock,
         brew,
@@ -280,7 +292,11 @@ pub(super) fn apply_many(
     }
     if is_verbose(user_flags) {
         let doing = match brew_verb {
-            "upgrade" => "upgrading installed formulae and casks",
+            "upgrade" => match only {
+                None => "upgrading installed formulae and casks",
+                Some(PkgKind::Formula) => "upgrading installed formulae",
+                Some(PkgKind::Cask) => "upgrading installed casks",
+            },
             "install" => "installing",
             "reinstall" => "reinstalling",
             other => other,
@@ -294,13 +310,19 @@ pub(super) fn apply_many(
     if !refused_only {
         session.update_before_soaked_work(names)?;
     }
+    if brew_verb == "upgrade" {
+        // Named or bare, a `--cask` run reads no formula, so it has no note.
+        for note in hidden_notes(inv, flags::kind_filter(user_flags)?) {
+            session.defer(note);
+        }
+    }
     if plan.is_some() {
         session.out.open()?;
     }
     if bare_run {
         // Walk the installed packages themselves: a formula and a cask can
         // share a name, and a name alone finds only one of them.
-        for pkg in &inv.pkgs {
+        for pkg in walked() {
             session.apply_pkg(pkg)?;
         }
     } else {
@@ -473,6 +495,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         match from {
             Some(from) if from != to => {
                 writeln!(self.out, "{counter}{doing} {name} {from} -> {to}")?
+            }
+            Some(_) if view.action == DesiredAction::InstallCutoff => {
+                writeln!(self.out, "{counter}{doing} {name} {to} (source changed)")?
             }
             _ => writeln!(self.out, "{counter}{doing} {name} {to}")?,
         }
@@ -916,7 +941,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
                         self.hold_target_not_ready(name, &self.soak_refusal())?
                     }
-                    Some(tap) => self.hold_target_untrusted(name, &tap),
+                    Some(tap) => self.hold_target_untrusted(name, &tap)?,
                     None => {
                         let hold = GateHold {
                             dep: None,
@@ -956,7 +981,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     ));
                 }
             }
-            InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
+            InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap)?,
             InstallRun::NotReady(n) => self.hold_target_not_ready(name, &n)?,
             InstallRun::Interrupted => self.hold_target_interrupted(name)?,
             InstallRun::NoCutoff => {
@@ -1003,7 +1028,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.note_dropped_flags("install", &install_flags, "soaked installs");
             tap::brew_install_args(pkg, &pkg.name, &install_flags)
         };
-        self.record_gate_install(origin_tap, &pkg.name, pkg.kind, installing, &args)
+        self.record_gate_install(origin_tap, &pkg.name, pkg.kind, installing, cutoff, &args)
     }
 
     fn collect_cutoff_deps(
@@ -1095,15 +1120,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if counted_here {
             let from = installed_id.as_ref().map(report::identity_version);
             let to = want.as_ref().map(report::identity_version);
+            let changed = report::source_changed(from.as_deref(), to.as_deref());
             let versions = match (from, to) {
+                (Some(_), Some(to)) if changed => format!(" {to}"),
                 (Some(from), Some(to)) => format!(" {from} -> {to}"),
                 (Some(from), None) => format!(" {from}"),
                 (None, Some(to)) => format!(" {to}"),
                 (None, None) => String::new(),
             };
+            let why = if changed { "source changed; " } else { "" };
             writeln!(
                 self.out,
-                "upgrading {dep}{versions} (dependency of {target})"
+                "upgrading {dep}{versions} ({why}dependency of {target})"
             )?;
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
@@ -1172,26 +1200,19 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                         "held {dep} (dependency of {target}): brew does not trust tap {tap}"
                     )?;
                 }
-                self.hold_target_untrusted_dep(target, dep, &tap);
+                self.hold_target_untrusted_dep(target, dep, &tap)?;
                 return Ok(false);
             }
         }
         Ok(true)
     }
 
-    /// The keg of `name` is installed at the cutoff version with a receipt
-    /// that names brewsoak's tap: brew really installed it from there. Only
-    /// the receipt can tell, because a no-op run leaves the old keg and its
-    /// receipt (`Not upgrading ...`) while brew's current file may still
-    /// equal the cutoff.
+    /// `name` is installed from brewsoak's tap at the cutoff version: brew
+    /// really installed it from there. Only the receipt can tell, because a
+    /// no-op run leaves the old keg and its receipt (`Not upgrading ...`)
+    /// while brew's current file may still equal the cutoff.
     fn keg_from_soak_tap_at(&self, kind: PkgKind, name: &str, cutoff: Option<&[u8]>) -> bool {
-        cutoff
-            .and_then(|c| soaktap::file_version(kind, c))
-            .is_some_and(|v| {
-                self.brew
-                    .receipt_tap(kind, name, &v)
-                    .is_some_and(|t| origin::own_tap(&t) == Some(OwnTap::Soak))
-            })
+        soaktap::from_tap_at(self.brew, kind, name, None, cutoff)
     }
 
     /// After a real run of a core or cask dependency's soak-tap command: its
@@ -1303,8 +1324,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let why = match &hold.why {
             GateFail::Untrusted(tap) => {
                 match &hold.dep {
-                    Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
-                    None => self.hold_target_untrusted(target, tap),
+                    Some(dep) => self.hold_target_untrusted_dep(target, dep, tap)?,
+                    None => self.hold_target_untrusted(target, tap)?,
                 }
                 return Ok(());
             }
@@ -1384,29 +1405,41 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     /// brew refuses to load a package from a tap the user has not trusted.
     /// Trusting a third-party tap is the user's decision, never brewsoak's.
-    fn hold_untrusted(&mut self, name: &str, tap: &str) {
-        self.defer(format!(
+    fn hold_untrusted(&mut self, name: &str, tap: &str) -> Result<(), Error> {
+        writeln!(self.out, "held {name}: brew does not trust tap {tap}")?;
+        self.defer_held(format!(
             "{name}: brew does not trust tap {tap}; run brew trust {tap}, or add it to NO_SOAK"
         ));
         self.counts.held += 1;
         self.refused = true;
+        Ok(())
     }
 
     /// A dependency lives in a tap brew does not trust, so the target cannot
     /// install: one hold line naming the dependency and the tap, and the
     /// target counted once as held.
-    fn hold_target_untrusted_dep(&mut self, target: &str, dep: &str, tap: &str) {
+    fn hold_target_untrusted_dep(
+        &mut self,
+        target: &str,
+        dep: &str,
+        tap: &str,
+    ) -> Result<(), Error> {
         self.hold_target_for_dep();
-        self.defer(format!(
+        writeln!(
+            self.out,
+            "held {target}: dependency {dep}: brew does not trust tap {tap}"
+        )?;
+        self.defer_held(format!(
             "{target}: dependency {dep}: brew does not trust tap {tap}; run brew trust {tap}, or add it to NO_SOAK"
         ));
+        Ok(())
     }
 
     /// The target was counted as upgraded when it was announced; it is held
     /// instead, so take that count back.
-    fn hold_target_untrusted(&mut self, name: &str, tap: &str) {
+    fn hold_target_untrusted(&mut self, name: &str, tap: &str) -> Result<(), Error> {
         self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
-        self.hold_untrusted(name, tap);
+        self.hold_untrusted(name, tap)
     }
 
     /// Runs one by-name install. A real install writes a receipt that names
@@ -1418,8 +1451,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         name: &str,
         kind: PkgKind,
         installing: Option<String>,
+        cutoff: Option<&[u8]>,
         args: &[String],
     ) -> Result<InstallRun, Error> {
+        let version = installing.clone();
         // The version being installed is on purpose; brew's "newer version is
         // available" warning about it is noise.
         let ctx = quiet::RunContext {
@@ -1458,20 +1493,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 "brew ran, but its keg is not from brewsoak's tap at the cutoff version".to_string()
             }
         };
-        // A core or cask package brew said it left alone, or whose receipts
-        // do not name brewsoak's tap (any keg version, so a keg directory
-        // brew named differently still counts, #24), was not installed from
-        // the tap.
+        // A core or cask package brew said it left alone, or no copy of which
+        // is from brewsoak's tap at the cutoff version (a keg directory brew
+        // named differently still counts, #24), was not installed from the tap.
         let left = if failed || self.counts.dry_run || !origin::is_core_or_cask(origin_tap) {
             no_op.filter(|_| !failed && !self.counts.dry_run)
         } else {
-            let from_tap = self
-                .brew
-                .installed_receipt_taps(kind, name)
-                .iter()
-                .any(|t| origin::own_tap(t) == Some(OwnTap::Soak));
+            let from_tap = soaktap::from_tap_at(self.brew, kind, name, version.as_deref(), cutoff);
             (no_op.is_some() || !from_tap).then(|| {
-                no_op.unwrap_or_else(|| "its receipt does not name brewsoak's tap".to_string())
+                no_op.unwrap_or_else(|| {
+                    "no installed copy of it is from brewsoak's tap at the cutoff version"
+                        .to_string()
+                })
             })
         };
         merge_status(&mut self.brew_status, output);
@@ -2105,6 +2138,13 @@ mod tests {
             ),
             "{text}"
         );
+        let dep_line = text
+            .find("held widget (dependency of node): brew does not trust tap hashicorp/tap")
+            .expect("dependency line");
+        let target_line = text
+            .find("held node: dependency widget: brew does not trust tap hashicorp/tap")
+            .expect("target line");
+        assert!(dep_line < target_line, "{text}");
         assert!(summary_has(&text, "upgraded", "0"), "{text}");
         assert!(summary_has(&text, "held", "1"), "{text}");
     }
@@ -2639,6 +2679,15 @@ mod tests {
         fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
             self.inner.receipt_tap(kind, name, version)
         }
+        fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+            self.inner.soak_tap_keg_files(name)
+        }
+        fn lock_formula(
+            &self,
+            name: &str,
+        ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+            self.inner.lock_formula(name)
+        }
         fn installed_receipt_taps(&self, kind: PkgKind, name: &str) -> Vec<String> {
             self.inner.installed_receipt_taps(kind, name)
         }
@@ -2748,6 +2797,38 @@ mod tests {
         );
         let text = String::from_utf8(out).unwrap();
         assert_eq!(text.matches("Updating Homebrew").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn named_run_of_only_no_soak_packages_reports_a_failed_update_from_the_no_soak_step() {
+        let (mut brew, git, cfg) = soaked_and_no_soak_world();
+        brew.next_status = 1;
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        upgrade(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &core_snaps(),
+            test_cache(),
+            tempfile::tempdir().unwrap().path(),
+            &inv,
+            &cfg,
+            &["wget".to_string()],
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(lock_runs(&brew), vec![vec!["update".to_string()]]);
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("no-soak: brew update failed (exit 1); not upgraded: wget"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("brew's data may be older than the soak cutoff"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -3497,7 +3578,7 @@ mod tests {
             assert!(summary_has(&text, "upgraded", "0"), "{text}");
             assert!(summary_has(&text, "skipped", "1"), "{text}");
             assert!(
-                text.contains("alt-tab: brew left the installed version in place: its receipt does not name brewsoak's tap"),
+                text.contains("alt-tab: brew left the installed version in place: no installed copy of it is from brewsoak's tap at the cutoff version"),
                 "{text}"
             );
             assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
@@ -3513,11 +3594,34 @@ mod tests {
                 (PkgKind::Formula, "alpha".into(), "go1.1_2".into()),
                 "ericfitz/brewsoak".into(),
             );
+            brew.kegs.insert(
+                ("alpha".into(), "go1.1_2".into()),
+                formula_rb("alpha", "1.1.0", "midsha"),
+            );
             let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
             assert!(summary_has(&text, "upgraded", "1"), "{text}");
             assert!(summary_has(&text, "skipped", "0"), "{text}");
             assert!(!text.contains("brew left the installed version"), "{text}");
+            assert!(tap_file(tap.path(), "Formula/alpha.rb").is_some());
             assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+        }
+
+        #[test]
+        fn formula_target_with_an_older_soak_keg_and_no_new_keg_is_skipped() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "alpha".into(), "1.0.0".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(summary_has(&text, "upgraded", "0"), "{text}");
+            assert!(summary_has(&text, "skipped", "1"), "{text}");
+            assert!(
+                text.contains("alpha: brew left the installed version in place: no installed copy of it is from brewsoak's tap at the cutoff version"),
+                "{text}"
+            );
+            assert!(tap_file(tap.path(), "Formula/alpha.rb").is_none());
         }
 
         #[test]
@@ -3562,7 +3666,7 @@ mod tests {
             assert!(summary_has(&text, "upgraded", "0"), "{text}");
             assert!(summary_has(&text, "skipped", "1"), "{text}");
             assert!(
-                text.contains("alpha: brew left the installed version in place: its receipt does not name brewsoak's tap"),
+                text.contains("alpha: brew left the installed version in place: no installed copy of it is from brewsoak's tap at the cutoff version"),
                 "{text}"
             );
             assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
@@ -3760,6 +3864,45 @@ mod tests {
             assert!(summary_has(&text, "held", "2"), "{text}");
             assert!(summary_has(&text, "upgraded", "0"), "{text}");
             assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn upgrade_notes_formulae_hidden_by_an_untrusted_tap_once() {
+            use crate::cmd::test_support::hidden_world;
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = hidden_world(tap.path());
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &[], &[]);
+            let note = crate::cmd::notes::hidden_tap_note(&crate::inventory::HiddenTap {
+                tap: "acme/tools".into(),
+                names: vec!["widget".into()],
+            });
+            assert_eq!(text.matches(&note).count(), 1, "{text}");
+            let notes_at = text.lines().position(|l| l == "Notes").expect("Notes line");
+            let note_at = text
+                .lines()
+                .position(|l| l.trim() == note)
+                .expect("note line");
+            assert!(note_at > notes_at, "{text}");
+            assert!(summary_has(&text, "held", "0"), "{text}");
+            assert_soak_tap_commands(&brew, &["alpha"]);
+        }
+
+        #[test]
+        fn named_cask_upgrade_has_no_hidden_formula_note() {
+            use crate::cmd::test_support::hidden_world;
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = hidden_world(tap.path());
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(text.contains("acme/tools"), "control: {text}");
+            let (_, text) = run_upgrade(
+                &brew,
+                &git,
+                &core_snaps(),
+                tap.path(),
+                &["alpha"],
+                &["--cask"],
+            );
+            assert!(!text.contains("hides these installed formulae"), "{text}");
         }
 
         #[test]
@@ -4106,6 +4249,91 @@ mod tests {
         }
 
         #[test]
+        fn upgrade_line_labels_a_same_version_change() {
+            for (names, want) in [
+                (&["alpha"][..], "upgrading alpha 1.1.0 (source changed)"),
+                (&[][..], "[1/1] upgrading alpha 1.1.0 (source changed)"),
+            ] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git) = soak_world(tap.path());
+                brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+                brew.next_stdout = b"Warning: alpha 1.1.0 already installed\n".to_vec();
+                let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), names, &[]);
+                assert!(text.lines().any(|l| l.trim() == want), "{want}: {text}");
+                assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
+                assert!(summary_has(&text, "skipped", "1"), "{text}");
+            }
+        }
+
+        #[test]
+        fn install_and_reinstall_lines_label_a_same_version_change() {
+            for verb in ["install", "reinstall"] {
+                let tap = tempfile::tempdir().unwrap();
+                let (mut brew, git) = soak_world(tap.path());
+                brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+                brew.next_stdout = b"Warning: alpha 1.1.0 already installed\n".to_vec();
+                let cfg = cfg24();
+                let inv = inv_from(&brew, &cfg);
+                let lock = crate::lock::RunLock::for_tests();
+                let names = ["alpha".to_string()];
+                let snaps = core_snaps();
+                let mut out = Vec::new();
+                if verb == "install" {
+                    crate::cmd::install::install(
+                        &lock,
+                        &brew,
+                        &git,
+                        &snaps,
+                        test_cache(),
+                        tap.path(),
+                        &inv,
+                        &cfg,
+                        &names,
+                        false,
+                        false,
+                        &[],
+                        &mut out,
+                    )
+                } else {
+                    reinstall(
+                        &lock,
+                        &brew,
+                        &git,
+                        &snaps,
+                        test_cache(),
+                        tap.path(),
+                        &inv,
+                        &cfg,
+                        &names,
+                        &[],
+                        &mut out,
+                    )
+                }
+                .unwrap();
+                let text = String::from_utf8(out).unwrap();
+                let want = format!("{verb}ing alpha 1.1.0 (source changed)");
+                assert!(text.lines().any(|l| l.trim() == want), "{want}: {text}");
+                assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
+            }
+        }
+
+        #[test]
+        fn dependency_line_labels_a_same_version_change() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.installed
+                .push(formula_pkg("libx", formula_rb("libx", "1.1.0", "othersha")));
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(
+                text.lines()
+                    .any(|l| l.trim()
+                        == "upgrading libx 1.1.0 (source changed; dependency of alpha)"),
+                "{text}"
+            );
+            assert!(!text.contains("1.1.0 -> 1.1.0"), "{text}");
+        }
+
+        #[test]
         fn tap_files_are_put_back_after_a_hold_and_after_a_dry_run() {
             // A hold after both files were staged.
             let tap = tempfile::tempdir().unwrap();
@@ -4203,6 +4431,32 @@ mod tests {
             assert!(alpha_soak_commands(brew).is_empty(), "{:?}", visible(brew));
             assert_eq!(&tree(tap), before, "staged files are put back");
             assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn dependency_keg_that_brew_named_differently_lets_the_target_install() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.by_name.insert("libx".into(), Ok(libx_by_name(false)));
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "libx".into(), "go1.1_2".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            brew.kegs.insert(
+                ("libx".into(), "go1.1_2".into()),
+                formula_rb("libx", "1.1.0", "midsha"),
+            );
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "alpha".into(), "1.1.0".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(!r.refused, "{text}");
+            assert_eq!(alpha_soak_commands(&brew).len(), 1, "{:?}", visible(&brew));
+            assert!(
+                !text.contains("was not installed from brewsoak's tap"),
+                "{text}"
+            );
         }
 
         #[test]
@@ -4485,6 +4739,7 @@ mod tests {
         /// the undo files left.
         fn upgrade_whose_install_errs(
             receipt_version: &str,
+            keg_copy_version: Option<&str>,
         ) -> (bool, Option<Vec<u8>>, BTreeMap<std::path::PathBuf, Vec<u8>>) {
             use std::os::unix::fs::PermissionsExt;
             let tap = tempfile::tempdir().unwrap();
@@ -4494,6 +4749,12 @@ mod tests {
                 (PkgKind::Formula, "alpha".into(), receipt_version.into()),
                 "ericfitz/brewsoak".into(),
             );
+            if let Some(v) = keg_copy_version {
+                brew.kegs.insert(
+                    ("alpha".into(), receipt_version.into()),
+                    formula_rb("alpha", v, "midsha"),
+                );
+            }
             // The install succeeds, then forgetting the stale origin record
             // fails: the cache directory cannot be written any more.
             let mut records = OriginRecords::default();
@@ -4532,7 +4793,7 @@ mod tests {
 
         #[test]
         fn tap_file_is_settled_and_the_error_returned_when_the_install_errs() {
-            let (erred, file, undo) = upgrade_whose_install_errs("1.1.0");
+            let (erred, file, undo) = upgrade_whose_install_errs("1.1.0", None);
             assert!(erred, "the install's error propagates");
             // The soak-tap receipt says the install was real, so settle keeps
             // the file and drops the undo entry.
@@ -4541,13 +4802,22 @@ mod tests {
         }
 
         #[test]
-        fn tap_file_is_put_back_and_the_error_returned_when_no_receipt_names_the_cutoff_keg() {
-            // The keg brew made is named `go1.1_2`, not the cutoff file's 1.1.0
-            // (#24): the receipt check passes for any keg, so the origin
-            // record is forgotten (and that fails), but settle finds no soak
-            // receipt at the cutoff version and puts the tap file back.
-            let (erred, file, undo) = upgrade_whose_install_errs("go1.1_2");
+        fn tap_file_is_kept_when_brew_named_the_cutoff_keg_differently() {
+            // The keg brew made is named `go1.1_2` (#24), but its own formula
+            // copy is the cutoff version, so settle keeps the tap file.
+            let (erred, file, undo) = upgrade_whose_install_errs("go1.1_2", Some("1.1.0"));
             assert!(erred, "the install's error propagates");
+            assert!(file.is_some());
+            assert!(undo.is_empty(), "{undo:?}");
+        }
+
+        #[test]
+        fn tap_file_is_put_back_when_no_keg_copy_has_the_cutoff_version() {
+            let (erred, file, undo) = upgrade_whose_install_errs("go1.1_2", Some("1.0.0"));
+            assert!(
+                !erred,
+                "the install is judged not to have come from the tap"
+            );
             assert_eq!(file, None, "the staged file is put back");
             assert!(undo.is_empty(), "{undo:?}");
         }

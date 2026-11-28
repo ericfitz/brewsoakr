@@ -2,6 +2,34 @@
 //! `brew <verb> --help`; a flag brew would reject is dropped (and reported)
 //! instead of making the whole brew run fail.
 
+use crate::Error;
+use crate::resolve::PkgKind;
+
+/// Which kind `--formula`/`--formulae` or `--cask`/`--casks` restricts a run
+/// to; `None` without either. One of each is a usage error, as in brew.
+pub fn kind_filter(flags: &[String]) -> Result<Option<PkgKind>, Error> {
+    let (mut formula, mut cask) = (false, false);
+    for f in flags.iter().filter(|f| crate::tap::is_kind_flag(f)) {
+        match f.as_str() {
+            "--formula" | "--formulae" => formula = true,
+            _ => cask = true,
+        }
+    }
+    match (formula, cask) {
+        (true, true) => Err(Error::Usage(
+            "--formula and --cask are mutually exclusive".into(),
+        )),
+        (true, false) => Ok(Some(PkgKind::Formula)),
+        (false, true) => Ok(Some(PkgKind::Cask)),
+        (false, false) => Ok(None),
+    }
+}
+
+/// Whether a package of `kind` is in a run restricted to `only`.
+pub fn kind_matches(only: Option<PkgKind>, kind: PkgKind) -> bool {
+    only.is_none_or(|k| k == kind)
+}
+
 /// Flags a verb takes without a value, as `--long` names.
 struct Table {
     bool_long: &'static [&'static str],
@@ -492,5 +520,33 @@ mod tests {
             without_greedy(&f(&["-v", "--force"])),
             f(&["-v", "--force"])
         );
+    }
+
+    #[test]
+    fn kind_filter_reads_all_four_spellings() {
+        assert_eq!(kind_filter(&f(&[])).unwrap(), None);
+        for flag in ["--formula", "--formulae"] {
+            assert_eq!(kind_filter(&f(&[flag])).unwrap(), Some(PkgKind::Formula));
+        }
+        assert_eq!(kind_filter(&f(&["--cask"])).unwrap(), Some(PkgKind::Cask));
+        assert_eq!(
+            kind_filter(&f(&["-v", "--casks", "--cask"])).unwrap(),
+            Some(PkgKind::Cask)
+        );
+        assert_eq!(kind_filter(&f(&["--cask=x"])).unwrap(), None);
+        match kind_filter(&f(&["--formulae", "--cask"])) {
+            Err(Error::Usage(m)) => assert_eq!(m, "--formula and --cask are mutually exclusive"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn kind_matches_everything_without_a_filter() {
+        for kind in [PkgKind::Formula, PkgKind::Cask] {
+            assert!(kind_matches(None, kind));
+            assert!(kind_matches(Some(kind), kind));
+        }
+        assert!(!kind_matches(Some(PkgKind::Cask), PkgKind::Formula));
+        assert!(!kind_matches(Some(PkgKind::Formula), PkgKind::Cask));
     }
 }

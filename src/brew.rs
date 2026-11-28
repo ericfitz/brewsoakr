@@ -86,7 +86,7 @@ const BY_NAME_RUBY: &str = r#"ARGV.each_slice(2) do |kind, name|
       puts ["OK", kind, name, f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?, Dependency.new(name).installed?].join("\t")
     end
   rescue StandardError, ScriptError => e
-    puts ["ERR", kind, name, e.class, e.message.lines.first.to_s.strip].join("\t")
+    puts ["ERR", kind, name, e.class.to_s.tr("\t", " "), e.message.lines.first.to_s.strip.tr("\t", " ")].join("\t")
   end
 end"#;
 
@@ -138,11 +138,15 @@ pub(crate) struct Loaded {
 /// One name's `BY_NAME_RUBY` answer, or brew's reason it has none.
 type LoadedAnswer = Result<Loaded, String>;
 
+/// The answer for a name the loader script printed no row for.
+const NO_LOADER_ROW: &str = "brew ruby gave no answer for this name";
+
 /// One answer per `asked` `(kind, name)` from `BY_NAME_RUBY` output. The
 /// `asked` entries must be unique: a row is consumed by the first entry that
-/// asks for it, so a repeated entry gets "no answer". Rows are matched by `kind name`, never by position: a missing or duplicated
-/// row is that name's `Err`, and lines that are not a row for an asked name
-/// (a stray brew message, a row for another name) are never assigned.
+/// asks for it, so a repeated entry gets "no answer". Rows are matched by
+/// `kind name`, never by position: a missing or duplicated row is that name's
+/// `Err`, and lines that are not a row for an asked name (a stray brew
+/// message, a row for another name) are never assigned.
 pub(crate) fn parse_by_name_lines(
     stdout: &str,
     asked: &[(PkgKind, String)],
@@ -160,7 +164,7 @@ pub(crate) fn parse_by_name_lines(
         .iter()
         .map(
             |(kind, name)| match rows.remove(&(kind_tag(*kind), name.as_str())) {
-                None => Err("brew ruby gave no answer for this name".to_string()),
+                None => Err(NO_LOADER_ROW.to_string()),
                 Some(mut found) if found.len() == 1 => found.remove(0),
                 Some(_) => Err("brew ruby answered this name more than once".to_string()),
             },
@@ -190,7 +194,8 @@ fn parse_by_name_row(fields: &[&str]) -> Result<Loaded, String> {
                 satisfied,
             })
         }
-        ["ERR", _, _, class, message] => {
+        ["ERR", _, _, class, message @ ..] if !message.is_empty() => {
+            let message = message.join(" ");
             let message = message.trim();
             Err(if message.is_empty() {
                 class.trim().to_string()
@@ -203,6 +208,27 @@ fn parse_by_name_row(fields: &[&str]) -> Result<Loaded, String> {
             fields.join("\t").trim()
         )),
     }
+}
+
+/// One answer per asked name from a finished loader run. Rows the script
+/// printed are used whatever its exit status; when it failed, a name with no
+/// row gets brew's failure text instead of `NO_LOADER_ROW`.
+fn by_name_answers(output: &Output, asking: &[(PkgKind, String)]) -> Vec<Result<Loaded, String>> {
+    let answers = parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), asking);
+    if output.status.success() {
+        return answers;
+    }
+    let text = match brew_fail(output) {
+        Error::Brew { message, .. } => message,
+        other => other.to_string(),
+    };
+    answers
+        .into_iter()
+        .map(|answer| match answer {
+            Err(e) if e == NO_LOADER_ROW => Err(text.clone()),
+            other => other,
+        })
+        .collect()
 }
 
 /// Compare one loaded answer with what the query expects.
@@ -262,6 +288,27 @@ pub trait Brew {
     /// left out. The default knows of none.
     fn installed_receipt_taps(&self, _kind: PkgKind, _name: &str) -> Vec<String> {
         Vec::new()
+    }
+    /// The formula file brew stored in each keg of `name` whose receipt names
+    /// the soak tap (`<cellar>/<name>/<keg>/.brew/<name>.rb`), whatever the keg
+    /// directory is called. A keg whose receipt or file cannot be read is left
+    /// out. The default knows of none.
+    fn soak_tap_keg_files(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
+    /// The Cellar racks `listed` lacks (`kegs_brew_left_out`) for this
+    /// machine. The default knows of none.
+    fn hidden_kegs(&self, _listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+        Vec::new()
+    }
+    /// brew's own lock on formula `name`, without waiting.
+    fn lock_formula(
+        &self,
+        _name: &str,
+    ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+        Err(crate::lock::BrewLockError::Unavailable(
+            "brew's lock directory is unknown".into(),
+        ))
     }
     /// Names brew itself considers outdated right now (no `brew update`),
     /// with the same greedy mode `upgrade` passes to brew.
@@ -323,6 +370,8 @@ pub struct ProcessBrew {
     cellar: std::cell::OnceCell<Option<PathBuf>>,
     /// `brew --caskroom`, asked once.
     caskroom: std::cell::OnceCell<Option<PathBuf>>,
+    /// `$(brew --prefix)/var/homebrew/locks`, asked once.
+    locks: std::cell::OnceCell<Option<PathBuf>>,
     /// `read_cask_languages` answers for this run, keyed by cask token.
     languages: Mutex<HashMap<String, Option<Vec<String>>>>,
     /// The `--language` flag's languages (`set_cli_languages`).
@@ -432,6 +481,7 @@ impl ProcessBrew {
             raw: Cell::new(false),
             cellar: std::cell::OnceCell::new(),
             caskroom: std::cell::OnceCell::new(),
+            locks: std::cell::OnceCell::new(),
             languages: Mutex::new(HashMap::new()),
             cli: Mutex::new(Vec::new()),
             orderings: Mutex::new(HashMap::new()),
@@ -482,6 +532,14 @@ pub struct MockBrew {
     pub tap_info_error_after_create: Option<String>,
     /// What `receipt_tap` reports, keyed by `(kind, name, version)`.
     pub receipt_taps: BTreeMap<(PkgKind, String, String), String>,
+    /// What `hidden_kegs` reports.
+    pub hidden: Vec<HiddenKeg>,
+    /// `lock_formula` answers `Busy` for these names.
+    pub busy_formulae: std::collections::BTreeSet<String>,
+    /// `lock_formula` answers `Unavailable` with this text.
+    pub lock_error: Option<String>,
+    /// Every name `lock_formula` was asked for, in order.
+    pub lock_calls: Mutex<Vec<String>>,
     /// Runs before the answer of `run`, `run_visible_in`, `tap_new` (their
     /// args) and `deps` (`["deps", "--formula"|"--cask", token]`). The hook
     /// runs while the `on_call` lock is held, so it must not call `run`,
@@ -489,6 +547,9 @@ pub struct MockBrew {
     pub on_call: Mutex<Option<OnCall>>,
     pub runs: Mutex<Vec<Vec<String>>>,
     pub visible_runs: Mutex<Vec<Vec<String>>>,
+    /// One ordered log across both kinds of call: `by_name <kind> <name>` per
+    /// query, and `visible <args joined by one space>` per `run_visible_in`.
+    pub events: Mutex<Vec<String>>,
     /// The `RunContext` of the latest `run_visible_in` call.
     pub last_ctx: Mutex<Option<quiet::RunContext>>,
     pub next_status: i32,
@@ -558,9 +619,14 @@ impl Default for MockBrew {
             tap_unlisted_after_create: false,
             tap_info_error_after_create: None,
             receipt_taps: BTreeMap::new(),
+            hidden: Vec::new(),
+            busy_formulae: std::collections::BTreeSet::new(),
+            lock_error: None,
+            lock_calls: Mutex::new(Vec::new()),
             on_call: Mutex::new(None),
             runs: Mutex::new(Vec::new()),
             visible_runs: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
             last_ctx: Mutex::new(None),
             next_status: 0,
             next_stdout: Vec::new(),
@@ -611,7 +677,15 @@ impl MockBrew {
             .push(args.to_vec());
     }
 
+    fn record_event(&self, event: String) {
+        self.events
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(event);
+    }
+
     fn record_visible(&self, args: &[String]) {
+        self.record_event(format!("visible {}", args.join(" ")));
         self.visible_runs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -711,6 +785,28 @@ impl Brew for ProcessBrew {
                 .into_iter()
                 .collect(),
         }
+    }
+
+    fn lock_formula(
+        &self,
+        name: &str,
+    ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+        let dir = self.locks_dir().ok_or_else(|| {
+            crate::lock::BrewLockError::Unavailable("brew --prefix gave no directory".into())
+        })?;
+        crate::lock::try_brew_formula_lock(&dir, name)
+    }
+
+    fn hidden_kegs(&self, listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+        self.cellar()
+            .map(|c| kegs_brew_left_out(&c, listed))
+            .unwrap_or_default()
+    }
+
+    fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+        self.cellar()
+            .map(|c| read_soak_tap_keg_files(&c, name))
+            .unwrap_or_default()
     }
 
     fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
@@ -974,15 +1070,7 @@ impl Brew for ProcessBrew {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = true;
             }
-            let answers: Vec<Result<Loaded, String>> = if output.status.success() {
-                parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), &asking)
-            } else {
-                let text = match brew_fail(&output) {
-                    Error::Brew { message, .. } => message,
-                    other => other.to_string(),
-                };
-                vec![Err(text); asking.len()]
-            };
+            let answers = by_name_answers(&output, &asking);
             let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
             for ((kind, name), answer) in asking.into_iter().zip(answers) {
                 loaded.insert((kind_tag(kind), name), answer);
@@ -1109,6 +1197,16 @@ impl ProcessBrew {
     fn cellar(&self) -> Option<PathBuf> {
         self.cellar
             .get_or_init(|| self.brew_dir("--cellar"))
+            .clone()
+    }
+
+    /// brew's formula lock directory, from `brew --prefix`, asked once.
+    fn locks_dir(&self) -> Option<PathBuf> {
+        self.locks
+            .get_or_init(|| {
+                self.brew_dir("--prefix")
+                    .map(|p| p.join("var/homebrew/locks"))
+            })
             .clone()
     }
 
@@ -1315,6 +1413,36 @@ impl Brew for MockBrew {
             .collect()
     }
 
+    fn lock_formula(
+        &self,
+        name: &str,
+    ) -> Result<crate::lock::BrewLock, crate::lock::BrewLockError> {
+        self.lock_calls.lock().unwrap().push(name.to_string());
+        if self.busy_formulae.contains(name) {
+            return Err(crate::lock::BrewLockError::Busy);
+        }
+        match &self.lock_error {
+            Some(why) => Err(crate::lock::BrewLockError::Unavailable(why.clone())),
+            None => Ok(crate::lock::BrewLock::unguarded()),
+        }
+    }
+
+    fn hidden_kegs(&self, _listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+        self.hidden.clone()
+    }
+
+    fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+        self.receipt_taps
+            .iter()
+            .filter(|((k, n, _), tap)| {
+                *k == PkgKind::Formula
+                    && n == name
+                    && crate::origin::own_tap(tap) == Some(crate::origin::OwnTap::Soak)
+            })
+            .filter_map(|((_, _, v), _)| self.kegs.get(&(name.to_string(), v.clone())).cloned())
+            .collect()
+    }
+
     fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
         self.outdated_modes
             .lock()
@@ -1434,6 +1562,14 @@ impl Brew for MockBrew {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         seen.extend(queries.iter().cloned());
+        drop(seen);
+        for q in queries {
+            let kind = match q.kind {
+                PkgKind::Formula => "formula",
+                PkgKind::Cask => "cask",
+            };
+            self.record_event(format!("by_name {kind} {}", q.name));
+        }
         Ok(queries
             .iter()
             .map(|q| {
@@ -1625,6 +1761,25 @@ fn read_formula_receipt_taps(cellar: &Path, name: &str) -> Vec<String> {
     found.into_iter().map(|(_, _, tap)| tap).collect()
 }
 
+/// The `.brew/<name>.rb` of each keg under `<cellar>/<name>/` whose receipt
+/// names the soak tap, in keg directory name order.
+fn read_soak_tap_keg_files(cellar: &Path, name: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(cellar.join(name)) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs.into_iter()
+        .filter(|keg| {
+            read_receipt_tap(&keg.join("INSTALL_RECEIPT.json"), None)
+                .is_some_and(|t| crate::origin::own_tap(&t) == Some(crate::origin::OwnTap::Soak))
+        })
+        .filter_map(|keg| {
+            std::fs::read_to_string(keg.join(".brew").join(format!("{name}.rb"))).ok()
+        })
+        .collect()
+}
+
 fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Option<String> {
     let metadata = caskroom.join(name).join(".metadata");
     let target = format!("{name}.rb");
@@ -1788,6 +1943,72 @@ fn parse_installed_json(
         }
     }
     Ok(out)
+}
+
+/// A Cellar rack brew's installed list lacks, with what its newest receipt
+/// says about its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HiddenKeg {
+    pub name: String,
+    /// Lowercase `source.tap`; `None` for null, empty, not a string, one of
+    /// brewsoak's own taps, or no readable receipt.
+    pub tap: Option<String>,
+    /// `source.path`, when `tap` is `None` and the receipt has one.
+    pub staged_path: Option<String>,
+    /// The receipt names one of brewsoak's own taps.
+    pub own_tap: bool,
+}
+
+/// Every rack in `cellar` (a real directory with at least one keg, not
+/// starting with `.`, as `Formula.racks` reads them) that is not a formula in
+/// `listed`. Sorted by name.
+pub(crate) fn kegs_brew_left_out(cellar: &Path, listed: &[InstalledPkg]) -> Vec<HiddenKeg> {
+    let real_dirs = |dir: &Path| -> Vec<String> {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .filter_map(|e| e.file_name().into_string().ok())
+            .collect()
+    };
+    let mut names: Vec<String> = real_dirs(cellar)
+        .into_iter()
+        .filter(|n| !n.starts_with('.'))
+        .filter(|n| {
+            !listed
+                .iter()
+                .any(|p| p.kind == PkgKind::Formula && &p.name == n)
+        })
+        .collect();
+    names.sort();
+    let mut out = Vec::new();
+    for name in names {
+        let kegs = real_dirs(&cellar.join(&name));
+        if kegs.is_empty() {
+            continue;
+        }
+        // The newest receipt: latest mtime, ties by keg directory name descending.
+        let newest = kegs
+            .iter()
+            .filter_map(|keg| {
+                let path = cellar.join(&name).join(keg).join("INSTALL_RECEIPT.json");
+                let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+                Some((mtime, keg))
+            })
+            .max();
+        let source = newest
+            .and_then(|(_, keg)| read_formula_receipt_source_opt(cellar, &name, Some(keg)))
+            .unwrap_or_default();
+        let own_tap = source.own_tap.is_some();
+        out.push(HiddenKeg {
+            name,
+            tap: source.tap.map(|t| t.to_lowercase()),
+            staged_path: if own_tap { None } else { source.path },
+            own_tap,
+        });
+    }
+    out
 }
 
 /// Formulae with a directory in `cellar` that `listed` lacks and whose newest
@@ -2070,6 +2291,27 @@ fn parse_json_string(s: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_events_interleave_queries_and_visible_runs() {
+        let brew = MockBrew::new();
+        let query = NameQuery {
+            kind: PkgKind::Formula,
+            name: "packer".into(),
+            origin: "hashicorp/tap".into(),
+            cutoff_sha256: None,
+        };
+        brew.by_name(&[query]).unwrap();
+        let args: Vec<String> = ["install", "--formula", "packer"]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        brew.run_visible(&args, &mut Vec::new()).unwrap();
+        assert_eq!(
+            *brew.events.lock().unwrap(),
+            ["by_name formula packer", "visible install --formula packer"]
+        );
+    }
 
     #[test]
     fn mock_deps_keys_by_exact_token() {
@@ -3778,6 +4020,7 @@ case "$1" in
     echo "ruby $*" >> {log}
     if [ {ruby_exit} -ne 0 ]; then echo "boom" >&2; exit {ruby_exit}; fi
     while [ $# -gt 0 ]; do
+      if [ "$2" = "crashme" ]; then echo "boom" >&2; exit 3; fi
       printf 'OK\t%s\t%s\thomebrew/core\t1.0\tabc\tfalse\tfalse\n' "$1" "$2"
       shift 2
     done
@@ -3856,6 +4099,87 @@ esac
             .filter(|l| l.starts_with("ruby"))
             .collect();
         assert_eq!(rubies, ["ruby formula wget", "ruby formula curl"]);
+    }
+
+    fn output_of(code: i32, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(exit_status_raw(code)),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    const WGET_ROW: &str = "OK\tformula\twget\thomebrew/core\t1.0\tabc\tfalse\ttrue\n";
+
+    #[test]
+    fn by_name_answers_keep_printed_rows_when_the_script_fails() {
+        let out = output_of(1, WGET_ROW, "Error: boom\nmore\n");
+        let got = by_name_answers(&out, &asked(&["wget", "curl"]));
+        let wget = got[0].as_ref().expect("wget row kept");
+        assert_eq!(wget.tap, "homebrew/core");
+        assert_eq!(wget.version, "1.0");
+        assert!(wget.satisfied);
+        assert_eq!(got[1], Err("Error: boom\nmore".to_string()));
+    }
+
+    #[test]
+    fn by_name_answers_of_a_successful_script_report_a_missing_row_as_no_answer() {
+        let out = output_of(0, WGET_ROW, "");
+        let got = by_name_answers(&out, &asked(&["wget", "curl"]));
+        assert_eq!(
+            got[1],
+            Err("brew ruby gave no answer for this name".to_string())
+        );
+    }
+
+    #[test]
+    fn process_brew_by_name_keeps_rows_printed_before_the_script_died() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        let got = brew
+            .by_name(&[
+                query("wget", "homebrew/core", None),
+                query("crashme", "homebrew/core", None),
+                query("after", "homebrew/core", None),
+            ])
+            .expect("by_name");
+        assert_eq!(got[0].as_ref().expect("wget").tap, "homebrew/core");
+        assert!(got[1].as_ref().unwrap_err().contains("boom"));
+        assert!(got[2].as_ref().unwrap_err().contains("boom"));
+        brew.by_name(&[query("wget", "homebrew/core", None)])
+            .expect("again");
+        let rubies = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby "))
+            .count();
+        assert_eq!(rubies, 1, "the kept row is remembered");
+    }
+
+    #[test]
+    fn parse_by_name_lines_keeps_an_err_message_that_contains_tabs() {
+        let out = "ERR\tformula\twget\tRuntimeError\tbad\tthing\there\n";
+        let got = parse_by_name_lines(out, &asked(&["wget"]));
+        assert_eq!(got[0], Err("bad thing here".to_string()));
+    }
+
+    #[test]
+    fn parse_by_name_row_rejects_an_err_row_without_a_message_field() {
+        let out = "ERR\tformula\twget\tRuntimeError\n";
+        let got = parse_by_name_lines(out, &asked(&["wget"]));
+        assert!(
+            got[0]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("unparseable brew loader row"),
+            "{got:?}"
+        );
+    }
+
+    /// A text check of the Ruby source: Ruby cannot run in tests, so the parser
+    /// test above carries the behavior.
+    #[test]
+    fn by_name_script_replaces_tabs_in_error_text() {
+        assert!(BY_NAME_RUBY.contains(r#"e.message.lines.first.to_s.strip.tr("\t", " ")"#));
     }
 
     #[test]
@@ -4164,6 +4488,100 @@ esac
     }
 
     #[test]
+    fn soak_tap_keg_files_reads_every_keg_whose_receipt_names_the_soak_tap() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let keg = |dir: &str, tap: Option<&str>, copy: Option<&str>| {
+            let k = tmp.path().join("wget").join(dir);
+            std::fs::create_dir_all(k.join(".brew")).expect("keg");
+            if let Some(tap) = tap {
+                std::fs::write(
+                    k.join("INSTALL_RECEIPT.json"),
+                    format!(r#"{{"source":{{"tap":"{tap}"}}}}"#),
+                )
+                .expect("receipt");
+            }
+            if let Some(copy) = copy {
+                std::fs::write(k.join(".brew").join("wget.rb"), copy).expect("copy");
+            }
+        };
+        keg("go1.1_2", Some("ericfitz/brewsoak"), Some("A"));
+        keg("1.0", Some("homebrew/core"), Some("B"));
+        keg("0.9", Some("ericfitz/brewsoak"), None);
+        let brew = rooms(tmp.path(), tmp.path());
+        assert_eq!(read_soak_tap_keg_files(tmp.path(), "wget"), ["A"]);
+        assert_eq!(brew.soak_tap_keg_files("wget"), ["A"]);
+        assert!(read_soak_tap_keg_files(tmp.path(), "curl").is_empty());
+    }
+
+    #[test]
+    fn process_brew_lock_formula_uses_the_prefix_lock_directory() {
+        use crate::lock::BrewLockError;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let prefix = tmp.path().join("prefix");
+        let log = tmp.path().join("log");
+        let script = tmp.path().join("brew.sh");
+        crate::test_util::write_executable(
+            &script,
+            format!(
+                "#!/bin/sh\necho \"$@\" >> {}\ncase \"$1\" in --prefix) echo {};; esac\n",
+                log.display(),
+                prefix.display()
+            ),
+        );
+        let brew = ProcessBrew::new(script);
+        let guard = brew.lock_formula("wget").expect("lock");
+        assert!(prefix.join("var/homebrew/locks/wget.formula.lock").exists());
+        assert_eq!(brew.lock_formula("wget").unwrap_err(), BrewLockError::Busy);
+        drop(guard);
+        let locks = prefix.join("var/homebrew/locks");
+        assert!(crate::test_util::lock_eventually(&locks, "wget").is_ok());
+        assert_eq!(log_lines(&log), ["--prefix"], "asked once");
+    }
+
+    #[test]
+    fn process_brew_lock_formula_without_a_prefix_is_unavailable() {
+        use crate::lock::BrewLockError;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let script = tmp.path().join("brew.sh");
+        crate::test_util::write_executable(&script, "#!/bin/sh\nexit 1\n");
+        let brew = ProcessBrew::new(script);
+        assert_eq!(
+            brew.lock_formula("wget").unwrap_err(),
+            BrewLockError::Unavailable("brew --prefix gave no directory".into())
+        );
+    }
+
+    #[test]
+    fn mock_lock_formula_follows_its_script() {
+        use crate::lock::BrewLockError;
+        let mut brew = MockBrew::new();
+        assert!(brew.lock_formula("wget").is_ok());
+        brew.busy_formulae.insert("curl".into());
+        assert_eq!(brew.lock_formula("curl").unwrap_err(), BrewLockError::Busy);
+        brew.lock_error = Some("nope".into());
+        assert_eq!(
+            brew.lock_formula("jq").unwrap_err(),
+            BrewLockError::Unavailable("nope".into())
+        );
+        assert_eq!(*brew.lock_calls.lock().unwrap(), ["wget", "curl", "jq"]);
+    }
+
+    #[test]
+    fn mock_soak_tap_keg_files_come_from_receipt_taps_and_kegs() {
+        let mut brew = MockBrew::new();
+        for (v, tap, copy) in [
+            ("go1.1_2", "ericfitz/brewsoak", "A"),
+            ("1.0", "homebrew/core", "B"),
+        ] {
+            brew.receipt_taps
+                .insert((PkgKind::Formula, "wget".into(), v.into()), tap.into());
+            brew.kegs.insert(("wget".into(), v.into()), copy.into());
+        }
+        assert_eq!(brew.soak_tap_keg_files("wget"), ["A"]);
+        assert!(brew.soak_tap_keg_files("curl").is_empty());
+    }
+
+    #[test]
     fn installed_receipt_taps_ignore_the_version_and_list_newest_first() {
         let tmp = tempfile::tempdir().expect("tmp");
         let write = |ver: &str, tap: &str, secs: u64| {
@@ -4449,5 +4867,100 @@ esac
         assert_eq!(got.len(), 1, "{got:?}");
         assert_eq!(got[0].name, "hello");
         assert_eq!(got[0].own_tap, Some(OwnTap::Soak));
+    }
+
+    fn write_hidden_receipt(cellar: &Path, name: &str, version: &str, tap: &str, path: &str) {
+        write_receipt(
+            cellar,
+            name,
+            version,
+            &format!(r#"{{"source":{{"tap":{tap},"path":{path}}}}}"#),
+        );
+    }
+
+    fn hidden(name: &str, tap: Option<&str>, staged: Option<&str>, own_tap: bool) -> HiddenKeg {
+        HiddenKeg {
+            name: name.into(),
+            tap: tap.map(str::to_string),
+            staged_path: staged.map(str::to_string),
+            own_tap,
+        }
+    }
+
+    #[test]
+    fn kegs_brew_left_out_reports_every_unlisted_rack_with_its_receipt_source() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        write_hidden_receipt(cellar, "widget", "1.0", r#""Acme/Tools""#, "null");
+        write_hidden_receipt(
+            cellar,
+            "staged",
+            "1.0",
+            "null",
+            r#""/c/staging/taps/acme/tools/Formula/staged.rb""#,
+        );
+        write_hidden_receipt(cellar, "bare", "1.0", "null", "null");
+        write_hidden_receipt(cellar, "numtap", "1.0", "3", "null");
+        std::fs::create_dir_all(cellar.join("norecpt").join("1.0")).expect("keg");
+        write_hidden_receipt(cellar, "soak", "1.0", r#""ericfitz/brewsoak""#, "null");
+        write_hidden_receipt(cellar, "wget", "1.0", r#""homebrew/core""#, "null");
+        let listed = [listed_pkg("wget", PkgKind::Formula)];
+        assert_eq!(
+            kegs_brew_left_out(cellar, &listed),
+            vec![
+                hidden("bare", None, None, false),
+                hidden("norecpt", None, None, false),
+                hidden("numtap", None, None, false),
+                hidden("soak", None, None, true),
+                hidden(
+                    "staged",
+                    None,
+                    Some("/c/staging/taps/acme/tools/Formula/staged.rb"),
+                    false
+                ),
+                hidden("widget", Some("acme/tools"), None, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn kegs_brew_left_out_skips_racks_brew_does_not_read() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        std::fs::create_dir_all(cellar.join("empty")).expect("empty rack");
+        write_hidden_receipt(cellar, ".hidden", "1.0", r#""acme/tools""#, "null");
+        write_hidden_receipt(cellar, "real", "1.0", r#""acme/tools""#, "null");
+        std::os::unix::fs::symlink(cellar.join("real"), cellar.join("link")).expect("link");
+        write_hidden_receipt(cellar, "widget", "1.0", r#""acme/tools""#, "null");
+        let listed = [listed_pkg("widget", PkgKind::Cask)];
+        let names: Vec<String> = kegs_brew_left_out(cellar, &listed)
+            .into_iter()
+            .map(|k| k.name)
+            .collect();
+        assert_eq!(names, vec!["real", "widget"]);
+    }
+
+    #[test]
+    fn kegs_brew_left_out_uses_the_newest_receipt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        for (version, tap, secs) in [("1.0", "acme/old", 1000), ("2.0", "acme/new", 2000)] {
+            write_hidden_receipt(cellar, "widget", version, &format!("\"{tap}\""), "null");
+            let f = std::fs::File::options()
+                .write(true)
+                .open(
+                    cellar
+                        .join("widget")
+                        .join(version)
+                        .join("INSTALL_RECEIPT.json"),
+                )
+                .expect("open");
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs))
+                .expect("mtime");
+        }
+        assert_eq!(
+            kegs_brew_left_out(cellar, &[]),
+            vec![hidden("widget", Some("acme/new"), None, false)]
+        );
     }
 }

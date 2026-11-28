@@ -174,6 +174,11 @@ apart from the #17 Human decisions above.
   verified by manual check 13.7.
 - **#23 Decision 3: `soaktap::file_version` keeps brewsoak's own parser.** The
   limitation is commented at the function and tracked in issue #24.
+
+> **2026-11-28 note.** The parser stays. Issue #24 is closed by
+> `soaktap::from_tap_at`, which decides on the receipt and the keg's own copy of
+> the file instead of a keg directory name. See `2026-11-28-follow-ups-19-27-design.md`.
+
 - **#23 Decision 6: the dependency hold is documented and its reason split.**
   "brew left the installed version in place" is used only for brew's
   already-installed answer (see "Holds and messages").
@@ -714,6 +719,9 @@ receipt names any other tap, the legacy tap included, is ignored, as it is
 today. Fact 37 very likely applies to formulae from any untrusted third-party
 tap; that is tracked in issue #22 and is not part of this design.
 
+> **2026-11-28 note.** Issue #22 adds the note: `upgrade`, `outdated` and `info`
+> say brew hides these formulae and never trust the tap. See `2026-11-28-follow-ups-19-27-design.md`.
+
 **Holding.** While the soak tap is not usable (untrusted, or tapped from a
 remote), every installed package whose receipt names it is held for
 `upgrade`, `install` and `reinstall`, with the line and the once-per-run note
@@ -913,6 +921,11 @@ full token, before its dependent.
 | An installed formula dependency this run does not upgrade | Passes when brew's own dependency test says it is satisfied. If not, and its receipt names another tap or none: it passes only when brew's current file is byte-identical to its cutoff (the by-name gate: brew would then install the cutoff itself); otherwise the target is held. If not, and it has a legacy receipt: see below |
 | An installed cask dependency | Left alone, as today |
 | A no-soak or unsoakable dependency; a dependency in a held tap or with no cutoff | As today |
+
+> **2026-11-28 note.** The row "a dependency in a held tap" is amended for an
+> installed dependency: one in a held tap, or in a tap with no snapshot this run,
+> passes when brew counts it as up to date and otherwise holds the target. See
+> `2026-11-28-follow-ups-19-27-design.md`.
 
 "brew's own dependency test" is `Dependency.new(name).installed?`, asked in
 the existing `brew ruby` loader script (`BY_NAME_RUBY`) as one more column.
@@ -1249,6 +1262,10 @@ Nothing unsoaked can be installed this way.
 > start-of-run prune removed a tap file during a plain `brew upgrade`, and the
 > keg was then lost. No mechanism is claimed. The README now warns not to run
 > brewsoak and a plain `brew upgrade` or `brew install` at the same time.
+
+> **2026-11-28 note.** Pruning now takes brew's formula lock and reads the
+> receipts again before it removes a formula's tap file; a busy lock skips the
+> file. See `2026-11-28-follow-ups-19-27-design.md`.
 
 **Leftovers from a failed run.** Undo entries are the only new persistent
 state. At the points and under the conditions of Choice 16 (`brewsoak update`

@@ -203,14 +203,19 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
             brew_args: chain_args(before, after),
             raw,
         },
-        "outdated" => Invocation {
-            soak_hours,
-            command: Command::Outdated,
-            brew_args: chain_args(before, after),
-            raw,
-        },
+        "outdated" => {
+            let brew_args = chain_args(before, after);
+            crate::flags::kind_filter(&brew_args)?;
+            Invocation {
+                soak_hours,
+                command: Command::Outdated,
+                brew_args,
+                raw,
+            }
+        }
         "upgrade" => {
             let (names, brew_args) = split_names_and_flags(before, after)?;
+            crate::flags::kind_filter(&brew_args)?;
             Invocation {
                 soak_hours,
                 command: Command::Upgrade { names },
@@ -220,6 +225,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
         }
         "reinstall" => {
             let (names, brew_args) = split_names_and_flags(before, after)?;
+            crate::flags::kind_filter(&brew_args)?;
             // brew reinstall has no dry run, and dropping the flag would run
             // the reinstall for real.
             if crate::flags::is_dry_run(&brew_args) {
@@ -236,6 +242,7 @@ pub fn parse_argv(args: &[String]) -> Result<Invocation, Error> {
         }
         "info" => {
             let (names, brew_args) = split_names_and_flags(before, after)?;
+            crate::flags::kind_filter(&brew_args)?;
             Invocation {
                 soak_hours,
                 command: Command::Info { names },
@@ -459,6 +466,7 @@ Packages born inside the soak window are held. Ahead-of-soak installs
 are left unchanged. Pinned packages are skipped.
 
 With no names, considers every installed formula and cask.
+--formula or --cask (with no names) considers only that kind.
 Third-party tap packages are soaked from brewsoak's own tap clones.
 Packages in NO_SOAK (no-soak) are handed to brew after the soaked work
 (one brew update, then one brew upgrade); their outdated dependencies go
@@ -519,6 +527,7 @@ ahead-of-soak, auto-updates, and pinned sections.
       --greedy-latest       version :latest casks only
   With --greedy or --greedy-latest, -v notes each :latest cask left
   because its contents cannot be soaked.
+      --formula, --cask  only installed formulae, or only installed casks
   -v, --verbose   print soak window and a line for every package evaluated
       --raw       print brew's output unfiltered (a full log is always
                   written under $TMPDIR; its path is printed at the end)
@@ -534,6 +543,8 @@ Named packages (or --verbose) print the long form.
 user/repo/name tokens are soaked (or no-soak) like any other package.
 Shows origin tap and effective soak hours; no-soak packages are marked.
 
+      --formula, --cask  with no names, only installed formulae, or only
+                         installed casks
   -v, --verbose   long form for every package plus soak window
 "
         }
@@ -585,8 +596,9 @@ fn split_install_args(
     after: &[String],
 ) -> Result<(Vec<String>, Vec<String>, bool, bool), Error> {
     let (names, brew_args) = split_names_and_flags(before, after)?;
-    let force_cask = brew_args.iter().any(|a| a == "--cask");
-    let force_formula = brew_args.iter().any(|a| a == "--formula");
+    let kind = crate::flags::kind_filter(&brew_args)?;
+    let force_cask = kind == Some(crate::resolve::PkgKind::Cask);
+    let force_formula = kind == Some(crate::resolve::PkgKind::Formula);
     Ok((names, brew_args, force_cask, force_formula))
 }
 
@@ -1009,6 +1021,53 @@ mod tests {
                 Err(Error::Usage(m)) => assert!(m.contains("settings soak-hours"), "{args:?}: {m}"),
                 other => panic!("{args:?}: {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn both_kind_flags_are_a_usage_error_on_every_command_that_takes_them() {
+        for sub in ["upgrade", "install", "reinstall", "outdated", "info"] {
+            for argv in [
+                s(&[sub, "--formula", "--casks", "x"]),
+                s(&["--cask", sub, "--formulae"]),
+            ] {
+                match parse_argv(&argv) {
+                    Err(Error::Usage(m)) => {
+                        assert_eq!(m, "--formula and --cask are mutually exclusive")
+                    }
+                    other => panic!("{argv:?}: {other:?}"),
+                }
+            }
+        }
+        assert!(parse_argv(&s(&["update", "--formula", "--cask"])).is_ok());
+    }
+
+    #[test]
+    fn install_kind_is_chosen_by_the_plural_spellings() {
+        let i = parse_argv(&s(&["install", "--casks", "firefox"])).unwrap();
+        assert!(matches!(
+            i.command,
+            Command::Install {
+                force_cask: true,
+                force_formula: false,
+                ..
+            }
+        ));
+        let i = parse_argv(&s(&["install", "--formulae", "wget"])).unwrap();
+        assert!(matches!(
+            i.command,
+            Command::Install {
+                force_cask: false,
+                force_formula: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn command_help_mentions_the_kind_filter() {
+        for verb in ["upgrade", "outdated", "info"] {
+            assert!(command_help(verb).unwrap().contains("--cask"), "{verb}");
         }
     }
 }

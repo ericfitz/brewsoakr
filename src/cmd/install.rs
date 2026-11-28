@@ -99,6 +99,7 @@ mod tests {
             None,
             "the receipt names the tap now, so the record is stale"
         );
+        crate::cmd::test_support::assert_gate_precedes_install(&brew, "packer");
     }
 
     #[test]
@@ -368,6 +369,46 @@ mod tests {
         )
         .unwrap();
         (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn install_line_of_a_package_that_is_not_installed_is_unchanged() {
+        let (git, snaps) = packer_world();
+        let brew = MockBrew {
+            taps: hashicorp_tap(),
+            ..MockBrew::new()
+        };
+        let (_, text) = install_packer(&brew, &git, &snaps);
+        assert!(
+            text.lines().any(|l| l.trim() == "installing packer 1.16.1"),
+            "{text}"
+        );
+        assert!(!text.contains("source changed"), "{text}");
+    }
+
+    #[test]
+    fn untrusted_tap_hold_has_an_inline_line_and_sits_under_held() {
+        let (git, snaps) = packer_world();
+        let brew = MockBrew {
+            taps: hashicorp_tap(),
+            next_status: 1,
+            next_stdout: PACKER_REFUSAL.to_vec(),
+            ..MockBrew::new()
+        };
+        brew.next_outputs.lock().unwrap().push_back((0, Vec::new()));
+        let (_, text) = install_packer(&brew, &git, &snaps);
+        assert!(
+            text.contains("held packer: brew does not trust tap hashicorp/tap"),
+            "{text}"
+        );
+        assert!(
+            text.find("Held:")
+                < text.find(
+                    "packer: brew does not trust tap hashicorp/tap; run brew trust hashicorp/tap, or add it to NO_SOAK"
+                ),
+            "the note sits under Held: {text}"
+        );
+        assert!(text.contains("Held:"), "{text}");
     }
 
     #[test]
@@ -1577,5 +1618,34 @@ mod tests {
                     && a.iter().any(|x| x.ends_with("hello"))),
             "{visible:?}"
         );
+    }
+
+    #[test]
+    fn install_does_not_print_the_hidden_note() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        assert!(!inv.hidden.is_empty(), "the world must hide a formula");
+        let mut out = Vec::new();
+        install(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &core_snaps(),
+            test_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["alpha".to_string()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("hides these installed formulae"), "{text}");
     }
 }

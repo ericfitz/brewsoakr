@@ -43,11 +43,13 @@ pub(super) fn cfg_with(file: &str) -> Config {
 }
 
 pub(super) fn inv_from(brew: &MockBrew, cfg: &Config) -> Inventory {
-    Inventory::build(
-        brew.installed.clone(),
-        &brew.tap_info().expect("mock taps"),
-        &OriginRecords::default(),
-        cfg,
+    let taps = brew.tap_info().expect("mock taps");
+    let origins = OriginRecords::default();
+    Inventory::build(brew.installed.clone(), &taps, &origins, cfg).with_hidden(
+        &brew.hidden_kegs(&brew.installed),
+        &taps,
+        &origins,
+        None,
     )
 }
 
@@ -216,6 +218,23 @@ pub(super) fn formula_pkg_pinned(name: &str, receipt_rb: String) -> InstalledPkg
 
 pub(super) fn lock_runs(brew: &MockBrew) -> Vec<Vec<String>> {
     brew.runs.lock().expect("runs").clone()
+}
+
+/// The first `by_name formula <name>` event precedes the first visible
+/// `install ... <name>`; panics with "no by_name query before the install of
+/// <name>" otherwise.
+pub(super) fn assert_gate_precedes_install(brew: &MockBrew, name: &str) {
+    let events = brew.events.lock().expect("events");
+    let query = format!("by_name formula {name}");
+    let queried = events.iter().position(|e| *e == query);
+    let installed = events.iter().position(|e| {
+        e.strip_prefix("visible install ")
+            .is_some_and(|rest| rest.split(' ').any(|a| a == name))
+    });
+    assert!(
+        matches!((queried, installed), (Some(q), Some(i)) if q < i),
+        "no by_name query before the install of {name}: {events:?}"
+    );
 }
 
 pub(super) fn run_has_token(runs: &[Vec<String>], token: &str) -> bool {
@@ -521,6 +540,12 @@ pub(super) fn greedy_world() -> (MockBrew, InMemoryGit, Snapshots) {
     );
     for (name, rb) in &casks {
         let version = crate::soaktap::file_version(PkgKind::Cask, rb.as_bytes()).unwrap();
+        // brew's receipt spells a `:latest` cask `latest`.
+        let version = if version == ":latest" {
+            "latest".to_string()
+        } else {
+            version
+        };
         receipt_taps.insert(
             (PkgKind::Cask, name.to_string(), version),
             "ericfitz/brewsoak".to_string(),
@@ -701,6 +726,40 @@ pub(crate) fn soak_tap_at(path: &Path, trusted: bool) -> TapInfo {
 pub(super) fn soak_world(tap: &Path) -> (MockBrew, InMemoryGit) {
     let (mut brew, git) = local_tap_world();
     brew.soak_tap = Some(soak_tap_at(tap, true));
+    (brew, git)
+}
+
+/// `soak_world` (formula `alpha` 1.0.0 behind cutoff 1.1.0, unsoakable formula
+/// `thing`) plus cask `docker` 4.0 (version-only receipt, tap homebrew/cask)
+/// behind `cask_rb("docker", "4.1")` at `caskcut` and `caskhead`,
+/// path `Casks/d/docker.rb`.
+pub(super) fn formula_and_cask_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+    let (mut brew, git) = soak_world(tap);
+    for sha in ["caskcut", "caskhead"] {
+        git.insert_blob(sha, "Casks/d/docker.rb", cask_rb("docker", "4.1"));
+    }
+    brew.installed.push(cask_pkg_from(
+        "docker",
+        "homebrew/cask",
+        crate::brew::version_only_cask_receipt("docker", "4.0"),
+    ));
+    (brew, git)
+}
+
+/// `soak_world` plus a formula `widget` brew hides because its tap,
+/// `acme/tools` (HTTPS remote), is untrusted.
+pub(super) fn hidden_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+    let (mut brew, git) = soak_world(tap);
+    brew.hidden = vec![crate::brew::HiddenKeg {
+        name: "widget".into(),
+        tap: Some("acme/tools".into()),
+        staged_path: None,
+        own_tap: false,
+    }];
+    brew.taps.push(TapInfo {
+        trusted: false,
+        ..tapped("acme/tools", Some("https://github.com/acme/homebrew-tools"))
+    });
     (brew, git)
 }
 
@@ -979,5 +1038,31 @@ mod assert_soak_tap_commands_tests {
             &runs(&["install", "--formula", "packer"]),
             "packer"
         ));
+    }
+
+    fn events_brew(events: &[&str]) -> MockBrew {
+        let brew = MockBrew::new();
+        *brew.events.lock().unwrap() = events.iter().map(|e| e.to_string()).collect();
+        brew
+    }
+
+    #[test]
+    fn gate_helper_accepts_a_query_before_the_install() {
+        let brew = events_brew(&["by_name formula packer", "visible install --formula packer"]);
+        assert_gate_precedes_install(&brew, "packer");
+    }
+
+    #[test]
+    #[should_panic(expected = "no by_name query before the install of packer")]
+    fn gate_helper_rejects_an_install_with_no_query() {
+        let brew = events_brew(&["visible install --formula packer"]);
+        assert_gate_precedes_install(&brew, "packer");
+    }
+
+    #[test]
+    #[should_panic(expected = "no by_name query before the install of packer")]
+    fn gate_helper_rejects_a_query_after_the_install() {
+        let brew = events_brew(&["visible install --formula packer", "by_name formula packer"]);
+        assert_gate_precedes_install(&brew, "packer");
     }
 }

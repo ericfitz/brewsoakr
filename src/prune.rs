@@ -8,6 +8,7 @@ use crate::Error;
 use crate::inventory::Inventory;
 use crate::lock::RunLock;
 use crate::origin::OriginRecords;
+use crate::resolve::PkgKind;
 use std::io::Write;
 use std::path::Path;
 
@@ -29,6 +30,11 @@ pub fn prune_cache(
         inv.pkgs
             .iter()
             .any(|p| p.kind == kind && p.name.eq_ignore_ascii_case(name))
+            || (kind == PkgKind::Formula
+                && inv
+                    .unlisted_formulae
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(name)))
     });
     if removed.is_empty() {
         return Ok(());
@@ -136,6 +142,7 @@ mod tests {
                 .collect(),
             tap_remotes: Default::default(),
             soak_tap: None,
+            ..Inventory::default()
         }
     }
 
@@ -317,5 +324,22 @@ mod tests {
             ),
             before
         );
+    }
+
+    #[test]
+    fn prune_cache_keeps_the_origin_record_of_a_formula_brew_does_not_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path();
+        let mut records = OriginRecords::default();
+        records.set(PkgKind::Formula, "widget", "acme/tools");
+        records.set(PkgKind::Formula, "gone", "acme/tools");
+        records.save(cache).unwrap();
+        let mut inv = inv(&["acme/tools"], vec![]);
+        inv.unlisted_formulae = vec!["Widget".into()];
+        let mut out = Vec::new();
+        prune_cache(&RunLock::for_tests(), cache, &inv, false, &mut out).unwrap();
+        let after = OriginRecords::load(cache);
+        assert_eq!(after.get(PkgKind::Formula, "widget"), Some("acme/tools"));
+        assert_eq!(after.get(PkgKind::Formula, "gone"), None);
     }
 }

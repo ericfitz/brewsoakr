@@ -1,4 +1,5 @@
-use super::notes::{held_tap_note, own_tap_token_note, unsoakable_note};
+use super::notes::{held_tap_note, hidden_notes, own_tap_token_note, unsoakable_note};
+use super::view::Resolved;
 use super::view::{
     host_for_pkg, natural_kind, parse_pkg, prefetch_orderings, resolve_token, resolve_view,
     settle_origin,
@@ -8,8 +9,9 @@ use crate::Error;
 use crate::brew::Brew;
 use crate::config::Config;
 use crate::eligibility::DesiredAction;
+use crate::flags;
 use crate::git::GitStore;
-use crate::inventory::{Inventory, PkgClass};
+use crate::inventory::{Inventory, Pkg, PkgClass};
 use crate::nosoak;
 use crate::origin;
 use crate::report::{self};
@@ -43,16 +45,38 @@ pub fn info(
     if names.is_empty() {
         prefetch_orderings(brew, git, snaps, cache, inv);
     }
-    let owned_names: Vec<String> = if names.is_empty() {
-        inv.pkgs.iter().map(|p| p.name.clone()).collect()
+    let only = if names.is_empty() {
+        flags::kind_filter(user_flags)?
     } else {
-        names.to_vec()
+        None
     };
-    for (i, raw) in owned_names.iter().enumerate() {
+    // A bare run walks the installed packages themselves, so a formula and a
+    // cask of one name each show their own kind; a typed name is resolved.
+    let entries: Vec<(&str, Option<&Pkg>)> = if names.is_empty() {
+        inv.pkgs
+            .iter()
+            .filter(|p| flags::kind_matches(only, p.kind))
+            .map(|p| (p.name.as_str(), Some(p)))
+            .collect()
+    } else {
+        names.iter().map(|n| (n.as_str(), None)).collect()
+    };
+    for (i, &(raw, known)) in entries.iter().enumerate() {
         if long_form && i > 0 {
             writeln!(out)?;
         }
-        let mut r = resolve_token(raw, inv, cfg)?;
+        let mut r = match known {
+            Some(pkg) => Resolved {
+                origin: pkg.origin.clone(),
+                name: pkg.name.clone(),
+                class: pkg.class,
+                receipt_tap: pkg.receipt_tap.clone(),
+                tapped: origin::is_core_or_cask(&pkg.origin)
+                    || inv.tap_class(&pkg.origin).is_some(),
+                named_origin: false,
+            },
+            None => resolve_token(raw, inv, cfg)?,
+        };
         if r.named_origin && origin::own_tap(&r.origin).is_some() {
             writeln!(out, "{}", own_tap_token_note(&r.name, &r.origin))?;
             refused = true;
@@ -60,7 +84,10 @@ pub fn info(
         }
         let mut kind = None;
         if r.class == PkgClass::Soaked && !snaps.held_taps.contains_key(&r.origin) {
-            let k = natural_kind(git, snaps, cache, inv, &r.origin, &r.name)?;
+            let k = match known {
+                Some(pkg) => pkg.kind,
+                None => natural_kind(git, snaps, cache, inv, &r.origin, &r.name)?,
+            };
             settle_origin(&mut r, k, inv, cfg);
             kind = Some(k);
         }
@@ -195,8 +222,14 @@ pub fn info(
                         .map(report::identity_version)
                         .as_deref(),
                 );
+            let installed_ver = view.installed.as_ref().map(report::identity_version);
+            let cutoff_ver = view.cutoff.as_ref().map(report::identity_version);
             if redefined {
                 writeln!(out, "action: would reinstall (latest definition changed)")?;
+            } else if view.action == DesiredAction::InstallCutoff
+                && report::source_changed(installed_ver.as_deref(), cutoff_ver.as_deref())
+            {
+                writeln!(out, "action: would upgrade (source changed)")?;
             } else {
                 let soaking = view
                     .soaking_label()
@@ -228,8 +261,12 @@ pub fn info(
             )?;
         }
     }
-    if let Some(why) = soaktap::unusable_with_packages(inv) {
+    if let Some(why) = soaktap::unusable_with_packages(inv, only) {
         writeln!(out, "{}", why.note())?;
+    }
+    // Named or bare, a `--cask` run reads no formula, so it has no note.
+    for note in hidden_notes(inv, flags::kind_filter(user_flags)?) {
+        writeln!(out, "{note}")?;
     }
     Ok(RunResult {
         refused,
@@ -320,6 +357,46 @@ mod tests {
             "missing install cutoff / upgrade wording: {text}"
         );
         assert!(!result.refused, "info is read-only");
+    }
+
+    #[test]
+    fn info_labels_a_same_version_change() {
+        let (mut brew, git) = local_tap_world();
+        brew.installed[0] = formula_pkg("alpha", formula_rb("alpha", "1.1.0", "oldsha"));
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let snaps = core_snaps();
+        let run = |names: &[&str]| {
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let mut out = Vec::new();
+            info(
+                &brew,
+                &git,
+                &snaps,
+                test_cache(),
+                &inv,
+                &cfg,
+                &names,
+                &[],
+                &mut out,
+            )
+            .unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let named = run(&["alpha"]);
+        for want in [
+            "installed: 1.1.0",
+            "cutoff: 1.1.0",
+            "action: would upgrade (source changed)",
+        ] {
+            assert!(named.lines().any(|l| l == want), "{want}: {named}");
+        }
+        let bare = run(&[]);
+        assert!(
+            bare.lines()
+                .any(|l| l == "alpha  1.1.0  would upgrade (source changed)"),
+            "{bare}"
+        );
     }
 
     #[test]
@@ -627,5 +704,142 @@ mod tests {
             text.contains("brewsoakr/soaked is brewsoak's own tap"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn info_prints_the_hidden_note_last() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let (r, text) = info_text(&brew, &git, &core_snaps(), &["alpha"]);
+        let note = crate::cmd::notes::hidden_tap_note(&crate::inventory::HiddenTap {
+            tap: "acme/tools".into(),
+            names: vec!["widget".into()],
+        });
+        assert!(text.ends_with(&format!("{note}\n")), "{text}");
+        assert!(!r.refused);
+    }
+
+    fn bare_info(brew: &MockBrew, git: &InMemoryGit, names: &[&str], flags: &[&str]) -> String {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        let flags: Vec<String> = flags.iter().map(|n| n.to_string()).collect();
+        let mut out = Vec::new();
+        info(
+            brew,
+            git,
+            &core_snaps(),
+            test_cache(),
+            &inv,
+            &cfg,
+            &names,
+            &flags,
+            &mut out,
+        )
+        .unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn named_info_with_cask_has_no_hidden_formula_note() {
+        use crate::cmd::test_support::hidden_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = hidden_world(tap.path());
+        let text = bare_info(&brew, &git, &["alpha"], &[]);
+        assert!(text.contains("acme/tools"), "control: {text}");
+        let text = bare_info(&brew, &git, &["alpha"], &["--cask"]);
+        assert!(!text.contains("hides these installed formulae"), "{text}");
+    }
+
+    #[test]
+    fn bare_info_with_cask_lists_only_casks() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = bare_info(&brew, &git, &[], &["--cask"]);
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("docker  4.0  would upgrade to 4.1")),
+            "{text}"
+        );
+        assert!(!text.lines().any(|l| l.starts_with("alpha")), "{text}");
+    }
+
+    #[test]
+    fn named_info_ignores_the_kind_filter() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = bare_info(&brew, &git, &["alpha"], &["--cask"]);
+        assert!(text.contains("alpha"), "{text}");
+    }
+
+    #[test]
+    fn bare_info_with_formula_lists_only_formulae() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        let text = bare_info(&brew, &git, &[], &["--formula"]);
+        assert!(text.lines().any(|l| l.starts_with("alpha")), "{text}");
+        assert!(!text.lines().any(|l| l.starts_with("docker")), "{text}");
+    }
+
+    /// Formula `docker` 2.0.0 and cask `docker` 4.0 share a name.
+    fn shared_name_world() -> (MockBrew, InMemoryGit) {
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git) = crate::cmd::test_support::formula_and_cask_world(tap.path());
+        for sha in ["cutoffsha", "headsha"] {
+            git.insert_blob(
+                sha,
+                "Formula/d/docker.rb",
+                formula_rb("docker", "2.1.0", "midsha"),
+            );
+        }
+        brew.installed.push(formula_pkg(
+            "docker",
+            formula_rb("docker", "2.0.0", "oldsha"),
+        ));
+        (brew, git)
+    }
+
+    fn docker_lines(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| l.starts_with("docker")).collect()
+    }
+
+    #[test]
+    fn bare_info_resolves_each_package_by_its_own_kind() {
+        let (brew, git) = shared_name_world();
+        let both = bare_info(&brew, &git, &[], &[]);
+        let mut lines = docker_lines(&both);
+        lines.sort();
+        assert_eq!(
+            lines,
+            [
+                "docker  2.0.0  would upgrade to 2.1.0",
+                "docker  4.0  would upgrade to 4.1"
+            ],
+            "{both}"
+        );
+        let cask = bare_info(&brew, &git, &[], &["--cask"]);
+        assert_eq!(
+            docker_lines(&cask),
+            ["docker  4.0  would upgrade to 4.1"],
+            "{cask}"
+        );
+        let formula = bare_info(&brew, &git, &[], &["--formula"]);
+        assert_eq!(
+            docker_lines(&formula),
+            ["docker  2.0.0  would upgrade to 2.1.0"],
+            "{formula}"
+        );
+    }
+
+    #[test]
+    fn bare_info_note_about_the_soak_tap_follows_the_kind() {
+        use crate::cmd::test_support::hello_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, _) = hello_world(tap.path(), false, "1.0.0");
+        let note = crate::soaktap::NotReady::Untrusted.note();
+        assert!(bare_info(&brew, &git, &[], &[]).contains(&note));
+        assert!(bare_info(&brew, &git, &[], &["--formula"]).contains(&note));
+        assert!(!bare_info(&brew, &git, &[], &["--cask"]).contains(&note));
     }
 }
