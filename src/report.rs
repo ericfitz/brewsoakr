@@ -227,6 +227,18 @@ pub fn nosoak_header(verb: Verb, dry_run: bool) -> String {
     format!("{} no-soak packages (brew decides)", verb.heading(dry_run))
 }
 
+/// `nosoak_header` for a step whose brew commands are not all the verb the
+/// user gave brewsoak (`brewsoak install` runs `brew upgrade` over a formula
+/// that is anchored in brewsoak's tap): it names the verbs brew runs.
+pub fn nosoak_header_running(verb: Verb, dry_run: bool, brew_verbs: &[&str]) -> String {
+    let runs: Vec<String> = brew_verbs.iter().map(|v| format!("brew {v}")).collect();
+    format!(
+        "{} no-soak packages (brew decides; runs {})",
+        verb.heading(dry_run),
+        runs.join(" and ")
+    )
+}
+
 /// One `label  value` row per count, values right-aligned in one column and
 /// zero rows kept. The caller's `Section` supplies the indent.
 pub fn summary_lines(c: &Counts, added_bytes: u64, freed_bytes: u64) -> Vec<String> {

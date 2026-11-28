@@ -73,7 +73,7 @@ use crate::cmd::{max_status, merge_status};
 use crate::flags::{dropped_note, filter_for_verb, is_dry_run};
 use crate::origin;
 use crate::quiet;
-use crate::report::{Verb, nosoak_header};
+use crate::report::{Verb, nosoak_header, nosoak_header_running};
 use crate::resolve::PkgKind;
 use crate::section::Section;
 use crate::tap::{is_kind_flag, is_stripped_flag};
@@ -246,7 +246,6 @@ pub fn run_step_after(
         mode: quiet::RunMode::NoSoak,
         ..quiet::RunContext::default()
     };
-    let mut section = Section::new(&mut *out, nosoak_header(verb_kind, dry_run));
     // What each brew run said and whether it exited 0, for the per-package verdicts.
     let mut runs: Vec<RunSaid> = Vec::new();
     let (switch, plain): (Vec<&Target>, Vec<&Target>) = targets
@@ -275,6 +274,19 @@ pub fn run_step_after(
     let plain_flags = filter_for_verb(verb, &flags);
     // `-g` is `--git` to install and `--greedy` to upgrade.
     let anchored_verb = official_verb(verb);
+    // The header says what brew runs when that is not the verb brewsoak was
+    // given: `brewsoak install` runs `brew upgrade` for an anchored formula.
+    let header = if anchored.is_empty() || anchored_verb == verb {
+        nosoak_header(verb_kind, dry_run)
+    } else {
+        let mut verbs = Vec::new();
+        if !plain.is_empty() {
+            verbs.push(verb);
+        }
+        verbs.push(anchored_verb);
+        nosoak_header_running(verb_kind, dry_run, &verbs)
+    };
+    let mut section = Section::new(&mut *out, header);
     let anchored_flags = filter_for_verb(anchored_verb, &crate::flags::without_greedy(&flags));
     for (run_verb, run_flags, run_targets) in [
         (verb, &plain_flags, &plain),
@@ -1398,6 +1410,42 @@ Error: formula-b: boom\n"
         assert_eq!(
             runs(&brew)[1],
             vec!["upgrade", "--cask", "--formulae", "--verbose", "wget"]
+        );
+    }
+
+    #[test]
+    fn header_names_the_brew_verbs_when_install_runs_upgrade_for_an_anchored_formula() {
+        let header = |targets: &[Target], verb: &str| {
+            let brew = MockBrew::new();
+            let mut out = Vec::new();
+            run_step(&brew, verb, &[], targets, &mut out).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            text.lines()
+                .find(|l| l.contains("no-soak packages"))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let anchored = Target {
+            official: true,
+            ..typed("homebrew/core", "hello", PkgKind::Formula)
+        };
+        let plain = typed("homebrew/core", "wget", PkgKind::Formula);
+        assert_eq!(
+            header(&[anchored.clone(), plain.clone()], "install"),
+            "Installing no-soak packages (brew decides; runs brew install and brew upgrade)"
+        );
+        assert_eq!(
+            header(&[anchored.clone()], "install"),
+            "Installing no-soak packages (brew decides; runs brew upgrade)"
+        );
+        // Nothing differs from the verb the user gave: the header is unchanged.
+        assert_eq!(
+            header(&[plain], "install"),
+            "Installing no-soak packages (brew decides)"
+        );
+        assert_eq!(
+            header(&[anchored], "upgrade"),
+            "Upgrading no-soak packages (brew decides)"
         );
     }
 
