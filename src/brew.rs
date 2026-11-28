@@ -29,7 +29,10 @@ pub struct InstalledPkg {
     pub staged_path: Option<String>,
     /// The keg's directory name under the Cellar (Caskroom for a cask), which
     /// is how Homebrew reads an installed version (`Keg#version`). The
-    /// install record's own version can differ from it.
+    /// install record's own version can differ from it. For an installed
+    /// package it comes from brew's `installed[].version` (the newest keg's),
+    /// which equals the keg directory name; `soak_tap_kegs_brew_left_out`
+    /// reads the directory name itself.
     pub keg_version: String,
 }
 
@@ -2557,6 +2560,38 @@ mod tests {
                 &["1.21.4"]
             )
         );
+    }
+
+    #[test]
+    fn parse_installed_json_takes_the_newest_of_two_kegs_with_a_revision() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path().to_path_buf();
+        for (v, body) in [("1.0.0", "old-receipt"), ("1.0.0_1", "new-receipt")] {
+            let brew = cellar.join("wget").join(v).join(".brew");
+            std::fs::create_dir_all(&brew).expect("keg");
+            std::fs::write(brew.join("wget.rb"), body).expect("rb");
+        }
+        let json = r#"{
+          "formulae": [
+            {
+              "name": "wget",
+              "tap": "homebrew/core",
+              "revision": 1,
+              "versions": {"stable": "1.0.0"},
+              "installed": [{"version": "1.0.0"}, {"version": "1.0.0_1"}]
+            }
+          ],
+          "casks": []
+        }"#;
+        let got = parse_installed_json(
+            json,
+            |name, _, version| read_formula_receipt(&cellar, name, version),
+            |_, _| core_source(),
+        )
+        .expect("parse");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].keg_version, "1.0.0_1");
+        assert_eq!(got[0].receipt_rb, "new-receipt");
     }
 
     /// `pkgs` with their keg directory versions filled in.
