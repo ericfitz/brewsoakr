@@ -1586,6 +1586,7 @@ mod tests {
         let (brew, git) = hidden_world(tap.path());
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
+        assert!(!inv.hidden.is_empty(), "the world must hide a formula");
         let mut out = Vec::new();
         install(
             &crate::lock::RunLock::for_tests(),

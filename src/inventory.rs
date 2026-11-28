@@ -68,6 +68,7 @@ pub fn hidden_taps(
             },
         };
         if tap == origin::CORE
+            || origin::own_tap(&tap).is_some()
             || !taps
                 .iter()
                 .any(|t| !t.trusted && t.name.eq_ignore_ascii_case(&tap))
@@ -810,6 +811,34 @@ mod tests {
         assert_eq!(inv.unlisted_formulae, vec!["mine", "widget"]);
         assert_eq!(inv.hidden.len(), 1);
         assert_eq!(inv.hidden[0].names, vec!["widget"]);
+    }
+
+    #[test]
+    fn hidden_taps_skips_an_own_tap_whatever_the_source_of_the_tap() {
+        let cache = tempfile::tempdir().unwrap();
+        let c = cache.path().display();
+        let kegs = vec![
+            hidden_keg("rec", None, None),
+            hidden_keg("leg", None, None),
+            hidden_keg(
+                "stg",
+                None,
+                Some(&format!(
+                    "{c}/staging/taps/ericfitz/brewsoak/Formula/stg.rb"
+                )),
+            ),
+        ];
+        let mut origins = OriginRecords::default();
+        origins.set(PkgKind::Formula, "rec", "ericfitz/brewsoak");
+        origins.set(PkgKind::Formula, "leg", "brewsoakr/soaked");
+        let taps = vec![
+            untrusted("ericfitz/brewsoak"),
+            untrusted("brewsoakr/soaked"),
+        ];
+        assert!(hidden_taps(&kegs, &taps, &origins, Some(cache.path())).is_empty());
+        let inv = Inventory::default().with_hidden(&kegs, &taps, &origins, Some(cache.path()));
+        assert!(inv.hidden.is_empty());
+        assert_eq!(inv.unlisted_formulae, vec!["rec", "leg", "stg"]);
     }
 
     #[test]
