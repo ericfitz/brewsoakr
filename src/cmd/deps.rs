@@ -549,7 +549,10 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
         // Its dependencies are listed through the tap only while brew would
         // load that file: the receipt names the tap, the file is there and
         // the tap is local and trusted. `tap_state` reads the state without
-        // creating the tap.
+        // creating the tap. A tap directory that cannot be resolved counts as
+        // "not through the tap" (the bare name): this only chooses how the
+        // dependency list is asked for, and the same `brew --repository`
+        // failure ends any run that goes on to stage or maintain the tap.
         let through_tap = pkg.own_tap == Some(OwnTap::Soak)
             && soaktap::tap_state(self.inv.soak_tap.as_ref()) == TapState::Ready
             && self

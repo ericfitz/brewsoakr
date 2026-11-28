@@ -300,6 +300,12 @@ impl<'a> SoakTap<'a> {
 
     /// `anchored` against the current tap directory. A receipt that does not
     /// name the soak tap, or a directory that cannot be resolved, is not anchored.
+    ///
+    /// The unresolvable directory is deliberately not an error here: the
+    /// callers only pick a hint or a no-soak token for a package that is
+    /// already installed, and every brew command of the run that follows
+    /// needs the same `brew --repository` answer. A run that stages or
+    /// maintains the tap fails on it through `dir()` (`stage`, `maintain`).
     pub fn anchored(&self, pkg: &Pkg) -> bool {
         pkg.own_tap == Some(OwnTap::Soak) && self.dir().is_ok_and(|dir| anchored(&dir, pkg))
     }
@@ -342,7 +348,9 @@ impl<'a> SoakTap<'a> {
 
     /// Decided on the first call and kept for the run. A real run creates a
     /// tap that is not tapped, reads tap-info again and applies the row that
-    /// then holds. Never fatal.
+    /// then holds. Never fatal: it returns a `NotReady` hold and never resolves the
+    /// tap directory (`stage`, which calls it, can still fail with an `Error`
+    /// when `dir` cannot be resolved).
     pub fn ready(&mut self, brew: &impl Brew) -> Result<(), NotReady> {
         if let Some(d) = &self.decided {
             return d.clone();
@@ -354,6 +362,9 @@ impl<'a> SoakTap<'a> {
 
     /// Make the package's tap file the sanitized cutoff. `version` is the
     /// cutoff version when the caller knows it; a later `Some` replaces it.
+    /// A tap that is not ready is `Staged::NotReady`; an `Err` is fatal: the
+    /// tap directory could not be resolved (`dir`), or I/O failed. A dry run
+    /// stages too (and settles it back), so it needs the directory as well.
     pub fn stage(
         &mut self,
         _lock: &RunLock,
@@ -1111,6 +1122,72 @@ mod tests {
         let brew = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", "ericfitz/brewsoak");
         s.settle(&e.lock, &brew).unwrap();
         assert!(!e.file("Formula", "wget").exists());
+    }
+
+    /// A tap root that counts its asks and can fail.
+    struct CountingRoot {
+        path: PathBuf,
+        fails: bool,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl TapRootSource for CountingRoot {
+        fn tap_root(&self) -> Result<PathBuf, Error> {
+            self.calls.set(self.calls.get() + 1);
+            if self.fails {
+                return Err(Error::Other("brew --repository failed".into()));
+            }
+            Ok(self.path.clone())
+        }
+    }
+
+    fn counting(path: &Path, fails: bool) -> CountingRoot {
+        CountingRoot {
+            path: path.to_path_buf(),
+            fails,
+            calls: std::cell::Cell::new(0),
+        }
+    }
+
+    #[test]
+    fn a_dry_run_stage_with_a_ready_tap_and_no_path_asks_for_the_root_once() {
+        // The dry run still writes the file brew is asked about (and settles
+        // it back), so the directory is needed: one ask, not avoidable.
+        let e = env();
+        let root = counting(e.tap.path(), false);
+        let mut s = SoakTap::new(Some(&local(true)), &root, e.cache.path(), true);
+        let cutoff = formula_rb("1.1.0");
+        let r = s
+            .stage(
+                &e.lock,
+                &MockBrew::new(),
+                &fref("wget"),
+                cutoff.as_bytes(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(r, Staged::Written);
+        assert_eq!(root.calls.get(), 1);
+        s.settle(&e.lock, &MockBrew::new()).unwrap();
+        assert!(!e.file("Formula", "wget").exists(), "a dry run restores");
+    }
+
+    #[test]
+    fn a_failing_tap_root_fails_stage_and_only_degrades_anchored() {
+        let e = env();
+        let root = counting(e.tap.path(), true);
+        let mut s = SoakTap::new(Some(&local(true)), &root, e.cache.path(), false);
+        let cutoff = formula_rb("1.1.0");
+        let r = s.stage(
+            &e.lock,
+            &MockBrew::new(),
+            &fref("wget"),
+            cutoff.as_bytes(),
+            None,
+        );
+        assert!(matches!(r, Err(Error::Other(m)) if m.contains("--repository")));
+        assert!(!s.anchored(&pkg(Some(OwnTap::Soak), "1.1.0")), "degrades");
+        assert!(s.dir().is_err());
     }
 
     #[test]
