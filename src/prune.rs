@@ -121,6 +121,7 @@ mod tests {
             class: PkgClass::Unsoakable,
             receipt_rb: String::new(),
             receipt_tap: None,
+            own_tap: None,
             pinned: false,
         }
     }
@@ -133,6 +134,7 @@ mod tests {
                 .map(|t| ((*t).to_string(), TapClass::Soakable))
                 .collect(),
             tap_remotes: Default::default(),
+            soak_tap: None,
         }
     }
 

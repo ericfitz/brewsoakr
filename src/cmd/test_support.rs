@@ -51,10 +51,7 @@ pub(super) fn inv_from(brew: &MockBrew, cfg: &Config) -> Inventory {
 }
 
 pub(super) fn tapped(name: &str, remote: Option<&str>) -> TapInfo {
-    TapInfo {
-        name: name.into(),
-        remote: remote.map(str::to_string),
-    }
+    TapInfo::new(name, remote)
 }
 
 pub(super) fn formula_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
@@ -188,6 +185,7 @@ pub(super) fn core_snaps() -> Snapshots {
 
 pub(super) fn formula_pkg(name: &str, receipt_rb: String) -> InstalledPkg {
     InstalledPkg {
+        own_tap: None,
         name: name.into(),
         kind: PkgKind::Formula,
         receipt_rb,
@@ -336,6 +334,7 @@ pub(super) fn local_tap_world() -> (MockBrew, InMemoryGit) {
 
 pub(super) fn cask_pkg_from(name: &str, tap: &str, receipt_rb: String) -> InstalledPkg {
     InstalledPkg {
+        own_tap: None,
         name: name.into(),
         kind: PkgKind::Cask,
         receipt_rb,

@@ -1,5 +1,6 @@
 use crate::Error;
 use crate::identity::{HostPlatform, VersionSource};
+use crate::origin::OwnTap;
 use crate::quiet;
 use crate::resolve::PkgKind;
 use crate::taps::TapInfo;
@@ -18,8 +19,10 @@ pub struct InstalledPkg {
     pub kind: PkgKind,
     pub receipt_rb: String,
     pub pinned: bool,
-    /// Receipt tap from `brew info`; `None` for null/empty/staging.
+    /// Receipt tap from `brew info`; `None` for null/empty/brewsoak's own taps.
     pub tap: Option<String>,
+    /// Which of brewsoak's own taps the receipt names, if either.
+    pub own_tap: Option<OwnTap>,
     /// `source.path` of a formula keg whose receipt tap is null: where the
     /// formula file was installed from. brewsoak's own staging paths name
     /// the tap the keg was staged from.
@@ -1327,8 +1330,10 @@ fn read_formula_receipt(cellar: &Path, name: &str, version: Option<&str>) -> Opt
 /// What a formula keg's receipt says about where it was installed from.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReceiptSource {
-    /// `source.tap`; `None` for null, empty or the staging tap.
+    /// `source.tap`; `None` for null, empty, not a string or one of brewsoak's own taps.
     pub tap: Option<String>,
+    /// Which of brewsoak's own taps `source.tap` names, if either.
+    pub own_tap: Option<OwnTap>,
     /// `source.path`, read only when `tap` is `None`.
     pub path: Option<String>,
 }
@@ -1356,15 +1361,16 @@ fn read_formula_receipt_source_opt(
     let source = find_json_key(&text, "source")?.trim_start();
     let end = skip_delimited(source.as_bytes(), 0, b'{', b'}')?;
     let source = source.get(..end)?;
-    let tap = json_string_value(source, "tap")
-        .filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
+    let raw_tap = json_string_value(source, "tap");
+    let own_tap = raw_tap.as_deref().and_then(crate::origin::own_tap);
+    let tap = raw_tap.filter(|t| !t.is_empty() && own_tap.is_none());
     // A staged keg has no tap; the path it was installed from may name one.
     let path = if tap.is_none() {
         json_string_value(source, "path").filter(|p| !p.is_empty())
     } else {
         None
     };
-    Some(ReceiptSource { tap, path })
+    Some(ReceiptSource { tap, path, own_tap })
 }
 
 fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Option<String> {
@@ -1497,6 +1503,7 @@ fn parse_installed_json(
                 receipt_rb,
                 pinned: json_bool_value(obj, "pinned").unwrap_or(false),
                 tap: source.tap,
+                own_tap: source.own_tap,
                 staged_path: source.path,
             });
         }
@@ -1505,9 +1512,9 @@ fn parse_installed_json(
         let Some(name) = json_string_value(obj, "token").filter(|n| !n.is_empty()) else {
             continue;
         };
-        let tap = json_string_value(obj, "tap");
-        let tap =
-            tap.filter(|t| !t.is_empty() && !t.eq_ignore_ascii_case(crate::origin::STAGING_TAP));
+        let raw_tap = json_string_value(obj, "tap");
+        let own_tap = raw_tap.as_deref().and_then(crate::origin::own_tap);
+        let tap = raw_tap.filter(|t| !t.is_empty() && own_tap.is_none());
         let version = installed_version(obj);
         let receipt_rb = read_receipt(&name, PkgKind::Cask, version.as_deref()).or_else(|| {
             version
@@ -1521,6 +1528,7 @@ fn parse_installed_json(
                 receipt_rb,
                 pinned: json_bool_value(obj, "pinned").unwrap_or(false),
                 tap,
+                own_tap,
                 staged_path: None,
             });
         }
@@ -1860,6 +1868,7 @@ mod tests {
 
     fn pkg(name: &str, kind: PkgKind, receipt_rb: &str, tap: Option<&str>) -> InstalledPkg {
         InstalledPkg {
+            own_tap: None,
             name: name.into(),
             kind,
             receipt_rb: receipt_rb.into(),
@@ -1881,10 +1890,7 @@ mod tests {
     #[test]
     fn mock_tap_info_returns_the_vec() {
         let brew = MockBrew {
-            taps: vec![crate::taps::TapInfo {
-                name: "a/b".into(),
-                remote: None,
-            }],
+            taps: vec![crate::taps::TapInfo::new("a/b", None)],
             ..MockBrew::new()
         };
         assert_eq!(brew.tap_info().unwrap().len(), 1);
@@ -2020,6 +2026,7 @@ mod tests {
                 "foo" => ReceiptSource {
                     tap: Some("acme/tools".into()),
                     path: None,
+                    own_tap: None,
                 },
                 other => panic!("unexpected tap read for {other}"),
             },
@@ -2256,6 +2263,7 @@ mod tests {
         ReceiptSource {
             tap: Some("homebrew/core".into()),
             path: None,
+            own_tap: None,
         }
     }
 
@@ -2286,6 +2294,63 @@ mod tests {
                 .tap
                 .as_deref(),
             Some("hashicorp/tap")
+        );
+    }
+
+    #[test]
+    fn receipt_naming_an_own_tap_has_no_tap_and_keeps_the_fact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        for (name, tap) in [
+            ("a", "ericfitz/brewsoak"),
+            ("b", "brewsoakr/soaked"),
+            ("c", "homebrew/core"),
+        ] {
+            write_receipt(
+                cellar,
+                name,
+                "1",
+                &format!(r#"{{"source":{{"tap":"{tap}","spec":"stable"}}}}"#),
+            );
+        }
+        let src = |n: &str| read_formula_receipt_source(cellar, n, Some("1"));
+        let (a, b, c) = (src("a"), src("b"), src("c"));
+        assert_eq!((a.tap, a.own_tap), (None, Some(OwnTap::Soak)));
+        assert_eq!((b.tap, b.own_tap), (None, Some(OwnTap::Legacy)));
+        assert_eq!((c.tap.as_deref(), c.own_tap), (Some("homebrew/core"), None));
+    }
+
+    #[test]
+    fn receipt_tap_that_is_not_a_string_is_not_from_the_soak_tap() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cellar = tmp.path();
+        for (name, value) in [("a", "7"), ("b", "{}"), ("c", "true")] {
+            write_receipt(
+                cellar,
+                name,
+                "1",
+                &format!(r#"{{"source":{{"tap":{value},"spec":"stable"}}}}"#),
+            );
+            let got = read_formula_receipt_source(cellar, name, Some("1"));
+            assert_eq!((got.tap, got.own_tap), (None, None), "tap {value}");
+        }
+    }
+
+    #[test]
+    fn parse_installed_json_cask_keeps_the_own_tap_fact() {
+        let json = r#"{"formulae": [], "casks": [
+            {"token": "flighty", "tap": "ericfitz/brewsoak", "installed": "2.0"}
+        ]}"#;
+        let got = parse_installed_json(
+            json,
+            |_, _, _| None,
+            |name, _| panic!("unexpected tap read for {name}"),
+        )
+        .expect("parse");
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            (got[0].tap.clone(), got[0].own_tap),
+            (None, Some(OwnTap::Soak))
         );
     }
 
@@ -2373,6 +2438,7 @@ mod tests {
                     ReceiptSource {
                         tap: Some("hashicorp/tap".into()),
                         path: None,
+                        own_tap: None,
                     }
                 } else {
                     ReceiptSource::default()

@@ -754,6 +754,7 @@ mod tests {
             brew: EchoVisibleBrew {
                 mock: MockBrew {
                     installed: vec![InstalledPkg {
+                        own_tap: None,
                         name: "wget".into(),
                         kind: PkgKind::Formula,
                         receipt_rb: "class Wget < Formula\nend\n".into(),
@@ -1123,6 +1124,7 @@ mod tests {
         );
         let brew = MockBrew {
             installed: vec![InstalledPkg {
+                own_tap: None,
                 name: "terraform".into(),
                 kind: PkgKind::Formula,
                 receipt_rb: "class X < Formula\n  url \"https://e.com/terraform-1.0.0.tar.gz\"\n  sha256 \"a\"\nend\n".into(),
@@ -1131,14 +1133,8 @@ mod tests {
  staged_path: None,
 }],
             taps: vec![
-                TapInfo {
-                    name: "hashicorp/tap".into(),
-                    remote: Some("https://github.com/hashicorp/homebrew-tap".into()),
-                },
-                TapInfo {
-                    name: "ericfitz/tap".into(),
-                    remote: Some("https://github.com/ericfitz/homebrew-tap".into()),
-                },
+                TapInfo::new("hashicorp/tap", Some("https://github.com/hashicorp/homebrew-tap")),
+                TapInfo::new("ericfitz/tap", Some("https://github.com/ericfitz/homebrew-tap")),
             ],
             ..MockBrew::new()
         };
