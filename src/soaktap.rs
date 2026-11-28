@@ -73,6 +73,25 @@ impl NotReady {
     }
 }
 
+/// Why the tap cannot be used, when it is tapped but `Untrusted` or `Remote`.
+pub fn unusable(entry: Option<&TapInfo>) -> Option<NotReady> {
+    match tap_state(entry) {
+        TapState::Untrusted => Some(NotReady::Untrusted),
+        TapState::Remote(r) => Some(NotReady::Remote(r)),
+        TapState::NotTapped | TapState::Ready => None,
+    }
+}
+
+/// `Some` when the tap is tapped but unusable (untrusted, or from a remote)
+/// and at least one installed package's receipt names it.
+pub fn unusable_with_packages(inv: &Inventory) -> Option<NotReady> {
+    let why = unusable(inv.soak_tap.as_ref())?;
+    inv.pkgs
+        .iter()
+        .any(|p| p.own_tap == Some(OwnTap::Soak))
+        .then_some(why)
+}
+
 /// Version of a formula or cask file in brew's spelling (`1.0.0_2`); `None`
 /// when it does not parse.
 pub fn file_version(kind: PkgKind, rb: &[u8]) -> Option<String> {

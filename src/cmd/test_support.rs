@@ -710,6 +710,38 @@ pub(super) fn soak_and_packer_world(tap: &Path) -> (MockBrew, InMemoryGit, Snaps
     (brew, git, snaps)
 }
 
+/// `soak_and_packer_world` with `hello` installed from the soak tap (receipt
+/// names it) at `installed`, soak cutoff 1.1.0 and HEAD 1.2.0, and the soak
+/// tap local at `tap` with the given trust.
+pub(super) fn hello_world(
+    tap: &Path,
+    trusted: bool,
+    installed: &str,
+) -> (MockBrew, InMemoryGit, Snapshots) {
+    let (mut brew, git, snaps) = soak_and_packer_world(tap);
+    brew.soak_tap = Some(soak_tap_at(tap, trusted));
+    git.insert_blob(
+        "cutoffsha",
+        "Formula/h/hello.rb",
+        formula_rb("hello", "1.1.0", "midsha"),
+    );
+    git.insert_blob(
+        "headsha",
+        "Formula/h/hello.rb",
+        formula_rb("hello", "1.2.0", "newsha"),
+    );
+    let sha = match installed {
+        "1.1.0" => "midsha",
+        "1.2.0" => "newsha",
+        _ => "oldsha",
+    };
+    brew.installed.push(InstalledPkg {
+        own_tap: Some(crate::origin::OwnTap::Soak),
+        ..formula_pkg("hello", formula_rb("hello", installed, sha))
+    });
+    (brew, git, snaps)
+}
+
 /// The bytes of `rel` below `tap`, if the file exists.
 pub(super) fn tap_file(tap: &Path, rel: &str) -> Option<Vec<u8>> {
     std::fs::read(tap.join(rel)).ok()

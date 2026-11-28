@@ -164,6 +164,26 @@ pub fn run_step(
     run_step_after(brew, verb, user_flags, targets, false, out)
 }
 
+/// A failed no-soak run whose brew refused brewsoak's own untrusted tap
+/// (a dependency of a no-soak package is anchored there): say how to trust
+/// it, once. The failure itself is reported as for any other.
+fn note_soak_tap_refusal(result: &mut StepResult, output: &std::process::Output) {
+    if output.status.success() {
+        return;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(tap) = crate::taps::untrusted_tap(&text) else {
+        return;
+    };
+    if !tap.eq_ignore_ascii_case(crate::origin::SOAK_TAP) {
+        return;
+    }
+    let note = crate::soaktap::NotReady::Untrusted.note();
+    if !result.notes.contains(&note) {
+        result.notes.push(note);
+    }
+}
+
 /// `run_step`, skipping its own update (and header) when `updated`.
 pub fn run_step_after(
     brew: &impl Brew,
@@ -233,6 +253,7 @@ pub fn run_step_after(
         args.extend(group.iter().map(|t| token_of(t)));
         let output = brew.run_visible_in(&args, &mut section, &ctx)?;
         runs.push(RunSaid::new(&group, &output));
+        note_soak_tap_refusal(&mut result, &output);
         result
             .installed
             .extend(quiet::installed_from_output(&output.stdout));
@@ -291,6 +312,7 @@ pub fn run_step_after(
         };
         let output = brew.run_visible_in(&args, &mut section, &switch_ctx)?;
         runs.push(RunSaid::new(&switch, &output));
+        note_soak_tap_refusal(&mut result, &output);
         // A Cellar line or a cask's success line proves that target's keg was
         // replaced even when the run as a whole failed. Without that proof,
         // success means exit 0 with no already-installed message for it.
@@ -1420,5 +1442,66 @@ Error: formula-b: boom\n"
             "{:?}",
             stale.notes
         );
+    }
+
+    #[test]
+    fn untrusted_soak_tap_refusal_adds_the_note_once() {
+        let refusal = |tap: &str| {
+            format!("Error: Refusing to load formula {tap}/hello from untrusted tap {tap}.\n")
+                .into_bytes()
+        };
+        let brew = MockBrew {
+            next_status: 1,
+            next_stdout: refusal("ericfitz/brewsoak"),
+            ..MockBrew::new()
+        };
+        let r = run_step_after(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget"), t("homebrew/core", "curl")],
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let note = crate::soaktap::NotReady::Untrusted.note();
+        assert_eq!(
+            r.notes.iter().filter(|n| **n == note).count(),
+            1,
+            "{:?}",
+            r.notes
+        );
+        assert_eq!(r.status, Some(1));
+
+        // Another tap's refusal, or a success, adds nothing.
+        let brew = MockBrew {
+            next_status: 1,
+            next_stdout: refusal("hashicorp/tap"),
+            ..MockBrew::new()
+        };
+        let r = run_step_after(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget")],
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!r.notes.contains(&note), "{:?}", r.notes);
+        let brew = MockBrew {
+            next_stdout: refusal("ericfitz/brewsoak"),
+            ..MockBrew::new()
+        };
+        let r = run_step_after(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget")],
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!r.notes.contains(&note), "{:?}", r.notes);
     }
 }

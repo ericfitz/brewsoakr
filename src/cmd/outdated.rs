@@ -211,6 +211,9 @@ pub fn outdated(
         .filter(|n| brew_outdated.contains(n))
         .map(|n| format!("{n} (no-soak, brew)"))
         .collect();
+    if let Some(why) = crate::soaktap::unusable_with_packages(inv) {
+        held.push(why.note());
+    }
     write_section_always(out, "==> Outdated (will upgrade)", &upgrades)?;
     write_section_always(out, "==> No-soak (brew)", &no_soak)?;
     write_section_always(out, "==> Held", &held)?;
@@ -244,6 +247,9 @@ pub fn outdated(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cmd::test_support::hello_world;
+    use crate::snapshot::Snapshots;
+    use crate::soaktap::NotReady;
 
     use crate::brew::MockBrew;
 
@@ -717,5 +723,48 @@ mod tests {
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("==> Pinned\nwget"), "{text}");
         assert!(!text.contains("wget (no-soak"), "{text}");
+    }
+
+    fn outdated_text(brew: &MockBrew, git: &InMemoryGit, snaps: &Snapshots) -> (RunResult, String) {
+        let cfg = cfg24();
+        let inv = inv_from(brew, &cfg);
+        let mut out = Vec::new();
+        let r = outdated(brew, git, snaps, test_cache(), &inv, &cfg, &[], &mut out).unwrap();
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn outdated_lists_the_package_and_the_note() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, snaps) = hello_world(tap.path(), false, "1.0.0");
+        let (r, text) = outdated_text(&brew, &git, &snaps);
+        assert!(text.contains("hello (1.0.0) < 1.1.0"), "{text}");
+        assert_eq!(
+            text.matches(&NotReady::Untrusted.note()).count(),
+            1,
+            "{text}"
+        );
+        assert!(
+            section_lines(&text, "==> Held").contains(&NotReady::Untrusted.note()),
+            "{text}"
+        );
+        assert!(!r.refused);
+    }
+
+    #[test]
+    fn outdated_without_such_a_package_has_no_note() {
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git, snaps) = hello_world(tap.path(), false, "1.0.0");
+        brew.installed.retain(|p| p.name != "hello");
+        let (_, text) = outdated_text(&brew, &git, &snaps);
+        assert!(!text.contains("brew trust"), "{text}");
+    }
+
+    #[test]
+    fn outdated_with_a_trusted_tap_has_no_note() {
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, snaps) = hello_world(tap.path(), true, "1.0.0");
+        let (_, text) = outdated_text(&brew, &git, &snaps);
+        assert!(!text.contains("brew trust"), "{text}");
     }
 }

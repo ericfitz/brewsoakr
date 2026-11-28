@@ -1531,4 +1531,46 @@ mod tests {
                 .contains("use `brew install hashicorp/tap/terraform` to bypass")
         );
     }
+
+    #[test]
+    fn install_of_a_package_from_the_untrusted_tap_is_a_hold_not_a_fresh_install() {
+        use crate::cmd::test_support::hello_world;
+        let tap = tempfile::tempdir().unwrap();
+        let (brew, git, snaps) = hello_world(tap.path(), false, "1.1.0");
+        let cfg = cfg24();
+        let inv = inv_from(&brew, &cfg);
+        let mut out = Vec::new();
+        let r = install(
+            &crate::lock::RunLock::for_tests(),
+            &brew,
+            &git,
+            &snaps,
+            test_cache(),
+            tap.path(),
+            &inv,
+            &cfg,
+            &["hello".to_string()],
+            false,
+            false,
+            &[],
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("held hello: brewsoak's tap is not ready"),
+            "{text}"
+        );
+        assert!(!text.contains("already installed"), "{text}");
+        assert!(r.refused);
+        let visible = brew.visible_runs.lock().unwrap().clone();
+        assert!(
+            !visible
+                .iter()
+                .chain(lock_runs(&brew).iter())
+                .any(|a| a.first().map(String::as_str) == Some("install")
+                    && a.iter().any(|x| x.ends_with("hello"))),
+            "{visible:?}"
+        );
+    }
 }

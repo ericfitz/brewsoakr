@@ -35,6 +35,11 @@ pub fn newer_than_cutoff_note(name: &str, installed: &str, cutoff: &str) -> Stri
     )
 }
 
+/// An explicit token that names brewsoak's own tap.
+pub(super) fn own_tap_token_note(name: &str, tap: &str) -> String {
+    format!("{name}: {tap} is brewsoak's own tap; name the package without the tap")
+}
+
 /// Why a package cannot be soaked, worded for a note.
 pub(super) fn unsoakable_note(name: &str, origin_tap: &str, tapped: bool) -> String {
     if tapped {

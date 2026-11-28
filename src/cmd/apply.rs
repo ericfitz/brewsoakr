@@ -3,8 +3,8 @@ use super::deps::{
     CutoffDepWalk, CutoffDeps, HeldDep, NameFail, NameHold, NameWhy, Role, first_line,
 };
 use super::notes::{
-    NoteKind, by_name_note, held_tap_note, newer_than_cutoff_note, refusal_message,
-    unsoakable_note, write_notes, write_session_tail,
+    NoteKind, by_name_note, held_tap_note, newer_than_cutoff_note, own_tap_token_note,
+    refusal_message, unsoakable_note, write_notes, write_session_tail,
 };
 use super::view::{
     Resolved, ResolvedView, calendar_today, host_for_pkg, natural_kind, parse_formula_detected,
@@ -158,6 +158,9 @@ pub fn reinstall(
             continue;
         };
         if eligibility::identities_match(view.installed.as_ref(), view.head.as_ref()) {
+            if session.holds_for_unusable_tap(&r.name, Some(pkg))? {
+                continue;
+            }
             if is_verbose(user_flags) {
                 writeln!(
                     session.out,
@@ -511,6 +514,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// brewsoak never uninstalls a keg to switch taps. Returns true when it
     /// refused.
     fn refuses_tap_switch(&mut self, r: &Resolved) -> bool {
+        // brewsoak's own taps are never named by the user: a brew command
+        // for such a token would bypass the soak.
+        if r.named_origin && origin::own_tap(&r.origin).is_some() {
+            self.defer_held(own_tap_token_note(&r.name, &r.origin));
+            self.counts.held += 1;
+            self.refused = true;
+            return true;
+        }
         if !r.named_origin || self.inv.find_in(&r.origin, &r.name).is_some() {
             return false;
         }
@@ -525,6 +536,35 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         self.counts.held += 1;
         self.refused = true;
         true
+    }
+
+    /// A package installed from brewsoak's tap while that tap is untrusted or
+    /// remote: brew would refuse to load its formula, so nothing is run for
+    /// it. One inline line, the note once, counted as held. Returns true when
+    /// it held the package.
+    fn holds_for_unusable_tap(
+        &mut self,
+        name: &str,
+        installed: Option<&Pkg>,
+    ) -> Result<bool, Error> {
+        if !installed.is_some_and(|p| p.own_tap == Some(origin::OwnTap::Soak)) {
+            return Ok(false);
+        }
+        let Some(why) = soaktap::unusable(self.inv.soak_tap.as_ref()) else {
+            return Ok(false);
+        };
+        writeln!(self.out, "held {name}: brewsoak's tap is not ready")?;
+        let note = why.note();
+        if !self
+            .deferred
+            .iter()
+            .any(|(kind, text)| *kind == NoteKind::Held && *text == note)
+        {
+            self.defer_held(note);
+        }
+        self.counts.held += 1;
+        self.refused = true;
+        Ok(true)
     }
 
     fn nosoak_target(&self, r: Resolved, installed: Option<&Pkg>) -> nosoak::Target {
@@ -697,6 +737,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     did,
                 )
             )?;
+        }
+        if view.action != DesiredAction::InstallCutoff
+            && self.holds_for_unusable_tap(&name, installed)?
+        {
+            return Ok(());
         }
         self.counts.note(view.action, view.newer_soaking());
         let token = nosoak::brew_token(&r.origin, &name);
@@ -2956,8 +3001,8 @@ mod tests {
         use super::*;
         use crate::cmd::combine_exit;
         use crate::cmd::test_support::{
-            assert_soak_tap_commands, run_has_token, run_upgrade, soak_and_packer_world,
-            soak_tap_at, soak_world, summary_has, tap_file, tree,
+            assert_soak_tap_commands, hello_world, run_has_token, run_upgrade,
+            soak_and_packer_world, soak_tap_at, soak_world, summary_has, tap_file, tree,
         };
         use crate::origin::SOAK_TAP;
         use crate::soaktap::{NotReady, UNDO_DIR};
@@ -3547,6 +3592,241 @@ mod tests {
             // back.rb recovered away, gone.rb pruned, alpha staged with its
             // undo entry, and the old entry settled.
             assert_eq!(seen, (false, false, true, false, true));
+        }
+
+        /// Run one brewsoak verb over `names`, returning its result and text.
+        fn verb_run(
+            brew: &MockBrew,
+            git: &InMemoryGit,
+            snaps: &Snapshots,
+            tap: &Path,
+            verb: &str,
+            names: &[&str],
+        ) -> (RunResult, String) {
+            let cfg = cfg24();
+            let inv = inv_from(brew, &cfg);
+            let lock = crate::lock::RunLock::for_tests();
+            let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+            let mut out = Vec::new();
+            let r = match verb {
+                "upgrade" => upgrade(
+                    &lock,
+                    brew,
+                    git,
+                    snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    &[],
+                    &mut out,
+                ),
+                "install" => crate::cmd::install::install(
+                    &lock,
+                    brew,
+                    git,
+                    snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    false,
+                    false,
+                    &[],
+                    &mut out,
+                ),
+                "reinstall" => reinstall(
+                    &lock,
+                    brew,
+                    git,
+                    snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    &[],
+                    &mut out,
+                ),
+                other => panic!("{other}"),
+            }
+            .unwrap_or_else(|e| panic!("{verb}: {e}"));
+            (r, String::from_utf8(out).expect("utf8"))
+        }
+
+        fn no_command_names(brew: &MockBrew, name: &str) {
+            let all: Vec<Vec<String>> = lock_runs(brew).into_iter().chain(visible(brew)).collect();
+            assert!(
+                !all.iter().any(|a| a.iter().any(|x| x.ends_with(name))),
+                "{all:?}"
+            );
+        }
+
+        #[test]
+        fn upgrade_holds_a_package_installed_from_the_untrusted_tap() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = hello_world(tap.path(), false, "1.0.0");
+            let (r, text) = verb_run(
+                &brew,
+                &git,
+                &snaps,
+                tap.path(),
+                "upgrade",
+                &["hello", "hashicorp/tap/packer"],
+            );
+            assert_eq!(
+                text.matches("held hello: brewsoak's tap is not ready")
+                    .count(),
+                1,
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Untrusted.note()).count(),
+                1,
+                "{text}"
+            );
+            assert!(summary_has(&text, "held", "1"), "{text}");
+            no_command_names(&brew, "hello");
+            assert!(visible(&brew).contains(&strs(&["install", "--formula", "packer"])));
+            assert_eq!(combine_exit(r.refused, r.brew_status), 1);
+        }
+
+        #[test]
+        fn package_at_its_cutoff_from_the_untrusted_tap_is_still_held() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = hello_world(tap.path(), false, "1.1.0");
+            let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), "upgrade", &["hello"]);
+            assert!(
+                text.contains("held hello: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Untrusted.note()).count(),
+                1,
+                "{text}"
+            );
+            assert!(summary_has(&text, "held", "1"), "{text}");
+            assert!(r.refused);
+            no_command_names(&brew, "hello");
+        }
+
+        #[test]
+        fn remote_soak_tap_holds_packages_installed_from_it() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+            let remote = "https://example.com/x/homebrew-brewsoak";
+            brew.soak_tap = Some(TapInfo::new(SOAK_TAP, Some(remote)));
+            let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), "upgrade", &["hello"]);
+            assert!(
+                text.contains("held hello: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Remote(remote.into()).note())
+                    .count(),
+                1,
+                "{text}"
+            );
+            assert!(r.refused);
+            no_command_names(&brew, "hello");
+        }
+
+        #[test]
+        fn reinstall_holds_it_before_the_true_repair() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = hello_world(tap.path(), false, "1.2.0");
+            let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), "reinstall", &["hello"]);
+            assert!(
+                text.contains("held hello: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert!(!text.contains("reinstalling hello"), "{text}");
+            assert!(r.refused);
+            assert!(summary_has(&text, "held", "1"), "{text}");
+            assert!(
+                !lock_runs(&brew)
+                    .into_iter()
+                    .chain(visible(&brew))
+                    .any(|a| a.first().map(String::as_str) == Some("reinstall")),
+            );
+        }
+
+        #[test]
+        fn explicit_own_tap_token_is_refused_on_every_verb() {
+            for (verb, token) in [
+                ("upgrade", "ericfitz/brewsoak/hello"),
+                ("install", "brewsoakr/soaked/hello"),
+                ("reinstall", "ericfitz/brewsoak/hello"),
+            ] {
+                let tap = tempfile::tempdir().unwrap();
+                let (brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+                let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), verb, &[token, "alpha"]);
+                let tap_name = token.rsplit_once('/').unwrap().0;
+                assert!(
+                    text.contains(&format!(
+                        "hello: {tap_name} is brewsoak's own tap; name the package without the tap"
+                    )),
+                    "{verb}: {text}"
+                );
+                assert!(!text.contains("brew upgrade ericfitz/brewsoak/"), "{text}");
+                assert!(!text.contains("brew install brewsoakr/soaked/"), "{text}");
+                assert!(
+                    !text.contains("brew reinstall ericfitz/brewsoak/"),
+                    "{text}"
+                );
+                assert!(summary_has(&text, "held", "1"), "{verb}: {text}");
+                assert_eq!(combine_exit(r.refused, r.brew_status), 1, "{verb}");
+                no_command_names(&brew, "hello");
+            }
+        }
+
+        #[test]
+        fn explicit_own_tap_token_does_not_stop_the_next_name() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+            let (_, text) = verb_run(
+                &brew,
+                &git,
+                &snaps,
+                tap.path(),
+                "upgrade",
+                &["ericfitz/brewsoak/hello", "alpha"],
+            );
+            assert!(
+                visible(&brew).contains(&strs(&[
+                    "upgrade",
+                    "--formula",
+                    "ericfitz/brewsoak/alpha"
+                ])),
+                "{:?}\n{text}",
+                visible(&brew)
+            );
+        }
+
+        #[test]
+        fn brew_install_failing_on_the_untrusted_soak_tap_is_a_hold_and_the_tap_file_goes_back() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.next_status = 1;
+            brew.next_stdout =
+                b"Error: Refusing to load formula ericfitz/brewsoak/alpha from untrusted tap ericfitz/brewsoak.\n"
+                    .to_vec();
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(
+                text.contains("held alpha: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Untrusted.note()).count(),
+                1,
+                "{text}"
+            );
+            assert!(summary_has(&text, "held", "1"), "{text}");
+            assert!(r.refused);
+            assert_eq!(tap_file(tap.path(), "Formula/alpha.rb"), None);
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
         }
     }
 }
