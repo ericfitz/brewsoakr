@@ -118,11 +118,9 @@ pub fn unusable_with_packages(inv: &Inventory) -> Option<NotReady> {
 /// Version of a formula or cask file in brew's spelling (`1.0.0_2`); `None`
 /// when it does not parse.
 ///
-/// Known limitation: this is the existing identity parser, not brew's version
-/// detection. For a formula whose keg directory name differs from the parsed
-/// version, recovery can put the old file back beside a new soak-tap keg, and
-/// the WriteCutoff rule never keeps its file; the package is then treated as a
-/// legacy receipt until its next soaked upgrade. See issue #24.
+/// This is brewsoak's own parser, not brew's version detection. A caller
+/// compares it with the same parser's reading of the keg's own copy
+/// (`from_tap_at`), never with a keg directory name alone.
 pub fn file_version(kind: PkgKind, rb: &[u8]) -> Option<String> {
     let rb = std::str::from_utf8(rb).ok()?;
     let id = match kind {
@@ -130,6 +128,42 @@ pub fn file_version(kind: PkgKind, rb: &[u8]) -> Option<String> {
         PkgKind::Cask => PkgIdentity::Cask(identity::parse_cask(rb, None).ok()?),
     };
     Some(crate::report::identity_version(&id))
+}
+
+/// `name` is installed from the soak tap at the version of `file`.
+/// First check: the receipt at `version` (else `file_version(kind, file)`)
+/// names the soak tap; a cask's `:latest` is asked as `latest`. Second check,
+/// formulae only: a keg whose receipt names the soak tap has a formula copy
+/// with the same `file_version` as `file`. Two versions that do not parse are
+/// never equal.
+pub fn from_tap_at(
+    brew: &impl Brew,
+    kind: PkgKind,
+    name: &str,
+    version: Option<&str>,
+    file: Option<&[u8]>,
+) -> bool {
+    let names_soak =
+        |tap: Option<String>| tap.is_some_and(|t| crate::origin::own_tap(&t) == Some(OwnTap::Soak));
+    let parsed = file.and_then(|f| file_version(kind, f));
+    let asked = version.map(str::to_string).or_else(|| parsed.clone());
+    let exact = asked.is_some_and(|v| {
+        let v = if kind == PkgKind::Cask && v == ":latest" {
+            "latest"
+        } else {
+            v.as_str()
+        };
+        names_soak(brew.receipt_tap(kind, name, v))
+    });
+    if exact || kind != PkgKind::Formula {
+        return exact;
+    }
+    let Some(want) = parsed else {
+        return false;
+    };
+    brew.soak_tap_keg_files(name)
+        .iter()
+        .any(|rb| file_version(kind, rb.as_bytes()).as_deref() == Some(want.as_str()))
 }
 
 pub(crate) fn tap_file(dir: &Path, kind: PkgKind, name: &str) -> PathBuf {
@@ -247,17 +281,8 @@ pub(crate) fn settle_entry(
         }
         Err(e) => return Err(e.into()),
     };
-    let keep = may_keep && {
-        let version = match version {
-            Some(v) => Some(v.to_string()),
-            None => std::fs::read(&file)
-                .ok()
-                .and_then(|b| file_version(kind, &b)),
-        };
-        version
-            .and_then(|v| brew.receipt_tap(kind, name, &v))
-            .is_some_and(|t| crate::origin::own_tap(&t) == Some(OwnTap::Soak))
-    };
+    let bytes = std::fs::read(&file).ok();
+    let keep = may_keep && from_tap_at(brew, kind, name, version, bytes.as_deref());
     if !keep {
         match &previous {
             Some(bytes) => atomic::write_bytes(&file, bytes)?,
@@ -1363,6 +1388,158 @@ mod tests {
             cask_rb("2.0").as_bytes()
         );
         assert!(!e.undo("Casks", "x", "rb").exists());
+    }
+
+    const GO_KEG: &str = "go1.1_2";
+
+    fn brew_with_go_keg(tap: &str, copy: &str) -> MockBrew {
+        let mut b = brew_with_receipt(PkgKind::Formula, "wget", GO_KEG, tap);
+        b.kegs.insert(("wget".into(), GO_KEG.into()), copy.into());
+        b
+    }
+
+    #[test]
+    fn from_tap_at_accepts_a_receipt_at_the_given_version() {
+        let b = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", SOAK_RECEIPT);
+        assert!(from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0"),
+            None
+        ));
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.0.0"),
+            None
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_reads_the_version_from_the_file_when_none_is_given() {
+        let b = brew_with_receipt(PkgKind::Formula, "wget", "1.1.0", SOAK_RECEIPT);
+        let file = formula_rb("1.1.0");
+        assert!(from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            None,
+            Some(file.as_bytes())
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_accepts_a_keg_brew_named_differently() {
+        let b = brew_with_go_keg(SOAK_RECEIPT, &formula_rb("1.1.0"));
+        let same = formula_rb("1.1.0");
+        let other = formula_rb("1.2.0");
+        assert!(from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0"),
+            Some(same.as_bytes())
+        ));
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0"),
+            Some(other.as_bytes())
+        ));
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0"),
+            None
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_ignores_a_keg_from_another_tap() {
+        let b = brew_with_go_keg("homebrew/core", &formula_rb("1.1.0"));
+        let file = formula_rb("1.1.0");
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            Some("1.1.0"),
+            Some(file.as_bytes())
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_rejects_copies_that_do_not_parse() {
+        let b = brew_with_go_keg(SOAK_RECEIPT, "not ruby");
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Formula,
+            "wget",
+            None,
+            Some(b"not ruby")
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_asks_a_latest_cask_as_latest() {
+        let b = brew_with_receipt(PkgKind::Cask, "nightly", "latest", SOAK_RECEIPT);
+        assert!(from_tap_at(
+            &b,
+            PkgKind::Cask,
+            "nightly",
+            Some(":latest"),
+            None
+        ));
+    }
+
+    #[test]
+    fn from_tap_at_has_no_second_check_for_a_cask() {
+        let mut b = brew_with_receipt(PkgKind::Cask, "docker", "4.0", SOAK_RECEIPT);
+        b.kegs
+            .insert(("docker".into(), "4.0".into()), cask_rb("4.1"));
+        let file = cask_rb("4.1");
+        assert!(!from_tap_at(
+            &b,
+            PkgKind::Cask,
+            "docker",
+            Some("4.1"),
+            Some(file.as_bytes())
+        ));
+    }
+
+    #[test]
+    fn settle_keeps_the_file_when_brew_named_the_keg_differently() {
+        let e = env();
+        let body = formula_rb("1.1.0");
+        let mut s = staged_wget(&e, false, None, &body, Some("1.1.0"));
+        let brew = brew_with_go_keg(SOAK_RECEIPT, &formula_rb("1.1.0"));
+        s.settle(&e.lock, &brew).unwrap();
+        assert_eq!(
+            fs::read(e.file("Formula", "wget")).unwrap(),
+            body.as_bytes()
+        );
+        assert!(!e.undo("Formula", "wget", "absent").exists());
+    }
+
+    #[test]
+    fn recover_keeps_a_file_whose_keg_brew_named_differently() {
+        let e = env();
+        let body = formula_rb("1.1.0");
+        e.put(&e.file("Formula", "wget"), body.as_bytes());
+        e.put(&e.undo("Formula", "wget", "absent"), b"");
+        let brew = brew_with_go_keg(SOAK_RECEIPT, &formula_rb("1.1.0"));
+        recover_in(&e, &brew).unwrap();
+        assert_eq!(
+            fs::read(e.file("Formula", "wget")).unwrap(),
+            body.as_bytes()
+        );
+        assert!(!e.undo("Formula", "wget", "absent").exists());
+        let before = crate::cmd::test_support::tree(e.tap.path());
+        recover_in(&e, &brew).unwrap();
+        assert_eq!(crate::cmd::test_support::tree(e.tap.path()), before);
     }
 
     #[test]

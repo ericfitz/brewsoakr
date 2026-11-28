@@ -765,6 +765,9 @@ mod tests {
         fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
             self.mock.receipt_tap(kind, name, version)
         }
+        fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+            self.mock.soak_tap_keg_files(name)
+        }
         fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
             self.mock.outdated_names(greedy)
         }

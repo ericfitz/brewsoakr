@@ -521,6 +521,12 @@ pub(super) fn greedy_world() -> (MockBrew, InMemoryGit, Snapshots) {
     );
     for (name, rb) in &casks {
         let version = crate::soaktap::file_version(PkgKind::Cask, rb.as_bytes()).unwrap();
+        // brew's receipt spells a `:latest` cask `latest`.
+        let version = if version == ":latest" {
+            "latest".to_string()
+        } else {
+            version
+        };
         receipt_taps.insert(
             (PkgKind::Cask, name.to_string(), version),
             "ericfitz/brewsoak".to_string(),

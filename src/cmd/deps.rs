@@ -972,6 +972,9 @@ mod tests {
             fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
                 self.0.receipt_tap(kind, name, version)
             }
+            fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+                self.0.soak_tap_keg_files(name)
+            }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
             }
@@ -1080,6 +1083,9 @@ mod tests {
             }
             fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
                 self.0.receipt_tap(kind, name, version)
+            }
+            fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+                self.0.soak_tap_keg_files(name)
             }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
@@ -2256,6 +2262,9 @@ mod gate_tests {
         }
         fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
             self.inner.receipt_tap(kind, name, version)
+        }
+        fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+            self.inner.soak_tap_keg_files(name)
         }
         fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
             self.inner.outdated_names(greedy)

@@ -289,6 +289,13 @@ pub trait Brew {
     fn installed_receipt_taps(&self, _kind: PkgKind, _name: &str) -> Vec<String> {
         Vec::new()
     }
+    /// The formula file brew stored in each keg of `name` whose receipt names
+    /// the soak tap (`<cellar>/<name>/<keg>/.brew/<name>.rb`), whatever the keg
+    /// directory is called. A keg whose receipt or file cannot be read is left
+    /// out. The default knows of none.
+    fn soak_tap_keg_files(&self, _name: &str) -> Vec<String> {
+        Vec::new()
+    }
     /// Names brew itself considers outdated right now (no `brew update`),
     /// with the same greedy mode `upgrade` passes to brew.
     fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error>;
@@ -737,6 +744,12 @@ impl Brew for ProcessBrew {
                 .into_iter()
                 .collect(),
         }
+    }
+
+    fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+        self.cellar()
+            .map(|c| read_soak_tap_keg_files(&c, name))
+            .unwrap_or_default()
     }
 
     fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
@@ -1333,6 +1346,18 @@ impl Brew for MockBrew {
             .collect()
     }
 
+    fn soak_tap_keg_files(&self, name: &str) -> Vec<String> {
+        self.receipt_taps
+            .iter()
+            .filter(|((k, n, _), tap)| {
+                *k == PkgKind::Formula
+                    && n == name
+                    && crate::origin::own_tap(tap) == Some(crate::origin::OwnTap::Soak)
+            })
+            .filter_map(|((_, _, v), _)| self.kegs.get(&(name.to_string(), v.clone())).cloned())
+            .collect()
+    }
+
     fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
         self.outdated_modes
             .lock()
@@ -1641,6 +1666,25 @@ fn read_formula_receipt_taps(cellar: &Path, name: &str) -> Vec<String> {
         .collect();
     found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     found.into_iter().map(|(_, _, tap)| tap).collect()
+}
+
+/// The `.brew/<name>.rb` of each keg under `<cellar>/<name>/` whose receipt
+/// names the soak tap, in keg directory name order.
+fn read_soak_tap_keg_files(cellar: &Path, name: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(cellar.join(name)) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs.into_iter()
+        .filter(|keg| {
+            read_receipt_tap(&keg.join("INSTALL_RECEIPT.json"), None)
+                .is_some_and(|t| crate::origin::own_tap(&t) == Some(crate::origin::OwnTap::Soak))
+        })
+        .filter_map(|keg| {
+            std::fs::read_to_string(keg.join(".brew").join(format!("{name}.rb"))).ok()
+        })
+        .collect()
 }
 
 fn read_cask_receipt(caskroom: &Path, name: &str, version: Option<&str>) -> Option<String> {
@@ -4261,6 +4305,47 @@ esac
         );
         assert_eq!(brew.receipt_tap(PkgKind::Formula, "wget", "1.0"), None);
         assert_eq!(brew.receipt_tap(PkgKind::Formula, "curl", "1.0_1"), None);
+    }
+
+    #[test]
+    fn soak_tap_keg_files_reads_every_keg_whose_receipt_names_the_soak_tap() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let keg = |dir: &str, tap: Option<&str>, copy: Option<&str>| {
+            let k = tmp.path().join("wget").join(dir);
+            std::fs::create_dir_all(k.join(".brew")).expect("keg");
+            if let Some(tap) = tap {
+                std::fs::write(
+                    k.join("INSTALL_RECEIPT.json"),
+                    format!(r#"{{"source":{{"tap":"{tap}"}}}}"#),
+                )
+                .expect("receipt");
+            }
+            if let Some(copy) = copy {
+                std::fs::write(k.join(".brew").join("wget.rb"), copy).expect("copy");
+            }
+        };
+        keg("go1.1_2", Some("ericfitz/brewsoak"), Some("A"));
+        keg("1.0", Some("homebrew/core"), Some("B"));
+        keg("0.9", Some("ericfitz/brewsoak"), None);
+        let brew = rooms(tmp.path(), tmp.path());
+        assert_eq!(read_soak_tap_keg_files(tmp.path(), "wget"), ["A"]);
+        assert_eq!(brew.soak_tap_keg_files("wget"), ["A"]);
+        assert!(read_soak_tap_keg_files(tmp.path(), "curl").is_empty());
+    }
+
+    #[test]
+    fn mock_soak_tap_keg_files_come_from_receipt_taps_and_kegs() {
+        let mut brew = MockBrew::new();
+        for (v, tap, copy) in [
+            ("go1.1_2", "ericfitz/brewsoak", "A"),
+            ("1.0", "homebrew/core", "B"),
+        ] {
+            brew.receipt_taps
+                .insert((PkgKind::Formula, "wget".into(), v.into()), tap.into());
+            brew.kegs.insert(("wget".into(), v.into()), copy.into());
+        }
+        assert_eq!(brew.soak_tap_keg_files("wget"), ["A"]);
+        assert!(brew.soak_tap_keg_files("curl").is_empty());
     }
 
     #[test]
