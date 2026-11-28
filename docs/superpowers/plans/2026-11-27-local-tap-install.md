@@ -613,8 +613,8 @@ git commit -m "feat: recover and prune brewsoak's tap at update and at the start
 After this task no soaked `homebrew/core` or `homebrew/cask` package goes through the by-name gate. `src/cmd/deps.rs` and `src/cmd/apply.rs` change together.
 
 **Files:**
-- Modify: `src/cmd/deps.rs:25-125` (`NameWhy`, `NameFail`, `CutoffDepWalk`), `src/cmd/deps.rs:157-342` (`visit`)
-- Modify: `src/cmd/apply.rs:272-319` (`ApplySession` fields), `:743-805` (`install_cutoff`), `:807-833` (`collect_cutoff_deps`), `:836-931` (`install_missing_dep`), `:968-1000` (`hold_target_by_name`), `:1073-1109` (`record_name_install`), `:1193-1198` (`NameRun`)
+- Modify: `src/cmd/deps.rs:25-125` (`GateWhy`, `GateFail`, `CutoffDepWalk`), `src/cmd/deps.rs:157-342` (`visit`)
+- Modify: `src/cmd/apply.rs:272-319` (`ApplySession` fields), `:743-805` (`install_cutoff`), `:807-833` (`collect_cutoff_deps`), `:836-931` (`install_missing_dep`), `:968-1000` (`hold_target_by_gate`), `:1073-1109` (`record_gate_install`), `:1193-1198` (`NameRun`)
 - Modify: `src/cmd/notes.rs:25-43` (`by_name_note`)
 - Modify: `src/cmd/test_support.rs:215-251` (`run_is_name_install`, `assert_no_path_args`)
 - Test: `src/cmd/deps.rs`, `src/cmd/apply.rs`, `src/cmd/upgrade.rs`, `src/cmd/install.rs`
@@ -625,7 +625,7 @@ After this task no soaked `homebrew/core` or `homebrew/cask` package goes throug
 
 ```rust
 // src/cmd/deps.rs
-pub(super) enum NameWhy {
+pub(super) enum GateWhy {
     NotCutoff { brew_version: String }, ChangedSinceCutoff { what: &'static str, version: String },
     OtherTap { tap: String, origin: String }, Lookup(String), Deps(String), NoCutoff,
     /// brew could not load the tap file or list its dependencies (first line).
@@ -633,7 +633,7 @@ pub(super) enum NameWhy {
     WouldReplace { dep: String, installed: String, brew_version: String, target: String },
     CannotReplace { dep: String, installed: String },
 }
-pub(super) enum NameFail { Untrusted(String), TapNotReady(NotReady), Interrupted, Why(NameWhy) }
+pub(super) enum GateFail { Untrusted(String), TapNotReady(NotReady), Interrupted, Why(GateWhy) }
 // CutoffDepWalk gains: pub(super) lock: &'a RunLock, pub(super) soak: &'a mut SoakTap,
 //                      pub(super) target: &'a str
 
@@ -653,7 +653,7 @@ pub(super) enum NameRun { Ran { failed: bool }, Untrusted(String), TapNotReady }
 pub(super) fn assert_soak_tap_commands(brew: &MockBrew, soak_names: &[&str]);
 ```
 
-`NameWhy::text()` (exact copy; `waits_on_issue_17` is deleted and no text names issue #17):
+`GateWhy::text()` (exact copy; `waits_on_issue_17` is deleted and no text names issue #17):
 
 ```text
 NotCutoff:          brew would install {brew_version}, which is not the soaked cutoff; it installs once that change soaks
@@ -675,14 +675,14 @@ Member rules in `visit` (a member is a soak-tap member when `origin::is_core_or_
 | Member | Rule |
 |---|---|
 | Root, or Install | `soak.stage(lock, brew, pkg, cutoff, file_version(kind, cutoff))`. `NotReady(n)` holds with `TapNotReady(n)`; `Leftover` holds with `Interrupted`. Then `brew.deps(kind, &tap::soak_token(name))`. An ambiguous-name error propagates as today. Brew's untrusted-tap text naming `ericfitz/brewsoak` holds with `TapNotReady(NotReady::Untrusted)`; naming another tap, `Untrusted(tap)`; any other brew error, `SoakedCopy(first_line)`. `by_name` is not asked. |
-| Check (installed formula, not upgraded this run) | Ask `by_name`. Untrusted-tap text naming `ericfitz/brewsoak` holds with `TapNotReady(Untrusted)`; other errors as today. Then `installed_dep_rule(answer.satisfied, pkg.own_tap, file_version(Formula, pkg.receipt_rb), file_version(Formula, cutoff), answer.installs_cutoff(origin))`: `Pass` passes; `WriteCutoff` stages the cutoff (same two hold outcomes) and passes; `WouldReplace` and `CannotReplace` hold with the same-named `NameWhy` (`brew_version` is `answer.version`). A passing member is walked through: its dependencies are listed with the soak token only when `pkg.own_tap == Some(Soak)`, its tap file exists in `soak.dir()` and `soaktap::tap_state(inv.soak_tap.as_ref())` is `TapState::Ready` (read the state; do not call `ready`, which could create the tap). Otherwise by bare name. |
+| Check (installed formula, not upgraded this run) | Ask `by_name`. Untrusted-tap text naming `ericfitz/brewsoak` holds with `TapNotReady(Untrusted)`; other errors as today. Then `installed_dep_rule(answer.satisfied, pkg.own_tap, file_version(Formula, pkg.receipt_rb), file_version(Formula, cutoff), answer.installs_cutoff(origin))`: `Pass` passes; `WriteCutoff` stages the cutoff (same two hold outcomes) and passes; `WouldReplace` and `CannotReplace` hold with the same-named `GateWhy` (`brew_version` is `answer.version`). A passing member is walked through: its dependencies are listed with the soak token only when `pkg.own_tap == Some(Soak)`, its tap file exists in `soak.dir()` and `soaktap::tap_state(inv.soak_tap.as_ref())` is `TapState::Ready` (read the state; do not call `ready`, which could create the tap). Otherwise by bare name. |
 | Installed cask dependency; no-soak or unsoakable dependency; dependency in a held tap or without a cutoff | As today (the dependency loop, `src/cmd/deps.rs:252-331`). |
 
-A soak-tap member that needs its cutoff file and has no cutoff blob holds with `NameWhy::NoCutoff`. The demotion of `Install` to `Check` at `src/cmd/deps.rs:200-211` applies to third-party members only.
+A soak-tap member that needs its cutoff file and has no cutoff blob holds with `GateWhy::NoCutoff`. The demotion of `Install` to `Check` at `src/cmd/deps.rs:200-211` applies to third-party members only.
 
 `ApplySession` rules:
 - A soak-tap dependency or target runs `tap::soak_tap_args(&pkg, installed, &self.name_install_flags())`, where `installed` is `self.inv.find_in(origin, name).is_some()`; `note_dropped_flags` uses `tap::soak_tap_verb`. Before the command, `install_missing_dep` and `install_cutoff` call `soak.stage` again with the view's cutoff version (`report::identity_version`), and treat `NotReady` and `Leftover` as the holds above. A third-party package runs `tap::brew_install_args` as today.
-- `record_name_install`: brew's untrusted-tap text naming `ericfitz/brewsoak` is `NameRun::TapNotReady` (hold with `NotReady::Untrusted`). `forget_origin` after a real install is unchanged.
+- `record_gate_install`: brew's untrusted-tap text naming `ericfitz/brewsoak` is `NameRun::TapNotReady` (hold with `NotReady::Untrusted`). `forget_origin` after a real install is unchanged.
 - `install_cutoff` settles on every path once the walk has started: run the body, then `self.soak.settle(self.lock, self.brew)`, and return the first error of the two.
 
 - [ ] **Step 1: Write the failing tests**
@@ -973,6 +973,6 @@ Setup: `cargo build --release`; `B=target/release/brewsoak`; `TAP="$(brew --repo
 ## Self-Review
 
 1. **Spec coverage.** Tap name, classification, bootstrap: Tasks 1, 5. Trust and the four notes: Tasks 5, 8. Untrusted tap with packages: Tasks 3, 8, 9. Tap files, undo, settle: Tasks 4, 5, 8. Pruning and when the tap is touched: Tasks 6, 7. Commands: Tasks 4, 8. Dependency table: Tasks 5, 8. Stopgap gate removal and hold texts: Task 8. Bypass and no-soak tokens: Task 10. Receipts, inventory, origin, explicit tokens: Tasks 1, 3, 9. Casks: Tasks 4, 5, 8, 10. Dry run and output: Tasks 8, 11. Re-running: Tasks 5, 6, 8. Documentation and supersession: Task 12. Real-brew checks: Task 13. `taps::staging_root` and `taps::staged_load_failure`: removed in Task 1.
-2. **Types.** `OwnTap`, `TapInfo`, `NotReady`, `Staged`, `DepRule`, `SoakTap`, `NameFail`, `NameRun` and `Target.official` are each defined in one task and used under the same name later.
+2. **Types.** `OwnTap`, `TapInfo`, `NotReady`, `Staged`, `DepRule`, `SoakTap`, `GateFail`, `NameRun` and `Target.official` are each defined in one task and used under the same name later.
 3. **Review Focus.** Each of the five lines has a named test: `sanitize_leaves_a_blob_without_the_stanza_byte_for_byte` (1), `write_blob_paths_for_odd_names`, `stage_keeps_kinds_and_odd_names_apart`, `prune_is_per_kind` (2), `recover_handles_entries_it_never_wrote` (3), `prune_removes_a_stale_link_and_spares_its_target` (4), `soak_tap_upgrade_never_receives_g` (5).
 4. **Open points resolved in this plan, for the maintainer to confirm.** Decisions P1 to P5 above; a package installed from an unusable soak tap is held even when it needs nothing (Task 9, the literal reading of the spec's "Holding" paragraph); the cask `reinstall` bypass form (Task 10) and the dry-run dependency line (Task 11); the copy of the own-tap token refusal (Task 9); the newest of several hidden kegs is chosen by `brew`'s version order (Task 3).

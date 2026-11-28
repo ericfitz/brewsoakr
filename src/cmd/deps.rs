@@ -25,8 +25,9 @@ pub(super) struct HeldDep {
 }
 
 /// Why the closure walk holds a member, other than a tap problem (see
-/// `NameFail`).
-pub(super) enum NameWhy {
+/// `GateFail`): the reasons of the by-name gate (third-party packages) and of
+/// the soak-tap member checks.
+pub(super) enum GateWhy {
     /// brew's own definition of the name is not the soaked cutoff.
     NotCutoff { brew_version: String },
     /// brew's current version is the cutoff's version but the file differs:
@@ -54,7 +55,7 @@ pub(super) enum NameWhy {
     CannotReplace { dep: String, installed: String },
 }
 
-impl NameWhy {
+impl GateWhy {
     /// The reason as it reads in a hold line and a note.
     pub(super) fn text(&self) -> String {
         match self {
@@ -98,23 +99,23 @@ fn with_version(dep: &str, version: &str) -> String {
     }
 }
 
-/// A gate failure: a tap problem, which keeps its own hold, or one of the
-/// reasons above.
-pub(super) enum NameFail {
+/// A gate failure of the by-name gate or a soak-tap member check: a tap
+/// problem, which keeps its own hold, or one of the reasons above.
+pub(super) enum GateFail {
     /// brew refuses to load the name from this untrusted tap.
     Untrusted(String),
     /// brewsoak's own tap cannot be used this run.
     TapNotReady(NotReady),
     /// An earlier run left an undo entry for this package.
     Interrupted,
-    Why(NameWhy),
+    Why(GateWhy),
 }
 
-impl NameFail {
+impl GateFail {
     /// Classify brew's error text for a lookup or dependency failure. Its
     /// untrusted-tap refusal of brewsoak's own tap is a tap that is not
     /// ready, whichever package brew was loading.
-    fn from_brew(text: &str, soak_refusal: NotReady, why: impl FnOnce(String) -> NameWhy) -> Self {
+    fn from_brew(text: &str, soak_refusal: NotReady, why: impl FnOnce(String) -> GateWhy) -> Self {
         match taps::blocking_untrusted_tap(text) {
             Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
                 Self::TapNotReady(soak_refusal)
@@ -125,18 +126,18 @@ impl NameFail {
     }
 }
 
-/// The member of the closure that holds the target, and why. `dep` is None
-/// when the member is the target itself.
-pub(super) struct NameHold {
+/// The member of the closure that holds the target, and why (by-name or
+/// soak-tap). `dep` is None when the member is the target itself.
+pub(super) struct GateHold {
     pub(super) dep: Option<String>,
-    pub(super) why: NameFail,
+    pub(super) why: GateFail,
 }
 
 pub(super) struct CutoffDeps {
     /// (origin, name, kind), dependencies first.
     pub(super) deps: Vec<(String, String, PkgKind)>,
     pub(super) held: Option<HeldDep>,
-    pub(super) by_name: Option<NameHold>,
+    pub(super) by_name: Option<GateHold>,
 }
 
 /// What a member of the closure is for.
@@ -166,7 +167,7 @@ pub(super) struct CutoffDepWalk<'a, 's, B, G> {
     pub(super) visited: HashSet<String>,
     pub(super) out: Vec<(String, String, PkgKind)>,
     pub(super) held: Option<HeldDep>,
-    pub(super) by_name: Option<NameHold>,
+    pub(super) by_name: Option<GateHold>,
 }
 
 pub(super) use crate::error::first_line;
@@ -179,9 +180,9 @@ fn kind_word(kind: PkgKind) -> &'static str {
 }
 
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
-    fn hold(&mut self, role: Role, name: &str, why: NameFail) {
+    fn hold(&mut self, role: Role, name: &str, why: GateFail) {
         let dep = (role != Role::Root).then(|| name.to_string());
-        self.by_name = Some(NameHold { dep, why });
+        self.by_name = Some(GateHold { dep, why });
     }
 
     fn failed(&self) -> bool {
@@ -349,12 +350,12 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
         let passes = installs || (role == Role::Check && answer.installed_current);
         if !passes {
             let why = if !answer.tap.eq_ignore_ascii_case(origin_tap) {
-                NameWhy::OtherTap {
+                GateWhy::OtherTap {
                     tap: answer.tap,
                     origin: origin_tap.to_ascii_lowercase(),
                 }
             } else if !has_cutoff {
-                NameWhy::NoCutoff
+                GateWhy::NoCutoff
             } else if blobs
                 .cutoff
                 .as_deref()
@@ -362,16 +363,16 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
                 .as_deref()
                 == Some(answer.version.as_str())
             {
-                NameWhy::ChangedSinceCutoff {
+                GateWhy::ChangedSinceCutoff {
                     what: kind_word(kind),
                     version: answer.version,
                 }
             } else {
-                NameWhy::NotCutoff {
+                GateWhy::NotCutoff {
                     brew_version: answer.version,
                 }
             };
-            self.hold(role, name, NameFail::Why(why));
+            self.hold(role, name, GateFail::Why(why));
             return Ok(None);
         }
         let listed = match early {
@@ -384,7 +385,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
                     self.hold(
                         role,
                         name,
-                        NameFail::from_brew(&message, self.soak_refusal(), NameWhy::Deps),
+                        GateFail::from_brew(&message, self.soak_refusal(), GateWhy::Deps),
                     );
                     return Ok(None);
                 }
@@ -413,7 +414,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
                 self.hold(
                     role,
                     name,
-                    NameFail::from_brew(&text, self.soak_refusal(), NameWhy::Lookup),
+                    GateFail::from_brew(&text, self.soak_refusal(), GateWhy::Lookup),
                 );
                 Ok(None)
             }
@@ -442,7 +443,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
         } else {
             // Staged for brew to install; nothing to stage without a cutoff.
             let Some(cutoff) = cutoff else {
-                self.hold(role, name, NameFail::Why(NameWhy::NoCutoff));
+                self.hold(role, name, GateFail::Why(GateWhy::NoCutoff));
                 return Ok(None);
             };
             if !self.stage_cutoff(role, name, kind, cutoff)? {
@@ -456,7 +457,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
                 self.hold(
                     role,
                     name,
-                    NameFail::from_brew(&message, self.soak_refusal(), NameWhy::SoakedCopy),
+                    GateFail::from_brew(&message, self.soak_refusal(), GateWhy::SoakedCopy),
                 );
                 Ok(None)
             }
@@ -483,11 +484,11 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
         {
             Staged::Unchanged | Staged::Written => Ok(true),
             Staged::NotReady(n) => {
-                self.hold(role, name, NameFail::TapNotReady(n));
+                self.hold(role, name, GateFail::TapNotReady(n));
                 Ok(false)
             }
             Staged::Leftover => {
-                self.hold(role, name, NameFail::Interrupted);
+                self.hold(role, name, GateFail::Interrupted);
                 Ok(false)
             }
         }
@@ -532,7 +533,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
             DepRule::Pass => {}
             DepRule::WriteCutoff => {
                 let Some(cutoff) = cutoff else {
-                    self.hold(Role::Check, name, NameFail::Why(NameWhy::NoCutoff));
+                    self.hold(Role::Check, name, GateFail::Why(GateWhy::NoCutoff));
                     return Ok(None);
                 };
                 if !self.stage_cutoff(Role::Check, name, kind, cutoff)? {
@@ -540,21 +541,21 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
                 }
             }
             DepRule::WouldReplace => {
-                let why = NameWhy::WouldReplace {
+                let why = GateWhy::WouldReplace {
                     dep: name.to_string(),
                     installed: installed_text,
                     brew_version: answer.version,
                     target: self.target.to_string(),
                 };
-                self.hold(Role::Check, name, NameFail::Why(why));
+                self.hold(Role::Check, name, GateFail::Why(why));
                 return Ok(None);
             }
             DepRule::CannotReplace => {
-                let why = NameWhy::CannotReplace {
+                let why = GateWhy::CannotReplace {
                     dep: name.to_string(),
                     installed: installed_text,
                 };
-                self.hold(Role::Check, name, NameFail::Why(why));
+                self.hold(Role::Check, name, GateFail::Why(why));
                 return Ok(None);
             }
         }
@@ -639,7 +640,7 @@ mod tests {
     #[test]
     fn replace_reasons_omit_an_empty_installed_version() {
         let would = |installed: &str| {
-            NameWhy::WouldReplace {
+            GateWhy::WouldReplace {
                 dep: "dep".into(),
                 installed: installed.into(),
                 brew_version: "2.0".into(),
@@ -648,7 +649,7 @@ mod tests {
             .text()
         };
         let cannot = |installed: &str| {
-            NameWhy::CannotReplace {
+            GateWhy::CannotReplace {
                 dep: "dep".into(),
                 installed: installed.into(),
             }

@@ -1,6 +1,6 @@
 use super::bare::{BareSkip, bare_action, bare_skip, latest_left, latest_note};
 use super::deps::{
-    CutoffDepWalk, CutoffDeps, HeldDep, NameFail, NameHold, NameWhy, Role, first_line,
+    CutoffDepWalk, CutoffDeps, GateFail, GateHold, GateWhy, HeldDep, Role, first_line,
 };
 use super::notes::{
     NoteKind, by_name_note, bypass_command, held_tap_note, newer_than_cutoff_note,
@@ -918,11 +918,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                     }
                     Some(tap) => self.hold_target_untrusted(name, &tap),
                     None => {
-                        let hold = NameHold {
+                        let hold = GateHold {
                             dep: None,
-                            why: NameFail::Why(NameWhy::Deps(first_line(&message))),
+                            why: GateFail::Why(GateWhy::Deps(first_line(&message))),
                         };
-                        self.hold_target_by_name(name, &bypass, &hold)?;
+                        self.hold_target_by_gate(name, &bypass, &hold)?;
                     }
                 }
                 return Ok(());
@@ -930,7 +930,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Err(e) => return Err(e),
         };
         if let Some(hold) = walked.by_name {
-            return self.hold_target_by_name(name, &bypass, &hold);
+            return self.hold_target_by_gate(name, &bypass, &hold);
         }
         if let Some(held) = walked.held {
             return self.refuse_held_dep(name, &bypass, &held);
@@ -953,11 +953,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             InstallRun::NotReady(n) => self.hold_target_not_ready(name, &n)?,
             InstallRun::Interrupted => self.hold_target_interrupted(name)?,
             InstallRun::NoCutoff => {
-                let hold = NameHold {
+                let hold = GateHold {
                     dep: None,
-                    why: NameFail::Why(NameWhy::NoCutoff),
+                    why: GateFail::Why(GateWhy::NoCutoff),
                 };
-                self.hold_target_by_name(name, &bypass, &hold)?;
+                self.hold_target_by_gate(name, &bypass, &hold)?;
             }
         }
         Ok(())
@@ -996,7 +996,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.note_dropped_flags("install", &install_flags, "soaked installs");
             tap::brew_install_args(pkg, &pkg.name, &install_flags)
         };
-        self.record_name_install(origin_tap, &pkg.name, pkg.kind, installing, &args)
+        self.record_gate_install(origin_tap, &pkg.name, pkg.kind, installing, &args)
     }
 
     fn collect_cutoff_deps(
@@ -1143,11 +1143,11 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
             InstallRun::NoCutoff => {
                 self.uncount_dep(dep);
-                let hold = NameHold {
+                let hold = GateHold {
                     dep: Some(dep.to_string()),
-                    why: NameFail::Why(NameWhy::NoCutoff),
+                    why: GateFail::Why(GateWhy::NoCutoff),
                 };
-                self.hold_target_by_name(target, bypass, &hold)?;
+                self.hold_target_by_gate(target, bypass, &hold)?;
                 return Ok(false);
             }
             InstallRun::Interrupted => {
@@ -1273,23 +1273,23 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     /// The by-name gate failed for the target or one of its dependencies:
     /// hold the target with one inline line and one note, and carry on.
-    fn hold_target_by_name(
+    fn hold_target_by_gate(
         &mut self,
         target: &str,
         bypass: &str,
-        hold: &NameHold,
+        hold: &GateHold,
     ) -> Result<(), Error> {
         let why = match &hold.why {
-            NameFail::Untrusted(tap) => {
+            GateFail::Untrusted(tap) => {
                 match &hold.dep {
                     Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
                     None => self.hold_target_untrusted(target, tap),
                 }
                 return Ok(());
             }
-            NameFail::TapNotReady(n) => return self.hold_target_not_ready(target, n),
-            NameFail::Interrupted => return self.hold_target_interrupted(target),
-            NameFail::Why(why) => why.text(),
+            GateFail::TapNotReady(n) => return self.hold_target_not_ready(target, n),
+            GateFail::Interrupted => return self.hold_target_interrupted(target),
+            GateFail::Why(why) => why.text(),
         };
         self.hold_target_for_dep();
         match &hold.dep {
@@ -1391,7 +1391,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// Runs one by-name install. A real install writes a receipt that names
     /// the tap, so any origin record is dropped. A tap package brew would not
     /// trust is reported without brew's status, so the caller holds it.
-    fn record_name_install(
+    fn record_gate_install(
         &mut self,
         origin_tap: &str,
         name: &str,
@@ -4023,7 +4023,7 @@ mod tests {
             assert!(r.refused && text.contains("cannot install alpha"), "{text}");
             assert_bypass_names_core(&text, "ineligible dependency");
 
-            // brew cannot list a dependency (hold_target_by_name).
+            // brew cannot list a dependency (hold_target_by_gate).
             let tap = tempfile::tempdir().unwrap();
             let (mut brew, git) = alpha_with_libx(tap.path());
             anchor_alpha(&mut brew, tap.path());
@@ -4559,7 +4559,7 @@ mod tests {
 
         #[test]
         fn a_by_name_install_refused_over_a_remote_soak_tap_gives_the_remote_note() {
-            // record_name_install: brew names the soak tap as untrusted while
+            // record_gate_install: brew names the soak tap as untrusted while
             // the inventory says it is remote.
             let (text, _) = packer_with_remote_soak_tap(
                 None,

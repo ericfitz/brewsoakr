@@ -917,7 +917,7 @@ by-name gate to be installed.
   ambiguous-name holds.
 - Kept for everything: the `brew ruby` loader script, which now also answers
   the dependency test, and the run's one `brew update`.
-- `NameWhy::waits_on_issue_17` goes away. No message names issue #17.
+- `GateWhy::waits_on_issue_17` goes away. No message names issue #17.
 
 ### Holds and messages
 
