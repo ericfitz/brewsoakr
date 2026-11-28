@@ -414,7 +414,7 @@ mod tests {
     use crate::cmd::test_support::{
         PACKER_REFUSAL, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_rb,
         hashicorp_tap, inv_from, lock_runs, packer_world, run_has_token, run_is_name_install,
-        tap_snaps, tapped, unused_cache,
+        tap_snaps, tapped, test_cache,
     };
 
     #[test]
@@ -692,6 +692,12 @@ mod tests {
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()
             }
+            fn tap_new(&self, tap: &str) -> Result<(), String> {
+                self.0.tap_new(tap)
+            }
+            fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
+                self.0.receipt_tap(kind, name, version)
+            }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
             }
@@ -792,6 +798,12 @@ mod tests {
             }
             fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
                 self.0.tap_info()
+            }
+            fn tap_new(&self, tap: &str) -> Result<(), String> {
+                self.0.tap_new(tap)
+            }
+            fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
+                self.0.receipt_tap(kind, name, version)
             }
             fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
                 self.0.outdated_names(greedy)
@@ -1447,7 +1459,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1502,7 +1514,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1603,7 +1615,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1659,7 +1671,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1716,7 +1728,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1747,7 +1759,7 @@ mod gate_tests {
     use crate::cmd::install::install;
     use crate::cmd::test_support::{
         cask_rb, cfg24, core_snaps, formula_pkg, formula_pkg_from, formula_rb, inv_from, lock_runs,
-        run_is_name_install, tap_snaps, tapped, unused_cache,
+        run_is_name_install, tap_snaps, tapped, test_cache,
     };
     use crate::cmd::upgrade::upgrade;
     use crate::digest::sha256_hex;
@@ -1798,6 +1810,7 @@ mod gate_tests {
             version: version.into(),
             same_source,
             installed_current,
+            satisfied: false,
         }
     }
 
@@ -1839,7 +1852,7 @@ mod gate_tests {
             brew,
             git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1891,6 +1904,12 @@ mod gate_tests {
         fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
             self.inner.tap_info()
         }
+        fn tap_new(&self, tap: &str) -> Result<(), String> {
+            self.inner.tap_new(tap)
+        }
+        fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
+            self.inner.receipt_tap(kind, name, version)
+        }
         fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
             self.inner.outdated_names(greedy)
         }
@@ -1929,7 +1948,7 @@ mod gate_tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2299,7 +2318,7 @@ mod gate_tests {
                 &brew,
                 &git,
                 &core_snaps(),
-                unused_cache(),
+                test_cache(),
                 tap.path(),
                 &inv,
                 &cfg,

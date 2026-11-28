@@ -141,7 +141,7 @@ mod tests {
         AUTO_UPDATES_HEADER, OUTDATED_HEADER, auto_updates_world, cask_rb, cfg24, formula_pkg,
         formula_pkg_from, formula_rb, greedy, greedy_outdated, greedy_upgrade, greedy_world,
         inv_from, lock_runs, openssl_is_newer, run_is_name_install, section_lines, tap_snaps,
-        tapped, unused_cache,
+        tapped, test_cache,
     };
     use crate::cmd::upgrade::upgrade;
     use crate::cmd::view::ResolvedView;
@@ -490,7 +490,7 @@ mod tests {
                 &brew,
                 &git,
                 &snaps,
-                unused_cache(),
+                test_cache(),
                 &inv,
                 flags::greedy_mode(&owned),
             );

@@ -691,6 +691,12 @@ mod tests {
         fn tap_info(&self) -> Result<Vec<TapInfo>, Error> {
             self.mock.tap_info()
         }
+        fn tap_new(&self, tap: &str) -> Result<(), String> {
+            self.mock.tap_new(tap)
+        }
+        fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
+            self.mock.receipt_tap(kind, name, version)
+        }
         fn outdated_names(&self, greedy: flags::Greedy) -> Result<Vec<String>, Error> {
             self.mock.outdated_names(greedy)
         }

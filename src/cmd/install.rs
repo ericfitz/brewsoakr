@@ -65,7 +65,7 @@ mod tests {
     use crate::cmd::test_support::{
         PACKER_REFUSAL, call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps,
         formula_pkg, formula_pkg_from, formula_rb, git_empty, hashicorp_tap, inv_from, lock_runs,
-        packer_world, run_has_token, run_is_name_install, tap_snaps, tapped, unused_cache,
+        packer_world, run_has_token, run_is_name_install, tap_snaps, tapped, test_cache,
     };
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -466,7 +466,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -503,7 +503,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -764,7 +764,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -858,7 +858,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -893,7 +893,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -933,7 +933,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -978,7 +978,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1057,7 +1057,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1080,7 +1080,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1118,7 +1118,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1171,7 +1171,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1226,7 +1226,12 @@ mod tests {
             origins.save(cache.path()).unwrap();
         }
         let cfg = cfg24();
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            &cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         reinstall(
             &brew,
@@ -1258,7 +1263,12 @@ mod tests {
         origins.set(PkgKind::Formula, "terraform", "hashicorp/tap");
         origins.save(cache.path()).unwrap();
         let cfg = cfg24();
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            &cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         let r = reinstall(
@@ -1398,7 +1408,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1431,7 +1441,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1477,7 +1487,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,

@@ -255,7 +255,7 @@ mod tests {
         AUTO_UPDATES_HEADER, OUTDATED_HEADER, auto_updates_world, cfg_with, cfg24, core_snaps,
         formula_pkg, formula_pkg_from, formula_pkg_pinned, formula_rb, greedy_outdated,
         greedy_world, inv_from, local_tap_world, lock_runs, openssl_is_newer,
-        openssl_repoint_world, run_has_token, section_lines, tapped, unused_cache, view_world,
+        openssl_repoint_world, run_has_token, section_lines, tapped, test_cache, view_world,
     };
     use crate::cmd::view::calendar_today;
 
@@ -265,17 +265,8 @@ mod tests {
         let mut out = Vec::new();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        let result = outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .expect("outdated");
+        let result = outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out)
+            .expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains("==> Outdated (will upgrade)"),
@@ -315,17 +306,7 @@ mod tests {
         let mut out = Vec::new();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .expect("outdated");
+        outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out).expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains(&format!("warning: py scheduled to be deprecated on {soon}")),
@@ -360,17 +341,8 @@ mod tests {
         let mut out = Vec::new();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        let result = outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .expect("outdated");
+        let result = outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out)
+            .expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("alpha"), "good pkg must still list: {text}");
         assert!(
@@ -395,17 +367,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
-        outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .expect("outdated");
+        outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out).expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(
             text.contains(
@@ -445,17 +407,7 @@ mod tests {
         let mut out = Vec::new();
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
-        outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .expect("outdated");
+        outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out).expect("outdated");
         let text = String::from_utf8(out).expect("utf8");
         assert!(text.contains("ok"), "unpinned must list: {text}");
         assert!(
@@ -483,7 +435,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &["acme/tools/foo".to_string()],
@@ -607,17 +559,7 @@ mod tests {
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
-        outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .unwrap();
+        outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains("==> Outdated (will upgrade)\n(none)\n"),
@@ -643,7 +585,7 @@ mod tests {
             &brew,
             &git,
             &snaps,
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &["-v".into()],
@@ -673,17 +615,7 @@ mod tests {
         let cfg = cfg_with("NO_SOAK = [\"ericfitz/tap\"]\n");
         let inv = inv_from(&brew, &cfg);
         let mut out = Vec::new();
-        outdated(
-            &brew,
-            &git,
-            &snaps,
-            unused_cache(),
-            &inv,
-            &cfg,
-            &[],
-            &mut out,
-        )
-        .unwrap();
+        outdated(&brew, &git, &snaps, test_cache(), &inv, &cfg, &[], &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(
             text.contains("==> No-soak (brew)\nbrewsoak (no-soak, brew)"),
@@ -746,7 +678,7 @@ mod tests {
                 &brew,
                 &git,
                 &snaps,
-                unused_cache(),
+                test_cache(),
                 &inv,
                 &cfg,
                 &flags,
@@ -775,7 +707,7 @@ mod tests {
             &brew,
             &InMemoryGit::new(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             &inv,
             &cfg,
             &[],

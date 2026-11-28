@@ -1236,7 +1236,7 @@ mod tests {
     use crate::cmd::test_support::{
         call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg,
         formula_pkg_from, formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs,
-        run_is_name_install, tapped, unused_cache, upgrade_names, upgrade_names_flags,
+        run_is_name_install, tapped, test_cache, upgrade_names, upgrade_names_flags,
     };
     use crate::cmd::upgrade::upgrade;
 
@@ -1342,7 +1342,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1876,7 +1876,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -1968,7 +1968,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2029,6 +2029,12 @@ mod tests {
         fn tap_info(&self) -> Result<Vec<crate::taps::TapInfo>, Error> {
             self.inner.tap_info()
         }
+        fn tap_new(&self, tap: &str) -> Result<(), String> {
+            self.inner.tap_new(tap)
+        }
+        fn receipt_tap(&self, kind: PkgKind, name: &str, version: &str) -> Option<String> {
+            self.inner.receipt_tap(kind, name, version)
+        }
         fn outdated_names(&self, greedy: crate::flags::Greedy) -> Result<Vec<String>, Error> {
             self.inner.outdated_names(greedy)
         }
@@ -2058,7 +2064,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tempfile::tempdir().unwrap().path(),
             &inv,
             &cfg,
@@ -2113,7 +2119,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tempfile::tempdir().unwrap().path(),
             &inv,
             &cfg,
@@ -2144,7 +2150,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tempfile::tempdir().unwrap().path(),
             &inv,
             &cfg,
@@ -2180,7 +2186,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tempfile::tempdir().unwrap().path(),
             &inv,
             &cfg,
@@ -2286,7 +2292,7 @@ mod tests {
                 brew,
                 git,
                 &core_snaps(),
-                unused_cache(),
+                test_cache(),
                 tap.path(),
                 &inv,
                 &cfg,
@@ -2309,7 +2315,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2328,7 +2334,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2402,7 +2408,7 @@ mod tests {
             &brew,
             &git,
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tempfile::tempdir().unwrap().path(),
             &inv,
             &cfg,
@@ -2445,7 +2451,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2467,7 +2473,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2499,14 +2505,19 @@ mod tests {
         let cfg = cfg_with("NO_SOAK = [\"hashicorp/tap\"]\n");
         let mut origins = OriginRecords::default();
         origins.set(PkgKind::Formula, "vault", "hashicorp/tap");
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            &cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,
@@ -2543,7 +2554,12 @@ mod tests {
         let mut origins = OriginRecords::default();
         origins.set(PkgKind::Formula, "vault", "hashicorp/tap");
         origins.save(cache).unwrap();
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         let mut out = Vec::new();
         upgrade(
@@ -2588,7 +2604,12 @@ mod tests {
         let mut origins = OriginRecords::default();
         origins.set(PkgKind::Formula, "vault", "hashicorp/tap");
         origins.save(cache.path()).unwrap();
-        let inv = Inventory::build(brew.installed.clone(), &brew.taps, &origins, &cfg);
+        let inv = Inventory::build(
+            brew.installed.clone(),
+            &brew.tap_info().expect("mock taps"),
+            &origins,
+            &cfg,
+        );
         let tap = tempfile::tempdir().unwrap();
         upgrade(
             &brew,
@@ -2647,7 +2668,7 @@ mod tests {
             &brew,
             &git_empty(),
             &core_snaps(),
-            unused_cache(),
+            test_cache(),
             tap.path(),
             &inv,
             &cfg,

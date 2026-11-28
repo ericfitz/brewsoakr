@@ -1,6 +1,6 @@
 use crate::Error;
 use crate::SoakHours;
-use crate::brew::{InstalledPkg, MockBrew};
+use crate::brew::{Brew, InstalledPkg, MockBrew};
 use crate::cmd::RunResult;
 use crate::cmd::apply::reinstall;
 use crate::cmd::outdated::outdated;
@@ -44,7 +44,7 @@ pub(super) fn cfg_with(file: &str) -> Config {
 pub(super) fn inv_from(brew: &MockBrew, cfg: &Config) -> Inventory {
     Inventory::build(
         brew.installed.clone(),
-        &brew.taps,
+        &brew.tap_info().expect("mock taps"),
         &OriginRecords::default(),
         cfg,
     )
@@ -90,8 +90,17 @@ pub(super) fn now() -> OffsetDateTime {
     OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("fixed now")
 }
 
-pub(super) fn unused_cache() -> &'static Path {
-    Path::new("/brewsoak-in-memory-unused")
+/// A writable cache directory, the same for every call on one test's thread
+/// and removed when that thread ends.
+pub(super) fn test_cache() -> &'static Path {
+    thread_local! {
+        static CACHE: (tempfile::TempDir, &'static Path) = {
+            let dir = tempfile::tempdir().expect("test cache");
+            let path: &'static Path = Box::leak(dir.path().to_path_buf().into_boxed_path());
+            (dir, path)
+        };
+    }
+    CACHE.with(|c| c.1)
 }
 
 pub(super) fn formula_rb(name: &str, version: &str, sha: &str) -> String {
@@ -266,7 +275,7 @@ pub(super) fn upgrade_names_flags(
         brew,
         git,
         &core_snaps(),
-        unused_cache(),
+        test_cache(),
         tap.path(),
         &inv,
         &cfg,
@@ -298,7 +307,7 @@ pub(super) fn call_reinstall(
         brew,
         git,
         snaps,
-        unused_cache(),
+        test_cache(),
         tap,
         &inv,
         &cfg,
@@ -525,17 +534,7 @@ pub(super) fn greedy_outdated(
     let inv = inv_from(brew, &cfg);
     let flags: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     let mut out = Vec::new();
-    outdated(
-        brew,
-        git,
-        snaps,
-        unused_cache(),
-        &inv,
-        &cfg,
-        &flags,
-        &mut out,
-    )
-    .unwrap();
+    outdated(brew, git, snaps, test_cache(), &inv, &cfg, &flags, &mut out).unwrap();
     String::from_utf8(out).unwrap()
 }
 
