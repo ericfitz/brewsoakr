@@ -410,9 +410,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// Say once which of `flags` `brew <verb>` would reject and we dropped.
     fn note_dropped_flags(&mut self, verb: &str, flags: &[String], context: &str) {
         let dropped = crate::flags::filter_for_verb(verb, flags).dropped;
-        if let Some(note) = crate::flags::dropped_note(verb, &dropped, context)
-            && !self.deferred.iter().any(|(_, m)| *m == note)
-        {
+        if let Some(note) = crate::flags::dropped_note(verb, &dropped, context) {
             self.defer(note);
         }
     }
@@ -567,14 +565,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             return Ok(false);
         };
         writeln!(self.out, "held {name}: brewsoak's tap is not ready")?;
-        let note = why.note();
-        if !self
-            .deferred
-            .iter()
-            .any(|(kind, text)| *kind == NoteKind::Held && *text == note)
-        {
-            self.defer_held(note);
-        }
+        self.defer_held(why.note());
         self.counts.held += 1;
         self.refused = true;
         Ok(true)
@@ -1279,14 +1270,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn hold_target_not_ready(&mut self, target: &str, n: &NotReady) -> Result<(), Error> {
         self.hold_target_for_dep();
         writeln!(self.out, "held {target}: brewsoak's tap is not ready")?;
-        let note = n.note();
-        if !self
-            .deferred
-            .iter()
-            .any(|(kind, text)| *kind == NoteKind::Held && *text == note)
-        {
-            self.defer_held(note);
-        }
+        self.defer_held(n.note());
         Ok(())
     }
 
