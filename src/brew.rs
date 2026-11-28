@@ -1480,21 +1480,26 @@ fn read_formula_receipt_source(cellar: &Path, name: &str, version: Option<&str>)
     read_formula_receipt_source_opt(cellar, name, version).unwrap_or_default()
 }
 
+/// The `source` object (braces included) of the `INSTALL_RECEIPT.json` at `path`.
+fn receipt_source_object(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let source = find_json_key(&text, "source")?.trim_start();
+    let end = skip_delimited(source.as_bytes(), 0, b'{', b'}')?;
+    source.get(..end).map(str::to_string)
+}
+
 fn read_formula_receipt_source_opt(
     cellar: &Path,
     name: &str,
     version: Option<&str>,
 ) -> Option<ReceiptSource> {
-    let text = std::fs::read_to_string(
-        cellar
+    let source = receipt_source_object(
+        &cellar
             .join(name)
             .join(version?)
             .join("INSTALL_RECEIPT.json"),
-    )
-    .ok()?;
-    let source = find_json_key(&text, "source")?.trim_start();
-    let end = skip_delimited(source.as_bytes(), 0, b'{', b'}')?;
-    let source = source.get(..end)?;
+    )?;
+    let source = source.as_str();
     let raw_tap = json_string_value(source, "tap");
     let own_tap = raw_tap.as_deref().and_then(crate::origin::own_tap);
     let tap = raw_tap.filter(|t| !t.is_empty() && own_tap.is_none());
@@ -1510,10 +1515,8 @@ fn read_formula_receipt_source_opt(
 /// Lowercase `source.tap` of the receipt at `path`; with `version`, only when
 /// `source.version` equals it.
 fn read_receipt_tap(path: &Path, version: Option<&str>) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let source = find_json_key(&text, "source")?.trim_start();
-    let end = skip_delimited(source.as_bytes(), 0, b'{', b'}')?;
-    let source = source.get(..end)?;
+    let source = receipt_source_object(path)?;
+    let source = source.as_str();
     if let Some(version) = version
         && json_string_value(source, "version").as_deref() != Some(version)
     {
@@ -3671,6 +3674,16 @@ esac
         let l = got[0].as_ref().expect("row");
         assert!(!l.installed_current);
         assert!(l.satisfied);
+    }
+
+    #[test]
+    fn parse_by_name_row_rejects_a_non_boolean_satisfied_column() {
+        let out = "OK\tformula\ta\thomebrew/core\t1.0\tabc\tfalse\tmaybe\n";
+        let got = parse_by_name_lines(out, &asked(&["a"]));
+        assert!(
+            got[0].as_ref().unwrap_err().contains("satisfied"),
+            "{got:?}"
+        );
     }
 
     #[test]
