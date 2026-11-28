@@ -8,6 +8,10 @@ use crate::config::{remove_stale_temps, write_temp};
 use std::path::Path;
 
 pub fn write(path: &Path, body: &str) -> Result<(), Error> {
+    write_bytes(path, body.as_bytes())
+}
+
+pub fn write_bytes(path: &Path, body: &[u8]) -> Result<(), Error> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())
@@ -108,5 +112,14 @@ mod tests {
         let nested = dir.path().join("a/b/state.toml");
         write(&nested, "x = 1\n").unwrap();
         assert_eq!(std::fs::read_to_string(&nested).unwrap(), "x = 1\n");
+    }
+
+    #[test]
+    fn write_bytes_round_trips_non_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Formula/x.rb");
+        let body = b"a\r\n\xff\xfe\x00b";
+        write_bytes(&path, body).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body);
     }
 }

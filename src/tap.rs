@@ -12,30 +12,72 @@ pub fn tap_cask_path(tap_root: &Path, name: &str) -> PathBuf {
     tap_root.join("Casks").join(format!("{name}.rb"))
 }
 
+/// Writes `sanitize_unofficial(blob)` to `Formula/<name>.rb` or `Casks/<name>.rb`
+/// through `.<name>.rb.tmp-<pid>` and a rename.
 pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf, Error> {
     let path = match pkg.kind {
         PkgKind::Formula => tap_formula_path(tap_root, &pkg.name),
         PkgKind::Cask => tap_cask_path(tap_root, &pkg.name),
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let text = String::from_utf8_lossy(blob);
-    std::fs::write(&path, sanitize_unofficial(&text))?;
+    crate::atomic::write_bytes(&path, &sanitize_unofficial(blob))?;
     Ok(path)
 }
 
-/// Drop stanzas that Homebrew only allows in official taps (load-time errors).
-pub fn sanitize_unofficial(rb: &str) -> String {
-    let mut out = String::with_capacity(rb.len());
-    for line in rb.lines() {
-        if line.trim_start().starts_with("no_autobump!") {
+/// The cutoff blob with every line removed whose first non-blank text is
+/// `no_autobump!` (Homebrew allows the stanza only in official taps). Every
+/// other byte, line endings included, is unchanged.
+pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
+    const STANZA: &[u8] = b"no_autobump!";
+    let mut out = Vec::with_capacity(rb.len());
+    for line in rb.split_inclusive(|b| *b == b'\n') {
+        let start = line
+            .iter()
+            .position(|b| !b.is_ascii_whitespace())
+            .unwrap_or(line.len());
+        if line[start..].starts_with(STANZA) {
             continue;
         }
-        out.push_str(line);
-        out.push('\n');
+        out.extend_from_slice(line);
     }
     out
+}
+
+/// `ericfitz/brewsoak/<name>`.
+pub fn soak_token(name: &str) -> String {
+    format!("{}/{name}", crate::origin::SOAK_TAP)
+}
+
+/// `upgrade` for an installed formula, else `install`.
+pub fn soak_tap_verb(kind: PkgKind, installed: bool) -> &'static str {
+    if installed && kind == PkgKind::Formula {
+        "upgrade"
+    } else {
+        "install"
+    }
+}
+
+/// `brew <verb> --formula|--cask [flags] ericfitz/brewsoak/<name>`, flags
+/// filtered for that verb.
+pub fn soak_tap_args(pkg: &PkgRef, installed: bool, user_flags: &[String]) -> Vec<String> {
+    let verb = soak_tap_verb(pkg.kind, installed);
+    let mut wanted: Vec<String> = user_flags
+        .iter()
+        .filter(|f| !is_stripped_flag(f))
+        .cloned()
+        .collect();
+    if verb == "upgrade" {
+        wanted = crate::flags::without_greedy(&wanted);
+    }
+    let mut args = vec![
+        verb.to_string(),
+        match pkg.kind {
+            PkgKind::Formula => "--formula".into(),
+            PkgKind::Cask => "--cask".into(),
+        },
+    ];
+    args.extend(crate::flags::filter_for_verb(verb, &wanted).kept);
+    args.push(soak_token(&pkg.name));
+    args
 }
 
 /// `brew install --formula|--cask [flags] <token>`; soaked installs pass the bare name.
@@ -145,9 +187,143 @@ mod tests {
 
     #[test]
     fn sanitize_unofficial_strips_no_autobump() {
-        let rb = "class Sqlite < Formula\n  url \"https://example.com/s.tgz\"\n  sha256 \"abc\"\n  no_autobump! because: :bumped_by_upstream\nend\n";
-        let got = sanitize_unofficial(rb);
+        let rb = b"class Sqlite < Formula\n  url \"https://example.com/s.tgz\"\n  sha256 \"abc\"\n  no_autobump! because: :bumped_by_upstream\nend\n";
+        let got = String::from_utf8(sanitize_unofficial(rb)).unwrap();
         assert!(!got.contains("no_autobump!"), "{got}");
         assert!(got.contains("class Sqlite"), "{got}");
+    }
+
+    #[test]
+    fn sanitize_leaves_a_blob_without_the_stanza_byte_for_byte() {
+        for blob in [
+            &b"a\r\nb"[..],
+            b"class X < Formula\nend",
+            b"\xff\xfe raw\n",
+            b"",
+        ] {
+            assert_eq!(sanitize_unofficial(blob), blob);
+        }
+    }
+
+    #[test]
+    fn sanitize_removes_only_the_stanza_line() {
+        let rb = b"class S < Formula\r\n  no_autobump! because: :bumped_by_upstream\r\n  # no_autobump! stays\r\nend";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\r\n  # no_autobump! stays\r\nend"
+        );
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn write_blob_writes_the_sanitized_bytes_and_leaves_no_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob = b"class Wget < Formula\r\n  no_autobump! because: :x\r\n\xff\r\nend";
+        let path = write_blob(tmp.path(), &formula("wget"), blob).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"class Wget < Formula\r\n\xff\r\nend"
+        );
+        assert_eq!(names(&tmp.path().join("Formula")), vec!["wget.rb"]);
+    }
+
+    #[test]
+    fn write_blob_replaces_an_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_blob(tmp.path(), &formula("wget"), b"old old old\n").unwrap();
+        let path = write_blob(tmp.path(), &formula("wget"), b"new\n").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new\n");
+        assert_eq!(names(&tmp.path().join("Formula")), vec!["wget.rb"]);
+    }
+
+    #[test]
+    fn write_blob_paths_for_odd_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (pkg, rel) in [
+            (formula("python@3.12"), "Formula/python@3.12.rb"),
+            (formula("c++filt"), "Formula/c++filt.rb"),
+            (cask("font-hack"), "Casks/font-hack.rb"),
+            (formula("docker"), "Formula/docker.rb"),
+            (cask("docker"), "Casks/docker.rb"),
+        ] {
+            let path = write_blob(tmp.path(), &pkg, rel.as_bytes()).unwrap();
+            assert_eq!(path, tmp.path().join(rel));
+            assert_eq!(std::fs::read(&path).unwrap(), rel.as_bytes());
+        }
+    }
+
+    fn strs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn soak_token_is_the_tap_and_name() {
+        assert_eq!(soak_token("wget"), "ericfitz/brewsoak/wget");
+    }
+
+    #[test]
+    fn soak_tap_args_follow_the_installed_state() {
+        let f = formula("wget");
+        assert_eq!(
+            soak_tap_args(&f, false, &[]),
+            ["install", "--formula", "ericfitz/brewsoak/wget"]
+        );
+        assert_eq!(
+            soak_tap_args(&f, true, &[]),
+            ["upgrade", "--formula", "ericfitz/brewsoak/wget"]
+        );
+        let c = cask("firefox");
+        for installed in [false, true] {
+            assert_eq!(
+                soak_tap_args(&c, installed, &[]),
+                ["install", "--cask", "ericfitz/brewsoak/firefox"]
+            );
+        }
+        assert_eq!(soak_tap_verb(PkgKind::Formula, true), "upgrade");
+        assert_eq!(soak_tap_verb(PkgKind::Cask, true), "install");
+    }
+
+    #[test]
+    fn soak_tap_args_filter_flags_for_the_verb_run() {
+        let flags = strs(&["--greedy", "--dry-run", "--git", "--ignore-dependencies"]);
+        assert_eq!(
+            soak_tap_args(&formula("wget"), true, &flags),
+            [
+                "upgrade",
+                "--formula",
+                "--dry-run",
+                "ericfitz/brewsoak/wget"
+            ]
+        );
+        assert_eq!(
+            soak_tap_args(&formula("wget"), false, &flags),
+            [
+                "install",
+                "--formula",
+                "--dry-run",
+                "--git",
+                "ericfitz/brewsoak/wget"
+            ]
+        );
+    }
+
+    #[test]
+    fn soak_tap_upgrade_never_receives_g() {
+        assert_eq!(
+            soak_tap_args(&formula("wget"), true, &strs(&["-g"])),
+            ["upgrade", "--formula", "ericfitz/brewsoak/wget"]
+        );
+        assert_eq!(
+            soak_tap_args(&formula("wget"), true, &strs(&["-vg"])),
+            ["upgrade", "--formula", "-v", "ericfitz/brewsoak/wget"]
+        );
     }
 }
