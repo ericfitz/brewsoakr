@@ -168,7 +168,7 @@ apart from the #17 Human decisions above.
 - **#23 Decision 2: tap files stay mode 0600.** brew runs as the same user, so
   that is enough.
 - **#23 Decision 4: the installed version in hold text is the keg directory
-  name**, as Homebrew's `Keg#version` reads it (`brew::PkgState::keg_version`);
+  name**, as Homebrew's `Keg#version` reads it (`brew::InstalledPkg::keg_version`);
   an empty version is omitted from the text.
 - **#23 Decision 5: a no-soak cask stays `brew install --cask`.** Its behavior is
   verified by manual check 13.7.
