@@ -741,11 +741,11 @@ mod tests {
         let runs = lock_runs(&brew);
         assert!(
             runs.contains(&vec![
-                "install".to_string(),
+                "upgrade".to_string(),
                 "--formula".to_string(),
-                "wget".to_string()
+                "ericfitz/brewsoak/wget".to_string()
             ]),
-            "behind reinstall must install the cutoff by bare name: {runs:?}"
+            "behind reinstall must upgrade the cutoff from the soak tap: {runs:?}"
         );
         assert!(
             !runs
@@ -887,9 +887,9 @@ mod tests {
             runs.contains(&vec![
                 "install".to_string(),
                 "--formula".to_string(),
-                "fresh".to_string()
+                "ericfitz/brewsoak/fresh".to_string()
             ]),
-            "install must pass the bare name: {runs:?}"
+            "install must pass the soak-tap token: {runs:?}"
         );
     }
 
@@ -923,7 +923,7 @@ mod tests {
             runs.contains(&vec![
                 "install".to_string(),
                 "--cask".to_string(),
-                "firefox".to_string()
+                "ericfitz/brewsoak/firefox".to_string()
             ]),
             "{runs:?}"
         );
@@ -964,7 +964,7 @@ mod tests {
             visible
                 .iter()
                 .any(|args| args.first().map(String::as_str) == Some("install")
-                    && args.last().map(String::as_str) == Some("fresh")),
+                    && args.last().map(String::as_str) == Some("ericfitz/brewsoak/fresh")),
             "soaked install must use run_visible: {visible:?}"
         );
     }

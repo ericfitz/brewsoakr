@@ -326,7 +326,7 @@ mod tests {
         );
         let installs: Vec<Vec<String>> = lock_runs(&brew)
             .into_iter()
-            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .filter(|a| matches!(a.first().map(String::as_str), Some("install" | "upgrade")))
             .collect();
         assert_eq!(installs.len(), 4, "{text}");
         for args in &installs {

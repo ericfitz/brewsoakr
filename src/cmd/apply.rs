@@ -28,7 +28,7 @@ use crate::report::{self, Counts, Verb};
 use crate::resolve::{PkgKind, PkgRef};
 use crate::section::Section;
 use crate::snapshot::Snapshots;
-use crate::soaktap;
+use crate::soaktap::{self, NotReady, SoakTap, Staged};
 use crate::tap;
 use crate::taps;
 use std::collections::{BTreeMap, HashSet};
@@ -68,6 +68,7 @@ pub fn reinstall(
         )?;
     }
     let mut session = ApplySession {
+        lock,
         brew,
         git,
         snaps,
@@ -76,6 +77,7 @@ pub fn reinstall(
         inv,
         cfg,
         brew_verb: "reinstall",
+        soak: SoakTap::new(inv.soak_tap.as_ref(), tap_root, cache, dry_run),
         verb: Verb::Reinstall,
         bare_run: false,
         force_cask: false,
@@ -218,6 +220,7 @@ pub(super) fn apply_many(
         .filter(|_| bare_run)
         .map(|total| (total, inv.pkgs.len()));
     let mut session = ApplySession {
+        lock,
         brew,
         git,
         snaps,
@@ -226,6 +229,7 @@ pub(super) fn apply_many(
         inv,
         cfg,
         brew_verb,
+        soak: SoakTap::new(inv.soak_tap.as_ref(), tap_root, cache, dry_run),
         verb,
         bare_run,
         force_cask,
@@ -298,6 +302,7 @@ pub(super) fn apply_many(
 }
 
 pub(super) struct ApplySession<'a, B, G, W: Write> {
+    lock: &'a RunLock,
     brew: &'a B,
     git: &'a G,
     snaps: &'a Snapshots,
@@ -306,6 +311,8 @@ pub(super) struct ApplySession<'a, B, G, W: Write> {
     inv: &'a Inventory,
     cfg: &'a Config,
     brew_verb: &'a str,
+    /// brewsoak's own tap: staged cutoff files for this run's installs.
+    soak: SoakTap,
     /// `brew_verb`, parsed; picks section header wording.
     verb: Verb,
     /// A bare `upgrade`: every installed package, none named by the user.
@@ -768,7 +775,22 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
+    /// Install one soaked target with its dependencies. Whatever happens, the
+    /// tap files staged for it are kept or put back afterwards; the first
+    /// error of the install and the settle is returned.
     fn install_cutoff(
+        &mut self,
+        name: &str,
+        origin_tap: &str,
+        kind: PkgKind,
+        view: &ResolvedView,
+    ) -> Result<(), Error> {
+        let installed = self.install_cutoff_staged(name, origin_tap, kind, view);
+        let settled = self.soak.settle(self.lock, self.brew);
+        installed.and(settled)
+    }
+
+    fn install_cutoff_staged(
         &mut self,
         name: &str,
         origin_tap: &str,
@@ -788,7 +810,8 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 self.refuse_ambiguous_dep(name, &token, &message)?;
                 return Ok(());
             }
-            // brew could not list the dependencies of the target by name.
+            // brew could not list the dependencies of a third-party target
+            // by name.
             Err(Error::Brew { message, .. }) => {
                 match taps::untrusted_tap(&message) {
                     Some(tap) => self.hold_target_untrusted(name, &tap),
@@ -816,24 +839,67 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
 
-        let install_flags = self.name_install_flags();
-        let args = tap::brew_install_args(&pkg, name, &install_flags);
-        self.note_dropped_flags("install", &install_flags, "soaked installs");
         let installing = view.cutoff.as_ref().map(report::identity_version);
-        match self.record_name_install(origin_tap, name, kind, installing, &args)? {
-            NameRun::Ran { failed } => {
+        match self.run_install(&pkg, origin_tap, view.cutoff_blob.as_deref(), installing)? {
+            InstallRun::Ran { failed } => {
                 // Counted as upgraded when it was announced; brew failed.
                 if failed {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
             }
-            NameRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
+            InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
+            InstallRun::NotReady(n) => self.hold_target_not_ready(name, &n)?,
+            InstallRun::Interrupted => self.hold_target_interrupted(name)?,
         }
         Ok(())
     }
 
+    /// Install a target or dependency by the route its origin has: a package
+    /// of homebrew/core or homebrew/cask from brewsoak's tap, after its cutoff
+    /// file is staged (again, when an earlier settle put it back); any other
+    /// by its bare name.
+    fn run_install(
+        &mut self,
+        pkg: &PkgRef,
+        origin_tap: &str,
+        cutoff: Option<&[u8]>,
+        installing: Option<String>,
+    ) -> Result<InstallRun, Error> {
+        let install_flags = self.name_install_flags();
+        let args = if origin::is_core_or_cask(origin_tap) {
+            let cutoff = cutoff.ok_or_else(|| {
+                Error::Other(format!(
+                    "{}: no cutoff file to stage for the soak tap",
+                    pkg.name
+                ))
+            })?;
+            match self
+                .soak
+                .stage(self.lock, self.brew, pkg, cutoff, installing.as_deref())?
+            {
+                Staged::NotReady(n) => return Ok(InstallRun::NotReady(n)),
+                Staged::Leftover => return Ok(InstallRun::Interrupted),
+                Staged::Unchanged | Staged::Written => {}
+            }
+            let installed = self.inv.find_in(origin_tap, &pkg.name).is_some();
+            let verb = tap::soak_tap_verb(pkg.kind, installed);
+            self.note_dropped_flags(verb, &install_flags, "soaked installs");
+            tap::soak_tap_args(pkg, installed, &install_flags)
+        } else {
+            self.note_dropped_flags("install", &install_flags, "soaked installs");
+            tap::brew_install_args(pkg, &pkg.name, &install_flags)
+        };
+        Ok(
+            match self.record_name_install(origin_tap, &pkg.name, pkg.kind, installing, &args)? {
+                NameRun::Ran { failed } => InstallRun::Ran { failed },
+                NameRun::Untrusted(tap) => InstallRun::Untrusted(tap),
+                NameRun::TapNotReady => InstallRun::NotReady(NotReady::Untrusted),
+            },
+        )
+    }
+
     fn collect_cutoff_deps(
-        &self,
+        &mut self,
         root_origin: &str,
         root: &str,
         root_kind: PkgKind,
@@ -845,6 +911,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             cache: self.cache,
             inv: self.inv,
             cfg: self.cfg,
+            lock: self.lock,
+            soak: &mut self.soak,
+            target: root,
             visiting: HashSet::new(),
             visited: HashSet::new(),
             out: Vec::new(),
@@ -931,18 +1000,27 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.counts.upgraded += 1;
             self.counted_deps.insert(dep.to_string());
         }
-        let install_flags = self.name_install_flags();
-        let args = tap::brew_install_args(&pkg, dep, &install_flags);
         let installing = want.as_ref().map(report::identity_version);
-        match self.record_name_install(dep_origin, dep, kind, installing, &args)? {
-            NameRun::Ran { failed } => {
+        match self.run_install(&pkg, dep_origin, blobs.cutoff.as_deref(), installing)? {
+            InstallRun::Ran { failed } => {
                 if failed && counted_here && self.counted_deps.remove(dep) {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
             }
+            // The target cannot install without this dep: hold the target.
+            InstallRun::NotReady(n) => {
+                self.uncount_dep(dep);
+                self.hold_target_not_ready(target, &n)?;
+                return Ok(false);
+            }
+            InstallRun::Interrupted => {
+                self.uncount_dep(dep);
+                self.hold_target_interrupted(target)?;
+                return Ok(false);
+            }
             // The target cannot install without this dep: hold the target once
             // (one line, one count) rather than the dep and then the target.
-            NameRun::Untrusted(tap) => {
+            InstallRun::Untrusted(tap) => {
                 if counted_here {
                     self.uncount_dep(dep);
                     writeln!(
@@ -999,7 +1077,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         target_token: &str,
         hold: &NameHold,
     ) -> Result<(), Error> {
-        let (why, issue_17) = match &hold.why {
+        let why = match &hold.why {
             NameFail::Untrusted(tap) => {
                 match &hold.dep {
                     Some(dep) => self.hold_target_untrusted_dep(target, dep, tap),
@@ -1007,20 +1085,46 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                 }
                 return Ok(());
             }
-            NameFail::Why(why) => (why.text(), why.waits_on_issue_17()),
+            NameFail::TapNotReady(n) => return self.hold_target_not_ready(target, n),
+            NameFail::Interrupted => return self.hold_target_interrupted(target),
+            NameFail::Why(why) => why.text(),
         };
         self.hold_target_for_dep();
         match &hold.dep {
             Some(dep) => writeln!(self.out, "held {target}: dependency {dep}: {why}")?,
             None => writeln!(self.out, "held {target}: {why}")?,
         }
-        self.defer_held(by_name_note(
-            target,
-            hold.dep.as_deref(),
-            &why,
-            issue_17,
-            self.brew_verb,
-            target_token,
+        let bypass = format!("brew {} {target_token}", self.brew_verb);
+        self.defer_held(by_name_note(target, hold.dep.as_deref(), &why, &bypass));
+        Ok(())
+    }
+
+    /// brewsoak's tap cannot be used this run: hold the target with one
+    /// inline line, and say why once however many packages it holds.
+    fn hold_target_not_ready(&mut self, target: &str, n: &NotReady) -> Result<(), Error> {
+        self.hold_target_for_dep();
+        writeln!(self.out, "held {target}: brewsoak's tap is not ready")?;
+        let note = n.note();
+        if !self
+            .deferred
+            .iter()
+            .any(|(kind, text)| *kind == NoteKind::Held && *text == note)
+        {
+            self.defer_held(note);
+        }
+        Ok(())
+    }
+
+    /// An earlier run left an undo entry for the package: nothing is written
+    /// until `brewsoak update` finishes it.
+    fn hold_target_interrupted(&mut self, target: &str) -> Result<(), Error> {
+        self.hold_target_for_dep();
+        writeln!(
+            self.out,
+            "held {target}: an earlier brewsoak run was interrupted"
+        )?;
+        self.defer_held(format!(
+            "{target}: an earlier brewsoak run was interrupted; run brewsoak update to finish it"
         ));
         Ok(())
     }
@@ -1118,10 +1222,14 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let output = self.brew.run_visible_in(args, &mut self.out, &ctx)?;
         let text = String::from_utf8_lossy(&output.stdout);
         if !output.status.success()
-            && !origin::is_core_or_cask(origin_tap)
             && let Some(tap) = taps::untrusted_tap(&text)
         {
-            return Ok(NameRun::Untrusted(tap));
+            if tap.eq_ignore_ascii_case(origin::SOAK_TAP) {
+                return Ok(NameRun::TapNotReady);
+            }
+            if !origin::is_core_or_cask(origin_tap) {
+                return Ok(NameRun::Untrusted(tap));
+            }
         }
         self.done
             .extend(quiet::installed_from_output(&output.stdout));
@@ -1223,6 +1331,16 @@ pub(super) enum NameRun {
     Ran { failed: bool },
     /// brew does not trust this tap (lowercase `user/repo`).
     Untrusted(String),
+    /// brew does not trust brewsoak's own tap.
+    TapNotReady,
+}
+
+/// What `run_install` came to.
+enum InstallRun {
+    Ran { failed: bool },
+    Untrusted(String),
+    NotReady(NotReady),
+    Interrupted,
 }
 
 pub(crate) fn max_status(slot: &mut Option<i32>, code: i32) {
@@ -1264,7 +1382,8 @@ mod tests {
     use crate::cmd::test_support::{
         call_reinstall, cask_pkg_from, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg,
         formula_pkg_from, formula_pkg_pinned, formula_rb, git_empty, inv_from, lock_runs,
-        run_is_name_install, tapped, test_cache, upgrade_names, upgrade_names_flags,
+        run_is_name_install, strip_soak_prefix, tapped, test_cache, upgrade_names,
+        upgrade_names_flags,
     };
     use crate::cmd::upgrade::upgrade;
 
@@ -1504,8 +1623,8 @@ mod tests {
             .lock()
             .expect("visible")
             .iter()
-            .filter(|a| a.first().map(String::as_str) == Some("install"))
-            .filter_map(|a| a.last().cloned())
+            .filter(|a| matches!(a.first().map(String::as_str), Some("install" | "upgrade")))
+            .filter_map(|a| a.last().map(|l| strip_soak_prefix(l).to_string()))
             .collect()
     }
 
@@ -1819,7 +1938,7 @@ mod tests {
             assert!(args.iter().any(|a| a == "--verbose"), "{args:?}");
         }
         // `--greedy` is brewsoak's on an upgrade, so it is not "dropped".
-        let note = "brew install does not accept --ignore-pinned; dropped from soaked installs";
+        let note = "brew upgrade does not accept --ignore-pinned; dropped from soaked installs";
         assert_eq!(text.matches(note).count(), 1, "{text}");
         assert!(!text.contains("does not accept --greedy"), "{text}");
     }
@@ -2241,7 +2360,7 @@ mod tests {
         assert!(
             visible
                 .iter()
-                .any(|a| a == &["install", "--formula", "left"]),
+                .any(|a| a == &["upgrade", "--formula", "ericfitz/brewsoak/left"]),
             "{visible:?}"
         );
         assert!(
@@ -2316,9 +2435,9 @@ mod tests {
     }
 
     #[test]
-    fn soaked_runs_never_hand_brew_a_path_or_full_token() {
+    fn soak_tap_runs_carry_only_soak_tap_tokens_and_no_paths() {
         use crate::cmd::install::install;
-        use crate::cmd::test_support::assert_no_path_args;
+        use crate::cmd::test_support::assert_soak_tap_commands;
 
         let run_install = |brew: &MockBrew, git: &InMemoryGit, name: &str, cask: bool| {
             let cfg = cfg24();
@@ -2363,7 +2482,7 @@ mod tests {
         )
         .unwrap();
         assert!(!name_install_order(&brew).is_empty());
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["node", "simdutf"]);
 
         // Bare upgrade.
         let (brew, git) = two_outdated_world("");
@@ -2383,7 +2502,7 @@ mod tests {
         )
         .unwrap();
         assert!(!name_install_order(&brew).is_empty());
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["left", "right"]);
 
         // Fresh install with a missing dependency.
         let git = InMemoryGit::new();
@@ -2404,7 +2523,7 @@ mod tests {
             .insert("fresh".to_string(), vec!["lib".to_string()]);
         run_install(&brew, &git, "fresh", false);
         assert_eq!(name_install_order(&brew), ["lib", "fresh"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["lib", "fresh"]);
 
         // Cutoff reinstall of an outdated package.
         let (brew, git) = node_simdutf_world("1.0.0", "1.0.0", "");
@@ -2418,7 +2537,7 @@ mod tests {
         )
         .unwrap();
         assert!(!name_install_order(&brew).is_empty());
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["node", "simdutf"]);
 
         // Cask target.
         let git = InMemoryGit::new();
@@ -2427,12 +2546,12 @@ mod tests {
         let brew = MockBrew::new();
         run_install(&brew, &git, "firefox", true);
         assert_eq!(name_install_order(&brew), ["firefox"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["firefox"]);
 
         // Tap formula dependency.
         let (_text, brew, _r) = node_with_tap_dep_world("");
         assert!(!name_install_order(&brew).is_empty());
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["node"]);
     }
 
     #[test]

@@ -222,19 +222,38 @@ pub(super) fn run_has_token(runs: &[Vec<String>], token: &str) -> bool {
 
 pub(super) fn run_is_name_install(runs: &[Vec<String>], name: &str) -> bool {
     runs.iter().any(|args| {
-        args.first().map(String::as_str) == Some("install")
-            && args.last().map(String::as_str) == Some(name)
+        matches!(
+            args.first().map(String::as_str),
+            Some("install" | "upgrade")
+        ) && args.last().map(|a| strip_soak_prefix(a)) == Some(name)
             && !args.iter().any(|a| a == "--ignore-dependencies")
     })
 }
 
-/// Soaked runs install and ask `brew deps` by bare name: no recorded argument
-/// is a path, and no `install` or `deps` argument is a `user/repo/name` token.
-pub(super) fn assert_no_path_args(brew: &MockBrew) {
+/// A command argument without the soak tap's `ericfitz/brewsoak/` prefix.
+pub(super) fn strip_soak_prefix(arg: &str) -> &str {
+    arg.strip_prefix("ericfitz/brewsoak/").unwrap_or(arg)
+}
+
+/// No argument is a path; no command is `trust` or `untrust`; no argument is
+/// `--ignore-dependencies` or contains `brewsoakr/soaked`; every argument that
+/// starts with `ericfitz/brewsoak/` names one of `soak_names`. Third-party
+/// installs and `brew deps` questions keep bare names, and no `by_name`
+/// query carries a full token.
+pub(super) fn assert_soak_tap_commands(brew: &MockBrew, soak_names: &[&str]) {
+    let prefix = "ericfitz/brewsoak/";
+    let soak_ok = |a: &str| {
+        a.strip_prefix(prefix)
+            .is_some_and(|n| soak_names.contains(&n))
+    };
     let mut all = lock_runs(brew);
     all.extend(brew.visible_runs.lock().expect("visible").clone());
     for args in &all {
         let verb = args.first().map(String::as_str);
+        assert!(
+            !matches!(verb, Some("trust" | "untrust")),
+            "trust command in {args:?}"
+        );
         let named = matches!(verb, Some("install" | "deps"));
         for a in args {
             assert!(
@@ -242,15 +261,31 @@ pub(super) fn assert_no_path_args(brew: &MockBrew) {
                 "path argument {a:?} in {args:?}"
             );
             assert!(
-                !(named && !a.starts_with('-') && a.contains('/')),
-                "full token {a:?} in soaked {args:?}"
+                a != "--ignore-dependencies" && !a.contains("brewsoakr/soaked"),
+                "forbidden argument {a:?} in {args:?}"
             );
+            if a.starts_with(prefix) {
+                assert!(
+                    soak_ok(a),
+                    "soak token {a:?} not among {soak_names:?} in {args:?}"
+                );
+            } else {
+                assert!(
+                    !(named && !a.starts_with('-') && a.contains('/')),
+                    "full token {a:?} in {args:?}"
+                );
+            }
         }
     }
     for (kind, token) in brew.deps_calls.lock().expect("deps calls").iter() {
+        let fine = if token.starts_with(prefix) {
+            soak_ok(token)
+        } else {
+            !token.contains('/')
+        };
         assert!(
-            !token.starts_with('/') && !token.ends_with(".rb") && !token.contains('/'),
-            "path or full token {token:?} handed to deps ({kind:?})"
+            fine && !token.starts_with('/') && !token.ends_with(".rb"),
+            "path or unexpected token {token:?} handed to deps ({kind:?})"
         );
     }
     for q in brew.by_name_queries.lock().expect("queries").iter() {
@@ -679,7 +714,7 @@ pub(crate) fn tree(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
 }
 
 #[cfg(test)]
-mod assert_no_path_args_tests {
+mod assert_soak_tap_commands_tests {
     use super::*;
     use crate::brew::NameQuery;
 
@@ -695,7 +730,7 @@ mod assert_no_path_args_tests {
     fn flags_a_slash_prefixed_argument() {
         let brew = MockBrew::new();
         visible(&brew, &["install", "/tmp/staging/x"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &[]);
     }
 
     #[test]
@@ -703,26 +738,69 @@ mod assert_no_path_args_tests {
     fn flags_an_rb_argument() {
         let brew = MockBrew::new();
         visible(&brew, &["install", "x.rb"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "trust command")]
+    fn flags_trust_and_untrust() {
+        let brew = MockBrew::new();
+        visible(&brew, &["untrust", "ericfitz/brewsoak"]);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "forbidden argument")]
+    fn flags_ignore_dependencies() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "--ignore-dependencies", "x"]);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "forbidden argument")]
+    fn flags_the_legacy_tap() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "brewsoakr/soaked/x"]);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "not among")]
+    fn flags_a_soak_token_for_an_unlisted_name() {
+        let brew = MockBrew::new();
+        visible(&brew, &["install", "--formula", "ericfitz/brewsoak/other"]);
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
     #[should_panic(expected = "full token")]
-    fn flags_a_full_token_on_an_install_run() {
+    fn flags_a_third_party_full_token_on_an_install_run() {
         let brew = MockBrew::new();
         visible(&brew, &["install", "--formula", "user/repo/name"]);
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
     #[should_panic(expected = "handed to deps")]
-    fn flags_a_full_token_in_deps_calls() {
+    fn flags_a_third_party_full_token_in_deps_calls() {
         let brew = MockBrew::new();
         brew.deps_calls
             .lock()
             .unwrap()
             .push((PkgKind::Formula, "user/repo/name".to_string()));
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "handed to deps")]
+    fn flags_a_soak_token_for_an_unlisted_name_in_deps_calls() {
+        let brew = MockBrew::new();
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "ericfitz/brewsoak/other".to_string()));
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
@@ -731,19 +809,29 @@ mod assert_no_path_args_tests {
         let brew = MockBrew::new();
         brew.by_name_queries.lock().unwrap().push(NameQuery {
             kind: PkgKind::Formula,
-            name: "user/repo/name".to_string(),
-            origin: "user/repo".to_string(),
+            name: "ericfitz/brewsoak/name".to_string(),
+            origin: "homebrew/core".to_string(),
             cutoff_sha256: None,
         });
-        assert_no_path_args(&brew);
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 
     #[test]
-    fn does_not_flag_no_soak_or_repair_full_tokens() {
+    fn accepts_listed_soak_tokens_bare_third_party_names_and_repair_tokens() {
         let brew = MockBrew::new();
-        visible(&brew, &["upgrade", "--formula", "user/repo/name"]);
-        visible(&brew, &["reinstall", "user/repo/name"]);
-        visible(&brew, &["install", "--formula", "name"]);
-        assert_no_path_args(&brew);
+        visible(&brew, &["upgrade", "--formula", "ericfitz/brewsoak/name"]);
+        visible(&brew, &["install", "--cask", "ericfitz/brewsoak/name"]);
+        visible(&brew, &["upgrade", "--formula", "user/repo/other"]);
+        visible(&brew, &["reinstall", "user/repo/other"]);
+        visible(&brew, &["install", "--formula", "packer"]);
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "ericfitz/brewsoak/name".to_string()));
+        brew.deps_calls
+            .lock()
+            .unwrap()
+            .push((PkgKind::Formula, "packer".to_string()));
+        assert_soak_tap_commands(&brew, &["name"]);
     }
 }

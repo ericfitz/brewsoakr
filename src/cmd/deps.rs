@@ -1,14 +1,17 @@
 use super::view::{cutoff_blob_exists, natural_kind, resolve_pkg_blobs, resolve_view};
 use crate::Error;
-use crate::brew::{Brew, NameQuery};
+use crate::brew::{Brew, ByName, NameQuery};
 use crate::config::Config;
 use crate::digest::sha256_hex;
 use crate::eligibility::DesiredAction;
 use crate::git::GitStore;
 use crate::inventory::{self, Inventory, Pkg, PkgClass};
-use crate::origin::{self};
-use crate::resolve::PkgKind;
+use crate::lock::RunLock;
+use crate::origin::{self, OwnTap};
+use crate::resolve::{PkgKind, PkgRef};
 use crate::snapshot::Snapshots;
+use crate::soaktap::{self, DepRule, NotReady, SoakTap, Staged, TapState};
+use crate::tap;
 use crate::taps;
 use std::collections::HashSet;
 use std::path::Path;
@@ -21,8 +24,8 @@ pub(super) struct HeldDep {
     pub(super) reason: String,
 }
 
-/// Why the by-name gate holds a member of the closure, other than an
-/// untrusted tap (see `NameFail`).
+/// Why the closure walk holds a member, other than a tap problem (see
+/// `NameFail`).
 pub(super) enum NameWhy {
     /// brew's own definition of the name is not the soaked cutoff.
     NotCutoff { brew_version: String },
@@ -37,45 +40,73 @@ pub(super) enum NameWhy {
     Deps(String),
     /// The member has no soaked cutoff to compare against.
     NoCutoff,
+    /// brew could not load the tap file or list its dependencies (first line).
+    SoakedCopy(String),
+    /// brew would replace an installed dependency with a version that has not
+    /// soaked.
+    WouldReplace {
+        dep: String,
+        installed: String,
+        brew_version: String,
+        target: String,
+    },
+    /// brew cannot replace an installed dependency as a dependency.
+    CannotReplace { dep: String, installed: String },
 }
 
 impl NameWhy {
-    /// True when the hold waits on issue #17; a changed file waits on its soak.
-    pub(super) fn waits_on_issue_17(&self) -> bool {
-        !matches!(self, Self::ChangedSinceCutoff { .. })
-    }
-
     /// The reason as it reads in a hold line and a note.
     pub(super) fn text(&self) -> String {
         match self {
-            Self::NotCutoff { brew_version } => {
-                format!("brew would install {brew_version}, which is not the soaked cutoff")
-            }
+            Self::NotCutoff { brew_version } => format!(
+                "brew would install {brew_version}, which is not the soaked cutoff; it installs once that change soaks"
+            ),
             Self::ChangedSinceCutoff { what, version } => format!(
                 "brew's {version} {what} changed since the soaked cutoff; it installs once the change soaks"
             ),
-            Self::OtherTap { tap, origin } => {
-                format!("brew resolves the name to {tap}, not {origin}")
-            }
+            Self::OtherTap { tap, origin } => format!(
+                "brew resolves the name to {tap}, not {origin}; brewsoak cannot install it by name"
+            ),
             Self::Lookup(first) => format!("brew could not describe it by name ({first})"),
             Self::Deps(first) => format!("brew could not read its dependencies ({first})"),
             Self::NoCutoff => "it has no soaked cutoff yet".to_string(),
+            Self::SoakedCopy(first) => format!("brew could not load its soaked copy ({first})"),
+            Self::WouldReplace {
+                dep,
+                installed,
+                brew_version,
+                target,
+            } => format!(
+                "brew would replace installed {dep} {installed} with {brew_version}, which has not soaked; {target} installs once it has"
+            ),
+            Self::CannotReplace { dep, installed } => format!(
+                "brew cannot replace installed {dep} {installed} as a dependency; run brew upgrade {dep} first"
+            ),
         }
     }
 }
 
-/// A gate failure: brew refuses the tap (kept as today's trust hold) or one
-/// of the reasons above.
+/// A gate failure: a tap problem, which keeps its own hold, or one of the
+/// reasons above.
 pub(super) enum NameFail {
     /// brew refuses to load the name from this untrusted tap.
     Untrusted(String),
+    /// brewsoak's own tap cannot be used this run.
+    TapNotReady(NotReady),
+    /// An earlier run left an undo entry for this package.
+    Interrupted,
     Why(NameWhy),
 }
 
 impl NameFail {
-    /// Classify brew's error text for a lookup or dependency failure.
+    /// Classify brew's error text for a lookup or dependency failure. Its
+    /// untrusted-tap refusal of brewsoak's own tap is a tap that is not
+    /// ready, whichever package brew was loading.
     fn from_brew(text: &str, why: impl FnOnce(String) -> NameWhy) -> Self {
         match taps::untrusted_tap(text) {
+            Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
+                Self::TapNotReady(NotReady::Untrusted)
+            }
             Some(tap) => Self::Untrusted(tap),
             None => Self::Why(why(first_line(text))),
         }
@@ -115,6 +146,10 @@ pub(super) struct CutoffDepWalk<'a, B, G> {
     pub(super) cache: &'a Path,
     pub(super) inv: &'a Inventory,
     pub(super) cfg: &'a Config,
+    pub(super) lock: &'a RunLock,
+    pub(super) soak: &'a mut SoakTap,
+    /// The package the walk was started for; named in dependency holds.
+    pub(super) target: &'a str,
     pub(super) visiting: HashSet<String>,
     pub(super) visited: HashSet<String>,
     pub(super) out: Vec<(String, String, PkgKind)>,
@@ -123,6 +158,21 @@ pub(super) struct CutoffDepWalk<'a, B, G> {
 }
 
 pub(super) use crate::error::first_line;
+
+fn kind_word(kind: PkgKind) -> &'static str {
+    match kind {
+        PkgKind::Formula => "formula",
+        PkgKind::Cask => "cask",
+    }
+}
+
+fn tap_file_exists(dir: &Path, kind: PkgKind, name: &str) -> bool {
+    match kind {
+        PkgKind::Formula => tap::tap_formula_path(dir, name),
+        PkgKind::Cask => tap::tap_cask_path(dir, name),
+    }
+    .exists()
+}
 
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
     fn hold(&mut self, role: Role, name: &str, why: NameFail) {
@@ -146,92 +196,13 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
             return Ok(());
         }
         self.visiting.insert(key.clone());
-        // A third-party root asks for its dependencies first, so brew's
-        // refusal to load an untrusted tap keeps its own note. The list is
-        // used only after the gate below passes.
-        let early = if role == Role::Root && !origin::is_core_or_cask(origin_tap) {
-            Some(self.brew.deps(kind, name)?)
+        let gated = if origin::is_core_or_cask(origin_tap) {
+            self.gate_soak_member(origin_tap, name, kind, role)?
         } else {
-            None
+            self.gate_by_name(origin_tap, name, kind, role)?
         };
-        let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, origin_tap, name, kind)?;
-        let query = NameQuery {
-            kind,
-            name: name.to_string(),
-            origin: origin_tap.to_ascii_lowercase(),
-            cutoff_sha256: blobs.cutoff.as_deref().map(sha256_hex),
-        };
-        let has_cutoff = query.cutoff_sha256.is_some();
-        let asked = match self.brew.by_name(std::slice::from_ref(&query)) {
-            Ok(rows) => rows.into_iter().next(),
-            // The whole call failed: the same as brew failing for this name.
-            Err(Error::Brew { message, .. }) => Some(Err(message)),
-            Err(e) => return Err(e),
-        };
-        let answer = match asked.unwrap_or_else(|| Err("brew gave no answer for this name".into()))
-        {
-            Ok(a) => a,
-            Err(text) => {
-                self.hold(role, name, NameFail::from_brew(&text, NameWhy::Lookup));
-                return Ok(());
-            }
-        };
-        let installs = answer.installs_cutoff(origin_tap);
-        // brew leaves an installed dependency at its current version alone,
-        // so one this run would upgrade only needs the gate when brew would
-        // change it.
-        let role = if role == Role::Install
-            && answer.installed_current
-            && !installs
-            && self.inv.find(name).is_some()
-        {
-            Role::Check
-        } else {
-            role
-        };
-        let passes = installs || (role == Role::Check && answer.installed_current);
-        if !passes {
-            let why = if !answer.tap.eq_ignore_ascii_case(origin_tap) {
-                NameWhy::OtherTap {
-                    tap: answer.tap,
-                    origin: origin_tap.to_ascii_lowercase(),
-                }
-            } else if !has_cutoff {
-                NameWhy::NoCutoff
-            } else if blobs
-                .cutoff
-                .as_deref()
-                .and_then(|b| crate::soaktap::file_version(kind, b))
-                .as_deref()
-                == Some(answer.version.as_str())
-            {
-                NameWhy::ChangedSinceCutoff {
-                    what: match kind {
-                        PkgKind::Formula => "formula",
-                        PkgKind::Cask => "cask",
-                    },
-                    version: answer.version,
-                }
-            } else {
-                NameWhy::NotCutoff {
-                    brew_version: answer.version,
-                }
-            };
-            self.hold(role, name, NameFail::Why(why));
+        let Some((role, listed)) = gated else {
             return Ok(());
-        }
-        let listed = match early {
-            Some(list) => list,
-            None => match self.brew.deps(kind, name) {
-                Ok(list) => list,
-                Err(Error::Brew { message, .. })
-                    if role != Role::Root && !taps::ambiguous_formula(&message) =>
-                {
-                    self.hold(role, name, NameFail::from_brew(&message, NameWhy::Deps));
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            },
         };
         for dep in listed {
             // Already installed, from any origin. One this run upgrades goes
@@ -322,6 +293,265 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         Ok(())
     }
 
+    /// A member of a third-party tap keeps the by-name gate: brew's own
+    /// definition of the bare name must be the soaked cutoff. Returns the
+    /// member's role (a passing installed dependency becomes a check) and its
+    /// dependencies, or None when it was held.
+    fn gate_by_name(
+        &mut self,
+        origin_tap: &str,
+        name: &str,
+        kind: PkgKind,
+        role: Role,
+    ) -> Result<Option<(Role, Vec<String>)>, Error> {
+        // A third-party root asks for its dependencies first, so brew's
+        // refusal to load an untrusted tap keeps its own note. The list is
+        // used only after the gate below passes.
+        let early = if role == Role::Root {
+            Some(self.brew.deps(kind, name)?)
+        } else {
+            None
+        };
+        let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, origin_tap, name, kind)?;
+        let query = NameQuery {
+            kind,
+            name: name.to_string(),
+            origin: origin_tap.to_ascii_lowercase(),
+            cutoff_sha256: blobs.cutoff.as_deref().map(sha256_hex),
+        };
+        let has_cutoff = query.cutoff_sha256.is_some();
+        let Some(answer) = self.ask_by_name(role, name, &query)? else {
+            return Ok(None);
+        };
+        let installs = answer.installs_cutoff(origin_tap);
+        // brew leaves an installed dependency at its current version alone,
+        // so one this run would upgrade only needs the gate when brew would
+        // change it.
+        let role = if role == Role::Install
+            && answer.installed_current
+            && !installs
+            && self.inv.find(name).is_some()
+        {
+            Role::Check
+        } else {
+            role
+        };
+        let passes = installs || (role == Role::Check && answer.installed_current);
+        if !passes {
+            let why = if !answer.tap.eq_ignore_ascii_case(origin_tap) {
+                NameWhy::OtherTap {
+                    tap: answer.tap,
+                    origin: origin_tap.to_ascii_lowercase(),
+                }
+            } else if !has_cutoff {
+                NameWhy::NoCutoff
+            } else if blobs
+                .cutoff
+                .as_deref()
+                .and_then(|b| soaktap::file_version(kind, b))
+                .as_deref()
+                == Some(answer.version.as_str())
+            {
+                NameWhy::ChangedSinceCutoff {
+                    what: kind_word(kind),
+                    version: answer.version,
+                }
+            } else {
+                NameWhy::NotCutoff {
+                    brew_version: answer.version,
+                }
+            };
+            self.hold(role, name, NameFail::Why(why));
+            return Ok(None);
+        }
+        let listed = match early {
+            Some(list) => list,
+            None => match self.brew.deps(kind, name) {
+                Ok(list) => list,
+                Err(Error::Brew { message, .. })
+                    if role != Role::Root && !taps::ambiguous_formula(&message) =>
+                {
+                    self.hold(role, name, NameFail::from_brew(&message, NameWhy::Deps));
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        Ok(Some((role, listed)))
+    }
+
+    /// Ask brew what a bare name is. A failure is a hold (None).
+    fn ask_by_name(
+        &mut self,
+        role: Role,
+        name: &str,
+        query: &NameQuery,
+    ) -> Result<Option<ByName>, Error> {
+        let asked = match self.brew.by_name(std::slice::from_ref(query)) {
+            Ok(rows) => rows.into_iter().next(),
+            // The whole call failed: the same as brew failing for this name.
+            Err(Error::Brew { message, .. }) => Some(Err(message)),
+            Err(e) => return Err(e),
+        };
+        match asked.unwrap_or_else(|| Err("brew gave no answer for this name".into())) {
+            Ok(a) => Ok(Some(a)),
+            Err(text) => {
+                self.hold(role, name, NameFail::from_brew(&text, NameWhy::Lookup));
+                Ok(None)
+            }
+        }
+    }
+
+    /// A member of homebrew/core or homebrew/cask installs from brewsoak's
+    /// tap. The root and every package this run installs get their cutoff
+    /// file staged; an installed dependency this run leaves alone is judged by
+    /// `installed_dep_rule`. Returns the member's role and its dependencies,
+    /// or None when it was held.
+    fn gate_soak_member(
+        &mut self,
+        origin_tap: &str,
+        name: &str,
+        kind: PkgKind,
+        role: Role,
+    ) -> Result<Option<(Role, Vec<String>)>, Error> {
+        let blobs = resolve_pkg_blobs(self.git, self.snaps, self.cache, origin_tap, name, kind)?;
+        let cutoff = blobs.cutoff.as_deref();
+        let token = if role == Role::Check {
+            let Some(token) = self.gate_installed_dep(origin_tap, name, kind, cutoff)? else {
+                return Ok(None);
+            };
+            token
+        } else {
+            // Staged for brew to install; nothing to stage without a cutoff.
+            let Some(cutoff) = cutoff else {
+                self.hold(role, name, NameFail::Why(NameWhy::NoCutoff));
+                return Ok(None);
+            };
+            if !self.stage_cutoff(role, name, kind, cutoff)? {
+                return Ok(None);
+            }
+            tap::soak_token(name)
+        };
+        match self.brew.deps(kind, &token) {
+            Ok(list) => Ok(Some((role, list))),
+            Err(Error::Brew { message, .. }) if !taps::ambiguous_formula(&message) => {
+                self.hold(
+                    role,
+                    name,
+                    NameFail::from_brew(&message, NameWhy::SoakedCopy),
+                );
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Stage the member's cutoff file; false when that held the walk.
+    fn stage_cutoff(
+        &mut self,
+        role: Role,
+        name: &str,
+        kind: PkgKind,
+        cutoff: &[u8],
+    ) -> Result<bool, Error> {
+        let pkg = PkgRef {
+            name: name.to_string(),
+            kind,
+        };
+        let version = soaktap::file_version(kind, cutoff);
+        match self
+            .soak
+            .stage(self.lock, self.brew, &pkg, cutoff, version.as_deref())?
+        {
+            Staged::Unchanged | Staged::Written => Ok(true),
+            Staged::NotReady(n) => {
+                self.hold(role, name, NameFail::TapNotReady(n));
+                Ok(false)
+            }
+            Staged::Leftover => {
+                self.hold(role, name, NameFail::Interrupted);
+                Ok(false)
+            }
+        }
+    }
+
+    /// An installed formula dependency this run does not upgrade. Returns the
+    /// token to list its dependencies with, or None when it was held.
+    fn gate_installed_dep(
+        &mut self,
+        origin_tap: &str,
+        name: &str,
+        kind: PkgKind,
+        cutoff: Option<&[u8]>,
+    ) -> Result<Option<String>, Error> {
+        let Some(pkg) = self.inv.find_in(origin_tap, name) else {
+            // Not installed after all: nothing to leave alone.
+            return Ok(Some(name.to_string()));
+        };
+        let query = NameQuery {
+            kind,
+            name: name.to_string(),
+            origin: origin_tap.to_ascii_lowercase(),
+            cutoff_sha256: cutoff.map(sha256_hex),
+        };
+        let Some(answer) = self.ask_by_name(Role::Check, name, &query)? else {
+            return Ok(None);
+        };
+        let installed = soaktap::file_version(kind, pkg.receipt_rb.as_bytes());
+        let rule = soaktap::installed_dep_rule(
+            answer.satisfied,
+            pkg.own_tap,
+            installed.as_deref(),
+            cutoff
+                .and_then(|c| soaktap::file_version(kind, c))
+                .as_deref(),
+            answer.installs_cutoff(origin_tap),
+        );
+        let installed_text = installed.unwrap_or_else(|| "?".to_string());
+        match rule {
+            DepRule::Pass => {}
+            DepRule::WriteCutoff => {
+                let Some(cutoff) = cutoff else {
+                    self.hold(Role::Check, name, NameFail::Why(NameWhy::NoCutoff));
+                    return Ok(None);
+                };
+                if !self.stage_cutoff(Role::Check, name, kind, cutoff)? {
+                    return Ok(None);
+                }
+            }
+            DepRule::WouldReplace => {
+                let why = NameWhy::WouldReplace {
+                    dep: name.to_string(),
+                    installed: installed_text,
+                    brew_version: answer.version,
+                    target: self.target.to_string(),
+                };
+                self.hold(Role::Check, name, NameFail::Why(why));
+                return Ok(None);
+            }
+            DepRule::CannotReplace => {
+                let why = NameWhy::CannotReplace {
+                    dep: name.to_string(),
+                    installed: installed_text,
+                };
+                self.hold(Role::Check, name, NameFail::Why(why));
+                return Ok(None);
+            }
+        }
+        // Its dependencies are listed through the tap only while brew would
+        // load that file: the receipt names the tap, the file is there and
+        // the tap is local and trusted. `tap_state` reads the state without
+        // creating the tap.
+        let through_tap = pkg.own_tap == Some(OwnTap::Soak)
+            && soaktap::tap_state(self.inv.soak_tap.as_ref()) == TapState::Ready
+            && tap_file_exists(self.soak.dir(), kind, name);
+        Ok(Some(if through_tap {
+            tap::soak_token(name)
+        } else {
+            name.to_string()
+        }))
+    }
+
     /// True when an installed dependency would be upgraded to its cutoff by
     /// its own plan entry: the same view the apply loop resolves, so a dep that
     /// is held, ahead, newer than its cutoff or pinned stays brew's.
@@ -396,9 +626,9 @@ mod tests {
     use crate::cmd::install::install;
 
     use crate::cmd::test_support::{
-        PACKER_REFUSAL, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg, formula_rb,
+        PACKER_REFUSAL, cask_rb, cfg_with, cfg24, core_snaps, formula_pkg_from, formula_rb,
         hashicorp_tap, inv_from, lock_runs, packer_world, run_has_token, run_is_name_install,
-        tap_snaps, tapped, test_cache,
+        strip_soak_prefix, tap_snaps, tapped, test_cache,
     };
 
     #[test]
@@ -506,8 +736,8 @@ mod tests {
             .collect();
         assert_eq!(
             installs,
-            vec!["widget", "helper", "zlib", "terraform"],
-            "deps first, each by bare name: {runs:?}"
+            vec!["widget", "helper", "ericfitz/brewsoak/zlib", "terraform"],
+            "deps first; core's zlib from the soak tap, the rest by bare name: {runs:?}"
         );
         let records = OriginRecords::load(cache.path());
         for name in ["widget", "helper", "zlib", "terraform"] {
@@ -1239,7 +1469,11 @@ mod tests {
             .map(|a| a.last().unwrap().clone())
             .collect();
         assert_eq!(installs.len(), 2, "{installs:?}");
-        assert_eq!(installs, ["zlib", "terraform"], "the bare dep is core's");
+        assert_eq!(
+            installs,
+            ["ericfitz/brewsoak/zlib", "terraform"],
+            "the bare dep is core's, installed from the soak tap"
+        );
     }
 
     #[test]
@@ -1328,7 +1562,11 @@ mod tests {
         );
         let brew = MockBrew {
             deps,
-            installed: vec![formula_pkg("widget", formula_rb("widget", "2.0.0", "w1"))],
+            installed: vec![formula_pkg_from(
+                "widget",
+                "acme/tools",
+                formula_rb("widget", "2.0.0", "w1"),
+            )],
             taps: vec![
                 tapped(
                     "hashicorp/tap",
@@ -1529,16 +1767,18 @@ mod tests {
             visible,
             vec![
                 vec!["update"],
-                vec!["install", "--formula", "lib"],
-                vec!["install", "--formula", "fresh"]
+                vec!["install", "--formula", "ericfitz/brewsoak/lib"],
+                vec!["install", "--formula", "ericfitz/brewsoak/fresh"]
             ]
         );
     }
 
     fn run_is_soaked_dep_install(runs: &[Vec<String>], name: &str, kind_flag: &str) -> bool {
         runs.iter().any(|args| {
-            args.first().map(String::as_str) == Some("install")
-                && args.last().map(String::as_str) == Some(name)
+            matches!(
+                args.first().map(String::as_str),
+                Some("install" | "upgrade")
+            ) && args.last().map(|a| strip_soak_prefix(a)) == Some(name)
                 && args.iter().any(|a| a == kind_flag)
                 && !args.iter().any(|a| a == "--ignore-dependencies")
         })
@@ -1760,7 +2000,7 @@ mod gate_tests {
     use crate::cmd::RunResult;
     use crate::cmd::install::install;
     use crate::cmd::test_support::{
-        cask_rb, cfg24, core_snaps, formula_pkg, formula_pkg_from, formula_rb, inv_from, lock_runs,
+        cask_rb, cfg24, core_snaps, formula_pkg_from, formula_rb, inv_from, lock_runs,
         run_is_name_install, tap_snaps, tapped, test_cache,
     };
     use crate::cmd::upgrade::upgrade;
@@ -1774,36 +2014,61 @@ mod gate_tests {
     use std::sync::Mutex;
 
     const CORE: &str = "homebrew/core";
+    /// The tap every package here comes from. A package of homebrew/core or
+    /// homebrew/cask installs from brewsoak's tap and is never gated by name;
+    /// these tests pin the gate that third-party packages keep.
+    const ACME: &str = "acme/tools";
 
-    /// Core formulae with a 1.1.0 cutoff and a 1.2.0 head each.
-    fn core_git(names: &[&str]) -> InMemoryGit {
+    /// Formulae of `acme/tools` with a 1.1.0 cutoff and a 1.2.0 head each.
+    fn tap_git(names: &[&str]) -> InMemoryGit {
         let git = InMemoryGit::new();
+        let files: Vec<String> = names.iter().map(|n| format!("Formula/{n}.rb")).collect();
+        let files: Vec<&str> = files.iter().map(String::as_str).collect();
         for name in names {
-            let dir = if name.starts_with("lib") {
-                "lib"
-            } else {
-                &name[..1]
-            };
             git.insert_blob(
-                "cutoffsha",
-                &format!("Formula/{dir}/{name}.rb"),
+                "tapcut",
+                &format!("Formula/{name}.rb"),
                 formula_rb(name, "1.1.0", "midsha"),
             );
             git.insert_blob(
-                "headsha",
-                &format!("Formula/{dir}/{name}.rb"),
+                "taphead",
+                &format!("Formula/{name}.rb"),
                 formula_rb(name, "1.2.0", "newsha"),
             );
         }
+        git.insert_tree("tapcut", &files);
+        git.insert_tree("taphead", &files);
         git
     }
 
+    /// Core and cask plus `acme/tools` at `tapcut`/`taphead`.
+    fn acme_snaps() -> crate::snapshot::Snapshots {
+        let mut snaps = core_snaps();
+        snaps.taps.insert(
+            ACME.into(),
+            crate::snapshot::TapState {
+                hours: crate::SoakHours::new(24).expect("hours"),
+                cutoff_sha: Some("tapcut".into()),
+                head_sha: "taphead".into(),
+                cutoff_time: None,
+            },
+        );
+        snaps
+    }
+
+    fn acme_brew() -> MockBrew {
+        MockBrew {
+            taps: vec![tapped(ACME, Some("https://example.com/acme/tools"))],
+            ..MockBrew::new()
+        }
+    }
+
     fn outdated(name: &str) -> InstalledPkg {
-        formula_pkg(name, formula_rb(name, "1.0.0", "oldsha"))
+        formula_pkg_from(name, ACME, formula_rb(name, "1.0.0", "oldsha"))
     }
 
     fn at_cutoff(name: &str) -> InstalledPkg {
-        formula_pkg(name, formula_rb(name, "1.1.0", "midsha"))
+        formula_pkg_from(name, ACME, formula_rb(name, "1.1.0", "midsha"))
     }
 
     fn answer(tap: &str, version: &str, same_source: bool, installed_current: bool) -> ByName {
@@ -1822,7 +2087,7 @@ mod gate_tests {
             .map(|(k, v)| {
                 (
                     (*k).to_string(),
-                    v.iter().map(|d| (*d).to_string()).collect(),
+                    v.iter().map(|d| format!("{ACME}/{d}")).collect(),
                 )
             })
             .collect()
@@ -1854,7 +2119,7 @@ mod gate_tests {
             &crate::lock::RunLock::for_tests(),
             brew,
             git,
-            &core_snaps(),
+            &acme_snaps(),
             test_cache(),
             tap.path(),
             &inv,
@@ -1871,7 +2136,7 @@ mod gate_tests {
         lock_runs(brew)
             .into_iter()
             .chain(brew.visible_runs.lock().expect("visible").clone())
-            .filter(|a| a.first().map(String::as_str) == Some("install"))
+            .filter(|a| matches!(a.first().map(String::as_str), Some("install" | "upgrade")))
             .collect()
     }
 
@@ -1933,12 +2198,12 @@ mod gate_tests {
 
     #[test]
     fn walk_asks_deps_by_bare_name() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let brew = RecordBrew {
             inner: MockBrew {
                 installed: vec![outdated("alpha")],
                 deps: deps_of(&[("alpha", &["libx"])]),
-                ..MockBrew::new()
+                ..acme_brew()
             },
             tokens: Mutex::new(Vec::new()),
             fail_by_name: None,
@@ -1951,7 +2216,7 @@ mod gate_tests {
             &crate::lock::RunLock::for_tests(),
             &brew,
             &git,
-            &core_snaps(),
+            &acme_snaps(),
             test_cache(),
             tap.path(),
             &inv,
@@ -1970,23 +2235,23 @@ mod gate_tests {
 
     #[test]
     fn by_name_is_asked_with_the_origin_and_the_raw_cutoff_hash() {
-        let git = core_git(&["alpha"]);
+        let git = tap_git(&["alpha"]);
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
-            ..MockBrew::new()
+            ..acme_brew()
         };
         run(&brew, &git, &["alpha"], &[]);
         let want = sha256_hex(formula_rb("alpha", "1.1.0", "midsha").as_bytes());
         let seen = brew.by_name_queries.lock().expect("queries").clone();
         let q = seen.iter().find(|q| q.name == "alpha").expect("asked");
-        assert_eq!(q.origin, CORE);
+        assert_eq!(q.origin, ACME);
         assert_eq!(q.kind, PkgKind::Formula);
         assert_eq!(q.cutoff_sha256.as_deref(), Some(want.as_str()));
     }
 
     #[test]
-    fn deps_failure_on_a_core_formula_holds_it_and_the_run_continues() {
-        let git = core_git(&["alpha", "delta"]);
+    fn deps_failure_on_a_third_party_formula_holds_it_and_the_run_continues() {
+        let git = tap_git(&["alpha", "delta"]);
         let mut deps_errors = BTreeMap::new();
         deps_errors.insert(
             "alpha".to_string(),
@@ -1995,7 +2260,7 @@ mod gate_tests {
         let brew = MockBrew {
             installed: vec![outdated("alpha"), outdated("delta")],
             deps_errors,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &[], &[]);
         assert!(r.refused, "{text}");
@@ -2005,7 +2270,7 @@ mod gate_tests {
             ),
             "{text}"
         );
-        assert!(text.contains("issue #17"), "{text}");
+        assert!(!text.contains("#17"), "{text}");
         assert!(run_is_name_install(&lock_runs(&brew), "delta"), "{text}");
         assert!(!run_is_name_install(&lock_runs(&brew), "alpha"), "{text}");
         assert!(summary(&text, "held", "1"), "{text}");
@@ -2014,7 +2279,7 @@ mod gate_tests {
 
     #[test]
     fn by_name_lookup_failure_holds_the_target_and_the_run_continues() {
-        let git = core_git(&["alpha", "delta"]);
+        let git = tap_git(&["alpha", "delta"]);
         let mut by_name = BTreeMap::new();
         by_name.insert(
             "alpha".to_string(),
@@ -2023,7 +2288,7 @@ mod gate_tests {
         let brew = MockBrew {
             installed: vec![outdated("alpha"), outdated("delta")],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &[], &[]);
         assert!(r.refused, "{text}");
@@ -2040,20 +2305,20 @@ mod gate_tests {
 
     #[test]
     fn missing_dep_not_at_brew_current_holds_the_target() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, false)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.2.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             deps: deps_of(&[("alpha", &["libx"])]),
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(r.refused, "{text}");
         assert!(
             text.contains(
-                "alpha: dependency libx: brew would install 1.2.0, which is not the soaked cutoff; brewsoak cannot install a soaked copy until issue #17 is fixed; use `brew upgrade alpha` to bypass brewsoak."
+                "alpha: dependency libx: brew would install 1.2.0, which is not the soaked cutoff; it installs once that change soaks; use `brew upgrade acme/tools/alpha` to bypass brewsoak."
             ),
             "{text}"
         );
@@ -2064,13 +2329,13 @@ mod gate_tests {
 
     #[test]
     fn same_version_changed_file_says_the_change_must_soak() {
-        let git = core_git(&["alpha"]);
+        let git = tap_git(&["alpha"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("alpha".to_string(), Ok(answer(CORE, "1.1.0", false, false)));
+        by_name.insert("alpha".to_string(), Ok(answer(ACME, "1.1.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(r.refused, "{text}");
@@ -2082,67 +2347,71 @@ mod gate_tests {
         );
         assert!(
             text.contains(
-                "alpha: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks; use `brew upgrade alpha` to bypass brewsoak."
+                "alpha: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks; use `brew upgrade acme/tools/alpha` to bypass brewsoak."
             ),
             "{text}"
         );
-        assert!(!text.contains("issue #17"), "{text}");
+        assert!(!text.contains("#17"), "{text}");
         assert!(!text.contains("not the soaked cutoff"), "{text}");
         assert!(installs(&brew).is_empty(), "{:?}", installs(&brew));
     }
 
     #[test]
     fn same_version_changed_dep_file_keeps_the_dependency_prefix() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.1.0", false, false)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.1.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             deps: deps_of(&[("alpha", &["libx"])]),
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (_, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(
             text.contains(
-                "alpha: dependency libx: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks; use `brew upgrade alpha` to bypass brewsoak."
+                "alpha: dependency libx: brew's 1.1.0 formula changed since the soaked cutoff; it installs once the change soaks; use `brew upgrade acme/tools/alpha` to bypass brewsoak."
             ),
             "{text}"
         );
-        assert!(!text.contains("issue #17"), "{text}");
+        assert!(!text.contains("#17"), "{text}");
     }
 
     #[test]
-    fn different_version_keeps_the_issue_17_text() {
-        let git = core_git(&["alpha"]);
+    fn different_version_says_it_installs_once_the_change_soaks() {
+        let git = tap_git(&["alpha"]);
         let mut by_name = BTreeMap::new();
         by_name.insert(
             "alpha".to_string(),
-            Ok(answer(CORE, "1.1.0_1", false, false)),
+            Ok(answer(ACME, "1.1.0_1", false, false)),
         );
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (_, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(
             text.contains("brew would install 1.1.0_1, which is not the soaked cutoff"),
             "{text}"
         );
-        assert!(text.contains("until issue #17 is fixed"), "{text}");
+        assert!(
+            text.contains("it installs once that change soaks"),
+            "{text}"
+        );
+        assert!(!text.contains("#17"), "{text}");
     }
 
     #[test]
     fn outdated_installed_dep_not_at_cutoff_holds_the_target() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, false)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.2.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha"), at_cutoff("libx")],
             deps: deps_of(&[("alpha", &["libx"])]),
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(r.refused, "{text}");
@@ -2155,15 +2424,15 @@ mod gate_tests {
 
     #[test]
     fn installed_current_dep_is_left_alone_and_walked_through() {
-        let git = core_git(&["alpha", "libx", "liby"]);
+        let git = tap_git(&["alpha", "libx", "liby"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, true)));
-        by_name.insert("liby".to_string(), Ok(answer(CORE, "1.2.0", false, false)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.2.0", false, true)));
+        by_name.insert("liby".to_string(), Ok(answer(ACME, "1.2.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha"), at_cutoff("libx")],
             deps: deps_of(&[("alpha", &["libx"]), ("libx", &["liby"])]),
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(r.refused, "{text}");
@@ -2176,14 +2445,14 @@ mod gate_tests {
 
     #[test]
     fn installed_current_dep_passes_alone() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, true)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.2.0", false, true)));
         let brew = MockBrew {
             installed: vec![outdated("alpha"), at_cutoff("libx")],
             deps: deps_of(&[("alpha", &["libx"])]),
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(!r.refused, "{text}");
@@ -2223,7 +2492,7 @@ mod gate_tests {
                 Some("https://github.com/cyclonedx/homebrew-cyclonedx"),
             )],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let snaps = tap_snaps(&git, "cyclonedx/cyclonedx", Some("tapcut"), "taphead");
         git.insert_tree("tapcut", &["Formula/cyclonedx-gomod.rb"]);
@@ -2264,13 +2533,13 @@ mod gate_tests {
 
     #[test]
     fn held_target_takes_back_its_upgraded_count() {
-        let git = core_git(&["alpha"]);
+        let git = tap_git(&["alpha"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("alpha".to_string(), Ok(answer(CORE, "1.2.0", false, false)));
+        by_name.insert("alpha".to_string(), Ok(answer(ACME, "1.2.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (_, text) = run(&brew, &git, &[], &[]);
         assert!(summary(&text, "held", "1"), "{text}");
@@ -2279,13 +2548,13 @@ mod gate_tests {
 
     #[test]
     fn dry_run_reports_the_same_hold() {
-        let git = core_git(&["alpha"]);
+        let git = tap_git(&["alpha"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("alpha".to_string(), Ok(answer(CORE, "1.2.0", false, false)));
+        by_name.insert("alpha".to_string(), Ok(answer(ACME, "1.2.0", false, false)));
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &[], &["--dry-run"]);
         assert!(r.refused, "{text}");
@@ -2297,20 +2566,22 @@ mod gate_tests {
     }
 
     #[test]
-    fn cask_target_is_gated_by_name() {
+    fn third_party_cask_target_is_gated_by_name() {
         let git = InMemoryGit::new();
-        git.insert_blob("caskcut", "Casks/a/app.rb", cask_rb("app", "1.1.0"));
-        git.insert_blob("caskhead", "Casks/a/app.rb", cask_rb("app", "1.2.0"));
+        git.insert_blob("tapcut", "Casks/app.rb", cask_rb("app", "1.1.0"));
+        git.insert_blob("taphead", "Casks/app.rb", cask_rb("app", "1.2.0"));
+        git.insert_tree("tapcut", &["Casks/app.rb"]);
+        git.insert_tree("taphead", &["Casks/app.rb"]);
         let ask = |at_cutoff: bool| {
             let mut by_name = BTreeMap::new();
             by_name.insert(
                 "app".to_string(),
-                Ok(answer("homebrew/cask", "1.2.0", at_cutoff, false)),
+                Ok(answer(ACME, "1.2.0", at_cutoff, false)),
             );
             let brew = RecordBrew {
                 inner: MockBrew {
                     by_name,
-                    ..MockBrew::new()
+                    ..acme_brew()
                 },
                 tokens: Mutex::new(Vec::new()),
                 fail_by_name: None,
@@ -2323,12 +2594,12 @@ mod gate_tests {
                 &crate::lock::RunLock::for_tests(),
                 &brew,
                 &git,
-                &core_snaps(),
+                &acme_snaps(),
                 test_cache(),
                 tap.path(),
                 &inv,
                 &cfg,
-                &["app".to_string()],
+                &["acme/tools/app".to_string()],
                 true,
                 false,
                 &[],
@@ -2347,7 +2618,7 @@ mod gate_tests {
             "{text}"
         );
         assert!(
-            text.contains("use `brew install app` to bypass brewsoak."),
+            text.contains("use `brew install acme/tools/app` to bypass brewsoak."),
             "{text}"
         );
         // Once the gate passes, the dependency list is asked by the bare token.
@@ -2357,7 +2628,7 @@ mod gate_tests {
 
     #[test]
     fn by_name_untrusted_tap_refusal_holds_with_the_trust_note() {
-        let git = core_git(&["alpha"]);
+        let git = tap_git(&["alpha"]);
         let mut by_name = BTreeMap::new();
         by_name.insert(
             "alpha".to_string(),
@@ -2366,7 +2637,7 @@ mod gate_tests {
         let brew = MockBrew {
             installed: vec![outdated("alpha")],
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &[], &[]);
         assert!(r.refused, "{text}");
@@ -2385,12 +2656,12 @@ mod gate_tests {
 
     #[test]
     fn whole_call_by_name_failure_on_a_dependency_holds_it_as_a_lookup_failure() {
-        let git = core_git(&["alpha", "delta", "libx"]);
+        let git = tap_git(&["alpha", "delta", "libx"]);
         let brew = RecordBrew {
             inner: MockBrew {
                 installed: vec![outdated("alpha"), outdated("delta")],
                 deps: deps_of(&[("alpha", &["libx"])]),
-                ..MockBrew::new()
+                ..acme_brew()
             },
             tokens: Mutex::new(Vec::new()),
             fail_by_name: Some("libx"),
@@ -2416,11 +2687,11 @@ mod gate_tests {
 
     #[test]
     fn whole_call_by_name_failure_on_the_target_holds_it_without_a_dep() {
-        let git = core_git(&["alpha"]);
+        let git = tap_git(&["alpha"]);
         let brew = RecordBrew {
             inner: MockBrew {
                 installed: vec![outdated("alpha")],
-                ..MockBrew::new()
+                ..acme_brew()
             },
             tokens: Mutex::new(Vec::new()),
             fail_by_name: Some("alpha"),
@@ -2437,14 +2708,14 @@ mod gate_tests {
     fn installed_dep_brew_leaves_alone_is_demoted_to_a_check() {
         // libx is outdated, so this run would upgrade it, but brew already
         // has its latest version installed and would not touch it.
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, true)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.2.0", false, true)));
         let brew = MockBrew {
             installed: vec![outdated("alpha"), outdated("libx")],
             deps: deps_of(&[("alpha", &["libx"])]),
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(!r.refused, "{text}");
@@ -2454,7 +2725,7 @@ mod gate_tests {
 
     #[test]
     fn deps_failure_on_a_dependency_holds_the_target_naming_it() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut deps_errors = BTreeMap::new();
         deps_errors.insert(
             "libx".to_string(),
@@ -2464,7 +2735,7 @@ mod gate_tests {
             installed: vec![outdated("alpha")],
             deps: deps_of(&[("alpha", &["libx"])]),
             deps_errors,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(r.refused, "{text}");
@@ -2480,9 +2751,9 @@ mod gate_tests {
 
     #[test]
     fn untrusted_tap_refusal_on_a_checked_dependency_keeps_the_trust_note() {
-        let git = core_git(&["alpha", "libx"]);
+        let git = tap_git(&["alpha", "libx"]);
         let mut by_name = BTreeMap::new();
-        by_name.insert("libx".to_string(), Ok(answer(CORE, "1.2.0", false, true)));
+        by_name.insert("libx".to_string(), Ok(answer(ACME, "1.2.0", false, true)));
         let mut deps_errors = BTreeMap::new();
         deps_errors.insert(
             "libx".to_string(),
@@ -2494,7 +2765,7 @@ mod gate_tests {
             deps: deps_of(&[("alpha", &["libx"])]),
             deps_errors,
             by_name,
-            ..MockBrew::new()
+            ..acme_brew()
         };
         let (r, text) = run(&brew, &git, &["alpha"], &[]);
         assert!(r.refused, "{text}");
