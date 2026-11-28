@@ -166,14 +166,6 @@ fn kind_word(kind: PkgKind) -> &'static str {
     }
 }
 
-fn tap_file_exists(dir: &Path, kind: PkgKind, name: &str) -> bool {
-    match kind {
-        PkgKind::Formula => tap::tap_formula_path(dir, name),
-        PkgKind::Cask => tap::tap_cask_path(dir, name),
-    }
-    .exists()
-}
-
 impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
     fn hold(&mut self, role: Role, name: &str, why: NameFail) {
         let dep = (role != Role::Root).then(|| name.to_string());
@@ -544,7 +536,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         // creating the tap.
         let through_tap = pkg.own_tap == Some(OwnTap::Soak)
             && soaktap::tap_state(self.inv.soak_tap.as_ref()) == TapState::Ready
-            && tap_file_exists(self.soak.dir(), kind, name);
+            && soaktap::tap_file(self.soak.dir(), kind, name).exists();
         Ok(Some(if through_tap {
             tap::soak_token(name)
         } else {

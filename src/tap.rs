@@ -344,15 +344,30 @@ mod tests {
         let flags = strs(&["--cask", "--formula", "--formulae", "--casks", "--dry-run"]);
         assert_eq!(
             soak_tap_args(&formula("wget"), false, &flags),
-            ["install", "--formula", "--dry-run", "ericfitz/brewsoak/wget"]
+            [
+                "install",
+                "--formula",
+                "--dry-run",
+                "ericfitz/brewsoak/wget"
+            ]
         );
         assert_eq!(
             soak_tap_args(&formula("wget"), true, &flags),
-            ["upgrade", "--formula", "--dry-run", "ericfitz/brewsoak/wget"]
+            [
+                "upgrade",
+                "--formula",
+                "--dry-run",
+                "ericfitz/brewsoak/wget"
+            ]
         );
         assert_eq!(
             soak_tap_args(&cask("firefox"), false, &flags),
-            ["install", "--cask", "--dry-run", "ericfitz/brewsoak/firefox"]
+            [
+                "install",
+                "--cask",
+                "--dry-run",
+                "ericfitz/brewsoak/firefox"
+            ]
         );
         assert_eq!(
             brew_install_args(&formula("wget"), "wget", &flags),

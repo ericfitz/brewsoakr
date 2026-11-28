@@ -94,6 +94,12 @@ pub fn unusable_with_packages(inv: &Inventory) -> Option<NotReady> {
 
 /// Version of a formula or cask file in brew's spelling (`1.0.0_2`); `None`
 /// when it does not parse.
+///
+/// Known limitation: this is the existing identity parser, not brew's version
+/// detection. For a formula whose keg directory name differs from the parsed
+/// version, recovery can put the old file back beside a new soak-tap keg, and
+/// the WriteCutoff rule never keeps its file; the package is then treated as a
+/// legacy receipt until its next soaked upgrade. See issue #24.
 pub fn file_version(kind: PkgKind, rb: &[u8]) -> Option<String> {
     let rb = std::str::from_utf8(rb).ok()?;
     let id = match kind {
@@ -103,7 +109,7 @@ pub fn file_version(kind: PkgKind, rb: &[u8]) -> Option<String> {
     Some(crate::report::identity_version(&id))
 }
 
-fn tap_file(dir: &Path, kind: PkgKind, name: &str) -> PathBuf {
+pub(crate) fn tap_file(dir: &Path, kind: PkgKind, name: &str) -> PathBuf {
     match kind {
         PkgKind::Formula => tap::tap_formula_path(dir, name),
         PkgKind::Cask => tap::tap_cask_path(dir, name),
@@ -354,6 +360,10 @@ impl SoakTap {
 
     /// Keep or put back every file staged since the last settle. A failure
     /// on one file does not stop the others; the first error is returned.
+    ///
+    /// The list is emptied first, so an entry whose settle failed is not tried
+    /// again in this run. Its undo entry stays on disk: a later `stage` of that
+    /// package returns `Leftover`, and the next recovery settles it.
     pub fn settle(&mut self, _lock: &RunLock, brew: &impl Brew) -> Result<(), Error> {
         let staged = std::mem::take(&mut self.staged);
         let mut first = None;
@@ -380,7 +390,9 @@ impl SoakTap {
 /// other file is left alone. Repeating it finds nothing; a run that died
 /// halfway is finished by the next, because `settle_entry` deletes an entry
 /// last. Every entry is tried; the first error is returned after the rest
-/// are settled. Creates nothing when there is no undo directory.
+/// are settled. Creates nothing when there is no undo directory. A directory
+/// that cannot be read is skipped without a message; a later run handles its
+/// entries.
 pub fn recover(_lock: &RunLock, brew: &impl Brew, dir: &Path, cache: &Path) -> Result<(), Error> {
     let undo_root = cache.join(UNDO_DIR);
     let mut first = None;
@@ -415,7 +427,9 @@ pub fn recover(_lock: &RunLock, brew: &impl Brew, dir: &Path, cache: &Path) -> R
 /// entry and no installed package of that kind and name whose receipt names
 /// the soak tap. Real directories only: a link is removed as a link and a
 /// linked directory is not entered. The test is the receipt alone, never the
-/// version. A removal that fails is reported and skipped.
+/// version. A removal that fails is reported and skipped. A directory that
+/// cannot be read is skipped without a message; a later run handles its
+/// entries.
 pub fn prune(
     _lock: &RunLock,
     dir: &Path,
@@ -852,6 +866,28 @@ mod tests {
     }
 
     #[test]
+    fn stage_meets_a_leftover_even_when_the_file_already_has_the_wanted_bytes() {
+        let e = env();
+        let brew = MockBrew::new();
+        let cutoff = formula_rb("1.1.0");
+        e.put(&e.file("Formula", "wget"), cutoff.as_bytes());
+        e.put(&e.undo("Formula", "wget", "rb"), b"saved\n");
+        let mut s = e.soak(Some(&local(true)), false);
+        let r = s
+            .stage(&e.lock, &brew, &fref("wget"), cutoff.as_bytes(), None)
+            .unwrap();
+        assert_eq!(r, Staged::Leftover);
+        assert_eq!(
+            fs::read(e.file("Formula", "wget")).unwrap(),
+            cutoff.as_bytes()
+        );
+        assert_eq!(
+            fs::read(e.undo("Formula", "wget", "rb")).unwrap(),
+            b"saved\n"
+        );
+    }
+
+    #[test]
     fn stage_meets_a_leftover_undo_entry() {
         let e = env();
         let brew = MockBrew::new();
@@ -1146,29 +1182,20 @@ mod tests {
             installed_dep_rule(false, l, Some("1"), Some("1"), true),
             CannotReplace
         );
+        assert_eq!(
+            installed_dep_rule(true, s, Some("1"), Some("2"), false),
+            Pass
+        );
+        assert_eq!(
+            installed_dep_rule(true, l, Some("1"), Some("2"), false),
+            Pass
+        );
     }
 
     const SOAK_RECEIPT: &str = "ericfitz/brewsoak";
 
     fn recover_in(e: &Env, brew: &MockBrew) -> Result<(), Error> {
         recover(&e.lock, brew, e.tap.path(), e.cache.path())
-    }
-
-    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-        fn walk(dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
-            let Ok(rd) = fs::read_dir(dir) else { return };
-            for ent in rd.flatten() {
-                let p = ent.path();
-                if p.is_dir() {
-                    walk(&p, out);
-                } else {
-                    out.insert(p.clone(), fs::read(&p).unwrap());
-                }
-            }
-        }
-        let mut m = BTreeMap::new();
-        walk(root, &mut m);
-        m
     }
 
     #[test]
@@ -1256,9 +1283,9 @@ mod tests {
         e.put(&e.undo("Formula", "wget", "rb"), OLD);
         recover_in(&e, &MockBrew::new()).unwrap();
         e.put(&e.file("Formula", "wget"), b"later\n");
-        let before = snapshot(e.tap.path());
+        let before = crate::cmd::test_support::tree(e.tap.path());
         recover_in(&e, &MockBrew::new()).unwrap();
-        assert_eq!(snapshot(e.tap.path()), before);
+        assert_eq!(crate::cmd::test_support::tree(e.tap.path()), before);
     }
 
     #[test]
@@ -1395,9 +1422,9 @@ mod tests {
         e.put(&e.tap.path().join(".github/x.yml"), b"y");
         e.put(&e.tap.path().join("Formula/notes.txt"), b"n");
         e.put(&e.tap.path().join("Other/x.rb"), b"o");
-        let before = snapshot(e.tap.path());
+        let before = crate::cmd::test_support::tree(e.tap.path());
         prune_in(&e, &inv_with(vec![]), true);
-        assert_eq!(snapshot(e.tap.path()), before);
+        assert_eq!(crate::cmd::test_support::tree(e.tap.path()), before);
     }
 
     #[test]
@@ -1465,6 +1492,22 @@ mod tests {
         assert_eq!(fs::read(outside.path().join("keep.rb")).unwrap(), b"k");
         assert!(out.contains("not a real directory"), "{out}");
         assert!(!e.file("Casks", "old").exists());
+    }
+
+    #[test]
+    fn prune_skips_a_symlinked_casks_root() {
+        let e = env();
+        let outside = tempfile::tempdir().unwrap();
+        e.put(&outside.path().join("keep.rb"), b"k");
+        std::os::unix::fs::symlink(outside.path(), e.tap.path().join("Casks")).unwrap();
+        e.put(&e.file("Formula", "old"), b"o");
+        let out = prune_in(&e, &inv_with(vec![]), false);
+        assert_eq!(fs::read(outside.path().join("keep.rb")).unwrap(), b"k");
+        assert!(
+            out.contains("not pruning") && out.contains("Casks"),
+            "{out}"
+        );
+        assert!(!e.file("Formula", "old").exists());
     }
 
     #[test]
@@ -1541,13 +1584,40 @@ mod tests {
     }
 
     #[test]
+    fn maintain_uses_the_tap_info_path_over_tap_root() {
+        let e = env();
+        let other = tempfile::tempdir().unwrap();
+        let mut entry = local(true);
+        entry.path = Some(e.tap.path().to_path_buf());
+        e.put(&e.file("Formula", "stale"), b"s");
+        let decoy = other.path().join("Formula/decoy.rb");
+        e.put(&decoy, b"d");
+        maintain(
+            &e.lock,
+            &MockBrew::new(),
+            Some(&entry),
+            other.path(),
+            e.cache.path(),
+            &inv_with(vec![]),
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(!e.file("Formula", "stale").exists());
+        assert_eq!(fs::read(&decoy).unwrap(), b"d");
+    }
+
+    #[test]
     fn maintain_does_nothing_when_not_tapped_or_remote() {
         let mut remote = local(true);
         remote.remote = Some("https://example.com/x.git".into());
         for entry in [None, Some(&remote)] {
             let e = env();
             seeded(&e);
-            let before = (snapshot(e.tap.path()), snapshot(e.cache.path()));
+            let before = (
+                crate::cmd::test_support::tree(e.tap.path()),
+                crate::cmd::test_support::tree(e.cache.path()),
+            );
             let mut out = Vec::new();
             maintain(
                 &e.lock,
@@ -1560,7 +1630,13 @@ mod tests {
                 &mut out,
             )
             .unwrap();
-            assert_eq!((snapshot(e.tap.path()), snapshot(e.cache.path())), before);
+            assert_eq!(
+                (
+                    crate::cmd::test_support::tree(e.tap.path()),
+                    crate::cmd::test_support::tree(e.cache.path())
+                ),
+                before
+            );
             assert!(out.is_empty());
         }
     }
