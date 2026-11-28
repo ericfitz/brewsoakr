@@ -16,11 +16,7 @@ pub(super) fn bypass_command(
     installed: Option<&Pkg>,
     anchored: bool,
 ) -> String {
-    let verb = if brew_verb == "reinstall" {
-        "reinstall"
-    } else {
-        "upgrade"
-    };
+    let verb = crate::nosoak::official_verb(brew_verb);
     match installed {
         Some(p) if p.kind == PkgKind::Formula && anchored => {
             format!("brew {verb} {}/{}", origin::CORE, p.name)

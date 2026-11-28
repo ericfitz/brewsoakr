@@ -103,6 +103,17 @@ pub fn target_token(t: &Target) -> String {
     }
 }
 
+/// The brew verb for a package brew knows under its official tap while it is
+/// installed from the soak tap: `install` would be refused over that keg, so
+/// it becomes `upgrade`; `reinstall` stays.
+pub fn official_verb(brew_verb: &str) -> &'static str {
+    if brew_verb == "reinstall" {
+        "reinstall"
+    } else {
+        "upgrade"
+    }
+}
+
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StepResult {
     pub status: Option<i32>,
@@ -241,6 +252,11 @@ pub fn run_step_after(
     let (switch, plain): (Vec<&Target>, Vec<&Target>) = targets
         .iter()
         .partition(|t| t.switch_tap && verb == "upgrade");
+    // brew refuses `install homebrew/core/<name>` over a keg from the soak
+    // tap, so an anchored formula under `install` runs as `upgrade`.
+    let (anchored, plain): (Vec<&Target>, Vec<&Target>) = plain
+        .into_iter()
+        .partition(|t| verb == "install" && t.official && t.kind == Some(PkgKind::Formula));
 
     // A formula and a cask can share a name, and a full token cannot tell
     // them apart (`brew upgrade vacuum` takes the formula). brew honours
@@ -250,14 +266,28 @@ pub fn run_step_after(
         && targets.iter().any(|t| t.kind == Some(PkgKind::Cask));
 
     let plain_flags = filter_for_verb(verb, &flags);
-    if !plain.is_empty()
-        && let Some(note) = dropped_note(verb, &plain_flags.dropped, "the no-soak run")
-    {
-        result.notes.push(note);
+    // `-g` is `--git` to install and `--greedy` to upgrade.
+    let anchored_verb = official_verb(verb);
+    let anchored_flags = filter_for_verb(anchored_verb, &crate::flags::without_greedy(&flags));
+    for (run_verb, run_flags, run_targets) in [
+        (verb, &plain_flags, &plain),
+        (anchored_verb, &anchored_flags, &anchored),
+    ] {
+        if !run_targets.is_empty()
+            && let Some(note) = dropped_note(run_verb, &run_flags.dropped, "the no-soak run")
+        {
+            result.notes.push(note);
+        }
     }
-    for (kind_flag, group) in kind_groups(&plain, split_kinds) {
-        let mut args = vec![verb.to_string()];
-        args.extend(plain_flags.kept.iter().cloned());
+    let plain_runs = kind_groups(&plain, split_kinds)
+        .into_iter()
+        .map(|(kind_flag, group)| (verb, &plain_flags, kind_flag, group));
+    let anchored_runs = kind_groups(&anchored, split_kinds)
+        .into_iter()
+        .map(|(kind_flag, group)| (anchored_verb, &anchored_flags, kind_flag, group));
+    for (run_verb, run_flags, kind_flag, group) in plain_runs.chain(anchored_runs) {
+        let mut args = vec![run_verb.to_string()];
+        args.extend(run_flags.kept.iter().cloned());
         args.extend(kind_flag.map(str::to_string));
         args.extend(group.iter().map(|t| token_of(t)));
         let output = brew.run_visible_in(&args, &mut section, &ctx)?;
@@ -1572,5 +1602,50 @@ Error: formula-b: boom\n"
                 vec!["upgrade".to_string(), want.to_string()]
             );
         }
+    }
+
+    #[test]
+    fn install_of_an_anchored_formula_runs_as_upgrade_in_its_own_group() {
+        let anchored = Target {
+            kind: Some(PkgKind::Formula),
+            official: true,
+            ..t("homebrew/core", "hello")
+        };
+        let plain = t("homebrew/core", "wget");
+        let brew = MockBrew::new();
+        run_step_after(
+            &brew,
+            "install",
+            &[],
+            &[anchored.clone(), plain.clone()],
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            runs(&brew),
+            vec![
+                vec!["install".to_string(), "wget".to_string()],
+                vec!["upgrade".to_string(), "homebrew/core/hello".to_string()],
+            ]
+        );
+        // `-g` is `--git` for install: upgrade must not read it as greedy.
+        let brew = MockBrew::new();
+        run_step_after(
+            &brew,
+            "install",
+            &["-g".to_string()],
+            &[anchored],
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            runs(&brew),
+            vec![vec![
+                "upgrade".to_string(),
+                "homebrew/core/hello".to_string()
+            ]]
+        );
     }
 }

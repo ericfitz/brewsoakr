@@ -4473,6 +4473,82 @@ mod tests {
             );
         }
 
+        /// Run `verb hello` with `NO_SOAK = ["hello"]` (and no other work);
+        /// the commands brew was given.
+        fn no_soak_hello_verb(
+            brew: &MockBrew,
+            git: &InMemoryGit,
+            snaps: &Snapshots,
+            tap: &Path,
+            verb: &str,
+        ) -> Vec<Vec<String>> {
+            let cfg = cfg_with("NO_SOAK = [\"hello\"]\n");
+            let inv = inv_from(brew, &cfg);
+            let lock = crate::lock::RunLock::for_tests();
+            let names = ["hello".to_string()];
+            let mut out = Vec::new();
+            match verb {
+                "install" => crate::cmd::install::install(
+                    &lock,
+                    brew,
+                    git,
+                    snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    false,
+                    false,
+                    &[],
+                    &mut out,
+                ),
+                "reinstall" => reinstall(
+                    &lock,
+                    brew,
+                    git,
+                    snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    &[],
+                    &mut out,
+                ),
+                other => panic!("{other}"),
+            }
+            .unwrap();
+            visible(brew)
+        }
+
+        #[test]
+        fn no_soak_install_of_an_anchored_formula_upgrades_it_under_core() {
+            // brew refuses `install homebrew/core/hello` over a soak-tap keg.
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = ahead_hello(tap.path(), true);
+            let runs = no_soak_hello_verb(&brew, &git, &snaps, tap.path(), "install");
+            assert!(
+                runs.contains(&strs(&["upgrade", "homebrew/core/hello"])),
+                "{runs:?}"
+            );
+            assert!(
+                !runs.contains(&strs(&["install", "homebrew/core/hello"])),
+                "{runs:?}"
+            );
+        }
+
+        #[test]
+        fn no_soak_reinstall_of_an_anchored_formula_reinstalls_under_core() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = ahead_hello(tap.path(), true);
+            let runs = no_soak_hello_verb(&brew, &git, &snaps, tap.path(), "reinstall");
+            assert!(
+                runs.contains(&strs(&["reinstall", "homebrew/core/hello"])),
+                "{runs:?}"
+            );
+        }
+
         #[test]
         fn no_soak_legacy_receipt_formula_keeps_its_bare_name() {
             let tap = tempfile::tempdir().unwrap();
