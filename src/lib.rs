@@ -786,6 +786,7 @@ mod tests {
                         pinned: false,
                         tap: None,
                         staged_path: None,
+                        keg_version: "1.0.0".into(),
                     }],
                     ..MockBrew::new()
                 },
@@ -1156,6 +1157,7 @@ mod tests {
                 pinned: false,
                 tap: Some("hashicorp/tap".into()),
  staged_path: None,
+ keg_version: "1.0.0".into(),
 }],
             taps: vec![
                 TapInfo::new("hashicorp/tap", Some("https://github.com/hashicorp/homebrew-tap")),

@@ -198,6 +198,8 @@ pub(super) fn formula_pkg(name: &str, receipt_rb: String) -> InstalledPkg {
         own_tap: None,
         name: name.into(),
         kind: PkgKind::Formula,
+        keg_version: crate::soaktap::file_version(PkgKind::Formula, receipt_rb.as_bytes())
+            .unwrap_or_default(),
         receipt_rb,
         pinned: false,
         tap: None,
@@ -390,6 +392,8 @@ pub(super) fn cask_pkg_from(name: &str, tap: &str, receipt_rb: String) -> Instal
         own_tap: None,
         name: name.into(),
         kind: PkgKind::Cask,
+        keg_version: crate::soaktap::file_version(PkgKind::Cask, receipt_rb.as_bytes())
+            .unwrap_or_default(),
         receipt_rb,
         pinned: false,
         tap: Some(tap.into()),

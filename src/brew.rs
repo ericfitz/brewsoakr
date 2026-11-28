@@ -27,6 +27,10 @@ pub struct InstalledPkg {
     /// formula file was installed from. brewsoak's own staging paths name
     /// the tap the keg was staged from.
     pub staged_path: Option<String>,
+    /// The keg's directory name under the Cellar (Caskroom for a cask), which
+    /// is how Homebrew reads an installed version (`Keg#version`). The
+    /// install record's own version can differ from it.
+    pub keg_version: String,
 }
 
 /// What a whole brewsoak session accumulated across every visible brew run:
@@ -1697,6 +1701,7 @@ fn parse_installed_json(
                 tap: source.tap,
                 own_tap: source.own_tap,
                 staged_path: source.path,
+                keg_version: version.unwrap_or_default(),
             });
         }
     }
@@ -1722,6 +1727,7 @@ fn parse_installed_json(
                 tap,
                 own_tap,
                 staged_path: None,
+                keg_version: version.unwrap_or_default(),
             });
         }
     }
@@ -1800,6 +1806,7 @@ pub(crate) fn soak_tap_kegs_brew_left_out(
             tap: None,
             own_tap: Some(OwnTap::Soak),
             staged_path: None,
+            keg_version: version,
         });
     }
     out
@@ -2154,6 +2161,7 @@ mod tests {
             pinned: false,
             tap: tap.map(str::to_string),
             staged_path: None,
+            keg_version: String::new(),
         }
     }
 
@@ -2230,12 +2238,15 @@ mod tests {
         .expect("parse fixture");
         assert_eq!(
             got,
-            vec![pkg(
-                "ca-certificates",
-                PkgKind::Formula,
-                "keg 2026-08-13",
-                Some("homebrew/core")
-            )]
+            kegs(
+                vec![pkg(
+                    "ca-certificates",
+                    PkgKind::Formula,
+                    "keg 2026-08-13",
+                    Some("homebrew/core")
+                )],
+                &["2026-08-13"]
+            )
         );
     }
 
@@ -2260,12 +2271,15 @@ mod tests {
         .expect("parse fixture");
         assert_eq!(
             got,
-            vec![pkg(
-                "wget",
-                PkgKind::Formula,
-                "keg 1.21.4",
-                Some("homebrew/core")
-            )]
+            kegs(
+                vec![pkg(
+                    "wget",
+                    PkgKind::Formula,
+                    "keg 1.21.4",
+                    Some("homebrew/core")
+                )],
+                &["1.21.4"]
+            )
         );
     }
 
@@ -2314,26 +2328,29 @@ mod tests {
         .expect("parse fixture");
         assert_eq!(
             got,
-            vec![
-                pkg(
-                    "wget",
-                    PkgKind::Formula,
-                    "class Wget; end",
-                    Some("homebrew/core")
-                ),
-                pkg(
-                    "foo",
-                    PkgKind::Formula,
-                    "class Foo; end",
-                    Some("acme/tools")
-                ),
-                pkg(
-                    "firefox",
-                    PkgKind::Cask,
-                    "cask \"firefox\"",
-                    Some("homebrew/cask")
-                ),
-            ]
+            kegs(
+                vec![
+                    pkg(
+                        "wget",
+                        PkgKind::Formula,
+                        "class Wget; end",
+                        Some("homebrew/core")
+                    ),
+                    pkg(
+                        "foo",
+                        PkgKind::Formula,
+                        "class Foo; end",
+                        Some("acme/tools")
+                    ),
+                    pkg(
+                        "firefox",
+                        PkgKind::Cask,
+                        "cask \"firefox\"",
+                        Some("homebrew/cask")
+                    ),
+                ],
+                &["1.21.4", "0.1.0", "128.0"]
+            )
         );
     }
 
@@ -2530,13 +2547,24 @@ mod tests {
         .expect("parse");
         assert_eq!(
             got,
-            vec![pkg(
-                "wget",
-                PkgKind::Formula,
-                "new-receipt",
-                Some("homebrew/core")
-            )]
+            kegs(
+                vec![pkg(
+                    "wget",
+                    PkgKind::Formula,
+                    "new-receipt",
+                    Some("homebrew/core")
+                )],
+                &["1.21.4"]
+            )
         );
+    }
+
+    /// `pkgs` with their keg directory versions filled in.
+    fn kegs(mut pkgs: Vec<InstalledPkg>, versions: &[&str]) -> Vec<InstalledPkg> {
+        for (p, v) in pkgs.iter_mut().zip(versions) {
+            p.keg_version = (*v).to_string();
+        }
+        pkgs
     }
 
     fn core_source() -> ReceiptSource {
@@ -2579,6 +2607,7 @@ mod tests {
             tap: None,
             own_tap: None,
             staged_path: None,
+            keg_version: String::new(),
         }
     }
 
@@ -2608,6 +2637,7 @@ mod tests {
                 tap: None,
                 own_tap: Some(OwnTap::Soak),
                 staged_path: None,
+                keg_version: "2.12.2".into(),
             }]
         );
     }

@@ -29,6 +29,9 @@ pub struct Pkg {
     /// Which of brewsoak's own taps the receipt names, if either.
     pub own_tap: Option<OwnTap>,
     pub pinned: bool,
+    /// The keg's Cellar directory name: brew's own reading of the installed
+    /// version, whatever the receipt says.
+    pub keg_version: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -91,6 +94,7 @@ impl Inventory {
                 receipt_tap: p.tap,
                 own_tap: p.own_tap,
                 pinned: p.pinned,
+                keg_version: p.keg_version,
             });
         }
         inv
@@ -222,6 +226,7 @@ mod tests {
             pinned: false,
             tap: tap.map(str::to_string),
             staged_path: None,
+            keg_version: String::new(),
         }
     }
 

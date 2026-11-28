@@ -1131,6 +1131,7 @@ mod tests {
             receipt_tap: None,
             own_tap,
             pinned: false,
+            keg_version: String::new(),
         }
     }
 

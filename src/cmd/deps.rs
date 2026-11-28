@@ -513,7 +513,9 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 .as_deref(),
             answer.installs_cutoff(origin_tap),
         );
-        let installed_text = installed.unwrap_or_else(|| "?".to_string());
+        // Said as brew reads it: the keg's directory name (`Keg#version`),
+        // which always exists, not a version parsed from the install record.
+        let installed_text = pkg.keg_version.clone();
         match rule {
             DepRule::Pass => {}
             DepRule::WriteCutoff => {
@@ -2970,6 +2972,46 @@ mod soak_closure_tests {
             "{text}"
         );
         assert!(visible(&brew).len() == 1, "{:?}", visible(&brew));
+    }
+
+    #[test]
+    fn hold_text_names_the_keg_directory_version_not_the_install_record() {
+        // The keg directory says 1.0.0_1; the receipt file parses to 1.0.0
+        // (WouldReplace), or does not parse at all (CannotReplace).
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git) = world(
+            tap.path(),
+            InstalledPkg {
+                keg_version: "1.0.0_1".into(),
+                ..pinned_old("dep")
+            },
+        );
+        brew.by_name
+            .insert("dep".into(), answer(false, "2.0", false));
+        let text = run(&brew, &git, tap.path(), &["target"]);
+        assert!(
+            text.contains("brew would replace installed dep 1.0.0_1 with 2.0,"),
+            "{text}"
+        );
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git) = world(
+            tap.path(),
+            InstalledPkg {
+                keg_version: "1.0.0".into(),
+                receipt_rb: "not a formula".into(),
+                ..with_tap(pinned_old("dep"), OwnTap::Legacy)
+            },
+        );
+        brew.by_name
+            .insert("dep".into(), answer(false, "1.2.0", false));
+        let text = run(&brew, &git, tap.path(), &["target"]);
+        assert!(
+            text.contains(
+                "brew cannot replace installed dep 1.0.0 as a dependency; run brew upgrade dep first"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("installed dep ?"), "{text}");
     }
 
     #[test]

@@ -123,6 +123,7 @@ mod tests {
             receipt_tap: None,
             own_tap: None,
             pinned: false,
+            keg_version: String::new(),
         }
     }
 
