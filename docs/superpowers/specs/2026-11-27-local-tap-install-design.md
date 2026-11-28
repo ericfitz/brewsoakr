@@ -717,6 +717,12 @@ lines that start with `no_autobump!` are dropped and nothing else changes
 (Fact 9). A blob with no such line is written byte for byte, and brew's
 `ruby_source_checksum` of it then equals the SHA-256 of the cutoff blob
 (Fact 8). The stanza only controls Homebrew's own version-bump automation.
+
+*Decision (Eric, 2026-11-27, issue #23):* a multi-line `no_autobump!` stanza
+is removed whole: a line ending in `,` or `\` pulls in the next line, and a
+`do ... end` block runs to the first later line with the stanza's own
+indentation that starts with `end`. A block with no such line loses only its
+first line. Every other byte stays unchanged.
 The by-name gate for third-party packages keeps hashing the raw blob.
 
 **Layout.** `Formula/<name>.rb` and `Casks/<token>.rb`, flat, written by

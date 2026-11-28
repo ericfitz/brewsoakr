@@ -24,29 +24,94 @@ pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf,
     Ok(path)
 }
 
-/// The cutoff blob with every line removed whose first non-blank text is
-/// `no_autobump!` (Homebrew allows the stanza only in official taps). Every
-/// other byte, line endings included, is unchanged.
+/// The cutoff blob with every `no_autobump!` stanza removed (Homebrew allows
+/// the stanza only in official taps). Every other byte, line endings
+/// included, is unchanged.
 ///
-/// Only the line that starts with `no_autobump!` goes. A stanza continued on
-/// the next line leaves that line behind; brew then either ignores it or fails
-/// to load the file, and a file that does not load holds the package (`brew
-/// could not load its soaked copy`). The spec lists a multi-line stanza under
-/// "Not verified"; manual check 13.9 looks for one in casks.
+/// A stanza starts at a line whose first non-blank text is `no_autobump!` and
+/// covers:
+/// - that line;
+/// - each following line while the previous one ends in `,` or `\`;
+/// - when the last of those lines ends in a `do` (with or without `|args|`),
+///   everything through the line that closes the block: the first later line
+///   that has the stanza's own indentation and starts with `end`.
+///
+/// A `do` block with no such closing line is not removed past its first line
+/// (the file then fails to load, and a file that does not load holds the
+/// package). Eric decided on 2026-11-27 that multi-line stanzas are handled.
 pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
     const STANZA: &[u8] = b"no_autobump!";
+    let lines: Vec<&[u8]> = rb.split_inclusive(|b| *b == b'\n').collect();
     let mut out = Vec::with_capacity(rb.len());
-    for line in rb.split_inclusive(|b| *b == b'\n') {
-        let start = line
-            .iter()
-            .position(|b| !b.is_ascii_whitespace())
-            .unwrap_or(line.len());
-        if line[start..].starts_with(STANZA) {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let indent = indent_of(line);
+        if !line[indent.len()..].starts_with(STANZA) {
+            out.extend_from_slice(line);
+            i += 1;
             continue;
         }
-        out.extend_from_slice(line);
+        let mut last = i;
+        while last + 1 < lines.len() && continues(lines[last]) {
+            last += 1;
+        }
+        let end = opens_block(lines[last])
+            .then(|| (last + 1..lines.len()).find(|&j| closes_block(lines[j], indent)))
+            .flatten();
+        last = end.unwrap_or(last);
+        i = last + 1;
     }
     out
+}
+
+/// The leading blanks of a line (all of a blank line).
+fn indent_of(line: &[u8]) -> &[u8] {
+    let n = line
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(line.len());
+    &line[..n]
+}
+
+/// The line without its trailing whitespace and line ending.
+fn code_of(line: &[u8]) -> &[u8] {
+    let n = line
+        .iter()
+        .rposition(|b| !b.is_ascii_whitespace())
+        .map_or(0, |p| p + 1);
+    &line[..n]
+}
+
+/// The line ends in `,` or `\`, so the next line belongs to the same statement.
+fn continues(line: &[u8]) -> bool {
+    matches!(code_of(line).last(), Some(b',' | b'\\'))
+}
+
+/// The line ends in `do` or `do |args|`.
+fn opens_block(line: &[u8]) -> bool {
+    let code = code_of(line);
+    let code = match code.last() {
+        Some(b'|') => match code[..code.len() - 1].iter().rposition(|b| *b == b'|') {
+            Some(p) => code_of(&code[..p]),
+            None => return false,
+        },
+        _ => code,
+    };
+    code.ends_with(b"do")
+        && (code.len() == 2
+            || !(code[code.len() - 3].is_ascii_alphanumeric() || code[code.len() - 3] == b'_'))
+}
+
+/// The line is indented exactly as `indent` and starts with the word `end`.
+fn closes_block(line: &[u8], indent: &[u8]) -> bool {
+    let Some(rest) = line.strip_prefix(indent) else {
+        return false;
+    };
+    rest.starts_with(b"end")
+        && !rest
+            .get(3)
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
 }
 
 /// `ericfitz/brewsoak/<name>`.
@@ -215,6 +280,44 @@ mod tests {
         ] {
             assert_eq!(sanitize_unofficial(blob), blob);
         }
+    }
+
+    #[test]
+    fn sanitize_removes_a_stanza_continued_by_a_comma_or_a_backslash() {
+        let rb = b"class S < Formula\n  no_autobump! :a,\n    because: :bumped_by_upstream\n  url \"u\"\n  no_autobump! \\\n    because: :x\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  url \"u\"\nend\n"
+        );
+        let rb = b"class S < Formula\r\n  no_autobump! :a,\r\n    :b,\r\n    :c\r\n  keep\r\nend";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\r\n  keep\r\nend"
+        );
+    }
+
+    #[test]
+    fn sanitize_removes_a_do_block_stanza_through_its_own_end() {
+        let rb = b"class S < Formula\n  no_autobump! because: :x do\n    if true\n      foo\n    end\n  end\n  keep do\n  end\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  keep do\n  end\nend\n"
+        );
+        let rb = b"cask \"x\" do\n  no_autobump! do |a|\n    a.b\n  end\n  keep\nend\n";
+        assert_eq!(sanitize_unofficial(rb), b"cask \"x\" do\n  keep\nend\n");
+    }
+
+    #[test]
+    fn sanitize_keeps_everything_after_an_unclosed_block() {
+        let rb = b"class S < Formula\n  no_autobump! do\n    x\nend\n";
+        // The closing `end` has a different indent: only the first line goes.
+        assert_eq!(sanitize_unofficial(rb), b"class S < Formula\n    x\nend\n");
+    }
+
+    #[test]
+    fn sanitize_does_not_treat_a_word_ending_in_do_as_a_block() {
+        let rb = b"  no_autobump! because: :undo\n  keep\n  end\n";
+        assert_eq!(sanitize_unofficial(rb), b"  keep\n  end\n");
     }
 
     #[test]
