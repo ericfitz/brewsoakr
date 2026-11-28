@@ -172,10 +172,10 @@ fn note_soak_tap_refusal(result: &mut StepResult, output: &std::process::Output)
         return;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let Some(tap) = crate::taps::untrusted_tap(&text) else {
-        return;
-    };
-    if !tap.eq_ignore_ascii_case(crate::origin::SOAK_TAP) {
+    if !crate::taps::untrusted_taps(&text)
+        .iter()
+        .any(|tap| tap.eq_ignore_ascii_case(crate::origin::SOAK_TAP))
+    {
         return;
     }
     let note = crate::soaktap::NotReady::Untrusted.note();
@@ -1472,6 +1472,28 @@ Error: formula-b: boom\n"
             r.notes
         );
         assert_eq!(r.status, Some(1));
+
+        // The soak tap's refusal is found after another tap's.
+        let brew = MockBrew {
+            next_status: 1,
+            next_stdout: [refusal("hashicorp/tap"), refusal("ericfitz/brewsoak")].concat(),
+            ..MockBrew::new()
+        };
+        let r = run_step_after(
+            &brew,
+            "upgrade",
+            &[],
+            &[t("homebrew/core", "wget")],
+            true,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            r.notes.iter().filter(|n| **n == note).count(),
+            1,
+            "{:?}",
+            r.notes
+        );
 
         // Another tap's refusal, or a success, adds nothing.
         let brew = MockBrew {

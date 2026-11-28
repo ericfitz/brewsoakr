@@ -134,14 +134,23 @@ pub fn resolve_path(tree: &[String], kind: PkgKind, name: &str) -> Option<String
 /// u/r.`), lowercase. brewsoak never runs `brew trust` for a third-party tap;
 /// that is the user's decision.
 pub fn untrusted_tap(brew_output: &str) -> Option<String> {
+    untrusted_taps(brew_output).into_iter().next()
+}
+
+/// Every tap named by such a refusal, in the order brew printed them.
+pub fn untrusted_taps(brew_output: &str) -> Vec<String> {
     let marker = "from untrusted tap ";
     let lower = brew_output.to_ascii_lowercase();
-    let rest = &lower[lower.find(marker)? + marker.len()..];
-    let tap = rest
-        .split_whitespace()
-        .next()?
-        .trim_end_matches(['.', ',', ';']);
-    (!tap.is_empty()).then(|| tap.to_string())
+    lower
+        .match_indices(marker)
+        .filter_map(|(at, _)| {
+            let tap = lower[at + marker.len()..]
+                .split_whitespace()
+                .next()?
+                .trim_end_matches(['.', ',', ';']);
+            (!tap.is_empty()).then(|| tap.to_string())
+        })
+        .collect()
 }
 
 /// True when brew's output is its `TapFormulaAmbiguityError`: a bare formula

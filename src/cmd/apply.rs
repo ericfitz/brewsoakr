@@ -385,13 +385,18 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(())
     }
 
+    /// A note's text is printed once, whichever kind first recorded it.
     fn defer(&mut self, msg: String) {
-        self.deferred.push((NoteKind::Other, msg));
+        if !self.deferred.iter().any(|(_, text)| *text == msg) {
+            self.deferred.push((NoteKind::Other, msg));
+        }
     }
 
     /// A package brewsoak refused or could not act on.
     fn defer_held(&mut self, msg: String) {
-        self.deferred.push((NoteKind::Held, msg));
+        if !self.deferred.iter().any(|(_, text)| *text == msg) {
+            self.deferred.push((NoteKind::Held, msg));
+        }
     }
 
     /// Say once which of `flags` `brew <verb>` would reject and we dropped.
@@ -3827,6 +3832,49 @@ mod tests {
             assert!(r.refused);
             assert_eq!(tap_file(tap.path(), "Formula/alpha.rb"), None);
             assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn tap_not_ready_note_prints_once_when_a_hold_and_a_no_soak_step_both_raise_it() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = hello_world(tap.path(), false, "1.1.0");
+            brew.installed
+                .push(formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha")));
+            brew.outdated = vec!["wget".into()];
+            brew.next_status = 1;
+            brew.next_stdout =
+                b"Error: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.\n"
+                    .to_vec();
+            // The `brew update` run succeeds; the no-soak step then fails.
+            *brew.next_outputs.lock().unwrap() =
+                std::collections::VecDeque::from(vec![(0, Vec::new())]);
+            let cfg = cfg_with("NO_SOAK = [\"wget\"]\n");
+            let inv = inv_from(&brew, &cfg);
+            let mut out = Vec::new();
+            upgrade(
+                &crate::lock::RunLock::for_tests(),
+                &brew,
+                &git,
+                &snaps,
+                test_cache(),
+                tap.path(),
+                &inv,
+                &cfg,
+                &["hello".to_string(), "wget".to_string()],
+                &[],
+                &mut out,
+            )
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(
+                text.contains("held hello: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Untrusted.note()).count(),
+                1,
+                "{text}"
+            );
         }
     }
 }
