@@ -2951,4 +2951,602 @@ mod tests {
             assert_eq!(tree(&undo), undo_before, "{verb}");
         }
     }
+
+    mod soak_tap_tests {
+        use super::*;
+        use crate::cmd::combine_exit;
+        use crate::cmd::test_support::{
+            assert_soak_tap_commands, run_has_token, run_upgrade, soak_and_packer_world,
+            soak_tap_at, soak_world, summary_has, tap_file, tree,
+        };
+        use crate::origin::SOAK_TAP;
+        use crate::soaktap::{NotReady, UNDO_DIR};
+        use crate::taps::TapInfo;
+
+        fn cutoff_alpha() -> String {
+            formula_rb("alpha", "1.1.0", "midsha")
+        }
+
+        fn undo_tree() -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+            tree(&test_cache().join(UNDO_DIR))
+        }
+
+        fn visible(brew: &MockBrew) -> Vec<Vec<String>> {
+            brew.visible_runs.lock().unwrap().clone()
+        }
+
+        fn strs(args: &[&str]) -> Vec<String> {
+            args.iter().map(|a| a.to_string()).collect()
+        }
+
+        fn tap_news(brew: &MockBrew) -> usize {
+            lock_runs(brew)
+                .iter()
+                .filter(|a| a.first().map(String::as_str) == Some("tap-new"))
+                .count()
+        }
+
+        #[test]
+        fn not_tapped_real_run_creates_the_tap_then_holds() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+            brew.soak_tap = None;
+            let (r, text) = run_upgrade(
+                &brew,
+                &git,
+                &snaps,
+                tap.path(),
+                &["alpha", "hashicorp/tap/packer"],
+                &[],
+            );
+            assert_eq!(tap_news(&brew), 1, "{:?}", lock_runs(&brew));
+            assert!(
+                text.contains("held alpha: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Untrusted.note()).count(),
+                1,
+                "{text}"
+            );
+            assert!(visible(&brew).contains(&strs(&["install", "--formula", "packer"])));
+            assert_eq!(combine_exit(r.refused, r.brew_status), 1);
+            assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn not_tapped_dry_run_creates_nothing() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+            brew.soak_tap = None;
+            let (_, text) =
+                run_upgrade(&brew, &git, &snaps, tap.path(), &["alpha"], &["--dry-run"]);
+            assert_eq!(tap_news(&brew), 0);
+            assert!(text.contains(&NotReady::DryRunNotTapped.note()), "{text}");
+            assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn remote_soak_tap_is_held_and_never_used() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+            let remote = "https://example.com/x/homebrew-brewsoak";
+            brew.soak_tap = Some(TapInfo::new(SOAK_TAP, Some(remote)));
+            let (_, text) = run_upgrade(&brew, &git, &snaps, tap.path(), &["alpha"], &[]);
+            assert!(
+                text.contains(&NotReady::Remote(remote.into()).note()),
+                "{text}"
+            );
+            assert!(
+                text.contains("held alpha: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert!(!run_has_token(&lock_runs(&brew), "ericfitz/brewsoak/alpha"));
+            assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn untrusted_soak_tap_holds_every_soak_tap_package_with_one_note() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = two_outdated_world("");
+            brew.soak_tap = Some(soak_tap_at(tap.path(), false));
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &[], &[]);
+            assert!(
+                text.contains("held left: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert!(
+                text.contains("held right: brewsoak's tap is not ready"),
+                "{text}"
+            );
+            assert_eq!(
+                text.matches(&NotReady::Untrusted.note()).count(),
+                1,
+                "{text}"
+            );
+            assert!(summary_has(&text, "held", "2"), "{text}");
+            assert!(summary_has(&text, "upgraded", "0"), "{text}");
+            assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn failed_tap_new_is_a_hold_not_an_error() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.soak_tap = None;
+            brew.tap_new_error = Some("Error: nope".into());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(r.refused, "{text}");
+            assert!(
+                text.contains(&NotReady::CreateFailed("Error: nope".into()).note()),
+                "{text}"
+            );
+        }
+
+        #[test]
+        fn tap_info_without_a_trusted_field_is_used() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.soak_tap = None;
+            brew.taps.extend(
+                crate::taps::parse_tap_info_json(r#"[{"name":"ericfitz/brewsoak","remote":null}]"#)
+                    .unwrap(),
+            );
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(!r.refused, "{text}");
+            assert!(
+                visible(&brew).contains(&strs(&[
+                    "upgrade",
+                    "--formula",
+                    "ericfitz/brewsoak/alpha"
+                ])),
+                "{:?}",
+                visible(&brew)
+            );
+        }
+
+        fn run_verbs(
+            brew: &MockBrew,
+            git: &InMemoryGit,
+            tap: &Path,
+            verb: &str,
+            cask: bool,
+            name: &str,
+        ) {
+            let cfg = cfg24();
+            let inv = inv_from(brew, &cfg);
+            let lock = crate::lock::RunLock::for_tests();
+            let names = [name.to_string()];
+            let snaps = core_snaps();
+            let mut out = Vec::new();
+            match verb {
+                "upgrade" => upgrade(
+                    &lock,
+                    brew,
+                    git,
+                    &snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    &[],
+                    &mut out,
+                ),
+                "install" => crate::cmd::install::install(
+                    &lock,
+                    brew,
+                    git,
+                    &snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    cask,
+                    false,
+                    &[],
+                    &mut out,
+                ),
+                "reinstall" => reinstall(
+                    &lock,
+                    brew,
+                    git,
+                    &snaps,
+                    test_cache(),
+                    tap,
+                    &inv,
+                    &cfg,
+                    &names,
+                    &[],
+                    &mut out,
+                ),
+                other => panic!("{other}"),
+            }
+            .unwrap_or_else(|e| panic!("{verb}: {e}"));
+        }
+
+        #[test]
+        fn soak_tap_verb_follows_the_installed_state_for_every_brewsoak_verb() {
+            let want = strs(&["upgrade", "--formula", "ericfitz/brewsoak/alpha"]);
+            for verb in ["upgrade", "install", "reinstall"] {
+                let tap = tempfile::tempdir().unwrap();
+                let (brew, git) = soak_world(tap.path());
+                run_verbs(&brew, &git, tap.path(), verb, false, "alpha");
+                assert!(
+                    visible(&brew).contains(&want),
+                    "{verb}: {:?}",
+                    visible(&brew)
+                );
+            }
+            // An absent formula installs.
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.installed.retain(|p| p.name != "alpha");
+            run_verbs(&brew, &git, tap.path(), "install", false, "alpha");
+            assert!(
+                visible(&brew).contains(&strs(&[
+                    "install",
+                    "--formula",
+                    "ericfitz/brewsoak/alpha"
+                ])),
+                "{:?}",
+                visible(&brew)
+            );
+            // A cask always installs, installed or not.
+            let git = InMemoryGit::new();
+            git.insert_blob("caskcut", "Casks/f/firefox.rb", cask_rb("firefox", "1.0"));
+            git.insert_blob("caskhead", "Casks/f/firefox.rb", cask_rb("firefox", "1.1"));
+            let cask_cmd = strs(&["install", "--cask", "ericfitz/brewsoak/firefox"]);
+            let tap = tempfile::tempdir().unwrap();
+            let mut brew = MockBrew::new();
+            brew.soak_tap = Some(soak_tap_at(tap.path(), true));
+            run_verbs(&brew, &git, tap.path(), "install", true, "firefox");
+            assert!(visible(&brew).contains(&cask_cmd), "{:?}", visible(&brew));
+            let tap = tempfile::tempdir().unwrap();
+            let mut brew = MockBrew::new();
+            brew.soak_tap = Some(soak_tap_at(tap.path(), true));
+            brew.installed.push(cask_pkg_from(
+                "firefox",
+                "homebrew/cask",
+                crate::brew::version_only_cask_receipt("firefox", "0.9"),
+            ));
+            run_verbs(&brew, &git, tap.path(), "upgrade", true, "firefox");
+            assert!(visible(&brew).contains(&cask_cmd), "{:?}", visible(&brew));
+        }
+
+        fn files_seen_by_brew(blob: &str) -> Vec<Option<Vec<u8>>> {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = soak_world(tap.path());
+            git.insert_blob("cutoffsha", "Formula/a/alpha.rb", blob.to_string());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (seen_in, dir) = (seen.clone(), tap.path().to_path_buf());
+            *brew.on_call.lock().unwrap() = Some(Box::new(move |args: &[String]| {
+                let asks_alpha = args.last().is_some_and(|a| a == "ericfitz/brewsoak/alpha");
+                let verb = args.first().map(String::as_str);
+                let deps = verb == Some("deps");
+                if asks_alpha && (deps || verb == Some("upgrade")) {
+                    seen_in
+                        .lock()
+                        .unwrap()
+                        .push(std::fs::read(dir.join("Formula/alpha.rb")).ok());
+                }
+            }));
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(!text.contains("held alpha"), "{text}");
+            seen.lock().unwrap().clone()
+        }
+
+        #[test]
+        fn tap_holds_the_cutoff_file_when_brew_is_asked() {
+            let with_stanza = format!(
+                "{}  no_autobump! because: :bumped_by_upstream\n",
+                cutoff_alpha().trim_end_matches("end\n")
+            ) + "end\n";
+            assert!(with_stanza.contains("no_autobump!"));
+            let seen = files_seen_by_brew(&with_stanza);
+            assert_eq!(seen.len(), 2, "deps and upgrade: {seen:?}");
+            let want = crate::tap::sanitize_unofficial(with_stanza.as_bytes());
+            assert_ne!(want, with_stanza.as_bytes());
+            for file in &seen {
+                assert_eq!(file.as_deref(), Some(want.as_slice()));
+            }
+            // No stanza: the file is the blob, byte for byte.
+            let plain = cutoff_alpha();
+            for file in files_seen_by_brew(&plain) {
+                assert_eq!(file.as_deref(), Some(plain.as_bytes()));
+            }
+        }
+
+        #[test]
+        fn third_party_file_is_never_written_to_the_tap() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git, snaps) = soak_and_packer_world(tap.path());
+            run_upgrade(
+                &brew,
+                &git,
+                &snaps,
+                tap.path(),
+                &["hashicorp/tap/packer"],
+                &[],
+            );
+            assert!(!tap.path().join("Formula").exists());
+            assert_eq!(
+                visible(&brew)[1..],
+                [strs(&["install", "--formula", "packer"])]
+            );
+            assert_soak_tap_commands(&brew, &[]);
+        }
+
+        #[test]
+        fn run_without_soak_tap_work_never_creates_the_tap() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+            brew.soak_tap = None;
+            brew.installed.retain(|p| p.name != "alpha");
+            let (r, text) = run_upgrade(&brew, &git, &snaps, tap.path(), &[], &[]);
+            assert_eq!(tap_news(&brew), 0, "{:?}", lock_runs(&brew));
+            assert!(!r.refused, "{text}");
+            assert!(visible(&brew).contains(&strs(&["install", "--formula", "packer"])));
+        }
+
+        fn run_with_origin_record(flags: &[&str], next_stdout: &str) -> Option<String> {
+            let tap = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.next_stdout = next_stdout.as_bytes().to_vec();
+            let mut records = OriginRecords::default();
+            records.set(PkgKind::Formula, "alpha", "acme/tools");
+            records.save(cache.path()).unwrap();
+            let cfg = cfg24();
+            let inv = inv_from(&brew, &cfg);
+            let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
+            upgrade(
+                &crate::lock::RunLock::for_tests(),
+                &brew,
+                &git,
+                &core_snaps(),
+                cache.path(),
+                tap.path(),
+                &inv,
+                &cfg,
+                &["alpha".to_string()],
+                &flags,
+                &mut Vec::new(),
+            )
+            .unwrap();
+            OriginRecords::load(cache.path())
+                .get(PkgKind::Formula, "alpha")
+                .map(str::to_string)
+        }
+
+        #[test]
+        fn real_install_from_the_tap_removes_a_stale_origin_record() {
+            assert_eq!(run_with_origin_record(&[], ""), None);
+            assert_eq!(
+                run_with_origin_record(&["--dry-run"], "").as_deref(),
+                Some("acme/tools")
+            );
+            assert_eq!(
+                run_with_origin_record(&[], "Warning: alpha 1.1.0 already installed\n").as_deref(),
+                Some("acme/tools")
+            );
+        }
+
+        fn run_alpha(
+            next_status: i32,
+            next_stdout: &str,
+            receipt: Option<&str>,
+        ) -> (tempfile::TempDir, String) {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.next_status = next_status;
+            brew.next_stdout = next_stdout.as_bytes().to_vec();
+            if let Some(r) = receipt {
+                brew.receipt_taps
+                    .insert((PkgKind::Formula, "alpha".into(), "1.1.0".into()), r.into());
+            }
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            (tap, text)
+        }
+
+        #[test]
+        fn tap_file_is_kept_after_a_real_install() {
+            let (tap, text) = run_alpha(0, "", Some("ericfitz/brewsoak"));
+            assert_eq!(
+                tap_file(tap.path(), "Formula/alpha.rb"),
+                Some(cutoff_alpha().into_bytes()),
+                "{text}"
+            );
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn tap_file_is_put_back_after_a_brew_failure_without_a_new_keg() {
+            let (tap, _) = run_alpha(1, "", None);
+            assert_eq!(tap_file(tap.path(), "Formula/alpha.rb"), None);
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn tap_file_is_put_back_after_already_installed_over_another_taps_keg() {
+            let (tap, _) = run_alpha(
+                0,
+                "Warning: alpha 1.1.0 already installed\n",
+                Some("homebrew/core"),
+            );
+            assert_eq!(tap_file(tap.path(), "Formula/alpha.rb"), None);
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn tap_file_is_kept_when_brew_fails_but_the_new_keg_exists() {
+            let (tap, _) = run_alpha(1, "", Some("ericfitz/brewsoak"));
+            assert_eq!(
+                tap_file(tap.path(), "Formula/alpha.rb"),
+                Some(cutoff_alpha().into_bytes())
+            );
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        /// `alpha` with the missing dependency `libx`, whose own dependency
+        /// listing fails, so `alpha` is held after both files were staged.
+        fn alpha_with_libx(tap: &Path) -> (MockBrew, InMemoryGit) {
+            let (mut brew, git) = soak_world(tap);
+            git.insert_blob(
+                "cutoffsha",
+                "Formula/lib/libx.rb",
+                formula_rb("libx", "1.1.0", "midsha"),
+            );
+            git.insert_blob(
+                "headsha",
+                "Formula/lib/libx.rb",
+                formula_rb("libx", "1.2.0", "newsha"),
+            );
+            brew.deps.insert("alpha".into(), vec!["libx".into()]);
+            (brew, git)
+        }
+
+        #[test]
+        fn tap_files_are_put_back_after_a_hold_and_after_a_dry_run() {
+            // A hold after both files were staged.
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.deps_errors
+                .insert("libx".into(), "Error: libx: boom".into());
+            let before = tree(tap.path());
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(text.contains("held alpha: dependency libx"), "{text}");
+            assert!(brew.deps_calls.lock().unwrap().len() >= 2);
+            assert_eq!(tree(tap.path()), before);
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+            // A dry run stages both and puts both back; every command is dry.
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = alpha_with_libx(tap.path());
+            let before = tree(tap.path());
+            run_upgrade(
+                &brew,
+                &git,
+                &core_snaps(),
+                tap.path(),
+                &["alpha"],
+                &["--dry-run"],
+            );
+            let soak: Vec<Vec<String>> = visible(&brew)
+                .into_iter()
+                .filter(|a| {
+                    a.last()
+                        .is_some_and(|l| l.starts_with("ericfitz/brewsoak/"))
+                })
+                .collect();
+            assert_eq!(soak.len(), 2, "{soak:?}");
+            for args in &soak {
+                assert!(args.iter().any(|a| a == "--dry-run"), "{args:?}");
+            }
+            assert_eq!(tree(tap.path()), before);
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
+        #[test]
+        fn dry_run_meeting_a_leftover_undo_entry_holds_that_target() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = two_outdated_world("");
+            brew.soak_tap = Some(soak_tap_at(tap.path(), true));
+            for (dir, file, bytes) in [
+                (tap.path().join("Formula"), "left.rb", "stale"),
+                (
+                    test_cache().join(UNDO_DIR).join("Formula"),
+                    "left.rb",
+                    "previous",
+                ),
+            ] {
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(file), bytes).unwrap();
+            }
+            let (tap_before, undo_before) = (tree(tap.path()), undo_tree());
+            let (r, text) =
+                run_upgrade(&brew, &git, &core_snaps(), tap.path(), &[], &["--dry-run"]);
+            assert!(r.refused, "{text}");
+            assert!(
+                text.contains("held left: an earlier brewsoak run was interrupted"),
+                "{text}"
+            );
+            assert!(
+                text.contains(
+                    "left: an earlier brewsoak run was interrupted; run brewsoak update to finish it"
+                ),
+                "{text}"
+            );
+            assert!(
+                visible(&brew)
+                    .iter()
+                    .any(|a| a.last().map(String::as_str) == Some("ericfitz/brewsoak/right")),
+                "{:?}",
+                visible(&brew)
+            );
+            assert_eq!(
+                tree(tap.path()).get(&tap.path().join("Formula/left.rb")),
+                tap_before.get(&tap.path().join("Formula/left.rb"))
+            );
+            assert_eq!(undo_tree(), undo_before);
+        }
+
+        #[test]
+        fn second_run_writes_nothing() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            brew.installed[0] = InstalledPkg {
+                own_tap: Some(crate::origin::OwnTap::Soak),
+                ..formula_pkg("alpha", cutoff_alpha())
+            };
+            std::fs::create_dir_all(tap.path().join("Formula")).unwrap();
+            std::fs::write(tap.path().join("Formula/alpha.rb"), cutoff_alpha()).unwrap();
+            let before = tree(tap.path());
+            run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            let commands: Vec<Vec<String>> = lock_runs(&brew)
+                .into_iter()
+                .filter(|a| a.iter().any(|x| x.contains("alpha")))
+                .collect();
+            assert!(commands.is_empty(), "{commands:?}");
+            assert_eq!(tree(tap.path()), before);
+            assert!(undo_tree().is_empty());
+        }
+
+        #[test]
+        fn recovery_and_pruning_happen_before_any_stage_or_install() {
+            use crate::cmd::test_support::seed_stale_tap;
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = soak_world(tap.path());
+            seed_stale_tap(tap.path(), test_cache());
+            let snapshot = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let (snap_in, dir) = (snapshot.clone(), tap.path().to_path_buf());
+            *brew.on_call.lock().unwrap() = Some(Box::new(move |args: &[String]| {
+                let alpha = args.last().is_some_and(|a| a == "ericfitz/brewsoak/alpha");
+                if alpha && args.first().map(String::as_str) == Some("upgrade") {
+                    *snap_in.lock().unwrap() = Some((
+                        dir.join("Formula/back.rb").exists(),
+                        dir.join("Formula/gone.rb").exists(),
+                        dir.join("Formula/alpha.rb").exists(),
+                        test_cache()
+                            .join(UNDO_DIR)
+                            .join("Formula/back.absent")
+                            .exists(),
+                        test_cache()
+                            .join(UNDO_DIR)
+                            .join("Formula/alpha.rb")
+                            .exists()
+                            || test_cache()
+                                .join(UNDO_DIR)
+                                .join("Formula/alpha.absent")
+                                .exists(),
+                    ));
+                }
+            }));
+            run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            let seen = snapshot.lock().unwrap().expect("the soak-tap upgrade ran");
+            // back.rb recovered away, gone.rb pruned, alpha staged with its
+            // undo entry, and the old entry settled.
+            assert_eq!(seen, (false, false, true, false, true));
+        }
+    }
 }

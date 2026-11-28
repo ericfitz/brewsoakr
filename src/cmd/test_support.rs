@@ -673,6 +673,79 @@ pub(crate) fn soak_tap_at(path: &Path, trusted: bool) -> TapInfo {
     tap
 }
 
+/// `local_tap_world` with the soak tap local, trusted and at `tap`.
+pub(super) fn soak_world(tap: &Path) -> (MockBrew, InMemoryGit) {
+    let (mut brew, git) = local_tap_world();
+    brew.soak_tap = Some(soak_tap_at(tap, true));
+    (brew, git)
+}
+
+/// `soak_world` plus the third-party `packer` of `packer_world`, installed
+/// behind its cutoff, so a run has a package the soak tap never touches.
+pub(super) fn soak_and_packer_world(tap: &Path) -> (MockBrew, InMemoryGit, Snapshots) {
+    let (mut brew, git) = soak_world(tap);
+    let (_packer_git, snaps) = packer_world();
+    for (sha, path, bytes) in [
+        (
+            "tapcut",
+            "Formula/packer.rb",
+            formula_rb("packer", "1.16.1", "midsha"),
+        ),
+        (
+            "taphead",
+            "Formula/packer.rb",
+            formula_rb("packer", "1.17.0", "newsha"),
+        ),
+    ] {
+        git.insert_blob(sha, path, bytes);
+    }
+    git.insert_tree("tapcut", &["Formula/packer.rb"]);
+    git.insert_tree("taphead", &["Formula/packer.rb"]);
+    brew.installed.push(formula_pkg_from(
+        "packer",
+        "hashicorp/tap",
+        formula_rb("packer", "1.15.0", "oldsha"),
+    ));
+    brew.taps.extend(hashicorp_tap());
+    (brew, git, snaps)
+}
+
+/// The bytes of `rel` below `tap`, if the file exists.
+pub(super) fn tap_file(tap: &Path, rel: &str) -> Option<Vec<u8>> {
+    std::fs::read(tap.join(rel)).ok()
+}
+
+/// Run `upgrade` with `tap` as the tap root and the per-thread test cache.
+pub(super) fn run_upgrade(
+    brew: &MockBrew,
+    git: &InMemoryGit,
+    snaps: &Snapshots,
+    tap: &Path,
+    names: &[&str],
+    user_flags: &[&str],
+) -> (RunResult, String) {
+    let cfg = cfg24();
+    let inv = inv_from(brew, &cfg);
+    let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    let user_flags: Vec<String> = user_flags.iter().map(|n| n.to_string()).collect();
+    let mut out = Vec::new();
+    let r = upgrade(
+        &crate::lock::RunLock::for_tests(),
+        brew,
+        git,
+        snaps,
+        test_cache(),
+        tap,
+        &inv,
+        &cfg,
+        &names,
+        &user_flags,
+        &mut out,
+    )
+    .expect("upgrade");
+    (r, String::from_utf8(out).expect("utf8"))
+}
+
 /// Leave a tap file no package needs (`Formula/gone.rb`) and an unfinished
 /// undo entry (`soak-tap-undo/Formula/back.absent`, whose tap file
 /// `Formula/back.rb` should not outlive it), so maintenance has work to do.
