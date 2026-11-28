@@ -194,7 +194,7 @@ whose receipt names the tap, while settle wants one at the file's version. With 
 keg and a brew that exits 0 without a no-op line and without a new keg, the run says "upgraded" and
 settle puts the file back. Using one predicate at both sites removes the difference. The fallback
 reason therefore changes from `its receipt does not name brewsoak's tap` to
-`no keg of it is from brewsoak's tap at the cutoff version`.
+`no installed copy of it is from brewsoak's tap at the cutoff version`. (Controller ruling, preflight: "installed copy", not "keg", because the text is also shown for casks, which have no keg.)
 
 **Re-running.**
 
@@ -340,6 +340,8 @@ tap, correction 4).
   them.`
 - `upgrade` (bare or named): the note goes under `Notes`. `outdated`: under `==> Held`. `info`: at
   the end. It never changes the exit status, a count or what is installed.
+- Controller ruling (preflight, 2026-11-28): a run restricted to casks (`--cask`, #26) prints no
+  hidden-formula note, since it walks no formulae. A run restricted to formulae, or unrestricted, does.
 - `prune::prune_cache` keeps the `origins.toml` record of every formula rack brew did not list.
   Today it drops the record of any package missing from the inventory (`src/prune.rs:28-32`), which
   for a hidden formula breaks the AGENTS.md rule "never prune a record ... while the package is
