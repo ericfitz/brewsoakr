@@ -20,7 +20,7 @@ pub fn write_bytes(path: &Path, body: &[u8]) -> Result<(), Error> {
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| Error::Other(format!("{} has no file name", path.display())))?;
-    std::fs::create_dir_all(dir)?;
+    create_dirs_durably(dir)?;
     let prefix = format!(".{name}.tmp-");
     let tmp = dir.join(format!("{prefix}{}", std::process::id()));
     let result = write_temp(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
@@ -34,9 +34,33 @@ pub fn write_bytes(path: &Path, body: &[u8]) -> Result<(), Error> {
     remove_stale_temps(dir, &prefix, &tmp)
 }
 
+/// `create_dir_all`, then an fsync of the parent of every directory this call
+/// created, so a power loss cannot lose the new directory entry (and the file
+/// renamed into it) while the file's own directory fsync succeeded.
+fn create_dirs_durably(dir: &Path) -> Result<(), Error> {
+    let mut missing: Vec<&Path> = dir.ancestors().take_while(|d| !d.exists()).collect();
+    std::fs::create_dir_all(dir)?;
+    missing.reverse();
+    for created in missing {
+        if let Some(parent) = created.parent().filter(|p| !p.as_os_str().is_empty()) {
+            sync_dir(parent)?;
+        }
+    }
+    Ok(())
+}
+
 fn sync_dir(dir: &Path) -> Result<(), Error> {
+    #[cfg(test)]
+    SYNCED.with(|s| s.borrow_mut().push(dir.to_path_buf()));
     std::fs::File::open(dir)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every directory `sync_dir` was asked to fsync on this thread (test seam).
+    static SYNCED: std::cell::RefCell<Vec<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -112,6 +136,29 @@ mod tests {
         let nested = dir.path().join("a/b/state.toml");
         write(&nested, "x = 1\n").unwrap();
         assert_eq!(std::fs::read_to_string(&nested).unwrap(), "x = 1\n");
+    }
+
+    #[test]
+    fn fsyncs_the_parent_of_each_directory_it_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.join("a")).unwrap();
+        SYNCED.with(|s| s.borrow_mut().clear());
+        write(&root.join("a/b/c/state.toml"), "x = 1\n").unwrap();
+        let synced = SYNCED.with(|s| s.borrow().clone());
+        // `a` existed; `b` and `c` are new: `a` and `a/b` each get an fsync,
+        // then the file's directory `a/b/c` after the rename.
+        assert_eq!(
+            synced,
+            vec![root.join("a"), root.join("a/b"), root.join("a/b/c")]
+        );
+        // A second write creates nothing, so only the file's directory syncs.
+        SYNCED.with(|s| s.borrow_mut().clear());
+        write(&root.join("a/b/c/state.toml"), "x = 2\n").unwrap();
+        assert_eq!(
+            SYNCED.with(|s| s.borrow().clone()),
+            vec![root.join("a/b/c")]
+        );
     }
 
     #[test]
