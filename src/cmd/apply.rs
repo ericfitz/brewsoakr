@@ -878,12 +878,17 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             kind,
         };
         let token = nosoak::brew_token(origin_tap, name);
+        // The hint that skips brewsoak depends on what is installed: an
+        // anchored package is named by its official tap.
+        let inv = self.inv;
+        let installed = inv.find_in(origin_tap, name).filter(|p| p.kind == kind);
+        let bypass = self.bypass_for(&token, installed);
         let walked = match self.collect_cutoff_deps(origin_tap, name, kind) {
             Ok(w) => w,
             // A bare dependency name matches formulae in several taps: brew
             // will not pick one, and neither will brewsoak.
             Err(Error::Brew { message, .. }) if taps::ambiguous_formula(&message) => {
-                self.refuse_ambiguous_dep(name, &token, &message)?;
+                self.refuse_ambiguous_dep(name, &bypass, &message)?;
                 return Ok(());
             }
             // brew could not list the dependencies of a third-party target
@@ -899,7 +904,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
                             dep: None,
                             why: NameFail::Why(NameWhy::Deps(first_line(&message))),
                         };
-                        self.hold_target_by_name(name, &token, &hold)?;
+                        self.hold_target_by_name(name, &bypass, &hold)?;
                     }
                 }
                 return Ok(());
@@ -907,13 +912,13 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Err(e) => return Err(e),
         };
         if let Some(hold) = walked.by_name {
-            return self.hold_target_by_name(name, &token, &hold);
+            return self.hold_target_by_name(name, &bypass, &hold);
         }
         if let Some(held) = walked.held {
-            return self.refuse_held_dep(name, &token, &held);
+            return self.refuse_held_dep(name, &bypass, &held);
         }
         for (dep_origin, dep, dep_kind) in walked.deps {
-            if !self.install_missing_dep(name, &token, &dep_origin, dep_kind, &dep)? {
+            if !self.install_missing_dep(name, &bypass, &dep_origin, dep_kind, &dep)? {
                 return Ok(());
             }
         }
@@ -1012,7 +1017,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn install_missing_dep(
         &mut self,
         target: &str,
-        target_token: &str,
+        bypass: &str,
         dep_origin: &str,
         kind: PkgKind,
         dep: &str,
@@ -1026,7 +1031,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             host.as_ref(),
         );
         if status != UpstreamStatus::Eligible {
-            self.refuse_ineligible_dep(target, target_token, dep, status)?;
+            self.refuse_ineligible_dep(target, bypass, dep, status)?;
             return Ok(false);
         }
         // The wanted cutoff and the installed receipt are parsed together:
@@ -1217,7 +1222,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn refuse_ineligible_dep(
         &mut self,
         target: &str,
-        target_token: &str,
+        bypass: &str,
         dep: &str,
         status: UpstreamStatus,
     ) -> Result<(), Error> {
@@ -1235,7 +1240,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         writeln!(
             self.out,
             "cannot install {target}: dependency {why}; use `{}` to bypass brewsoak.",
-            bypass_command(self.brew_verb, target_token, None, false)
+            bypass
         )?;
         Ok(())
     }
@@ -1245,7 +1250,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn hold_target_by_name(
         &mut self,
         target: &str,
-        target_token: &str,
+        bypass: &str,
         hold: &NameHold,
     ) -> Result<(), Error> {
         let why = match &hold.why {
@@ -1265,8 +1270,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Some(dep) => writeln!(self.out, "held {target}: dependency {dep}: {why}")?,
             None => writeln!(self.out, "held {target}: {why}")?,
         }
-        let bypass = bypass_command(self.brew_verb, target_token, None, false);
-        self.defer_held(by_name_note(target, hold.dep.as_deref(), &why, &bypass));
+        self.defer_held(by_name_note(target, hold.dep.as_deref(), &why, bypass));
         Ok(())
     }
 
@@ -1302,19 +1306,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
     /// A dependency lives in a tap whose history could not be refreshed this
     /// run, so its cutoff is unknown: refuse the target.
-    fn refuse_held_dep(
-        &mut self,
-        target: &str,
-        target_token: &str,
-        held: &HeldDep,
-    ) -> Result<(), Error> {
+    fn refuse_held_dep(&mut self, target: &str, bypass: &str, held: &HeldDep) -> Result<(), Error> {
         self.hold_target_for_dep();
         writeln!(
             self.out,
             "cannot install {target}: dependency {}: {}\nuse `{}` to bypass brewsoak.",
-            held.dep,
-            held.reason,
-            bypass_command(self.brew_verb, target_token, None, false)
+            held.dep, held.reason, bypass
         )?;
         Ok(())
     }
@@ -1324,7 +1321,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     fn refuse_ambiguous_dep(
         &mut self,
         target: &str,
-        target_token: &str,
+        bypass: &str,
         message: &str,
     ) -> Result<(), Error> {
         self.hold_target_for_dep();
@@ -1332,7 +1329,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.out,
             "cannot install {target}: a dependency name is ambiguous;\n  {}\nuse `{}` to bypass brewsoak.",
             message.trim().replace('\n', "\n  "),
-            bypass_command(self.brew_verb, target_token, None, false)
+            bypass
         )?;
         Ok(())
     }
@@ -3815,6 +3812,91 @@ mod tests {
                 &["--dry-run"],
             );
             assert!(!text.contains("would install libx"), "{text}");
+        }
+
+        /// `alpha` installed from the soak tap at 1.0.0, its file in the tap:
+        /// anchored, behind its 1.1.0 cutoff.
+        fn anchor_alpha(brew: &mut MockBrew, tap: &Path) {
+            let old = formula_rb("alpha", "1.0.0", "oldsha");
+            brew.installed[0] = InstalledPkg {
+                own_tap: Some(crate::origin::OwnTap::Soak),
+                ..formula_pkg("alpha", old.clone())
+            };
+            std::fs::create_dir_all(tap.join("Formula")).unwrap();
+            std::fs::write(tap.join("Formula/alpha.rb"), old).unwrap();
+        }
+
+        fn assert_bypass_names_core(text: &str, site: &str) {
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("to bypass brewsoak"))
+                .collect();
+            assert!(!lines.is_empty(), "{site}: no bypass hint: {text}");
+            for l in lines {
+                assert!(
+                    l.ends_with("use `brew upgrade homebrew/core/alpha` to bypass brewsoak."),
+                    "{site}: {l}"
+                );
+            }
+        }
+
+        #[test]
+        fn closure_holds_of_an_anchored_target_name_core_in_the_bypass() {
+            // A dependency that is too new or yanked (refuse_ineligible_dep).
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            anchor_alpha(&mut brew, tap.path());
+            git.insert_blob(
+                "cutoffsha",
+                "Formula/lib/libx.rb",
+                formula_rb("libx", "1.1.0", "midsha"),
+            );
+            brew.deps.insert("alpha".into(), vec!["libx".into()]);
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(r.refused && text.contains("cannot install alpha"), "{text}");
+            assert_bypass_names_core(&text, "ineligible dependency");
+
+            // brew cannot list a dependency (hold_target_by_name).
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            anchor_alpha(&mut brew, tap.path());
+            brew.deps_errors
+                .insert("libx".into(), "Error: libx: boom".into());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(r.refused && text.contains("held alpha"), "{text}");
+            assert_bypass_names_core(&text, "by-name hold");
+
+            // A dependency in a tap whose history could not be refreshed
+            // (refuse_held_dep).
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            anchor_alpha(&mut brew, tap.path());
+            brew.taps.push(crate::cmd::test_support::tapped(
+                "acme/tools",
+                Some("https://github.com/acme/homebrew-tools"),
+            ));
+            brew.deps
+                .insert("alpha".into(), vec!["acme/tools/widget".into()]);
+            let mut snaps = core_snaps();
+            snaps
+                .held_taps
+                .insert("acme/tools".into(), "git failed: boom".into());
+            let (r, text) = run_upgrade(&brew, &git, &snaps, tap.path(), &["alpha"], &[]);
+            assert!(r.refused && text.contains("cannot install alpha"), "{text}");
+            assert_bypass_names_core(&text, "held dependency tap");
+
+            // A dependency name matching formulae in several taps
+            // (refuse_ambiguous_dep).
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = soak_world(tap.path());
+            anchor_alpha(&mut brew, tap.path());
+            brew.deps_errors.insert(
+                "alpha".into(),
+                "Error: Formulae found in multiple taps: a/b/x, c/d/x".into(),
+            );
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(r.refused && text.contains("ambiguous"), "{text}");
+            assert_bypass_names_core(&text, "ambiguous dependency");
         }
 
         #[test]
