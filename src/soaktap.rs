@@ -587,6 +587,16 @@ fn prune_walk(
         if used(name) {
             continue;
         }
+        if name.is_empty() {
+            if verbose {
+                writeln!(
+                    out,
+                    "not pruning {}: the file has no formula name",
+                    path.display()
+                )?;
+            }
+            continue;
+        }
         // The inventory is a snapshot: the receipt is read again under brew's
         // own lock (formulae), so an install in flight is never undone.
         let _guard = if kind == PkgKind::Formula {
@@ -1981,6 +1991,23 @@ mod tests {
         prune_in(&e, &brew, &inv, true);
         assert!(e.file("Formula", "wget").exists());
         assert!(e.file("Formula", "curl").exists());
+        assert!(brew.lock_calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_keeps_a_file_with_no_name_and_says_so() {
+        let e = env();
+        e.put(&e.tap.path().join("Formula/.rb"), b"a");
+        let brew = MockBrew::new();
+        let out = prune_in(&e, &brew, &inv_with(vec![]), true);
+        assert!(e.tap.path().join("Formula/.rb").exists());
+        assert_eq!(
+            out,
+            format!(
+                "not pruning {}: the file has no formula name\n",
+                e.tap.path().join("Formula/.rb").display()
+            )
+        );
         assert!(brew.lock_calls.lock().unwrap().is_empty());
     }
 

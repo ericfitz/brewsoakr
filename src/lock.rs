@@ -152,6 +152,17 @@ pub enum BrewLockError {
 
 /// Takes brew's lock on formula `name` in `locks_dir` without waiting.
 pub fn try_brew_formula_lock(locks_dir: &Path, name: &str) -> Result<BrewLock, BrewLockError> {
+    lock_with_hook(locks_dir, name, &|_, _| {})
+}
+
+/// `try_brew_formula_lock`, with `between(path, attempt)` called after each
+/// lock and before the identity check: the window brew's `cleanup` can unlink
+/// the file in. Tests use it to play brew.
+fn lock_with_hook(
+    locks_dir: &Path,
+    name: &str,
+    between: &dyn Fn(&Path, usize),
+) -> Result<BrewLock, BrewLockError> {
     use std::os::unix::fs::MetadataExt;
     let unavailable = BrewLockError::Unavailable;
     if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\0']) {
@@ -163,22 +174,31 @@ pub fn try_brew_formula_lock(locks_dir: &Path, name: &str) -> Result<BrewLock, B
     // must still be the one at the path (brew's own check, `lock_file.rb`).
     // The path is judged by `symlink_metadata`, so a link swapped in after the
     // first check is a different file and sends the loop around to refuse it.
-    for _ in 0..3 {
+    for attempt in 0..3 {
         if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink()) {
             return Err(unavailable("the lock file is a symbolic link".into()));
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|e| unavailable(e.to_string()))?;
+        // Open read-only first: it creates and writes nothing, and a link
+        // swapped in now is only read through. A missing file is created with
+        // O_EXCL, which never follows a link (a dangling one gives
+        // AlreadyExists and the loop refuses it on the next pass).
+        let file = match OpenOptions::new().read(true).open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                match OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(unavailable(e.to_string())),
+                }
+            }
+            Err(e) => return Err(unavailable(e.to_string())),
+        };
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => return Err(BrewLockError::Busy),
             Err(TryLockError::Error(e)) => return Err(unavailable(e.to_string())),
         }
+        between(&path, attempt);
         let same = match (file.metadata(), std::fs::symlink_metadata(&path)) {
             (Ok(a), Ok(b)) => {
                 !b.file_type().is_symlink() && a.ino() == b.ino() && a.dev() == b.dev()
@@ -437,6 +457,46 @@ mod tests {
         let _b = try_brew_formula_lock(dir.path(), "c++filt").unwrap();
         assert!(dir.path().join("python@3.12.formula.lock").exists());
         assert!(dir.path().join("c++filt.formula.lock").exists());
+    }
+
+    #[test]
+    fn brew_formula_lock_refuses_a_dangling_link_and_creates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        std::os::unix::fs::symlink(&target, tmp.path().join("wget.formula.lock")).unwrap();
+        let err = try_brew_formula_lock(tmp.path(), "wget").unwrap_err();
+        assert_eq!(
+            err,
+            BrewLockError::Unavailable("the lock file is a symbolic link".into())
+        );
+        assert!(target.symlink_metadata().is_err(), "target not created");
+    }
+
+    #[test]
+    fn brew_formula_lock_retries_when_brew_unlinks_the_file_after_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let unlinks = std::cell::Cell::new(0);
+        let got = lock_with_hook(dir.path(), "wget", &|path, attempt| {
+            if attempt == 0 {
+                std::fs::remove_file(path).unwrap();
+                unlinks.set(unlinks.get() + 1);
+            }
+        });
+        assert!(got.is_ok(), "{got:?}");
+        assert_eq!(unlinks.get(), 1);
+        assert!(dir.path().join("wget.formula.lock").exists());
+    }
+
+    #[test]
+    fn brew_formula_lock_gives_up_loudly_when_the_file_changes_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = lock_with_hook(dir.path(), "wget", &|path, _| {
+            std::fs::remove_file(path).unwrap();
+        });
+        assert_eq!(
+            got.unwrap_err(),
+            BrewLockError::Unavailable("lock file kept changing".into())
+        );
     }
 
     #[test]
