@@ -7,6 +7,7 @@ use crate::git::GitStore;
 use crate::inventory::Inventory;
 use crate::lock::RunLock;
 use crate::snapshot::Snapshots;
+use crate::soaktap::TapRootSource;
 use std::io::Write;
 use std::path::Path;
 
@@ -17,7 +18,7 @@ pub fn install(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     inv: &Inventory,
     cfg: &Config,
     names: &[String],

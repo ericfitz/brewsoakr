@@ -41,11 +41,34 @@ pub fn tap_state(entry: Option<&TapInfo>) -> TapState {
     }
 }
 
+/// Where brewsoak's tap lives when tap-info does not say. Resolving it can
+/// cost a `brew --repository`, so callers ask only when they need a directory
+/// and tap-info has no `path` (Minor 7). A `&Path` is already resolved.
+pub trait TapRootSource {
+    fn tap_root(&self) -> Result<PathBuf, Error>;
+}
+
+impl TapRootSource for Path {
+    fn tap_root(&self) -> Result<PathBuf, Error> {
+        Ok(self.to_path_buf())
+    }
+}
+
+impl TapRootSource for PathBuf {
+    fn tap_root(&self) -> Result<PathBuf, Error> {
+        Ok(self.clone())
+    }
+}
+
 /// The entry's `path` when it has one, else `tap_root` (decision P1).
-pub fn tap_dir(entry: Option<&TapInfo>, tap_root: &Path) -> PathBuf {
-    entry
-        .and_then(|e| e.path.clone())
-        .unwrap_or_else(|| tap_root.to_path_buf())
+pub fn tap_dir(
+    entry: Option<&TapInfo>,
+    tap_root: &(impl TapRootSource + ?Sized),
+) -> Result<PathBuf, Error> {
+    match entry.and_then(|e| e.path.clone()) {
+        Some(path) => Ok(path),
+        None => tap_root.tap_root(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -245,9 +268,10 @@ pub(crate) fn settle_entry(
     remove_if_present(&absent)
 }
 
-pub struct SoakTap {
-    tap_root: PathBuf,
-    dir: PathBuf,
+pub struct SoakTap<'a> {
+    tap_root: Box<dyn Fn() -> Result<PathBuf, Error> + 'a>,
+    /// The tap-info `path`; `None` means ask `tap_root` when a directory is needed.
+    dir: Option<PathBuf>,
     undo_root: PathBuf,
     dry_run: bool,
     state: TapState,
@@ -256,11 +280,16 @@ pub struct SoakTap {
     staged: BTreeMap<(PkgKind, String), Option<String>>,
 }
 
-impl SoakTap {
-    pub fn new(entry: Option<&TapInfo>, tap_root: &Path, cache: &Path, dry_run: bool) -> Self {
+impl<'a> SoakTap<'a> {
+    pub fn new<R: TapRootSource + ?Sized>(
+        entry: Option<&TapInfo>,
+        tap_root: &'a R,
+        cache: &Path,
+        dry_run: bool,
+    ) -> Self {
         Self {
-            tap_root: tap_root.to_path_buf(),
-            dir: tap_dir(entry, tap_root),
+            tap_root: Box::new(move || tap_root.tap_root()),
+            dir: entry.and_then(|e| e.path.clone()),
             undo_root: cache.join(UNDO_DIR),
             dry_run,
             state: tap_state(entry),
@@ -269,9 +298,19 @@ impl SoakTap {
         }
     }
 
+    /// `anchored` against the current tap directory. A receipt that does not
+    /// name the soak tap, or a directory that cannot be resolved, is not anchored.
+    pub fn anchored(&self, pkg: &Pkg) -> bool {
+        pkg.own_tap == Some(OwnTap::Soak) && self.dir().is_ok_and(|dir| anchored(&dir, pkg))
+    }
+
     /// Current tap directory (`tap_dir`), whether or not the tap is ready.
-    pub fn dir(&self) -> &Path {
-        &self.dir
+    /// Asks for the tap root only when tap-info gave no `path`.
+    pub fn dir(&self) -> Result<PathBuf, Error> {
+        match &self.dir {
+            Some(d) => Ok(d.clone()),
+            None => (self.tap_root)(),
+        }
     }
 
     fn decide(&mut self, brew: &impl Brew) -> Result<(), NotReady> {
@@ -285,7 +324,7 @@ impl SoakTap {
                 .tap_info()
                 .map_err(|e| NotReady::CreateFailed(first_line(&e.to_string())))?;
             let entry = taps.iter().find(|t| t.name.eq_ignore_ascii_case(SOAK_TAP));
-            self.dir = tap_dir(entry, &self.tap_root);
+            self.dir = entry.and_then(|e| e.path.clone());
             self.state = tap_state(entry);
             if self.state == TapState::NotTapped {
                 return Err(NotReady::CreateFailed(
@@ -339,7 +378,8 @@ impl SoakTap {
             return Ok(Staged::Leftover);
         }
         let wanted = tap::sanitize_unofficial(cutoff);
-        let file = tap_file(&self.dir, pkg.kind, &pkg.name);
+        let dir = self.dir()?;
+        let file = tap_file(&dir, pkg.kind, &pkg.name);
         let previous = match std::fs::read(&file) {
             Ok(bytes) => Some(bytes),
             Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => None,
@@ -354,7 +394,7 @@ impl SoakTap {
         }
         // Recorded before the write so a failed write is still settled.
         self.staged.insert(key, version.map(str::to_string));
-        tap::write_blob(&self.dir, pkg, cutoff)?;
+        tap::write_blob(&dir, pkg, cutoff)?;
         Ok(Staged::Written)
     }
 
@@ -366,11 +406,15 @@ impl SoakTap {
     /// package returns `Leftover`, and the next recovery settles it.
     pub fn settle(&mut self, _lock: &RunLock, brew: &impl Brew) -> Result<(), Error> {
         let staged = std::mem::take(&mut self.staged);
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let dir = self.dir()?;
         let mut first = None;
         for ((kind, name), version) in staged {
             if let Err(e) = settle_entry(
                 brew,
-                &self.dir,
+                &dir,
                 &self.undo_root,
                 kind,
                 &name,
@@ -516,17 +560,17 @@ pub fn maintain(
     lock: &RunLock,
     brew: &impl Brew,
     entry: Option<&TapInfo>,
-    tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     cache: &Path,
     inv: &Inventory,
     verbose: bool,
     out: &mut impl Write,
 ) -> Result<(), Error> {
-    let dir = tap_dir(entry, tap_root);
     match tap_state(entry) {
         TapState::NotTapped | TapState::Remote(_) => Ok(()),
-        TapState::Untrusted => recover(lock, brew, &dir, cache),
+        TapState::Untrusted => recover(lock, brew, &tap_dir(entry, tap_root)?, cache),
         TapState::Ready => {
+            let dir = tap_dir(entry, tap_root)?;
             recover(lock, brew, &dir, cache)?;
             prune(lock, &dir, cache, inv, verbose, out)
         }
@@ -581,7 +625,7 @@ mod tests {
     }
 
     impl Env {
-        fn soak(&self, entry: Option<&TapInfo>, dry: bool) -> SoakTap {
+        fn soak(&self, entry: Option<&TapInfo>, dry: bool) -> SoakTap<'_> {
             SoakTap::new(entry, self.tap.path(), self.cache.path(), dry)
         }
         fn file(&self, kind: &str, name: &str) -> PathBuf {
@@ -634,12 +678,15 @@ mod tests {
     fn tap_dir_prefers_the_reported_path() {
         let mut e = local(true);
         e.path = Some(PathBuf::from("/p"));
-        assert_eq!(tap_dir(Some(&e), Path::new("/q")), PathBuf::from("/p"));
         assert_eq!(
-            tap_dir(Some(&local(true)), Path::new("/q")),
+            tap_dir(Some(&e), Path::new("/q")).unwrap(),
+            PathBuf::from("/p")
+        );
+        assert_eq!(
+            tap_dir(Some(&local(true)), Path::new("/q")).unwrap(),
             PathBuf::from("/q")
         );
-        assert_eq!(tap_dir(None, Path::new("/q")), PathBuf::from("/q"));
+        assert_eq!(tap_dir(None, Path::new("/q")).unwrap(), PathBuf::from("/q"));
     }
 
     #[test]
@@ -978,7 +1025,13 @@ mod tests {
         assert!(e.undo("Formula", "python@3.12", "absent").exists());
     }
 
-    fn staged_wget(e: &Env, dry: bool, old: Option<&[u8]>, body: &str, v: Option<&str>) -> SoakTap {
+    fn staged_wget<'a>(
+        e: &'a Env,
+        dry: bool,
+        old: Option<&[u8]>,
+        body: &str,
+        v: Option<&str>,
+    ) -> SoakTap<'a> {
         if let Some(old) = old {
             e.put(&e.file("Formula", "wget"), old);
         }

@@ -16,7 +16,7 @@ use crate::prune;
 use crate::report::{self};
 use crate::section::Section;
 use crate::snapshot::{self, Snapshots};
-use crate::soaktap;
+use crate::soaktap::{self, TapRootSource};
 use std::io::Write;
 use std::path::Path;
 
@@ -165,7 +165,7 @@ pub fn update(
     git: &impl GitStore,
     gh: &impl GithubApi,
     cache: &Path,
-    tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     cfg: &Config,
     inv: &Inventory,
     now: time::OffsetDateTime,

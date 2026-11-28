@@ -29,7 +29,7 @@ use crate::report::{self, Counts, Verb};
 use crate::resolve::{PkgKind, PkgRef};
 use crate::section::Section;
 use crate::snapshot::Snapshots;
-use crate::soaktap::{self, NotReady, SoakTap, Staged};
+use crate::soaktap::{self, NotReady, SoakTap, Staged, TapRootSource};
 use crate::tap;
 use crate::taps;
 use std::collections::{BTreeMap, HashSet};
@@ -43,7 +43,7 @@ pub fn reinstall(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -211,7 +211,7 @@ pub(super) fn apply_many(
     git: &impl GitStore,
     snaps: &Snapshots,
     cache: &Path,
-    tap_root: &Path,
+    tap_root: &(impl TapRootSource + ?Sized),
     inv: &Inventory,
     cfg: &Config,
     names: &[String],
@@ -338,7 +338,7 @@ pub(super) struct ApplySession<'a, B, G, W: Write> {
     cfg: &'a Config,
     brew_verb: &'a str,
     /// brewsoak's own tap: staged cutoff files for this run's installs.
-    soak: SoakTap,
+    soak: SoakTap<'a>,
     /// `brew_verb`, parsed; picks section header wording.
     verb: Verb,
     /// A bare `upgrade`: every installed package, none named by the user.
@@ -598,15 +598,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     /// formula anchored in the soak tap, or a cask whose receipt names it.
     fn is_official(&self, installed: Option<&Pkg>) -> bool {
         installed.is_some_and(|p| match p.kind {
-            PkgKind::Formula => soaktap::anchored(self.soak.dir(), p),
+            PkgKind::Formula => self.soak.anchored(p),
             PkgKind::Cask => p.own_tap == Some(OwnTap::Soak),
         })
     }
 
     /// The brew command that bypasses brewsoak for one package.
     fn bypass_for(&self, token: &str, installed: Option<&Pkg>) -> String {
-        let anchored = installed
-            .is_some_and(|p| p.kind == PkgKind::Formula && soaktap::anchored(self.soak.dir(), p));
+        let anchored =
+            installed.is_some_and(|p| p.kind == PkgKind::Formula && self.soak.anchored(p));
         bypass_command(self.brew_verb, token, installed, anchored)
     }
 

@@ -251,7 +251,7 @@ pub fn dispatch(
         }
         cli::Command::Update => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root()?;
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             soaked_exit(
                 cmd::update(
@@ -331,7 +331,7 @@ pub fn dispatch(
         }
         cli::Command::Upgrade { names } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root()?;
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -366,7 +366,7 @@ pub fn dispatch(
             force_formula,
         } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root()?;
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -399,7 +399,7 @@ pub fn dispatch(
         }
         cli::Command::Reinstall { names } => {
             let cache = world.cache_path();
-            let tap_root = world.tap_root()?;
+            let tap_root = LazyTapRoot::new(world);
             let pkgs = inventory::Inventory::load(world.brew(), &cache, &cfg)?;
             let snaps = cmd::ensure_snapshots(
                 &mut lock,
@@ -428,6 +428,33 @@ pub fn dispatch(
                 &mut *out,
             ))
         }
+    }
+}
+
+/// `world.tap_root()` asked for at most once, and only when a run needs a tap
+/// directory that tap-info did not give (a dry run, `outdated` and `info` never
+/// reach this).
+struct LazyTapRoot<'a, W: World> {
+    world: &'a W,
+    resolved: std::cell::OnceCell<PathBuf>,
+}
+
+impl<'a, W: World> LazyTapRoot<'a, W> {
+    fn new(world: &'a W) -> Self {
+        Self {
+            world,
+            resolved: std::cell::OnceCell::new(),
+        }
+    }
+}
+
+impl<W: World> soaktap::TapRootSource for LazyTapRoot<'_, W> {
+    fn tap_root(&self) -> Result<PathBuf, Error> {
+        if let Some(root) = self.resolved.get() {
+            return Ok(root.clone());
+        }
+        let root = self.world.tap_root()?;
+        Ok(self.resolved.get_or_init(|| root).clone())
     }
 }
 
@@ -592,6 +619,9 @@ mod tests {
         config_path: PathBuf,
         cache_path: PathBuf,
         tap_root: PathBuf,
+        /// `tap_root` answers an error, and counts every ask in `tap_root_calls`.
+        tap_root_fails: bool,
+        tap_root_calls: Cell<usize>,
         env_soak: Option<String>,
         git: InMemoryGit,
         github: RecordingGithub,
@@ -635,6 +665,8 @@ mod tests {
                 config_path,
                 cache_path,
                 tap_root,
+                tap_root_fails: false,
+                tap_root_calls: Cell::new(0),
                 env_soak: None,
                 git: InMemoryGit::new(),
                 github: RecordingGithub {
@@ -666,6 +698,10 @@ mod tests {
             now()
         }
         fn tap_root(&self) -> Result<PathBuf, Error> {
+            self.tap_root_calls.set(self.tap_root_calls.get() + 1);
+            if self.tap_root_fails {
+                return Err(Error::Other("brew --repository failed".into()));
+            }
             Ok(self.tap_root.clone())
         }
         fn git(&self) -> &InMemoryGit {
@@ -1552,6 +1588,52 @@ mod tests {
         assert!(world.github.refreshed.get(), "no refresh was forced");
         dispatch_quiet(&s(&["info", "wget"]), &world).unwrap();
         assert_eq!(tap_and_undo(&world), before);
+    }
+
+    #[test]
+    fn tap_root_is_not_asked_for_by_a_dry_run_outdated_or_info() {
+        for args in [
+            &["upgrade", "--dry-run"][..],
+            &["upgrade", "wget", "--dry-run"],
+            &["install", "wget", "--dry-run"],
+            &["reinstall", "wget", "--dry-run"],
+            &["outdated"],
+            &["info", "wget"],
+        ] {
+            let mut world = TestWorld::new();
+            world.tap_root_fails = true;
+            let result = dispatch_quiet(&s(args), &world);
+            assert!(
+                !matches!(&result, Err(Error::Other(m)) if m.contains("--repository")),
+                "{args:?}: {result:?}"
+            );
+            assert_eq!(world.tap_root_calls.get(), 0, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn tap_root_is_not_asked_for_when_tap_info_has_a_path() {
+        let mut world = stale_world();
+        world.tap_root_fails = true;
+        world.brew.soak_tap = Some(crate::cmd::test_support::soak_tap_at(&world.tap_root, true));
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        assert_eq!(world.tap_root_calls.get(), 0);
+        assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn tap_root_is_asked_for_once_when_tap_info_has_no_path_and_the_run_needs_it() {
+        let world = stale_world();
+        dispatch_quiet(&s(&["update"]), &world).unwrap();
+        assert_eq!(world.tap_root_calls.get(), 1);
+        assert!(tap_and_undo(&world).iter().all(|t| t.is_empty()));
+    }
+
+    #[test]
+    fn a_failing_tap_root_fails_a_run_that_needs_it() {
+        let mut world = stale_world();
+        world.tap_root_fails = true;
+        assert!(dispatch_quiet(&s(&["update"]), &world).is_err());
     }
 
     #[test]

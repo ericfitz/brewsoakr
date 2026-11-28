@@ -139,7 +139,7 @@ pub(super) enum Role {
     Check,
 }
 
-pub(super) struct CutoffDepWalk<'a, B, G> {
+pub(super) struct CutoffDepWalk<'a, 's, B, G> {
     pub(super) brew: &'a B,
     pub(super) git: &'a G,
     pub(super) snaps: &'a Snapshots,
@@ -147,7 +147,7 @@ pub(super) struct CutoffDepWalk<'a, B, G> {
     pub(super) inv: &'a Inventory,
     pub(super) cfg: &'a Config,
     pub(super) lock: &'a RunLock,
-    pub(super) soak: &'a mut SoakTap,
+    pub(super) soak: &'a mut SoakTap<'s>,
     /// The package the walk was started for; named in dependency holds.
     pub(super) target: &'a str,
     pub(super) visiting: HashSet<String>,
@@ -166,7 +166,7 @@ fn kind_word(kind: PkgKind) -> &'static str {
     }
 }
 
-impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
+impl<B: Brew, G: GitStore> CutoffDepWalk<'_, '_, B, G> {
     fn hold(&mut self, role: Role, name: &str, why: NameFail) {
         let dep = (role != Role::Root).then(|| name.to_string());
         self.by_name = Some(NameHold { dep, why });
@@ -552,7 +552,10 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         // creating the tap.
         let through_tap = pkg.own_tap == Some(OwnTap::Soak)
             && soaktap::tap_state(self.inv.soak_tap.as_ref()) == TapState::Ready
-            && soaktap::tap_file(self.soak.dir(), kind, name).exists();
+            && self
+                .soak
+                .dir()
+                .is_ok_and(|dir| soaktap::tap_file(&dir, kind, name).exists());
         Ok(Some(if through_tap {
             tap::soak_token(name)
         } else {
