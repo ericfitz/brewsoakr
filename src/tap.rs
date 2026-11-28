@@ -33,15 +33,20 @@ pub fn write_blob(tap_root: &Path, pkg: &PkgRef, blob: &[u8]) -> Result<PathBuf,
 /// - that line;
 /// - each following line while the previous one ends in `,` or `\`;
 /// - when the last of those lines ends in a `do` (with or without `|args|`),
-///   everything through the line that closes the block: the first later line
-///   that has the stanza's own indentation and starts with `end`.
+///   everything through the line that closes the block. The search does not
+///   cross lines: it stops at the first later non-blank line that is not
+///   indented deeper than the stanza. If that line has the stanza's own
+///   indentation and starts with `end` as a whole word (end of line,
+///   whitespace or `#` after it), the block closes there.
 ///
-/// A `do` block with no such closing line leaves the whole stanza in the file
+/// Otherwise (any other such line, `end.foo` and `end: 1` included, or the end
+/// of the file) the block is unclosed and the whole stanza stays in the file
 /// untouched (brew then fails with its known error and the package holds).
 /// A trailing Ruby `# comment` is ignored when looking at a line's end. Only
 /// a line whose first non-blank text is `no_autobump!` starts a stanza, so
 /// the word inside a string on another line is kept; a heredoc body line that
-/// itself starts with it is not told apart from code and goes. Eric decided
+/// itself starts with it is not told apart from code and goes (the one
+/// documented exception to "every other byte is unchanged"). Eric decided
 /// on 2026-11-27 that multi-line stanzas are handled.
 pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
     const STANZA: &[u8] = b"no_autobump!";
@@ -64,7 +69,7 @@ pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
             i = last + 1;
             continue;
         }
-        match (last + 1..lines.len()).find(|&j| closes_block(lines[j], indent)) {
+        match block_end(&lines, last + 1, indent) {
             Some(e) => i = e + 1,
             None => {
                 // Unclosed block: keep the stanza as it is.
@@ -78,6 +83,20 @@ pub fn sanitize_unofficial(rb: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The index of the line that closes a block opened by a stanza with this
+/// `indent`, searching from `from`: blank lines are skipped and the first
+/// other line that is not indented deeper than the stanza decides. It closes
+/// the block only when it is exactly `indent` plus `end` as a whole word;
+/// anything else (a shallower or equal line that is not a bare `end`, or the
+/// end of the file) means the block is unclosed.
+fn block_end(lines: &[&[u8]], from: usize, indent: &[u8]) -> Option<usize> {
+    let j = (from..lines.len()).find(|&j| {
+        let l = lines[j];
+        !l.iter().all(u8::is_ascii_whitespace) && indent_of(l).len() <= indent.len()
+    })?;
+    closes_block(lines[j], indent).then_some(j)
+}
+
 /// The leading blanks of a line (all of a blank line).
 fn indent_of(line: &[u8]) -> &[u8] {
     let n = line
@@ -87,8 +106,11 @@ fn indent_of(line: &[u8]) -> &[u8] {
     &line[..n]
 }
 
-/// The line without a trailing Ruby comment (a `#` outside a quoted string),
-/// trailing whitespace and line ending.
+/// The line without a trailing Ruby comment (a `#` outside a `"` or `'`
+/// string), trailing whitespace and line ending. Only those two quotes are
+/// tracked: a `#` inside a `%q()`, `%Q()`, `%()`, `%w[]` literal or a regexp
+/// reads as a comment, so such a stanza is cut short and brew then fails to
+/// load the file (the package holds).
 fn code_of(line: &[u8]) -> &[u8] {
     let mut quote: Option<u8> = None;
     let mut cut = line.len();
@@ -374,20 +396,67 @@ mod tests {
 
     #[test]
     fn sanitize_closes_a_block_only_at_the_word_end() {
-        let rb = b"class S < Formula\n  no_autobump! do\n  end: 1\n  end.foo\n  endx\n  end\n  url \"u\"\nend\n";
+        let rb = b"class S < Formula\n  no_autobump! do\n  end # done\n  url \"u\"\nend\n";
         assert_eq!(
             sanitize_unofficial(rb),
             b"class S < Formula\n  url \"u\"\nend\n"
         );
-        // With no real `end`, the stanza stays.
-        let rb = b"class S < Formula\n  no_autobump! do\n  end: 1\n  end.foo\nend\n";
-        assert_eq!(sanitize_unofficial(rb), rb);
+        // A first same-indent line that is not the word `end` leaves the stanza.
+        for bad in ["  end: 1", "  end.foo", "  endx"] {
+            let rb =
+                format!("class S < Formula\n  no_autobump! do\n{bad}\n  end\n  url \"u\"\nend\n");
+            assert_eq!(sanitize_unofficial(rb.as_bytes()), rb.as_bytes(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_does_not_search_past_the_first_line_that_is_not_deeper() {
+        // The block is closed by a mis-indented `end` or by `end.foo`; the
+        // lines after it must survive and the stanza stays untouched.
+        for closer in ["    end", "  end.foo", "  end: 1", "end"] {
+            let rb = format!(
+                "class S < Formula\n  no_autobump! do\n    x\n{closer}\n  url \"u\"\n  depends_on \"d\"\n  livecheck do\n    y\n  end\n  def install\n  end\nend\n"
+            );
+            assert_eq!(
+                sanitize_unofficial(rb.as_bytes()),
+                rb.as_bytes(),
+                "closer {closer:?}"
+            );
+        }
+        // Blank lines inside the block do not stop the search.
+        let rb = b"class S < Formula\n  no_autobump! do\n\n    x\n  \n  end\n  url \"u\"\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  url \"u\"\nend\n"
+        );
     }
 
     #[test]
     fn sanitize_only_a_line_starting_with_the_stanza_counts() {
         let rb = b"class S < Formula\n  desc \"no_autobump! in text\"\n  url \"u\" # no_autobump! x\n  puts <<~EOS\n    see no_autobump! here\n  EOS\nend\n";
         assert_eq!(sanitize_unofficial(rb), rb);
+    }
+
+    #[test]
+    fn sanitize_removes_a_heredoc_body_line_that_starts_with_the_stanza() {
+        // Pinned limitation: a heredoc body is not told apart from code.
+        let rb = b"class S < Formula\n  puts <<~EOS\n    no_autobump! here\n  EOS\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n  puts <<~EOS\n  EOS\nend\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_reads_a_hash_inside_a_percent_literal_as_a_comment() {
+        // Pinned limitation: only `"` and `'` quote a `#`. The continuation
+        // is missed and a stray line is left, so brew fails to load the file
+        // and the package holds (fails loud).
+        let rb = b"class S < Formula\n  no_autobump! because: %q(a # b),\n    more: 1\n  url \"u\"\nend\n";
+        assert_eq!(
+            sanitize_unofficial(rb),
+            b"class S < Formula\n    more: 1\n  url \"u\"\nend\n"
+        );
     }
 
     #[test]

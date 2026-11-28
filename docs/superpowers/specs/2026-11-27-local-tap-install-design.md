@@ -150,6 +150,30 @@ options are under "Questions answered by the maintainer".
 6. **No up-front migration.** An installed package moves to the soak tap at
    its next soaked upgrade.
 
+### Human decisions (#23)
+
+Made by the maintainer, Eric, on 2026-11-27 while implementing issue #23.
+Numbers are the issue's decision numbers.
+
+- **Decision 1: the user's kind flags are dropped.** Where brewsoak adds its
+  own `--formula` or `--cask` (soaked commands, third-party by-name installs,
+  split no-soak groups), the user's `--formula`/`--cask`/`--formulae`/`--casks`
+  are not forwarded. Where brewsoak adds none (a single-kind no-soak run, the
+  true repair) they are forwarded. A typed name's kind is still chosen by the
+  user's flag.
+  *Ruling, 2026-11-27: the drop is silent by design.* brewsoak adds the right
+  kind flag itself and the user's flag still picks the kind, so no note is
+  printed. Cost if wrong: one note line to add.
+- **Decision 2: tap files stay mode 0600.** brew runs as the same user, so
+  that is enough.
+- **Decision 4: the installed version in hold text is the keg directory
+  name**, as Homebrew's `Keg#version` reads it (`brew::PkgState::keg_version`);
+  an empty version is omitted from the text.
+- **Decision 5: a no-soak cask stays `brew install --cask`.** Its behavior is
+  verified by manual check 13.7.
+- **Decision 8: release-check script messages** name the cause (an unreadable
+  trust list is not reported as an untrusted tap) and carry a self-test.
+
 ## Approaches considered
 
 | Approach | For | Against |
@@ -721,16 +745,30 @@ below) and nothing else changes
 (Fact 8). The stanza only controls Homebrew's own version-bump automation.
 
 *Decision (Eric, 2026-11-27, issue #23):* multi-line `no_autobump!` stanzas
-are handled: a line ending in `,` or `\` pulls in the next line (a trailing
-`# comment` outside a string is ignored when judging the line's end), and a
-`do ... end` block runs to the first later line with the stanza's own
-indentation whose first word is `end` (`end:` and `end.foo` do not close it).
-Every other byte stays unchanged.
+are handled: a line ending in `,` or `\` pulls in the next line, and a
+`do ... end` block is removed through its closing `end`. Every other byte
+stays unchanged, with one documented exception below.
+
+*Implementation detail (Claude):* a trailing `# comment` outside a `"` or `'`
+string is ignored when judging a line's end (a `#` inside a `%q()`-style
+literal or a regexp is read as a comment, so such a stanza is cut short and
+brew fails to load the file: the package holds). The block's closing line is
+found without crossing lines: skip blank lines, then take the first line that
+is not indented deeper than the stanza. The block closes there only if that
+line has exactly the stanza's indentation and starts with `end` as a whole
+word (end of line, whitespace or `#` after it). A heredoc body line that
+itself starts with `no_autobump!` is not told apart from code and is removed;
+this is the one exception to "every other byte stays unchanged" and costs one
+caveats line.
 
 *Rule (Claude's call, confirmed by Eric 2026-11-27, issue #23):* a `do` block
-with no such closing line leaves the whole stanza in the file untouched. Brew
-then fails to load the file with its known error and brewsoak holds the
-package; removing only the first line would leave a dangling block body.
+with no such closing line (the deciding line is anything else, `end.foo` and
+`end: 1` and a mis-indented `end` included, or the file ends) leaves the whole
+stanza in the file untouched. Brew then fails to load the file with its known
+error and brewsoak holds the package; removing only the first line, or
+searching on past the deciding line, would drop unrelated lines. Eric
+confirmed the rule and left Claude free to change it: "You're free to change
+your earlier call on no_autobump! if you judge it the correct course".
 
 The by-name gate for third-party packages keeps hashing the raw blob.
 
