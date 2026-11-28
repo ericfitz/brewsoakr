@@ -235,7 +235,11 @@ mod tests {
         let mut records = OriginRecords::default();
         records.set(PkgKind::Formula, "alpha", "old/tap");
         records.save(cache.path()).unwrap();
-        let brew = MockBrew::new();
+        let mut brew = MockBrew::new();
+        brew.receipt_taps.insert(
+            (PkgKind::Formula, "alpha".into(), "1.1.0".into()),
+            "ericfitz/brewsoak".into(),
+        );
         let cfg = cfg24();
         let inv = inv_from(&brew, &cfg);
         let tap = tempfile::tempdir().unwrap();

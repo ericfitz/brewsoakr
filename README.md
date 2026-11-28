@@ -335,6 +335,15 @@ For packages from the tap, the hold texts are:
   the package is already installed; or `brew ran, but its keg is not from
   brewsoak's tap at the cutoff version`, when brew reported success and the
   receipt check then failed.
+- `<name>: brew left the installed version in place: <reason>`. brew exited 0
+  for a target but did not install it, so brewsoak counts it as `skipped`, not
+  `upgraded`; it is not a failure and does not change the exit status. The
+  reason is brew's own line without its `Warning: `/`Error: ` prefix, either
+  `Not upgrading <name>, ...` (for example `no newer app version was detected`
+  for a cask that updates itself) or an `already installed` line about the
+  target; for a `homebrew/core` or `homebrew/cask` package with no such line,
+  it is `its receipt does not name brewsoak's tap`, when no receipt of the
+  package names brewsoak's tap.
 - `held <name>: an earlier brewsoak run was interrupted`, with the note
   `<name>: an earlier brewsoak run was interrupted; run brewsoak update to
   finish it`. You normally see this on a dry run, because a real run settles

@@ -943,29 +943,9 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
 
         let installing = view.cutoff.as_ref().map(report::identity_version);
         match self.run_install(&pkg, origin_tap, view.cutoff_blob.as_deref(), installing)? {
-            InstallRun::Ran { failed, no_op, .. } => {
+            InstallRun::Ran { failed, left, .. } => {
                 // Counted as upgraded when it was announced; brew failed, or
                 // exited 0 and left the package where it was.
-                let left = if failed || self.counts.dry_run {
-                    None
-                } else if origin::is_core_or_cask(origin_tap) {
-                    // brew installed it from the soak tap only when a receipt
-                    // of the package names that tap (any keg version, so a keg
-                    // directory brew named differently still counts, #24) and
-                    // brew did not say it left the package alone.
-                    let from_tap = self
-                        .brew
-                        .installed_receipt_taps(kind, name)
-                        .iter()
-                        .any(|t| origin::own_tap(t) == Some(OwnTap::Soak));
-                    (no_op.is_some() || !from_tap).then(|| {
-                        no_op.unwrap_or_else(|| {
-                            "its receipt does not name brewsoak's tap".to_string()
-                        })
-                    })
-                } else {
-                    no_op
-                };
                 if failed || left.is_some() {
                     self.counts.upgraded = self.counts.upgraded.saturating_sub(1);
                 }
@@ -1468,20 +1448,37 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         let no_op = brew_no_op_reason(&output, name);
         let installed_now = output.status.success() && no_op.is_none();
         let failed = brew_failed(&output);
-        let why = if failed {
-            first_error_line(&output)
-        } else if already_installed_message(&output) {
-            "brew left the installed version in place".to_string()
-        } else if let Some(reason) = &no_op {
-            reason.clone()
+        let why = match &no_op {
+            _ if failed => first_error_line(&output),
+            Some(line) if already_installed_line(&line.to_ascii_lowercase()) => {
+                "brew left the installed version in place".to_string()
+            }
+            Some(line) => line.clone(),
+            None => {
+                "brew ran, but its keg is not from brewsoak's tap at the cutoff version".to_string()
+            }
+        };
+        // A core or cask package brew said it left alone, or whose receipts
+        // do not name brewsoak's tap (any keg version, so a keg directory
+        // brew named differently still counts, #24), was not installed from
+        // the tap.
+        let left = if failed || self.counts.dry_run || !origin::is_core_or_cask(origin_tap) {
+            no_op.filter(|_| !failed && !self.counts.dry_run)
         } else {
-            "brew ran, but its keg is not from brewsoak's tap at the cutoff version".to_string()
+            let from_tap = self
+                .brew
+                .installed_receipt_taps(kind, name)
+                .iter()
+                .any(|t| origin::own_tap(t) == Some(OwnTap::Soak));
+            (no_op.is_some() || !from_tap).then(|| {
+                no_op.unwrap_or_else(|| "its receipt does not name brewsoak's tap".to_string())
+            })
         };
         merge_status(&mut self.brew_status, output);
-        if installed_now {
+        if installed_now && left.is_none() {
             self.forget_origin(kind, name)?;
         }
-        Ok(InstallRun::Ran { failed, no_op, why })
+        Ok(InstallRun::Ran { failed, left, why })
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1600,9 +1597,10 @@ pub(super) enum InstallRun {
     /// version alone, or that its keg is not the soaked one.
     Ran {
         failed: bool,
-        /// brew's line saying it left the package where it was
-        /// (`brew_no_op_reason`).
-        no_op: Option<String>,
+        /// Why brew left the package where it was after a successful real
+        /// run (brew's no-op line, or that no receipt names the soak tap);
+        /// `None` when it installed it, failed, or this was a dry run.
+        left: Option<String>,
         why: String,
     },
     /// brew does not trust this tap (lowercase `user/repo`).
@@ -1626,10 +1624,11 @@ pub(super) fn already_installed_message(output: &std::process::Output) -> bool {
 }
 
 /// Why brew left `name` where it was, when its output says so: the first line
-/// that is brew's "already installed" answer or `Not upgrading <name>, ...`
-/// (what `brew upgrade` and `brew install --cask` print for a package they
-/// leave alone), without its `Warning: `/`Error: ` prefix. Only those shapes
-/// count; any other line, including one about another package, does not.
+/// that is brew's "already installed" answer about `name` or `Not upgrading
+/// <name>, ...` (what `brew upgrade` and `brew install --cask` print for a
+/// package they leave alone), without its `Warning: `/`Error: ` prefix. Only
+/// those shapes count; any other line, including one about another package
+/// (a dependency that was already installed), does not.
 pub(super) fn brew_no_op_reason(output: &std::process::Output, name: &str) -> Option<String> {
     let text = format!(
         "{}\n{}",
@@ -1639,7 +1638,7 @@ pub(super) fn brew_no_op_reason(output: &std::process::Output, name: &str) -> Op
     let skipping = format!("not upgrading {},", name.to_ascii_lowercase());
     text.lines().map(str::trim).find_map(|line| {
         let lower = line.to_ascii_lowercase();
-        let is_no_op = already_installed_line(&lower)
+        let is_no_op = (already_installed_line(&lower) && mentions_package(&lower, name))
             || lower
                 .trim_start_matches("warning: ")
                 .trim_start_matches("error: ")
@@ -1649,6 +1648,17 @@ pub(super) fn brew_no_op_reason(output: &std::process::Output, name: &str) -> Op
             line.strip_prefix("Error: ").unwrap_or(line).to_string()
         })
     })
+}
+
+/// Whether the (lowercased) line names the package: a word that is `name` or
+/// ends in `/name` (a full tap name), once quotes and trailing punctuation
+/// are dropped.
+fn mentions_package(line: &str, name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    let tail = format!("/{name}");
+    line.split(|c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '`' | '(' | ')'))
+        .map(|w| w.trim_end_matches(['.', ',', ':', ';']))
+        .any(|w| w == name || w.ends_with(&tail))
 }
 
 /// brew's no-op answer for one (lowercased) output line. `x 1.0 is already
@@ -2480,9 +2490,24 @@ mod tests {
             );
             assert_eq!(said(&format!("Error: {line}\n")), Some(line));
         }
+        // An "already installed" line counts only when it is about the target.
         assert_eq!(
-            said("Warning: foo 1.0 is already installed and up-to-date.\n").as_deref(),
-            Some("foo 1.0 is already installed and up-to-date.")
+            said("Warning: foo 1.0 is already installed and up-to-date.\n"),
+            None
+        );
+        for line in [
+            "Warning: alt-tab 1.0 is already installed and up-to-date.",
+            "Warning: Cask 'alt-tab' is already installed.",
+            "Warning: homebrew/cask/alt-tab 1.0 already installed",
+        ] {
+            assert_eq!(
+                said(&format!("{line}\n")).as_deref(),
+                line.strip_prefix("Warning: ")
+            );
+        }
+        assert_eq!(
+            said("Warning: alt-tab-pro 1.0 is already installed\n"),
+            None
         );
         assert_eq!(
             said("cats 1.0 is already installed but outdated (so it will be upgraded).\n"),
@@ -3514,6 +3539,81 @@ mod tests {
         }
 
         #[test]
+        fn target_that_installs_for_real_is_upgraded_despite_a_dependency_already_installed_line() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alt_tab_world(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Cask, "alt-tab".into(), "11.10.2".into()),
+                "ericfitz/brewsoak".into(),
+            );
+            brew.next_stdout =
+                b"Warning: libx 1.1.0 is already installed and up-to-date.\n".to_vec();
+            let (_, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alt-tab"], &[]);
+            assert!(summary_has(&text, "upgraded", "1"), "{text}");
+            assert!(summary_has(&text, "skipped", "0"), "{text}");
+            assert!(!text.contains("brew left the installed version"), "{text}");
+        }
+
+        #[test]
+        fn formula_target_with_no_soak_receipt_is_skipped_with_the_receipt_reason() {
+            let tap = tempfile::tempdir().unwrap();
+            let (brew, git) = soak_world(tap.path());
+            let (r, text) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert!(summary_has(&text, "upgraded", "0"), "{text}");
+            assert!(summary_has(&text, "skipped", "1"), "{text}");
+            assert!(
+                text.contains("alpha: brew left the installed version in place: its receipt does not name brewsoak's tap"),
+                "{text}"
+            );
+            assert_eq!(combine_exit(r.refused, r.brew_status), 0, "{text}");
+        }
+
+        /// The origin record of cask `alt-tab` after one real upgrade run; the
+        /// receipt of the cask names homebrew/cask, so the record is stale.
+        fn alt_tab_origin_record_after(soak_receipt: bool) -> Option<String> {
+            let tap = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alt_tab_world(tap.path());
+            if soak_receipt {
+                brew.receipt_taps.insert(
+                    (PkgKind::Cask, "alt-tab".into(), "11.10.2".into()),
+                    "ericfitz/brewsoak".into(),
+                );
+            }
+            let mut records = OriginRecords::default();
+            records.set(PkgKind::Cask, "alt-tab", "acme/tools");
+            records.save(cache.path()).unwrap();
+            let cfg = cfg24();
+            let inv = inv_from(&brew, &cfg);
+            upgrade(
+                &crate::lock::RunLock::for_tests(),
+                &brew,
+                &git,
+                &core_snaps(),
+                cache.path(),
+                tap.path(),
+                &inv,
+                &cfg,
+                &["alt-tab".to_string()],
+                &[],
+                &mut Vec::new(),
+            )
+            .unwrap();
+            OriginRecords::load(cache.path())
+                .get(PkgKind::Cask, "alt-tab")
+                .map(str::to_string)
+        }
+
+        #[test]
+        fn target_left_in_place_by_its_receipt_alone_keeps_its_origin_record() {
+            assert_eq!(alt_tab_origin_record_after(true), None, "real install");
+            assert_eq!(
+                alt_tab_origin_record_after(false).as_deref(),
+                Some("acme/tools")
+            );
+        }
+
+        #[test]
         fn cask_target_that_brew_really_installed_is_upgraded() {
             let tap = tempfile::tempdir().unwrap();
             let (mut brew, git) = alt_tab_world(tap.path());
@@ -3888,6 +3988,11 @@ mod tests {
             let cache = tempfile::tempdir().unwrap();
             let (mut brew, git) = soak_world(tap.path());
             brew.next_stdout = next_stdout.as_bytes().to_vec();
+            // brew wrote a soak-tap receipt for a real install.
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "alpha".into(), "1.1.0".into()),
+                "ericfitz/brewsoak".into(),
+            );
             let mut records = OriginRecords::default();
             records.set(PkgKind::Formula, "alpha", "acme/tools");
             records.save(cache.path()).unwrap();
@@ -4374,11 +4479,15 @@ mod tests {
         }
 
         #[test]
-        fn tap_file_is_put_back_and_the_error_returned_when_the_install_errs() {
+        fn tap_file_is_settled_and_the_error_returned_when_the_install_errs() {
             use std::os::unix::fs::PermissionsExt;
             let tap = tempfile::tempdir().unwrap();
             let cache = tempfile::tempdir().unwrap();
-            let (brew, git) = soak_world(tap.path());
+            let (mut brew, git) = soak_world(tap.path());
+            brew.receipt_taps.insert(
+                (PkgKind::Formula, "alpha".into(), "1.1.0".into()),
+                "ericfitz/brewsoak".into(),
+            );
             // The install succeeds, then forgetting the stale origin record
             // fails: the cache directory cannot be written any more.
             let mut records = OriginRecords::default();
@@ -4417,7 +4526,9 @@ mod tests {
                 "{:?}",
                 visible(&brew)
             );
-            assert_eq!(tap_file(tap.path(), "Formula/alpha.rb"), None);
+            // The soak-tap receipt says the install was real, so settle keeps
+            // the file and drops the undo entry.
+            assert!(tap_file(tap.path(), "Formula/alpha.rb").is_some());
             assert!(
                 tree(&cache.path().join(UNDO_DIR)).is_empty(),
                 "{:?}",
