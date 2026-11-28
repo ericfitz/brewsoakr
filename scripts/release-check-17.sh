@@ -264,7 +264,10 @@ do_run() {
 	run_step "upgrade $PKG through brewsoak's tap" "$BREW" upgrade --formula "$SOAK_TAP/$PKG"
 
 	local receipt tap
-	receipt="$(find "$CELLAR/$PKG" -maxdepth 2 -path '*_1/INSTALL_RECEIPT.json' | head -n 1)"
+	# Captured whole, then cut at the first newline: a pipe into `head` can die
+	# of SIGPIPE under pipefail.
+	receipt="$(find "$CELLAR/$PKG" -maxdepth 2 -path '*_1/INSTALL_RECEIPT.json')"
+	receipt="${receipt%%$'\n'*}"
 	[[ -n "$receipt" ]] || fail "no $PKG keg with a _1 revision exists after the upgrade"
 	tap="$("$JQ" -r .source.tap "$receipt")"
 	[[ "$tap" == "$SOAK_TAP" ]] || fail "the _1 receipt names '$tap', expected '$SOAK_TAP'"
