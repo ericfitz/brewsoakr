@@ -402,7 +402,8 @@ After the maintainer's decisions:
   simulation), and a real run of Fact 32.
 - A bare `brew reinstall <name>` of an anchored package (Source fact 8 says
   what to expect; it was not run).
-- A `no_autobump!` stanza that spans more than one line.
+- A `no_autobump!` stanza that spans more than one line, against a real
+  brew (unit-tested only).
 - Any Homebrew other than 7.0.17-27-g96c963e (see "Supported Homebrew").
 - Anything on Linux.
 
@@ -435,7 +436,7 @@ so that references stay valid.
    run that needs it. A dry run does not create it.
 4. Trust is read from `brew tap-info`. An untrusted tap holds every package
    that needs it. There is no fall back to the by-name gate.
-5. The tap file is the cutoff file with `no_autobump!` lines removed and
+5. The tap file is the cutoff file with `no_autobump!` stanzas removed and
    nothing else changed. The layout is flat.
 6. A tap file is written just before brew is asked about the package, and is
    kept or put back according to the keg brew leaves behind. An undo copy in
@@ -713,16 +714,24 @@ or moving a package back to core with `brew upgrade homebrew/core/<name>`
 ### Tap files (Choices 5 and 6)
 
 **Content.** The file is `tap::sanitize_unofficial` of the raw cutoff blob:
-lines that start with `no_autobump!` are dropped and nothing else changes
+stanzas that start with a `no_autobump!` line are dropped (see the decision
+below) and nothing else changes
 (Fact 9). A blob with no such line is written byte for byte, and brew's
 `ruby_source_checksum` of it then equals the SHA-256 of the cutoff blob
 (Fact 8). The stanza only controls Homebrew's own version-bump automation.
 
-*Decision (Eric, 2026-11-27, issue #23):* a multi-line `no_autobump!` stanza
-is removed whole: a line ending in `,` or `\` pulls in the next line, and a
+*Decision (Eric, 2026-11-27, issue #23):* multi-line `no_autobump!` stanzas
+are handled: a line ending in `,` or `\` pulls in the next line (a trailing
+`# comment` outside a string is ignored when judging the line's end), and a
 `do ... end` block runs to the first later line with the stanza's own
-indentation that starts with `end`. A block with no such line loses only its
-first line. Every other byte stays unchanged.
+indentation whose first word is `end` (`end:` and `end.foo` do not close it).
+Every other byte stays unchanged.
+
+*Rule (Claude's call, confirmed by Eric 2026-11-27, issue #23):* a `do` block
+with no such closing line leaves the whole stanza in the file untouched. Brew
+then fails to load the file with its known error and brewsoak holds the
+package; removing only the first line would leave a dangling block body.
+
 The by-name gate for third-party packages keeps hashing the raw blob.
 
 **Layout.** `Formula/<name>.rb` and `Casks/<token>.rb`, flat, written by
@@ -1233,7 +1242,9 @@ brew was called.
   another class still runs, the run exits 1, and the note appears once.
 - No recorded command is ever `trust` or `untrust`, and no child environment
   has `HOMEBREW_NO_REQUIRE_TAP_TRUST` (existing pins stay).
-- File content: byte-exact without `no_autobump!`; the stanza removed with it;
+- File content: byte-exact without `no_autobump!`; the whole stanza removed
+  with it (continuation lines, `do` blocks, trailing comments, an unclosed
+  block left alone);
   formula and cask paths.
 - Verb: install when absent, upgrade when installed, for each of
   `brewsoak upgrade`, `install`, `reinstall`; cask always install; flags
