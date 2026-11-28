@@ -1435,7 +1435,7 @@ Error: formula-b: boom\n"
             "Installing no-soak packages (brew decides; runs brew install and brew upgrade)"
         );
         assert_eq!(
-            header(&[anchored.clone()], "install"),
+            header(std::slice::from_ref(&anchored), "install"),
             "Installing no-soak packages (brew decides; runs brew upgrade)"
         );
         // Nothing differs from the verb the user gave: the header is unchanged.
