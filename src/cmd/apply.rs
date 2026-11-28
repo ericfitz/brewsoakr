@@ -3732,6 +3732,29 @@ mod tests {
             assert!(undo_tree().is_empty(), "{:?}", undo_tree());
         }
 
+        #[test]
+        fn second_run_after_a_hold_holds_again_and_leaves_nothing() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git) = alpha_with_libx(tap.path());
+            brew.deps_errors
+                .insert("libx".into(), "Error: libx: boom".into());
+            let before = tree(tap.path());
+            let (r1, first) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert_eq!(tree(tap.path()), before);
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+            let (r2, second) = run_upgrade(&brew, &git, &core_snaps(), tap.path(), &["alpha"], &[]);
+            assert_eq!(second, first, "the same hold, the same text");
+            assert_eq!((r2.refused, r1.refused), (true, true));
+            assert!(summary_has(&second, "held", "1"), "{second}");
+            assert!(
+                alpha_soak_commands(&brew).is_empty(),
+                "{:?}",
+                visible(&brew)
+            );
+            assert_eq!(tree(tap.path()), before, "nothing kept between runs");
+            assert!(undo_tree().is_empty(), "{:?}", undo_tree());
+        }
+
         fn libx_by_name(same_source: bool) -> crate::brew::ByName {
             crate::brew::ByName {
                 tap: "homebrew/core".into(),
