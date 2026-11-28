@@ -935,6 +935,13 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             InstallRun::Untrusted(tap) => self.hold_target_untrusted(name, &tap),
             InstallRun::NotReady(n) => self.hold_target_not_ready(name, &n)?,
             InstallRun::Interrupted => self.hold_target_interrupted(name)?,
+            InstallRun::NoCutoff => {
+                let hold = NameHold {
+                    dep: None,
+                    why: NameFail::Why(NameWhy::NoCutoff),
+                };
+                self.hold_target_by_name(name, &bypass, &hold)?;
+            }
         }
         Ok(())
     }
@@ -952,12 +959,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
     ) -> Result<InstallRun, Error> {
         let install_flags = self.name_install_flags();
         let args = if origin::is_core_or_cask(origin_tap) {
-            let cutoff = cutoff.ok_or_else(|| {
-                Error::Other(format!(
-                    "{}: no cutoff file to stage for the soak tap",
-                    pkg.name
-                ))
-            })?;
+            let cutoff = match require_cutoff(cutoff) {
+                Ok(c) => c,
+                Err(held) => return Ok(held),
+            };
             match self
                 .soak
                 .stage(self.lock, self.brew, pkg, cutoff, installing.as_deref())?
@@ -1117,6 +1122,15 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             InstallRun::NotReady(n) => {
                 self.uncount_dep(dep);
                 self.hold_target_not_ready(target, &n)?;
+                return Ok(false);
+            }
+            InstallRun::NoCutoff => {
+                self.uncount_dep(dep);
+                let hold = NameHold {
+                    dep: Some(dep.to_string()),
+                    why: NameFail::Why(NameWhy::NoCutoff),
+                };
+                self.hold_target_by_name(target, bypass, &hold)?;
                 return Ok(false);
             }
             InstallRun::Interrupted => {
@@ -1508,8 +1522,17 @@ pub(super) fn brew_failed(output: &std::process::Output) -> bool {
     !output.status.success() && !already_installed_message(output)
 }
 
+/// The cutoff file a soak-tap install stages. A member without one is held
+/// (`InstallRun::NoCutoff`), not an error: the walk already holds it, so this
+/// is a second line of defense that must never abort the run.
+fn require_cutoff(cutoff: Option<&[u8]>) -> Result<&[u8], InstallRun> {
+    cutoff.ok_or(InstallRun::NoCutoff)
+}
+
 /// What `run_install` came to.
 pub(super) enum InstallRun {
+    /// There is no soaked cutoff file to stage for it.
+    NoCutoff,
     /// brew ran; `failed` when it exited non-zero for a reason of its own.
     /// `why` is what to say when the run did not leave the package installed
     /// from the soak tap: brew's first error line, that it left the installed
@@ -1548,6 +1571,12 @@ pub(crate) fn already_installed_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn require_cutoff_holds_a_member_without_one() {
+        assert!(matches!(require_cutoff(None), Err(InstallRun::NoCutoff)));
+        assert!(matches!(require_cutoff(Some(b"rb")), Ok(b"rb")));
+    }
     use crate::cmd::test_support::summary_has;
 
     use crate::brew::{InstalledPkg, MockBrew};
