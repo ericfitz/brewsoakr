@@ -86,7 +86,7 @@ const BY_NAME_RUBY: &str = r#"ARGV.each_slice(2) do |kind, name|
       puts ["OK", kind, name, f.tap&.name, f.pkg_version, f.ruby_source_checksum&.hexdigest, f.latest_version_installed?, Dependency.new(name).installed?].join("\t")
     end
   rescue StandardError, ScriptError => e
-    puts ["ERR", kind, name, e.class, e.message.lines.first.to_s.strip].join("\t")
+    puts ["ERR", kind, name, e.class.to_s.tr("\t", " "), e.message.lines.first.to_s.strip.tr("\t", " ")].join("\t")
   end
 end"#;
 
@@ -138,11 +138,15 @@ pub(crate) struct Loaded {
 /// One name's `BY_NAME_RUBY` answer, or brew's reason it has none.
 type LoadedAnswer = Result<Loaded, String>;
 
+/// The answer for a name the loader script printed no row for.
+const NO_LOADER_ROW: &str = "brew ruby gave no answer for this name";
+
 /// One answer per `asked` `(kind, name)` from `BY_NAME_RUBY` output. The
 /// `asked` entries must be unique: a row is consumed by the first entry that
-/// asks for it, so a repeated entry gets "no answer". Rows are matched by `kind name`, never by position: a missing or duplicated
-/// row is that name's `Err`, and lines that are not a row for an asked name
-/// (a stray brew message, a row for another name) are never assigned.
+/// asks for it, so a repeated entry gets "no answer". Rows are matched by
+/// `kind name`, never by position: a missing or duplicated row is that name's
+/// `Err`, and lines that are not a row for an asked name (a stray brew
+/// message, a row for another name) are never assigned.
 pub(crate) fn parse_by_name_lines(
     stdout: &str,
     asked: &[(PkgKind, String)],
@@ -160,7 +164,7 @@ pub(crate) fn parse_by_name_lines(
         .iter()
         .map(
             |(kind, name)| match rows.remove(&(kind_tag(*kind), name.as_str())) {
-                None => Err("brew ruby gave no answer for this name".to_string()),
+                None => Err(NO_LOADER_ROW.to_string()),
                 Some(mut found) if found.len() == 1 => found.remove(0),
                 Some(_) => Err("brew ruby answered this name more than once".to_string()),
             },
@@ -190,7 +194,8 @@ fn parse_by_name_row(fields: &[&str]) -> Result<Loaded, String> {
                 satisfied,
             })
         }
-        ["ERR", _, _, class, message] => {
+        ["ERR", _, _, class, message @ ..] if !message.is_empty() => {
+            let message = message.join(" ");
             let message = message.trim();
             Err(if message.is_empty() {
                 class.trim().to_string()
@@ -203,6 +208,27 @@ fn parse_by_name_row(fields: &[&str]) -> Result<Loaded, String> {
             fields.join("\t").trim()
         )),
     }
+}
+
+/// One answer per asked name from a finished loader run. Rows the script
+/// printed are used whatever its exit status; when it failed, a name with no
+/// row gets brew's failure text instead of `NO_LOADER_ROW`.
+fn by_name_answers(output: &Output, asking: &[(PkgKind, String)]) -> Vec<Result<Loaded, String>> {
+    let answers = parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), asking);
+    if output.status.success() {
+        return answers;
+    }
+    let text = match brew_fail(output) {
+        Error::Brew { message, .. } => message,
+        other => other.to_string(),
+    };
+    answers
+        .into_iter()
+        .map(|answer| match answer {
+            Err(e) if e == NO_LOADER_ROW => Err(text.clone()),
+            other => other,
+        })
+        .collect()
 }
 
 /// Compare one loaded answer with what the query expects.
@@ -974,15 +1000,7 @@ impl Brew for ProcessBrew {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner()) = true;
             }
-            let answers: Vec<Result<Loaded, String>> = if output.status.success() {
-                parse_by_name_lines(&String::from_utf8_lossy(&output.stdout), &asking)
-            } else {
-                let text = match brew_fail(&output) {
-                    Error::Brew { message, .. } => message,
-                    other => other.to_string(),
-                };
-                vec![Err(text); asking.len()]
-            };
+            let answers = by_name_answers(&output, &asking);
             let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
             for ((kind, name), answer) in asking.into_iter().zip(answers) {
                 loaded.insert((kind_tag(kind), name), answer);
@@ -3778,6 +3796,7 @@ case "$1" in
     echo "ruby $*" >> {log}
     if [ {ruby_exit} -ne 0 ]; then echo "boom" >&2; exit {ruby_exit}; fi
     while [ $# -gt 0 ]; do
+      if [ "$2" = "crashme" ]; then echo "boom" >&2; exit 3; fi
       printf 'OK\t%s\t%s\thomebrew/core\t1.0\tabc\tfalse\tfalse\n' "$1" "$2"
       shift 2
     done
@@ -3856,6 +3875,87 @@ esac
             .filter(|l| l.starts_with("ruby"))
             .collect();
         assert_eq!(rubies, ["ruby formula wget", "ruby formula curl"]);
+    }
+
+    fn output_of(code: i32, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(exit_status_raw(code)),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    const WGET_ROW: &str = "OK\tformula\twget\thomebrew/core\t1.0\tabc\tfalse\ttrue\n";
+
+    #[test]
+    fn by_name_answers_keep_printed_rows_when_the_script_fails() {
+        let out = output_of(1, WGET_ROW, "Error: boom\nmore\n");
+        let got = by_name_answers(&out, &asked(&["wget", "curl"]));
+        let wget = got[0].as_ref().expect("wget row kept");
+        assert_eq!(wget.tap, "homebrew/core");
+        assert_eq!(wget.version, "1.0");
+        assert!(wget.satisfied);
+        assert_eq!(got[1], Err("Error: boom\nmore".to_string()));
+    }
+
+    #[test]
+    fn by_name_answers_of_a_successful_script_report_a_missing_row_as_no_answer() {
+        let out = output_of(0, WGET_ROW, "");
+        let got = by_name_answers(&out, &asked(&["wget", "curl"]));
+        assert_eq!(
+            got[1],
+            Err("brew ruby gave no answer for this name".to_string())
+        );
+    }
+
+    #[test]
+    fn process_brew_by_name_keeps_rows_printed_before_the_script_died() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (brew, log) = fake_loader_brew(tmp.path(), 0);
+        let got = brew
+            .by_name(&[
+                query("wget", "homebrew/core", None),
+                query("crashme", "homebrew/core", None),
+                query("after", "homebrew/core", None),
+            ])
+            .expect("by_name");
+        assert_eq!(got[0].as_ref().expect("wget").tap, "homebrew/core");
+        assert!(got[1].as_ref().unwrap_err().contains("boom"));
+        assert!(got[2].as_ref().unwrap_err().contains("boom"));
+        brew.by_name(&[query("wget", "homebrew/core", None)])
+            .expect("again");
+        let rubies = log_lines(&log)
+            .into_iter()
+            .filter(|l| l.starts_with("ruby "))
+            .count();
+        assert_eq!(rubies, 1, "the kept row is remembered");
+    }
+
+    #[test]
+    fn parse_by_name_lines_keeps_an_err_message_that_contains_tabs() {
+        let out = "ERR\tformula\twget\tRuntimeError\tbad\tthing\there\n";
+        let got = parse_by_name_lines(out, &asked(&["wget"]));
+        assert_eq!(got[0], Err("bad thing here".to_string()));
+    }
+
+    #[test]
+    fn parse_by_name_row_rejects_an_err_row_without_a_message_field() {
+        let out = "ERR\tformula\twget\tRuntimeError\n";
+        let got = parse_by_name_lines(out, &asked(&["wget"]));
+        assert!(
+            got[0]
+                .as_ref()
+                .unwrap_err()
+                .starts_with("unparseable brew loader row"),
+            "{got:?}"
+        );
+    }
+
+    /// A text check of the Ruby source: Ruby cannot run in tests, so the parser
+    /// test above carries the behavior.
+    #[test]
+    fn by_name_script_replaces_tabs_in_error_text() {
+        assert!(BY_NAME_RUBY.contains(r#"e.message.lines.first.to_s.strip.tr("\t", " ")"#));
     }
 
     #[test]
