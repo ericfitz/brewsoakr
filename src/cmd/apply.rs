@@ -3900,6 +3900,58 @@ mod tests {
         }
 
         #[test]
+        fn tap_file_is_put_back_and_the_error_returned_when_the_install_errs() {
+            use std::os::unix::fs::PermissionsExt;
+            let tap = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let (brew, git) = soak_world(tap.path());
+            // The install succeeds, then forgetting the stale origin record
+            // fails: the cache directory cannot be written any more.
+            let mut records = OriginRecords::default();
+            records.set(PkgKind::Formula, "alpha", "acme/tools");
+            records.save(cache.path()).unwrap();
+            let locked = cache.path().to_path_buf();
+            *brew.on_call.lock().unwrap() = Some(Box::new(move |args: &[String]| {
+                if args.first().map(String::as_str) == Some("upgrade") {
+                    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+                        .unwrap();
+                }
+            }));
+            let cfg = cfg24();
+            let inv = inv_from(&brew, &cfg);
+            let result = upgrade(
+                &crate::lock::RunLock::for_tests(),
+                &brew,
+                &git,
+                &core_snaps(),
+                cache.path(),
+                tap.path(),
+                &inv,
+                &cfg,
+                &["alpha".to_string()],
+                &[],
+                &mut Vec::new(),
+            );
+            std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(result.is_err(), "the install's error propagates");
+            assert!(
+                visible(&brew).contains(&strs(&[
+                    "upgrade",
+                    "--formula",
+                    "ericfitz/brewsoak/alpha"
+                ])),
+                "{:?}",
+                visible(&brew)
+            );
+            assert_eq!(tap_file(tap.path(), "Formula/alpha.rb"), None);
+            assert!(
+                tree(&cache.path().join(UNDO_DIR)).is_empty(),
+                "{:?}",
+                tree(&cache.path().join(UNDO_DIR))
+            );
+        }
+
+        #[test]
         fn dry_run_meeting_a_leftover_undo_entry_holds_that_target() {
             let tap = tempfile::tempdir().unwrap();
             let (mut brew, git) = two_outdated_world("");
