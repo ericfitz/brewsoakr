@@ -580,6 +580,12 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         Ok(true)
     }
 
+    /// Why brew refused brewsoak's tap: the tap's own state, else untrusted
+    /// (a tap created in this run has no inventory entry).
+    fn soak_refusal(&self) -> NotReady {
+        soaktap::unusable(self.inv.soak_tap.as_ref()).unwrap_or(NotReady::Untrusted)
+    }
+
     /// An installed package that brew knows under its official tap: a
     /// formula anchored in the soak tap, or a cask whose receipt names it.
     fn is_official(&self, installed: Option<&Pkg>) -> bool {
@@ -896,7 +902,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             Err(Error::Brew { message, .. }) => {
                 match taps::blocking_untrusted_tap(&message) {
                     Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
-                        self.hold_target_not_ready(name, &NotReady::Untrusted)?
+                        self.hold_target_not_ready(name, &self.soak_refusal())?
                     }
                     Some(tap) => self.hold_target_untrusted(name, &tap),
                     None => {
@@ -973,13 +979,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             self.note_dropped_flags("install", &install_flags, "soaked installs");
             tap::brew_install_args(pkg, &pkg.name, &install_flags)
         };
-        Ok(
-            match self.record_name_install(origin_tap, &pkg.name, pkg.kind, installing, &args)? {
-                NameRun::Ran { failed, why } => InstallRun::Ran { failed, why },
-                NameRun::Untrusted(tap) => InstallRun::Untrusted(tap),
-                NameRun::TapNotReady => InstallRun::NotReady(NotReady::Untrusted),
-            },
-        )
+        self.record_name_install(origin_tap, &pkg.name, pkg.kind, installing, &args)
     }
 
     fn collect_cutoff_deps(
@@ -1379,7 +1379,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         kind: PkgKind,
         installing: Option<String>,
         args: &[String],
-    ) -> Result<NameRun, Error> {
+    ) -> Result<InstallRun, Error> {
         // The version being installed is on purpose; brew's "newer version is
         // available" warning about it is noise.
         let ctx = quiet::RunContext {
@@ -1395,10 +1395,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             && let Some(tap) = taps::blocking_untrusted_tap(&text)
         {
             if tap.eq_ignore_ascii_case(origin::SOAK_TAP) {
-                return Ok(NameRun::TapNotReady);
+                return Ok(InstallRun::NotReady(self.soak_refusal()));
             }
             if !origin::is_core_or_cask(origin_tap) {
-                return Ok(NameRun::Untrusted(tap));
+                return Ok(InstallRun::Untrusted(tap));
             }
         }
         self.done
@@ -1416,7 +1416,7 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
         if installed_now {
             self.forget_origin(kind, name)?;
         }
-        Ok(NameRun::Ran { failed, why })
+        Ok(InstallRun::Ran { failed, why })
     }
 
     fn resolve_kind(&self, origin_tap: &str, name: &str) -> Result<PkgKind, Error> {
@@ -1455,6 +1455,10 @@ impl<B: Brew, G: GitStore, W: Write> ApplySession<'_, B, G, W> {
             }
         }
         for note in step.notes {
+            self.defer(note);
+        }
+        if step.soak_tap_refused {
+            let note = self.soak_refusal().note();
             self.defer(note);
         }
         if let Some(code) = step.status {
@@ -1514,22 +1518,18 @@ pub(super) fn brew_failed(output: &std::process::Output) -> bool {
     !output.status.success() && !already_installed_message(output)
 }
 
-/// What one by-name `brew install` came to.
-pub(super) enum NameRun {
+/// What `run_install` came to.
+pub(super) enum InstallRun {
     /// brew ran; `failed` when it exited non-zero for a reason of its own.
     /// `why` is what to say when the run did not leave the package installed:
     /// brew's first error line, or that it left the installed version alone.
-    Ran { failed: bool, why: String },
+    Ran {
+        failed: bool,
+        why: String,
+    },
     /// brew does not trust this tap (lowercase `user/repo`).
     Untrusted(String),
-    /// brew does not trust brewsoak's own tap.
-    TapNotReady,
-}
-
-/// What `run_install` came to.
-enum InstallRun {
-    Ran { failed: bool, why: String },
-    Untrusted(String),
+    /// brewsoak's own tap cannot be used.
     NotReady(NotReady),
     Interrupted,
 }
@@ -4329,6 +4329,46 @@ mod tests {
                 1,
                 "{text}"
             );
+        }
+
+        #[test]
+        fn no_soak_step_refusing_a_remote_soak_tap_gives_the_remote_note() {
+            let tap = tempfile::tempdir().unwrap();
+            let (mut brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+            let mut entry = soak_tap_at(tap.path(), true);
+            entry.remote = Some("https://example.invalid/x".into());
+            brew.soak_tap = Some(entry);
+            brew.installed
+                .push(formula_pkg("wget", formula_rb("wget", "1.0.0", "oldsha")));
+            brew.outdated = vec!["wget".into()];
+            brew.next_status = 1;
+            brew.next_stdout =
+                b"Error: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.\n"
+                    .to_vec();
+            // The `brew update` run succeeds; the no-soak step then fails.
+            *brew.next_outputs.lock().unwrap() =
+                std::collections::VecDeque::from(vec![(0, Vec::new())]);
+            let cfg = cfg_with("NO_SOAK = [\"wget\"]\n");
+            let inv = inv_from(&brew, &cfg);
+            let mut out = Vec::new();
+            upgrade(
+                &crate::lock::RunLock::for_tests(),
+                &brew,
+                &git,
+                &snaps,
+                test_cache(),
+                tap.path(),
+                &inv,
+                &cfg,
+                &["wget".to_string()],
+                &[],
+                &mut out,
+            )
+            .unwrap();
+            let text = String::from_utf8(out).unwrap();
+            let remote = NotReady::Remote("https://example.invalid/x".into()).note();
+            assert_eq!(text.matches(&remote).count(), 1, "{text}");
+            assert!(!text.contains(&NotReady::Untrusted.note()), "{text}");
         }
 
         /// `hello` installed from the soak tap at 1.2.0, ahead of its soak

@@ -130,6 +130,9 @@ pub struct StepResult {
     pub current: usize,
     /// Targets brew said nothing about.
     pub no_result: usize,
+    /// A failed run whose brew refused brewsoak's own tap; the caller says
+    /// why, from the tap's state.
+    pub soak_tap_refused: bool,
 }
 
 /// The targets as `(kind flag, group)` runs: one unflagged group, or when
@@ -188,8 +191,8 @@ pub fn run_step(
 }
 
 /// A failed no-soak run whose brew refused brewsoak's own untrusted tap
-/// (a dependency of a no-soak package is anchored there): say how to trust
-/// it, once. The failure itself is reported as for any other.
+/// (a dependency of a no-soak package is anchored there): flag it, so the
+/// caller says why, once. The failure itself is reported as for any other.
 fn note_soak_tap_refusal(result: &mut StepResult, output: &std::process::Output) {
     if output.status.success() {
         return;
@@ -201,10 +204,7 @@ fn note_soak_tap_refusal(result: &mut StepResult, output: &std::process::Output)
     {
         return;
     }
-    let note = crate::soaktap::NotReady::Untrusted.note();
-    if !result.notes.contains(&note) {
-        result.notes.push(note);
-    }
+    result.soak_tap_refused = true;
 }
 
 /// `run_step`, skipping its own update (and header) when `updated`.
@@ -1489,7 +1489,7 @@ Error: formula-b: boom\n"
     }
 
     #[test]
-    fn untrusted_soak_tap_refusal_adds_the_note_once() {
+    fn soak_tap_refusal_sets_the_flag_and_no_note() {
         let refusal = |tap: &str| {
             format!("Error: Refusing to load formula {tap}/hello from untrusted tap {tap}.\n")
                 .into_bytes()
@@ -1508,13 +1508,7 @@ Error: formula-b: boom\n"
             &mut Vec::new(),
         )
         .unwrap();
-        let note = crate::soaktap::NotReady::Untrusted.note();
-        assert_eq!(
-            r.notes.iter().filter(|n| **n == note).count(),
-            1,
-            "{:?}",
-            r.notes
-        );
+        assert!(r.soak_tap_refused && r.notes.is_empty(), "{:?}", r.notes);
         assert_eq!(r.status, Some(1));
 
         // The soak tap's refusal is found after another tap's.
@@ -1532,12 +1526,7 @@ Error: formula-b: boom\n"
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(
-            r.notes.iter().filter(|n| **n == note).count(),
-            1,
-            "{:?}",
-            r.notes
-        );
+        assert!(r.soak_tap_refused && r.notes.is_empty(), "{:?}", r.notes);
 
         // Another tap's refusal, or a success, adds nothing.
         let brew = MockBrew {
@@ -1554,7 +1543,7 @@ Error: formula-b: boom\n"
             &mut Vec::new(),
         )
         .unwrap();
-        assert!(!r.notes.contains(&note), "{:?}", r.notes);
+        assert!(!r.soak_tap_refused, "{:?}", r.notes);
         let brew = MockBrew {
             next_stdout: refusal("ericfitz/brewsoak"),
             ..MockBrew::new()
@@ -1568,7 +1557,7 @@ Error: formula-b: boom\n"
             &mut Vec::new(),
         )
         .unwrap();
-        assert!(!r.notes.contains(&note), "{:?}", r.notes);
+        assert!(!r.soak_tap_refused, "{:?}", r.notes);
     }
 
     #[test]

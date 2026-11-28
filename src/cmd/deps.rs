@@ -102,10 +102,10 @@ impl NameFail {
     /// Classify brew's error text for a lookup or dependency failure. Its
     /// untrusted-tap refusal of brewsoak's own tap is a tap that is not
     /// ready, whichever package brew was loading.
-    fn from_brew(text: &str, why: impl FnOnce(String) -> NameWhy) -> Self {
+    fn from_brew(text: &str, soak_refusal: NotReady, why: impl FnOnce(String) -> NameWhy) -> Self {
         match taps::blocking_untrusted_tap(text) {
             Some(tap) if tap.eq_ignore_ascii_case(origin::SOAK_TAP) => {
-                Self::TapNotReady(NotReady::Untrusted)
+                Self::TapNotReady(soak_refusal)
             }
             Some(tap) => Self::Untrusted(tap),
             None => Self::Why(why(first_line(text))),
@@ -174,6 +174,12 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
 
     fn failed(&self) -> bool {
         self.held.is_some() || self.by_name.is_some()
+    }
+
+    /// Why brew refused brewsoak's tap: the tap's own state, else untrusted
+    /// (a tap created in this run has no inventory entry).
+    fn soak_refusal(&self) -> NotReady {
+        soaktap::unusable(self.inv.soak_tap.as_ref()).unwrap_or(NotReady::Untrusted)
     }
 
     pub(super) fn visit(
@@ -363,7 +369,11 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 Err(Error::Brew { message, .. })
                     if role != Role::Root && !taps::ambiguous_formula(&message) =>
                 {
-                    self.hold(role, name, NameFail::from_brew(&message, NameWhy::Deps));
+                    self.hold(
+                        role,
+                        name,
+                        NameFail::from_brew(&message, self.soak_refusal(), NameWhy::Deps),
+                    );
                     return Ok(None);
                 }
                 Err(e) => return Err(e),
@@ -388,7 +398,11 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
         match asked.unwrap_or_else(|| Err("brew gave no answer for this name".into())) {
             Ok(a) => Ok(Some(a)),
             Err(text) => {
-                self.hold(role, name, NameFail::from_brew(&text, NameWhy::Lookup));
+                self.hold(
+                    role,
+                    name,
+                    NameFail::from_brew(&text, self.soak_refusal(), NameWhy::Lookup),
+                );
                 Ok(None)
             }
         }
@@ -430,7 +444,7 @@ impl<B: Brew, G: GitStore> CutoffDepWalk<'_, B, G> {
                 self.hold(
                     role,
                     name,
-                    NameFail::from_brew(&message, NameWhy::SoakedCopy),
+                    NameFail::from_brew(&message, self.soak_refusal(), NameWhy::SoakedCopy),
                 );
                 Ok(None)
             }
@@ -3200,6 +3214,52 @@ mod soak_closure_tests {
                 .any(|a| a.last().is_some_and(|l| l == "packer")),
             "{text}"
         );
+    }
+
+    fn remote_soak_tap(brew: &mut MockBrew, tap: &std::path::Path) {
+        let mut entry = soak_tap_at(tap, true);
+        entry.remote = Some("https://example.invalid/x".into());
+        brew.soak_tap = Some(entry);
+    }
+
+    #[test]
+    fn soak_tap_refusal_with_a_remote_tap_gives_the_remote_note() {
+        let remote_note = NotReady::Remote("https://example.invalid/x".into()).note();
+        // The target's own dependency lookup is refused.
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git, snaps) = soak_and_packer_world(tap.path());
+        remote_soak_tap(&mut brew, tap.path());
+        brew.deps_errors.insert(
+            "packer".into(),
+            "Error: Refusing to load formula ericfitz/brewsoak/x from untrusted tap ericfitz/brewsoak."
+                .into(),
+        );
+        let (_, text) = run_upgrade(
+            &brew,
+            &git,
+            &snaps,
+            tap.path(),
+            &["hashicorp/tap/packer"],
+            &[],
+        );
+        assert_eq!(text.matches(&remote_note).count(), 1, "{text}");
+        assert!(!text.contains(&NotReady::Untrusted.note()), "{text}");
+        // A dependency's lookup is refused.
+        let tap = tempfile::tempdir().unwrap();
+        let (mut brew, git, snaps) = third_party_with_core_dep(tap.path());
+        remote_soak_tap(&mut brew, tap.path());
+        brew.installed.push(pinned_old("dep"));
+        brew.by_name.insert("dep".into(), Err(REFUSAL.into()));
+        let (_, text) = run_upgrade(
+            &brew,
+            &git,
+            &snaps,
+            tap.path(),
+            &["hashicorp/tap/packer"],
+            &[],
+        );
+        assert_eq!(text.matches(&remote_note).count(), 1, "{text}");
+        assert!(!text.contains(&NotReady::Untrusted.note()), "{text}");
     }
 
     const MULTI_REFUSAL: &str = "Error: packer: Refusing to load formula hashicorp/tap/packer from untrusted tap hashicorp/tap.\nError: dep: Refusing to load formula ericfitz/brewsoak/dep from untrusted tap ericfitz/brewsoak.";
