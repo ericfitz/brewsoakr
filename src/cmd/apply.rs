@@ -56,7 +56,8 @@ pub fn reinstall(
     validate_tokens(names)?;
     let plan_total = None;
     let dry_run = flags::is_dry_run(user_flags);
-    if !dry_run {
+    let refused_only = only_own_tap_tokens(names);
+    if !dry_run && !refused_only {
         soaktap::maintain(
             lock,
             brew,
@@ -109,7 +110,9 @@ pub fn reinstall(
             report::soak_banner("reinstalling", snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
-    session.update_before_soaked_work(names)?;
+    if !refused_only {
+        session.update_before_soaked_work(names)?;
+    }
     for raw in names {
         let r = resolve_token(raw, inv, cfg)?;
         if session.refuses_tap_switch(&r) {
@@ -262,7 +265,8 @@ pub(super) fn apply_many(
         out: Section::new(out, report::soaked_header(verb, dry_run, plan)),
     };
     validate_tokens(names)?;
-    if !dry_run {
+    let refused_only = only_own_tap_tokens(names);
+    if !dry_run && !refused_only {
         soaktap::maintain(
             lock,
             brew,
@@ -287,7 +291,9 @@ pub(super) fn apply_many(
             report::soak_banner(doing, snaps.hours.get(), &snaps.core, &snaps.cask)
         )?;
     }
-    session.update_before_soaked_work(names)?;
+    if !refused_only {
+        session.update_before_soaked_work(names)?;
+    }
     if plan.is_some() {
         session.out.open()?;
     }
@@ -308,6 +314,17 @@ pub(super) fn apply_many(
         refused: session.refused,
         brew_status: session.brew_status,
     })
+}
+
+/// True when every name is an explicit token of brewsoak's own tap. Each is
+/// refused (`refuses_tap_switch`), so such a run needs neither tap maintenance
+/// nor `brew update`. One other name and both happen, in the usual order.
+fn only_own_tap_tokens(names: &[String]) -> bool {
+    !names.is_empty()
+        && names.iter().all(|raw| {
+            crate::inventory::parse_token(raw)
+                .is_ok_and(|t| t.origin.is_some_and(|o| origin::own_tap(&o).is_some()))
+        })
 }
 
 pub(super) struct ApplySession<'a, B, G, W: Write> {
@@ -4364,6 +4381,78 @@ mod tests {
                 assert!(summary_has(&text, "held", "1"), "{verb}: {text}");
                 assert_eq!(combine_exit(r.refused, r.brew_status), 1, "{verb}");
                 no_command_names(&brew, "hello");
+            }
+        }
+
+        #[test]
+        fn case_variant_own_tap_token_is_refused_like_the_lowercase_one() {
+            for verb in ["upgrade", "install", "reinstall"] {
+                let tap = tempfile::tempdir().unwrap();
+                let (brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+                let (r, text) = verb_run(
+                    &brew,
+                    &git,
+                    &snaps,
+                    tap.path(),
+                    verb,
+                    &["ERICFITZ/BrewSoak/hello", "alpha"],
+                );
+                assert!(
+                    text.contains(
+                        "hello: ericfitz/brewsoak is brewsoak's own tap; name the package without the tap"
+                    ),
+                    "{verb}: {text}"
+                );
+                assert!(summary_has(&text, "held", "1"), "{verb}: {text}");
+                assert_eq!(combine_exit(r.refused, r.brew_status), 1, "{verb}");
+                no_command_names(&brew, "hello");
+            }
+        }
+
+        #[test]
+        fn own_tap_tokens_alone_skip_maintenance_and_brew_update() {
+            use crate::cmd::test_support::seed_stale_tap;
+            let own = ["ericfitz/brewsoak/hello"];
+            for verb in ["upgrade", "install", "reinstall"] {
+                // Only own-tap tokens: all are refused, so no maintenance and
+                // no brew update.
+                let tap = tempfile::tempdir().unwrap();
+                let (brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+                seed_stale_tap(tap.path(), test_cache());
+                let (tap_before, undo_before) = (tree(tap.path()), undo_tree());
+                let (r, text) = verb_run(&brew, &git, &snaps, tap.path(), verb, &own);
+                assert!(r.refused, "{verb}: {text}");
+                assert!(summary_has(&text, "held", "1"), "{verb}: {text}");
+                assert!(
+                    !visible(&brew).contains(&strs(&["update"])),
+                    "{verb}: {:?}",
+                    visible(&brew)
+                );
+                assert_eq!(tree(tap.path()), tap_before, "{verb}");
+                assert_eq!(undo_tree(), undo_before, "{verb}");
+                std::fs::remove_dir_all(test_cache().join(UNDO_DIR)).unwrap();
+                // Another name remains: both still happen.
+                let tap = tempfile::tempdir().unwrap();
+                let (brew, git, snaps) = hello_world(tap.path(), true, "1.1.0");
+                seed_stale_tap(tap.path(), test_cache());
+                let (tap_before, _) = (tree(tap.path()), undo_tree());
+                verb_run(
+                    &brew,
+                    &git,
+                    &snaps,
+                    tap.path(),
+                    verb,
+                    &["ericfitz/brewsoak/hello", "alpha"],
+                );
+                assert_ne!(tree(tap.path()), tap_before, "{verb}: maintenance ran");
+                if verb != "reinstall" {
+                    assert!(
+                        visible(&brew).contains(&strs(&["update"])),
+                        "{verb}: {:?}",
+                        visible(&brew)
+                    );
+                }
+                let _ = std::fs::remove_dir_all(test_cache().join(UNDO_DIR));
             }
         }
 
